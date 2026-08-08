@@ -34,6 +34,8 @@ Components:
 
 The agent harness is rig.rs. The extraction call is a rig completion request with a JSON output schema (schemars) for a typed `KnowledgeGraph` struct; the Anthropic provider uses native structured output. NOTE: rig-core 0.41 has no `Extractor` type; earlier drafts referenced it. The reply generation uses a rig completion with a manually maintained message history. Relationship-name validation and all memory-side rules run in plain Rust after the extraction returns.
 
+LLM access is endpoint-portable. Every LLM call uses one of two API families: an Anthropic-compatible endpoint or an OpenAI-compatible endpoint. The base URL of the endpoint is a user configuration item, so proxies and self-hosted endpoints work. Model names are configuration items. Refer to Section 13.
+
 ## 4. Platform abstraction
 
 ### 4.1 Rules
@@ -66,7 +68,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 - `messages` table: one row per normalized inbound or outbound message. Outbound rows store the bot's own speech. Rule B1 applies.
 - `reactions` table: one row per reaction event on a group message. The Phase 2 warmup backoff consumes this table. Reaction data is not recoverable later, so collection starts at intake time in Phase 1.
 - `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`.
-- `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag. Refer to Section 9.5.
+- `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag, rendered content. The rendered content is stored so a restart rebuild is bit-identical without graph queries. Refer to Section 9.5.
 - Vector index: sqlite-vec virtual tables in the same file. The embeddings of Person, Alias, and Concept names and descriptions live here. Refer to `proposed-graph-database-specs.md` Section 7.6.
 
 To delete the memory of a group, delete the directory. Both files share one lifecycle.
@@ -102,13 +104,13 @@ The live context is an ordered list of items:
 2. The previous digested chunk. Already extracted into the graph. Kept as an overlap buffer.
 3. The current tail. Undigested inbound messages, bot replies, and recall injections.
 
-Each item carries a message-id range tag. The boundary `last_digest_boundary_msg_id` splits the previous chunk from the current tail.
+Each item carries a message-id range tag. The boundary pair (`prev_digest_boundary_msg_id`, `last_digest_boundary_msg_id`) splits the previous chunk from the current tail. The previous chunk is the range at or below the previous boundary.
 
 ### 7.2 Rules
 
 - C1: Between two digests, the context is append-only. Rule P2 applies.
 - C2: A recall injection is always appended at the tail, directly after the messages that triggered it. An insertion into the middle of the history is forbidden.
-- C3: At digest time, the actor removes every item with a range tag at or below the previous boundary. The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. Refer to Section 10.3.
+- C3: At digest time, the actor removes every item with a range tag at or below the previous boundary. The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. Refer to Section 10.3. The actor performs the removal, the deduplication pruning of Section 10.2, and the boundary update as one serialized step (Section 6.1). Post-digest hooks are stateless observers only. They must not mutate the context.
 - C4: A persona preamble change invalidates the provider cache for all groups. Preamble edits are deliberate events, not runtime side effects.
 - C5: The context size is bounded by approximately two digest chunks. The maximum size follows from the digest thresholds in Section 8.2.
 
@@ -256,7 +258,15 @@ Global defaults. Every item is overridable per group.
 | `digest_max_retries` | 5 total attempts, including the first | 10.3 |
 | `warmup_quota` | 1–3 per day | 8.4 |
 
-Model selection is also configuration, but it is global (not per-group): `digest_model` (default `claude-haiku-4-5`) for extraction, with environment-variable override `TAMAKO_DIGEST_MODEL`. API keys come from the environment only, never from a config file.
+LLM access is global configuration, not per-group:
+
+| Key | Default | Notes |
+|---|---|---|
+| `llm_api` | `anthropic` | API family: `anthropic` or `openai-compatible`. Environment override: `TAMAKO_LLM_API`. |
+| `llm_base_url` | The canonical URL of the selected family | User-specified endpoint base URL. Permits proxies and self-hosted endpoints. Environment override: `TAMAKO_LLM_BASE_URL`. |
+| `digest_model` | `claude-haiku-4-5` | Extraction model. Environment override: `TAMAKO_DIGEST_MODEL`. |
+
+API keys come from the environment only, never from a config file (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` per the selected family).
 | `warmup_silence` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
 
