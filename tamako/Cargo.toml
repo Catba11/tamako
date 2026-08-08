@@ -10,6 +10,7 @@ tamako-memory.workspace = true
 tamako-agent.workspace = true
 tamako-persona.workspace = true
 tamako-adapter-mock.workspace = true
+tamako-adapter-teloxide.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true

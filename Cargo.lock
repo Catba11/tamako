@@ -2515,6 +2515,7 @@ dependencies = [
  "anyhow",
  "serde",
  "tamako-adapter-mock",
+ "tamako-adapter-teloxide",
  "tamako-agent",
  "tamako-core",
  "tamako-memory",
