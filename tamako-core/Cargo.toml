@@ -17,3 +17,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# test-util: the paused-time runtime of the M4 timer-driver test.
+tokio = { workspace = true, features = ["test-util"] }

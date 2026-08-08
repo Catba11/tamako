@@ -3,8 +3,39 @@
 //! Message intake appends to the raw log and updates the counters. The
 //! digest trigger (specs.md Section 8.2) is wired in Phase 1 (M1): when
 //! the trigger fires, the actor launches the digest pipeline as a
-//! spawned task and the result returns through the FIFO inbox. The wake
-//! procedure stays a stub (M4).
+//! spawned task and the result returns through the FIFO inbox.
+//!
+//! The wake procedure (specs.md Section 9, steps 1-5) is live since
+//! Phase 1 M4. A wake failure is logged and skipped, never retried
+//! inline and never fatal. The counters `wakes_total` and
+//! `participations_total` (Section 12) are best effort. The steps:
+//! 1. The monologue lock (Section 8.5): a muted, unforced wake resets
+//!    and returns. `wake_last_row_id` stays put, so messages of the
+//!    muted period remain "new" for the next real wake.
+//! 2. Recall (the seam): the wake calls the `RecallProvider` before the
+//!    gate. M4 wires `NoopRecall`; M5 replaces it.
+//! 3. The participation decision (Section 9.6) over the new messages of
+//!    this wake. Forced wakes (mention/reply, Section 8.1) bypass the
+//!    gate. Documented decision: the resets of spec steps 1 and 5
+//!    collapse into ONE reset at wake START, so messages that arrive
+//!    during a running wake count toward the next wake.
+//! 4. On participate, the reply model generates over a snapshot of the
+//!    live context. Before the send, the recency re-check (Section 6.2)
+//!    DISCARDS a stale reply (documented: discard, not regenerate; the
+//!    next wake is the natural retry). The send path persists the
+//!    outbound raw-log row FIRST (Rules B1/P1), then sends through the
+//!    outbound channel, appends the bot speech to the context, and
+//!    records the bot message for the monologue lock.
+//! 5. Done at start (refer to step 3).
+//!
+//! The timer driver (M4, known gap 2): a tokio interval inside the
+//! actor task evaluates the triggers on cadence ticks (`timer_cadence`;
+//! `MissedTickBehavior::Delay` — a delayed tick loses at most cadence
+//! time, while Burst could storm the FIFO evaluation). This closes the
+//! M1-known silent-group digest-timeout gap: a group with no traffic
+//! still gets its Section 8.2 timeout fallback evaluated on cadence
+//! ticks. Shutdown is structural: the ticker lives and dies inside the
+//! actor task.
 //!
 //! Reaction intake (Phase 1, M3) is passive collection: the actor
 //! persists one reaction row per event (specs.md Section 5.2) and
@@ -18,6 +49,7 @@
 //! persisted rows (specs.md Section 6.1, rule 4).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -28,14 +60,19 @@ use tamako_store::{
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
-use crate::context::{ContextItem, LiveContext};
+use crate::context::{render_human_content, ContextItem, ContextMessage, LiveContext};
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
-use crate::event::{InboundEvent, NormalizedMessage, ReactionEvent};
+use crate::event::{InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent};
 use crate::session::{round_to_millis, SessionState};
-use crate::trigger::{digest_should_fire, tail_stats, WakeScheduler};
+use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeScheduler};
+use crate::wake::{
+    GateDecision, GateInput, GateMessage, ParticipationGate, RecallProvider, ReplyGenerator,
+    ReplyRequest, WakeServices,
+};
 
 /// Errors of tamako-core.
 #[derive(Debug, thiserror::Error)]
@@ -52,17 +89,36 @@ pub enum CoreError {
     /// batch never blocks later batches (Section 10.3).
     #[error("digest error: {0}")]
     Digest(String),
+    /// A failure of the wake procedure (specs.md Section 9). Log and skip
+    /// this wake; the next wake is the natural retry.
+    #[error("wake error: {0}")]
+    Wake(String),
 }
 
 /// The default inbox capacity when the caller has no preference.
 pub const DEFAULT_INBOX_CAPACITY: usize = 256;
 
+/// The result of one wake procedure run, reported back through the
+/// FIFO inbox (specs.md Section 6.1, rule 1).
+#[derive(Debug)]
+pub struct WakeReport {
+    /// True for a forced wake (mention/reply, Section 8.1).
+    pub forced: bool,
+    /// The resolved target of the reply. `None` means the gate said no
+    /// (or named a target outside the presented set — treated as
+    /// no-participation).
+    pub target: Option<GateMessage>,
+    /// The generated reply text. `Some` only when `target` is `Some`.
+    pub reply_text: Option<String>,
+}
+
 /// Commands of the per-group actor inbox. specs.md Section 6.1, rule 1:
 /// all trigger events enter one FIFO inbox.
 pub enum ActorCommand {
     Inbound(InboundEvent),
-    /// Evaluates the wake timer at the given instant. The Phase 0 demo and
-    /// tests drive time explicitly; a real timer driver is Phase 1.
+    /// Evaluates the triggers at the given instant. The M4 timer driver
+    /// emits these on cadence with `OffsetDateTime::now_utc()`; tests
+    /// drive time explicitly.
     Tick(OffsetDateTime),
     /// Returns a snapshot of the session state (tests, restart checks).
     Snapshot(oneshot::Sender<SessionState>),
@@ -73,6 +129,9 @@ pub enum ActorCommand {
     /// (internal plumbing). Every session mutation stays serialized in
     /// the actor loop — specs.md Section 6.1, rule 2.
     DigestCompleted(std::result::Result<Option<DigestOutcome>, CoreError>),
+    /// The spawned wake task reports its result through this command
+    /// (internal plumbing, the same pattern as `DigestCompleted`).
+    WakeCompleted(std::result::Result<WakeReport, CoreError>),
     Shutdown,
 }
 
@@ -155,6 +214,20 @@ pub struct GroupActorParams<M: MemoryBackend> {
     /// `None` = no-op. The actor itself performs the Rule C3 context
     /// removal BEFORE it calls this hook (M2).
     pub post_digest_hook: Option<Arc<dyn PostDigestHook>>,
+    /// The wake-procedure services (M4). `None` keeps the stub behavior
+    /// EXACTLY: an unforced fire logs and resets, a forced wake logs
+    /// only. `Some` runs the wake procedure of specs.md Section 9.
+    pub wake: Option<WakeServices>,
+    /// The outbound action sink (Rule A3). The binary owns the platform
+    /// adapter and pumps this channel into `PlatformAdapter::execute`.
+    /// `None` drops actions with a debug log. The actor never blocks on
+    /// the sink: a full or closed channel degrades to a logged drop
+    /// (Section 4.2 tolerates outbound failures; the raw-log row — the
+    /// source of truth — is already persisted at that point).
+    pub outbound: Option<mpsc::Sender<OutboundAction>>,
+    /// The sender display name of outbound raw-log rows (the persona
+    /// name). `None` falls back to "Tamako".
+    pub bot_name: Option<String>,
 }
 
 /// Spawns the actor task and returns the handle immediately.
@@ -256,6 +329,35 @@ async fn persist_session(
     blocking_store(store, move |store| store.set_state_many(&chat_id, &pairs)).await
 }
 
+/// The counter increment of specs.md Section 12. Best effort (the M1
+/// counter style): a failure is logged and swallowed, never propagated —
+/// the wake does not depend on its metrics.
+async fn bump_counter(store: &Arc<Store>, chat_id: &str, key: &str) {
+    let chat_id_owned = chat_id.to_string();
+    let key_owned = key.to_string();
+    let result = blocking_store(store, move |store| {
+        store.increment_counter(&chat_id_owned, &key_owned, 1)
+    })
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, counter = key, "failed to increment a wake counter");
+    }
+}
+
+/// The period of the M4 timer driver. `timer_cadence` can return zero
+/// (only when `wake_floor` is zero), and `tokio::time::interval` panics
+/// on a zero period, so a zero cadence falls back to one second. With a
+/// zero floor the intake path drives nearly every wake anyway; the
+/// interval trigger fires at most one second late.
+fn timer_period(config: &TriggerConfig) -> Duration {
+    let cadence = timer_cadence(config);
+    if cadence.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        cadence
+    }
+}
+
 /// Evaluates the digest trigger (specs.md Section 8.2). On fire, spawns
 /// the pipeline task; the result returns through the FIFO inbox as
 /// `DigestCompleted`. No-op when no pipeline is wired or a digest is
@@ -329,8 +431,12 @@ async fn run_actor<M: MemoryBackend>(
         preamble,
         digest,
         post_digest_hook,
+        wake: wake_services,
+        outbound,
+        bot_name,
         ..
     } = params;
+    let bot_name = bot_name.unwrap_or_else(|| "Tamako".to_string());
 
     // --- Startup (see the docstring of spawn_group_actor) ---
     let startup_chat_id = chat_id.clone();
@@ -370,9 +476,35 @@ async fn run_actor<M: MemoryBackend>(
 
     // One digest at a time per group (Section 6.1, rule 2).
     let mut digest_in_flight = false;
+    // One wake at a time per group (Section 6.2: a forced Wake queues
+    // behind a running wake; it does not preempt it). The queued entry
+    // carries the intake time of the forcing message, so the queued
+    // wake stays on the deterministic replay clock.
+    let mut wake_in_flight = false;
+    let mut forced_pending: Option<(GateMessage, OffsetDateTime)> = None;
+
+    // --- The M4 timer driver (known gap 2) ---
+    // `MissedTickBehavior::Delay`: a delayed tick loses at most cadence
+    // time; Burst could storm the FIFO evaluation after a long blockage.
+    let mut ticker = tokio::time::interval(timer_period(&config));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick of `interval` completes immediately; consume it so
+    // startup does not cause an instant evaluation.
+    ticker.tick().await;
 
     // --- Inbox loop ---
-    while let Some(command) = inbox.recv().await {
+    loop {
+        let command = tokio::select! {
+            received = inbox.recv() => {
+                // A closed inbox means every handle is gone; end the task
+                // like Shutdown does.
+                match received {
+                    Some(command) => command,
+                    None => break,
+                }
+            }
+            _ = ticker.tick() => ActorCommand::Tick(OffsetDateTime::now_utc()),
+        };
         match command {
             ActorCommand::Inbound(InboundEvent::Message(msg)) => {
                 handle_message(
@@ -385,6 +517,9 @@ async fn run_actor<M: MemoryBackend>(
                     &mut context,
                     digest.as_ref(),
                     &mut digest_in_flight,
+                    wake_services.as_ref(),
+                    &mut wake_in_flight,
+                    &mut forced_pending,
                     &inbox_sender,
                     msg,
                 )
@@ -424,22 +559,70 @@ async fn run_actor<M: MemoryBackend>(
                 debug!(chat_id = %chat_id, event = ?event, "member event ignored (no consumer yet)");
             }
             ActorCommand::Tick(now) => {
-                // specs.md Section 6.2: Digest runs BEFORE Wake.
-                maybe_launch_digest(
+                // One shared handler for the explicit Tick command and
+                // the timer-driver tick, so the two cannot diverge.
+                handle_tick(
                     &store,
                     &chat_id,
                     &config,
-                    &session,
+                    &mut session,
+                    &mut wake,
+                    &mut rng,
+                    &context,
                     digest.as_ref(),
                     &mut digest_in_flight,
+                    wake_services.as_ref(),
+                    &mut wake_in_flight,
                     &inbox_sender,
                     now,
                 )
                 .await?;
-                if wake.should_fire(now, &config) {
-                    info!(chat_id = %chat_id, "wake timer fired (stub)");
-                    reset_wake(&config, &mut session, &mut wake, &mut rng, now);
-                    persist_session(&store, &chat_id, &session).await?;
+            }
+            ActorCommand::WakeCompleted(result) => {
+                wake_in_flight = false;
+                match result {
+                    Err(error) => {
+                        // Log, skip, no crash, NO inline retry: the next
+                        // wake is the natural retry (specs.md Section 9
+                        // failure handling).
+                        tracing::error!(chat_id = %chat_id, %error, "wake procedure failed; skipping this wake");
+                    }
+                    Ok(report) => {
+                        handle_wake_report(
+                            &store,
+                            &chat_id,
+                            &config,
+                            &mut session,
+                            &mut context,
+                            outbound.as_ref(),
+                            &bot_name,
+                            report,
+                        )
+                        .await?;
+                    }
+                }
+                // Section 6.2: a queued forced Wake moves to the head of
+                // the queue; it starts immediately after the current
+                // wake completes. The intake time of the forcing message
+                // is its `now` (deterministic replay).
+                if let Some(services) = wake_services.as_ref() {
+                    if let Some((forcing, forced_at)) = forced_pending.take() {
+                        start_wake(
+                            &store,
+                            &chat_id,
+                            &config,
+                            &mut session,
+                            &mut wake,
+                            &mut rng,
+                            &context,
+                            services,
+                            &mut wake_in_flight,
+                            &inbox_sender,
+                            Some(forcing),
+                            forced_at,
+                        )
+                        .await?;
+                    }
                 }
             }
             ActorCommand::DigestCompleted(result) => {
@@ -589,6 +772,9 @@ async fn handle_message(
     context: &mut LiveContext,
     digest: Option<&Arc<dyn DigestPipeline>>,
     digest_in_flight: &mut bool,
+    wake_services: Option<&WakeServices>,
+    wake_in_flight: &mut bool,
+    forced_pending: &mut Option<(GateMessage, OffsetDateTime)>,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     msg: NormalizedMessage,
 ) -> Result<(), CoreError> {
@@ -600,11 +786,12 @@ async fn handle_message(
         store.insert_message(&intake_chat_id, &row)
     })
     .await?;
-    match outcome {
+    let inserted_id = match outcome {
         InsertOutcome::Inserted(id) => {
             // Rule C1: the log row exists first (Rule P1), then the
             // materialized view gets the same item.
             context.append_human_message(id, &msg.sender_display_name, msg.timestamp, &msg.text);
+            Some(id)
         }
         InsertOutcome::Duplicate => {
             // Idempotent intake (AGENT.md Section 6.2): a replay after a
@@ -613,8 +800,9 @@ async fn handle_message(
             // one delivery twice. The log row — the source of truth — is
             // not duplicated, and the view must not duplicate either.
             debug!(chat_id = %chat_id, platform_msg_id = %msg.platform_msg_id, "duplicate delivery");
+            None
         }
-    }
+    };
 
     // Update the session in memory.
     session.record_human_message();
@@ -622,8 +810,7 @@ async fn handle_message(
     session.wake = wake.snapshot();
     persist_session(store, chat_id, session).await?;
 
-    // Trigger evaluation. The wake procedure is a stub (M4); only the
-    // scheduling runs here. `msg.timestamp` is `now`: deterministic
+    // Trigger evaluation. `msg.timestamp` is `now`: deterministic
     // replay. specs.md Section 6.2: Digest runs BEFORE Wake, so the
     // digest trigger is evaluated first.
     let now = msg.timestamp;
@@ -638,15 +825,425 @@ async fn handle_message(
         now,
     )
     .await?;
-    if msg.mentions_bot || msg.is_reply_to_bot {
-        // specs.md Section 8.1: the bot must respond when addressed
-        // directly. The muted state does not suppress a forced wake.
-        info!(chat_id = %chat_id, "forced wake requested (stub)");
+    let Some(services) = wake_services else {
+        // The M1-M3 stub behavior, kept EXACTLY for `wake: None`: an
+        // unforced fire logs and resets; a forced wake logs only.
+        if msg.mentions_bot || msg.is_reply_to_bot {
+            // specs.md Section 8.1: the bot must respond when addressed
+            // directly. The muted state does not suppress a forced wake.
+            info!(chat_id = %chat_id, "forced wake requested (stub)");
+        } else if wake.should_fire(now, config) {
+            info!(chat_id = %chat_id, "wake trigger fired (stub)");
+            reset_wake(config, session, wake, rng, now);
+            persist_session(store, chat_id, session).await?;
+        }
+        return Ok(());
+    };
+    // specs.md Section 8.1: a mention of the bot or a reply to the bot
+    // forces a wake. Only a NEWLY INSERTED row forces one: a Duplicate
+    // redelivery must not force a second wake.
+    let forcing = inserted_id
+        .filter(|_| msg.mentions_bot || msg.is_reply_to_bot)
+        .map(|row_id| GateMessage {
+            row_id,
+            platform_msg_id: msg.platform_msg_id.clone(),
+            content: render_human_content(&msg.sender_display_name, msg.timestamp, &msg.text),
+        });
+    if let Some(forcing) = forcing {
+        if *wake_in_flight {
+            // Section 6.2: a forced Wake moves to the head of the queue;
+            // it does not preempt a running call. It starts immediately
+            // after the current wake completes. A second forced wake
+            // replaces the queued one (the newest address wins).
+            debug!(chat_id = %chat_id, "a wake is in flight; the forced wake is queued");
+            *forced_pending = Some((forcing, now));
+        } else {
+            start_wake(
+                store,
+                chat_id,
+                config,
+                session,
+                wake,
+                rng,
+                context,
+                services,
+                wake_in_flight,
+                inbox_sender,
+                Some(forcing),
+                now,
+            )
+            .await?;
+        }
     } else if wake.should_fire(now, config) {
-        info!(chat_id = %chat_id, "wake trigger fired (stub)");
+        if *wake_in_flight {
+            // Section 6.2: inbound messages during a running wake do not
+            // interrupt the call. Thanks to reset-at-start their counts
+            // already go toward the next wake, so this fire is a no-op.
+            debug!(chat_id = %chat_id, "wake fired while a wake is in flight; skipped");
+        } else {
+            start_wake(
+                store,
+                chat_id,
+                config,
+                session,
+                wake,
+                rng,
+                context,
+                services,
+                wake_in_flight,
+                inbox_sender,
+                None,
+                now,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The shared tick handling of the explicit `ActorCommand::Tick` and the
+/// M4 timer driver, so the two paths cannot diverge. specs.md Section
+/// 6.2: Digest runs BEFORE Wake. A tick never forces a wake (forcing
+/// needs a mention/reply, Section 8.1), so there is no `forced_pending`
+/// parameter here.
+#[allow(clippy::too_many_arguments)]
+async fn handle_tick(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &mut SessionState,
+    wake: &mut WakeScheduler,
+    rng: &mut StdRng,
+    context: &LiveContext,
+    digest: Option<&Arc<dyn DigestPipeline>>,
+    digest_in_flight: &mut bool,
+    wake_services: Option<&WakeServices>,
+    wake_in_flight: &mut bool,
+    inbox_sender: &mpsc::Sender<ActorCommand>,
+    now: OffsetDateTime,
+) -> Result<(), CoreError> {
+    maybe_launch_digest(
+        store,
+        chat_id,
+        config,
+        session,
+        digest,
+        digest_in_flight,
+        inbox_sender,
+        now,
+    )
+    .await?;
+    let Some(services) = wake_services else {
+        // The M1-M3 stub behavior, kept EXACTLY for `wake: None`.
+        if wake.should_fire(now, config) {
+            info!(chat_id = %chat_id, "wake timer fired (stub)");
+            reset_wake(config, session, wake, rng, now);
+            persist_session(store, chat_id, session).await?;
+        }
+        return Ok(());
+    };
+    if wake.should_fire(now, config) {
+        if *wake_in_flight {
+            // Same rule as the intake path: the counts already go toward
+            // the next wake (reset-at-start), so this fire is a no-op.
+            debug!(chat_id = %chat_id, "wake fired while a wake is in flight; skipped");
+        } else {
+            start_wake(
+                store,
+                chat_id,
+                config,
+                session,
+                wake,
+                rng,
+                context,
+                services,
+                wake_in_flight,
+                inbox_sender,
+                None,
+                now,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The wake procedure of specs.md Section 9, steps 1-5, actor side.
+/// Runs inside the actor loop; only the LLM calls leave the loop (they
+/// run in a spawned task over owned data and report back through the
+/// FIFO inbox as `WakeCompleted`).
+#[allow(clippy::too_many_arguments)]
+async fn start_wake(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &mut SessionState,
+    wake: &mut WakeScheduler,
+    rng: &mut StdRng,
+    context: &LiveContext,
+    services: &WakeServices,
+    wake_in_flight: &mut bool,
+    inbox_sender: &mpsc::Sender<ActorCommand>,
+    forced: Option<GateMessage>,
+    now: OffsetDateTime,
+) -> Result<(), CoreError> {
+    // Step 1 (Sections 9 and 8.5): the monologue lock suppresses an
+    // unforced wake. A forced wake is never suppressed (Section 8.1).
+    // `wake_last_row_id` is deliberately NOT advanced here: messages
+    // that arrive during the muted period stay "new" for the next real
+    // wake (the Section 9.6 input).
+    if session.muted && forced.is_none() {
+        bump_counter(store, chat_id, "wakes_total").await;
         reset_wake(config, session, wake, rng, now);
         persist_session(store, chat_id, session).await?;
+        info!(chat_id = %chat_id, "wake suppressed by the monologue lock");
+        return Ok(());
     }
+
+    // Step 2 (Section 9.6): the new messages of this wake are the
+    // inbound raw-log rows above `wake_last_row_id`, rendered with the
+    // same helper as the live context so the gate input stays
+    // consistent with what the reply model sees.
+    let after_id = session.wake_last_row_id;
+    let gather_chat_id = chat_id.to_string();
+    let rows = blocking_store(store, move |store| {
+        store.list_messages_after(&gather_chat_id, after_id)
+    })
+    .await?;
+    // The tail row of ANY direction (the bot's own rows included)
+    // becomes the new `wake_last_row_id`; an empty range keeps the old
+    // value.
+    let tail_id = rows.last().map(|row| row.id).unwrap_or(after_id);
+    let new_messages: Vec<GateMessage> = rows
+        .iter()
+        .filter(|row| row.direction == Direction::Inbound)
+        .map(|row| GateMessage {
+            row_id: row.id,
+            platform_msg_id: row.platform_msg_id.clone(),
+            content: render_human_content(&row.sender_display_name, row.timestamp, &row.text),
+        })
+        .collect();
+
+    // Step 3, documented decision: the resets of spec steps 1 and 5
+    // collapse into ONE reset at wake START, so messages that arrive
+    // during a running wake count toward the next wake instead of being
+    // zeroed at completion (Section 6.2). The counter is best effort: a
+    // counter failure logs and never aborts the wake.
+    reset_wake(config, session, wake, rng, now);
+    session.wake_last_row_id = tail_id;
+    bump_counter(store, chat_id, "wakes_total").await;
+    persist_session(store, chat_id, session).await?;
+
+    // Step 4: Section 9.6 decides over the new messages; none exist
+    // here. An interval wake over a silent group must not burn an LLM
+    // call. The counter/timer reset already happened in step 3.
+    if forced.is_none() && new_messages.is_empty() {
+        debug!(chat_id = %chat_id, "wake over a silent group; no participation decision needed");
+        return Ok(());
+    }
+
+    // Step 5: the LLM calls run in a spawned task (the Section 6.1
+    // rule 3 analog). The context is actor-owned (Section 6.1 rule 2),
+    // so the task gets a SNAPSHOT taken NOW; it touches NO actor state
+    // at all. Inbound messages during the call are logged and appended;
+    // they do not interrupt it (Section 6.2).
+    let snapshot = context.messages_for_llm();
+    *wake_in_flight = true;
+    let recall = Arc::clone(&services.recall);
+    let gate = Arc::clone(&services.gate);
+    let reply = Arc::clone(&services.reply);
+    let task_chat_id = chat_id.to_string();
+    let sender = inbox_sender.clone();
+    tokio::spawn(async move {
+        let result = run_wake_calls(
+            &task_chat_id,
+            recall,
+            gate,
+            reply,
+            new_messages,
+            snapshot,
+            forced,
+        )
+        .await;
+        // A failed send means the actor is shutting down; the result is
+        // dropped (same rule as the digest task).
+        let _ = sender.send(ActorCommand::WakeCompleted(result)).await;
+    });
+    Ok(())
+}
+
+/// The LLM calls of one wake: recall (step 2), the participation
+/// decision (step 3), and the reply generation (step 4). Runs in a
+/// spawned task over owned data; touches NO actor state (specs.md
+/// Section 6.1, rule 2).
+async fn run_wake_calls(
+    chat_id: &str,
+    recall: Arc<dyn RecallProvider>,
+    gate: Arc<dyn ParticipationGate>,
+    reply: Arc<dyn ReplyGenerator>,
+    new_messages: Vec<GateMessage>,
+    snapshot: Vec<ContextMessage>,
+    forced: Option<GateMessage>,
+) -> Result<WakeReport, CoreError> {
+    // Step 2 (the M4 seam): recall before the gate. M4 wires
+    // `NoopRecall`, so `injections` is empty. M4 does not append
+    // injections to the context (appending zero items is identity); M5
+    // implements the context append and the `injected_memories` dedup
+    // persistence. The injections DO enter the gate input (Section 9.6).
+    let injections = recall.recall(chat_id, &new_messages).await?;
+    let forced_flag = forced.is_some();
+    // Step 3 (Section 9.6). Forced wakes BYPASS the gate (Section 8.1):
+    // `decide` is never called for them.
+    let decision = match &forced {
+        Some(forcing) => GateDecision {
+            participate: true,
+            target_row_id: Some(forcing.row_id),
+        },
+        None => {
+            gate.decide(&GateInput {
+                new_messages: new_messages.clone(),
+                injections,
+                forced: false,
+            })
+            .await?
+        }
+    };
+    // Target resolution. An id outside the presented set is treated as
+    // no-participation (the gate named a message the wake never saw).
+    let target = if !decision.participate {
+        None
+    } else if let Some(forcing) = &forced {
+        Some(forcing.clone())
+    } else {
+        let resolved = decision
+            .target_row_id
+            .and_then(|row_id| new_messages.iter().find(|msg| msg.row_id == row_id))
+            .cloned();
+        if resolved.is_none() {
+            debug!(chat_id = %chat_id, "the gate named a target outside the presented set; treated as no-participation");
+        }
+        resolved
+    };
+    // Step 4: the reply generation with the reply model over the context
+    // snapshot. Skipped when the decision is no-participation.
+    let reply_text = match &target {
+        Some(target) => Some(
+            reply
+                .generate(&ReplyRequest {
+                    messages: snapshot,
+                    target: target.clone(),
+                })
+                .await?,
+        ),
+        None => None,
+    };
+    Ok(WakeReport {
+        forced: forced_flag,
+        target,
+        reply_text,
+    })
+}
+
+/// The completion side of the wake procedure (specs.md Section 9 step 4
+/// send path). Runs inside the actor loop on `WakeCompleted(Ok(..))`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_wake_report(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &mut SessionState,
+    context: &mut LiveContext,
+    outbound: Option<&mpsc::Sender<OutboundAction>>,
+    bot_name: &str,
+    report: WakeReport,
+) -> Result<(), CoreError> {
+    let (Some(target), Some(text)) = (report.target, report.reply_text) else {
+        // The gate said no: nothing is sent. Only `wakes_total` was
+        // counted at the start of the wake.
+        return Ok(());
+    };
+    // The recency re-check (Section 6.2): when too many newer human
+    // messages arrived after the target, DISCARD the reply (documented
+    // decision: discard, NOT regenerate — the next wake is the natural
+    // retry).
+    let recheck_chat_id = chat_id.to_string();
+    let target_row_id = target.row_id;
+    let newer = blocking_store(store, move |store| {
+        store.count_inbound_after(&recheck_chat_id, target_row_id)
+    })
+    .await?;
+    if newer > config.reply_staleness_threshold {
+        info!(
+            chat_id = %chat_id,
+            newer,
+            threshold = config.reply_staleness_threshold,
+            "wake reply discarded: the conversation moved on"
+        );
+        return Ok(());
+    }
+    // a. Rules B1/P1: persist the outbound raw-log row FIRST — the log
+    // is the source of truth; never speak without logging. The
+    // synthetic id: the adapter contract (Rule A3) returns no platform
+    // id for a sent message, so the row carries a local synthetic id;
+    // nanosecond time keeps the idempotency key unique.
+    let now = OffsetDateTime::now_utc();
+    let row = NewMessage {
+        platform_msg_id: format!("bot-out:{}", now.unix_timestamp_nanos()),
+        direction: Direction::Outbound,
+        event_type: EventType::Message,
+        timestamp: now,
+        sender_id: "bot".to_string(),
+        sender_display_name: bot_name.to_string(),
+        text: text.clone(),
+        reply_to_platform_msg_id: Some(target.platform_msg_id.clone()),
+        mentions_bot: false,
+        is_reply_to_bot: false,
+    };
+    let insert_chat_id = chat_id.to_string();
+    let outcome = blocking_store(store, move |store| {
+        store.insert_message(&insert_chat_id, &row)
+    })
+    .await;
+    let row_id = match outcome {
+        Ok(InsertOutcome::Inserted(row_id)) => row_id,
+        // An insert failure (or an impossible duplicate of the synthetic
+        // id) aborts this wake's send path with an error log. The error
+        // is NOT propagated: the actor must not die over one reply.
+        Ok(InsertOutcome::Duplicate) => {
+            tracing::error!(chat_id = %chat_id, "outbound raw-log insert returned Duplicate; the reply is not sent");
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::error!(chat_id = %chat_id, %error, "failed to persist the outbound raw-log row; the reply is not sent");
+            return Ok(());
+        }
+    };
+    // b. The outbound action (Section 4.2: outbound failures are
+    // tolerated; M3 handles the platform-level ones). `try_send`: the
+    // actor never blocks on the sink; a full or closed channel degrades
+    // to a logged drop — the raw-log row above is already the source of
+    // truth.
+    let action = OutboundAction::SendText {
+        chat_id: chat_id.to_string(),
+        text: text.clone(),
+        reply_to_platform_msg_id: Some(target.platform_msg_id.clone()),
+    };
+    match outbound {
+        Some(sink) => {
+            if let Err(error) = sink.try_send(action) {
+                tracing::error!(chat_id = %chat_id, %error, "outbound action dropped (channel full or closed); the raw-log row is persisted");
+            }
+        }
+        None => debug!(chat_id = %chat_id, "outbound action dropped: no outbound sink wired"),
+    }
+    // c. The live context gets the same item (Rule C1).
+    context.append_bot_speech(row_id, &text);
+    // d. The Section 8.5 monologue lock, wired for live speech.
+    session.record_bot_message(config);
+    // e. Best-effort counter + the session persist of Section 6.1
+    // rule 4.
+    bump_counter(store, chat_id, "participations_total").await;
+    persist_session(store, chat_id, session).await?;
     Ok(())
 }
 
@@ -885,6 +1482,9 @@ mod tests {
             preamble: TEST_PREAMBLE.to_string(),
             digest: None,
             post_digest_hook: None,
+            wake: None,
+            outbound: None,
+            bot_name: None,
         })
     }
 
@@ -904,6 +1504,9 @@ mod tests {
             preamble: TEST_PREAMBLE.to_string(),
             digest: Some(digest),
             post_digest_hook: None,
+            wake: None,
+            outbound: None,
+            bot_name: None,
         })
     }
 
@@ -1030,6 +1633,9 @@ mod tests {
             preamble: TEST_PREAMBLE.to_string(),
             digest: None,
             post_digest_hook: None,
+            wake: None,
+            outbound: None,
+            bot_name: None,
         });
         let rebuilt = restarted.snapshot().await.expect("snapshot succeeds");
         assert_eq!(first, rebuilt);
@@ -1535,6 +2141,633 @@ mod tests {
         assert_eq!(items[0].kind, ContextItemKind::Preamble);
         assert_eq!(items[1].kind, ContextItemKind::HumanMessage);
         assert_eq!(items[1].range_tag, Some(RangeTag::single(1)));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- M4 wake-procedure tests ---
+
+    use crate::wake::NoopRecall;
+    use tokio::sync::Notify;
+
+    /// Which message of the presented set the scripted gate targets.
+    #[derive(Debug, Clone, Copy)]
+    enum GateTarget {
+        First,
+        Last,
+    }
+
+    /// A scripted participation gate (the `ScriptedDigest` pattern). The
+    /// double runs inside the spawned wake task, so it computes its
+    /// decision from the input: participate and target the first/last
+    /// new message. Every `decide` call is recorded.
+    struct ScriptedGate {
+        participate: bool,
+        target: GateTarget,
+        calls: Mutex<Vec<GateInput>>,
+    }
+
+    impl ScriptedGate {
+        fn yes(target: GateTarget) -> Arc<Self> {
+            Arc::new(Self {
+                participate: true,
+                target,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn no() -> Arc<Self> {
+            Arc::new(Self {
+                participate: false,
+                target: GateTarget::Last,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        }
+    }
+
+    impl ParticipationGate for ScriptedGate {
+        fn decide<'a>(
+            &'a self,
+            input: &'a GateInput,
+        ) -> Pin<Box<dyn Future<Output = Result<GateDecision, CoreError>> + Send + 'a>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(input.clone());
+            let target_row_id = if self.participate {
+                match self.target {
+                    GateTarget::First => input.new_messages.first(),
+                    GateTarget::Last => input.new_messages.last(),
+                }
+                .map(|msg| msg.row_id)
+            } else {
+                None
+            };
+            let participate = self.participate;
+            Box::pin(async move {
+                Ok(GateDecision {
+                    participate,
+                    target_row_id,
+                })
+            })
+        }
+    }
+
+    /// A scripted reply generator. With `hold` set, the FIRST `generate`
+    /// call waits on the notify (the in-flight hold of the queueing
+    /// tests). Every call is counted.
+    struct ScriptedReply {
+        text: String,
+        calls: Mutex<usize>,
+        hold: Option<Arc<Notify>>,
+    }
+
+    impl ScriptedReply {
+        fn new(text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                text: text.to_string(),
+                calls: Mutex::new(0),
+                hold: None,
+            })
+        }
+
+        fn held(text: &str, hold: Arc<Notify>) -> Arc<Self> {
+            Arc::new(Self {
+                text: text.to_string(),
+                calls: Mutex::new(0),
+                hold: Some(hold),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl ReplyGenerator for ScriptedReply {
+        fn generate<'a>(
+            &'a self,
+            _request: &'a ReplyRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
+            let call = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *calls += 1;
+                *calls
+            };
+            Box::pin(async move {
+                if call == 1 {
+                    if let Some(hold) = &self.hold {
+                        hold.notified().await;
+                    }
+                }
+                Ok(self.text.clone())
+            })
+        }
+    }
+
+    /// The trigger config of the wake tests: `count` messages fire the
+    /// threshold, no floor, and a 1 h interval whose jittered minimum
+    /// (42 min) stays above every elapsed time these tests use, so only
+    /// the count (or an explicit tick) fires.
+    fn wake_config(count: u32) -> TriggerConfig {
+        TriggerConfig {
+            wake_msg_count: count,
+            wake_floor: Duration::ZERO,
+            wake_interval: Duration::from_secs(60 * 60),
+            ..TriggerConfig::default()
+        }
+    }
+
+    /// Spawns an actor with the M4 wake services over the scripted
+    /// doubles and the real `NoopRecall`. Returns the outbound receiver
+    /// for the sent actions.
+    fn spawn_with_wake(
+        fixture: &Fixture,
+        config: TriggerConfig,
+        gate: Arc<ScriptedGate>,
+        reply: Arc<ScriptedReply>,
+    ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(64);
+        let services = WakeServices {
+            recall: Arc::new(NoopRecall),
+            gate,
+            reply,
+        };
+        let handle = spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config,
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: None,
+            post_digest_hook: None,
+            wake: Some(services),
+            outbound: Some(outbound_tx),
+            bot_name: None,
+        });
+        (handle, outbound_rx)
+    }
+
+    /// Reads one counter of the state table (None when the key does not
+    /// exist).
+    async fn counter_value(store: &Arc<Store>, key: &str) -> Option<i64> {
+        let key = key.to_string();
+        blocking_store_call(store, move |store| store.get_state(CHAT_ID, &key))
+            .await
+            .map(|value| value.parse().expect("a counter value is decimal"))
+    }
+
+    /// Polls until the counter reaches `want` or the deadline passes
+    /// (the `wait_for_boundary` pattern: bounded, deterministic).
+    async fn wait_for_counter(store: &Arc<Store>, key: &str, want: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if counter_value(store, key).await == Some(want) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for counter {key} to reach {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls until the gate double records `want` calls (bounded).
+    async fn wait_for_gate_calls(gate: &ScriptedGate, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if gate.call_count() >= want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {want} gate calls"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls until the reply double records `want` calls (bounded).
+    async fn wait_for_reply_calls(reply: &ScriptedReply, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reply.call_count() >= want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {want} reply calls"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls `snapshot()` until `muted` has the wanted value (bounded).
+    async fn wait_for_muted(handle: &GroupActorHandle, want: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let session = handle.snapshot().await.expect("snapshot succeeds");
+            if session.muted == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for muted == {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Receives the next outbound action with a bounded wait.
+    async fn next_action(outbound: &mut mpsc::Receiver<OutboundAction>) -> OutboundAction {
+        tokio::time::timeout(Duration::from_secs(5), outbound.recv())
+            .await
+            .expect("an outbound action arrives within 5 s")
+            .expect("the outbound channel stays open")
+    }
+
+    /// Asserts that no outbound action arrives within `window` (a
+    /// bounded negative check).
+    async fn assert_no_action(outbound: &mut mpsc::Receiver<OutboundAction>, window: Duration) {
+        assert!(
+            tokio::time::timeout(window, outbound.recv()).await.is_err(),
+            "an unexpected outbound action arrived"
+        );
+    }
+
+    /// Destructures a SendText action; panics on any other variant.
+    fn expect_send_text(action: OutboundAction) -> (String, String, Option<String>) {
+        let OutboundAction::SendText {
+            chat_id,
+            text,
+            reply_to_platform_msg_id,
+        } = action
+        else {
+            panic!("the action is a SendText, got {action:?}");
+        };
+        (chat_id, text, reply_to_platform_msg_id)
+    }
+
+    #[tokio::test]
+    async fn threshold_wake_participates_end_to_end() {
+        // specs.md Section 9 end to end in-core: three messages reach
+        // wake_msg_count; the gate says yes and targets the last new
+        // message (row 3).
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("a thoughtful reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+
+        // The reply goes out as a SendText with reply-to the target.
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "a thoughtful reply");
+        assert_eq!(reply_to, Some("m3".to_string()));
+
+        // participations_total lands at the END of the completion
+        // handler, so this wait covers the whole send path.
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+
+        // Rule B1: the outbound row is in the raw log.
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 4);
+        let bot_row = &rows[3];
+        assert_eq!(bot_row.direction, Direction::Outbound);
+        assert_eq!(bot_row.event_type, EventType::Message);
+        assert_eq!(bot_row.text, "a thoughtful reply");
+        assert_eq!(bot_row.reply_to_platform_msg_id, Some("m3".to_string()));
+        // bot_name None falls back to "Tamako".
+        assert_eq!(bot_row.sender_display_name, "Tamako");
+
+        // Rule C1: the context carries the bot speech at the tail.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 5);
+        let last = items.last().expect("items exist");
+        assert_eq!(last.kind, ContextItemKind::BotSpeech);
+        assert_eq!(last.role, ContextRole::Assistant);
+        assert_eq!(last.content, "a thoughtful reply");
+        assert_eq!(last.range_tag, Some(RangeTag::single(bot_row.id)));
+
+        // The wake advanced the tail marker.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 3);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn gate_no_sends_nothing() {
+        // Section 9.6: a negative decision sends nothing and counts no
+        // participation. Only wakes_total (counted at wake start) moves.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("never used");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_gate_calls(&gate, 1).await;
+        // The reply model never runs on a negative decision (Section 9.6).
+        assert_eq!(reply.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            None
+        );
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn forced_wake_bypasses_the_gate() {
+        // Section 8.1: a mention forces a wake. The gate double RECORDS
+        // its calls; the forced path must record ZERO calls and target
+        // the mention message itself.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("forced reply");
+        // A high count: only the mention can fire the wake.
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(100),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+
+        let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "forced reply");
+        assert_eq!(reply_to, Some("m1".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+
+        assert_eq!(gate.call_count(), 0);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].direction, Direction::Outbound);
+        assert_eq!(rows[1].reply_to_platform_msg_id, Some("m1".to_string()));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_monologue_lock_suppresses_an_unforced_wake() {
+        // Section 8.5 with the live speech path (Section 9 step 1).
+        // Counter design asserted below: wakes_total counts EVERY wake
+        // invocation — the two forced wakes, the suppressed wake, and
+        // the final wake = 4. participations_total counts the sent
+        // replies = 3.
+        //
+        // Note on the scenario: intake of ANY human message clears the
+        // lock (Section 8.5), so the muted unforced wake is driven by an
+        // explicit Tick, not by a message threshold — a threshold wake
+        // can never observe the muted state.
+        let fixture = make_fixture();
+        let hold = Arc::new(Notify::new());
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::held("monologue reply", Arc::clone(&hold));
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+
+        // Wake 1 (forced) holds inside the reply generation; mention m2
+        // queues behind it (Section 6.2). Both mentions land BEFORE any
+        // bot reply, so the two replies are consecutive in the log and
+        // engage the lock (monologue_limit 2).
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+        wait_for_reply_calls(&reply, 1).await;
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, true)))
+            .await
+            .expect("send succeeds");
+        hold.notify_one();
+
+        let (_, _, first_reply_to) = expect_send_text(next_action(&mut outbound).await);
+        let (_, _, second_reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(first_reply_to, Some("m1".to_string()));
+        assert_eq!(second_reply_to, Some("m2".to_string()));
+        wait_for_muted(&handle, true).await;
+        assert_eq!(gate.call_count(), 0);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            Some(2)
+        );
+
+        // The muted check (Section 9 step 1): the unforced tick wake is
+        // suppressed. wake_last_row_id is NOT advanced (messages of the
+        // muted period stay "new"); here it keeps the value wake 2's
+        // gather produced (row 3, the first bot reply row).
+        handle
+            .send(ActorCommand::Tick(t0() + time::Duration::hours(10)))
+            .await
+            .expect("send succeeds");
+        wait_for_counter(&fixture.store, "wakes_total", 3).await;
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert_eq!(gate.call_count(), 0);
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 3);
+
+        // One human message clears the lock (Section 8.5); three
+        // messages reach the threshold and the wake runs.
+        for (id, seconds) in [("c1", 36001), ("c2", 36002), ("c3", 36003)] {
+            handle
+                .send_event(InboundEvent::Message(message(id, seconds, false)))
+                .await
+                .expect("send succeeds");
+        }
+        let (_, _, third_reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(third_reply_to, Some("c3".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 3).await;
+        assert_eq!(gate.call_count(), 1);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(4));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn stale_reply_is_discarded_by_the_recency_recheck() {
+        // Section 6.2 recency re-check: threshold 0, so any newer human
+        // message after the target discards the reply. The gate targets
+        // the FIRST new message (row 1); rows 2-3 are newer. Documented
+        // decision: discard, NOT regenerate.
+        let fixture = make_fixture();
+        let mut config = wake_config(3);
+        config.reply_staleness_threshold = 0;
+        let gate = ScriptedGate::yes(GateTarget::First);
+        let reply = ScriptedReply::new("stale reply");
+        let (handle, mut outbound) =
+            spawn_with_wake(&fixture, config, Arc::clone(&gate), Arc::clone(&reply));
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_gate_calls(&gate, 1).await;
+        // The reply WAS generated (the generation is not the waste the
+        // re-check guards against; the SEND is), then discarded.
+        assert_eq!(reply.call_count(), 1);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            None
+        );
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_driver_evaluates_a_silent_group() {
+        // The M4 timer driver end to end: only the interval can fire
+        // (count 100; the message is timestamped exactly at started_at,
+        // so intake cannot fire). wake_interval 10 ms gives cadence 0
+        // (floor 0), which `timer_period` guards to 1 s; the paused
+        // runtime auto-advances to the first tick. The tick runs the
+        // SAME handler as an explicit Tick with
+        // `OffsetDateTime::now_utc()`, so the interval condition fires.
+        let config = TriggerConfig {
+            wake_interval: Duration::from_millis(10),
+            wake_floor: Duration::ZERO,
+            wake_msg_count: 100,
+            ..TriggerConfig::default()
+        };
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("timer reply");
+        let (handle, mut outbound) =
+            spawn_with_wake(&fixture, config, Arc::clone(&gate), Arc::clone(&reply));
+        handle
+            .send_event(InboundEvent::Message(message("m1", 0, false)))
+            .await
+            .expect("send succeeds");
+
+        // wakes_total moves only when a wake starts: the tick must have
+        // driven the evaluation (intake could not). The first cadence
+        // tick fires at 1 s virtual (the zero-cadence guard of
+        // `timer_period`); the paused runtime auto-advances to it during
+        // this one virtual sleep. A 10 ms poll loop would need ~100 real
+        // sqlite round trips to get there — one virtual jump instead.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        wait_for_counter(&fixture.store, "wakes_total", 1).await;
+        let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        // The live wake path ran (the stub path sends nothing and never
+        // participates).
+        assert_eq!(text, "timer reply");
+        assert_eq!(reply_to, Some("m1".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        assert_eq!(gate.call_count(), 1);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn forced_wake_queues_behind_a_running_wake() {
+        // Section 6.2: a forced Wake moves to the head of the queue; it
+        // does not preempt a running call. The reply double holds the
+        // first wake in flight until the test releases it.
+        let fixture = make_fixture();
+        let hold = Arc::new(Notify::new());
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::held("queued reply", Arc::clone(&hold));
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        // The threshold fires wake 1; its reply generation blocks, so
+        // the wake stays in flight.
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("p{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_reply_calls(&reply, 1).await;
+        // The mention queues behind the running wake.
+        handle
+            .send_event(InboundEvent::Message(message("m4", 4, true)))
+            .await
+            .expect("send succeeds");
+        hold.notify_one();
+
+        // BOTH replies arrive, in order: the running wake first, the
+        // forced one second.
+        let (_, _, first_reply_to) = expect_send_text(next_action(&mut outbound).await);
+        let (_, _, second_reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(first_reply_to, Some("p3".to_string()));
+        assert_eq!(second_reply_to, Some("m4".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 2).await;
+        // The gate ran exactly once: the forced wake bypassed it
+        // (Section 8.1).
+        assert_eq!(gate.call_count(), 1);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
         handle.shutdown().await.expect("shutdown succeeds");
     }
 }

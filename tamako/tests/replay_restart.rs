@@ -88,6 +88,10 @@ fn spawn_on(store: &Arc<Store>, memory: &Arc<LbugBackend>, chat_id: &str) -> Gro
         // Phase 0 replay: no digest pipeline (specs.md Section 8.2 stub).
         digest: None,
         post_digest_hook: None,
+        // The M4 wake wiring enters in a later subtask.
+        wake: None,
+        outbound: None,
+        bot_name: None,
     })
 }
 

@@ -196,6 +196,10 @@ fn spawn_actor(
         preamble: TEST_PREAMBLE.to_string(),
         digest: Some(digest),
         post_digest_hook,
+        // The M4 wake wiring enters in a later subtask.
+        wake: None,
+        outbound: None,
+        bot_name: None,
     })
 }
 

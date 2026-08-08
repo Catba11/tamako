@@ -283,6 +283,11 @@ async fn run_replay(data_root: &Path, setup: &SharedSetup, fixture: &Path) -> Re
         // The actor performs the Rule C3 removal itself (M2); the hook
         // stays a seam for observers that need no actor state.
         post_digest_hook: None,
+        // The M4 wake wiring (services, the outbound sink, the persona
+        // name) enters in a later subtask.
+        wake: None,
+        outbound: None,
+        bot_name: None,
     });
 
     let mut events_replayed = 0_usize;
@@ -504,6 +509,11 @@ async fn run_live(setup: &SharedSetup) -> Result<()> {
                                 preamble: setup.preamble.clone(),
                                 digest,
                                 post_digest_hook: None,
+                                // The M4 wake wiring enters in a later
+                                // subtask.
+                                wake: None,
+                                outbound: None,
+                                bot_name: None,
                             }))
                         }
                     };

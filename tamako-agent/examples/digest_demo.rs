@@ -160,6 +160,11 @@ async fn main() {
         preamble: "You are Tamako, a test pet.\n".to_string(),
         digest: Some(pipeline),
         post_digest_hook: None,
+        // The demo has no wake services (M4 wiring enters in a later
+        // subtask).
+        wake: None,
+        outbound: None,
+        bot_name: None,
     });
 
     let mut events = 0_usize;

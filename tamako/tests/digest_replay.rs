@@ -134,6 +134,10 @@ fn spawn_with_digest(
         preamble: "test preamble".to_string(),
         digest: Some(digest),
         post_digest_hook: None,
+        // The M4 wake wiring enters in a later subtask.
+        wake: None,
+        outbound: None,
+        bot_name: None,
     })
 }
 
