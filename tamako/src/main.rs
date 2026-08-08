@@ -2,9 +2,10 @@
 //! The demo replays a recorded chat log through the mock adapter into one
 //! group actor and prints a summary. The live mode runs against Telegram
 //! through the teloxide adapter (specs.md Section 4.2) and routes the
-//! events of every configured group to its own actor. Phase 1 (M1) wires
-//! the digest pipeline of specs.md Section 10 when `ANTHROPIC_API_KEY` is
-//! present; without the key digests simply do not run.
+//! events of every configured group to its own actor. Phase 1 wires the
+//! digest pipeline of specs.md Section 10 (M1) and the wake procedure of
+//! specs.md Section 9 (M4) from the resolved LLM endpoints of Section 13;
+//! without the family API key the pipelines degrade to silence.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -16,7 +17,8 @@ use anyhow::{Context, Result};
 use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::{
-    AgentDigestPipeline, AgentError, ExtractorConfig, PipelineConfig, RigExtractor,
+    AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
+    RigExtractor, RigGate, RigReplyGenerator,
 };
 use tamako_core::actor::{
     spawn_group_actor, GroupActorHandle, GroupActorParams, DEFAULT_INBOX_CAPACITY,
@@ -24,6 +26,8 @@ use tamako_core::actor::{
 use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::{BotConfig, TriggerConfig};
 use tamako_core::digest::DigestPipeline;
+use tamako_core::event::OutboundAction;
+use tamako_core::wake::{NoopRecall, WakeServices};
 use tamako_memory::LbugBackend;
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
 use tamako_store::Store;
@@ -185,27 +189,48 @@ fn load_persona_with_fallback(data_root: &Path) -> PersonaConfig {
     PersonaConfig::default()
 }
 
-/// Builds the digest pipeline (specs.md Section 10) when
-/// `ANTHROPIC_API_KEY` is present. `Ok(None)` means digests are disabled
-/// for this run: the replay still works, the digest trigger stays a
-/// stub. A provider configuration error degrades to `None` with a
-/// warning; every other build error propagates.
+/// Maps a `TriggerConfig` to the endpoint-resolution input of
+/// tamako-agent (specs.md Section 13). A mechanical field copy.
+fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
+    LlmConfigValues {
+        llm_api: config.llm_api.clone(),
+        llm_base_url: config.llm_base_url.clone(),
+        digest_model: config.digest_model.clone(),
+        gate_model: config.gate_model.clone(),
+        reply_model: config.reply_model.clone(),
+        digest_llm_api: config.digest_llm_api.clone(),
+        digest_llm_base_url: config.digest_llm_base_url.clone(),
+        gate_llm_api: config.gate_llm_api.clone(),
+        gate_llm_base_url: config.gate_llm_base_url.clone(),
+        reply_llm_api: config.reply_llm_api.clone(),
+        reply_llm_base_url: config.reply_llm_base_url.clone(),
+    }
+}
+
+/// Resolves the three LLM endpoints of specs.md Section 13 from the
+/// group configuration and the environment. A resolve error (an unknown
+/// `llm_api` family string, in the config or in `TAMAKO_LLM_API`) is a
+/// HARD startup error: operator misconfiguration must surface, never
+/// silently default.
+fn resolve_endpoints(config: &TriggerConfig) -> Result<LlmEndpoints> {
+    LlmEndpoints::resolve(&llm_config_values(config))
+        .map_err(anyhow::Error::new)
+        .context("failed to resolve the LLM endpoints (specs.md Section 13)")
+}
+
+/// Builds the digest pipeline (specs.md Section 10) for the resolved
+/// digest endpoint. `Ok(None)` means digests are disabled for this run:
+/// the replay still works, the digest trigger stays a stub. A missing
+/// family API key (`EndpointClient::build` reports it as
+/// `AgentError::ProviderConfig`, either family) degrades to `None` with
+/// a warning; every other build error propagates.
 fn build_digest_pipeline(
     store: &Arc<Store>,
     memory: &Arc<LbugBackend>,
-    config: &TriggerConfig,
+    endpoint: &EndpointConfig,
 ) -> Result<Option<Arc<dyn DigestPipeline>>> {
-    // rig reads ANTHROPIC_API_KEY itself (Client::from_env); the binary
-    // never reads the key. The check only decides whether to try.
-    if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
-        info!("ANTHROPIC_API_KEY is not set; the digest pipeline is disabled for this run");
-        return Ok(None);
-    }
-    // Override order: TAMAKO_DIGEST_MODEL, then the config-file
-    // digest_model (specs.md Section 13), then the default.
-    let extractor_config = ExtractorConfig::resolve(config.digest_model.as_deref());
-    let model = extractor_config.model.clone();
-    match RigExtractor::from_env(extractor_config) {
+    let model = endpoint.model.clone();
+    match RigExtractor::from_endpoint(endpoint) {
         Ok(extractor) => {
             info!(model = %model, "digest pipeline wired (live extraction)");
             Ok(Some(Arc::new(AgentDigestPipeline::new(
@@ -224,11 +249,49 @@ fn build_digest_pipeline(
     }
 }
 
+/// Builds the wake-procedure services (specs.md Section 9) for the
+/// resolved gate and reply endpoints. `Ok(None)` means the wake
+/// procedure is disabled for this run: the actor keeps its stub
+/// behavior and the bot stays silent. A missing family API key in
+/// EITHER endpoint (reported as `AgentError::ProviderConfig`) degrades
+/// to `None` with one warning; every other build error propagates.
+fn build_wake_services(endpoints: &LlmEndpoints) -> Result<Option<WakeServices>> {
+    match (
+        RigGate::from_endpoint(&endpoints.gate),
+        RigReplyGenerator::from_endpoint(&endpoints.reply),
+    ) {
+        (Ok(gate), Ok(reply)) => {
+            info!(
+                gate_model = %endpoints.gate.model,
+                reply_model = %endpoints.reply.model,
+                "wake procedure wired (live gate and reply)"
+            );
+            Ok(Some(WakeServices {
+                // specs.md Section 9 step 2: the recall seam. M4 wires
+                // the no-op; M5 replaces it with shallow recall.
+                recall: Arc::new(NoopRecall),
+                gate: Arc::new(gate),
+                reply: Arc::new(reply),
+            }))
+        }
+        (Err(AgentError::ProviderConfig(error)), _)
+        | (_, Err(AgentError::ProviderConfig(error))) => {
+            warn!(%error, "wake procedure disabled: no provider configuration; the bot stays silent this run");
+            Ok(None)
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            Err(error).context("failed to build the wake services")
+        }
+    }
+}
+
 /// The run setup shared by both modes: bot configuration, the rendered
-/// persona preamble, and the two storage backends.
+/// persona preamble, the persona name (the sender display name of
+/// outbound raw-log rows), and the two storage backends.
 struct SharedSetup {
     bot_config: BotConfig,
     preamble: String,
+    bot_name: String,
     store: Arc<Store>,
     memory: Arc<LbugBackend>,
 }
@@ -243,22 +306,34 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     Ok(SharedSetup {
         bot_config,
         preamble,
+        bot_name: persona.name,
         store: Arc::new(Store::new(cli.data_root.clone())),
         memory: Arc::new(LbugBackend::new(cli.data_root.clone())),
     })
 }
 
-/// Dispatches to the selected run mode after the shared setup.
+/// Dispatches to the selected run mode after the shared setup. One
+/// outbound channel serves every actor of the run (Rule A3): the actions
+/// carry their chat id, so one pump into the platform adapter is enough.
 async fn run(cli: Cli) -> Result<()> {
     let setup = shared_setup(&cli)?;
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<OutboundAction>(100);
     match cli.mode {
-        Mode::Replay { fixture } => run_replay(&cli.data_root, &setup, &fixture).await,
-        Mode::Live => run_live(&setup).await,
+        Mode::Replay { fixture } => {
+            run_replay(&cli.data_root, &setup, &fixture, outbound_tx, outbound_rx).await
+        }
+        Mode::Live => run_live(&setup, outbound_tx, outbound_rx).await,
     }
 }
 
 /// The `--replay` run. Refer to dev-roadmap.md Section 2.
-async fn run_replay(data_root: &Path, setup: &SharedSetup, fixture: &Path) -> Result<()> {
+async fn run_replay(
+    data_root: &Path,
+    setup: &SharedSetup,
+    fixture: &Path,
+    outbound_tx: tokio::sync::mpsc::Sender<OutboundAction>,
+    mut outbound_rx: tokio::sync::mpsc::Receiver<OutboundAction>,
+) -> Result<()> {
     let mut adapter = MockAdapter::from_fixture_path(fixture)
         .with_context(|| format!("failed to load the replay fixture {}", fixture.display()))?;
     let chat_id = adapter.chat_id().to_string();
@@ -267,9 +342,11 @@ async fn run_replay(data_root: &Path, setup: &SharedSetup, fixture: &Path) -> Re
     let store = Arc::clone(&setup.store);
     let memory = Arc::clone(&setup.memory);
     let group_config = setup.bot_config.for_group(&chat_id);
-    // The digest pipeline is built after the chat_id is known and before
-    // the actor spawns (Phase 1, M1).
-    let digest = build_digest_pipeline(&store, &memory, &group_config)?;
+    // The endpoints, the digest pipeline, and the wake services are
+    // built after the chat_id is known and before the actor spawns.
+    let endpoints = resolve_endpoints(&group_config)?;
+    let digest = build_digest_pipeline(&store, &memory, &endpoints.digest)?;
+    let wake = build_wake_services(&endpoints)?;
     let handle = spawn_group_actor(GroupActorParams {
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
@@ -283,29 +360,54 @@ async fn run_replay(data_root: &Path, setup: &SharedSetup, fixture: &Path) -> Re
         // The actor performs the Rule C3 removal itself (M2); the hook
         // stays a seam for observers that need no actor state.
         post_digest_hook: None,
-        // The M4 wake wiring (services, the outbound sink, the persona
-        // name) enters in a later subtask.
-        wake: None,
-        outbound: None,
-        bot_name: None,
+        wake,
+        outbound: Some(outbound_tx),
+        bot_name: Some(setup.bot_name.clone()),
     });
 
     let mut events_replayed = 0_usize;
-    while let Some(event) = adapter
-        .next_event()
-        .await
-        .context("the replay source failed")?
-    {
-        handle
-            .send_event(event)
-            .await
-            .context("the group actor inbox closed during the replay")?;
-        events_replayed += 1;
+    loop {
+        tokio::select! {
+            result = adapter.next_event() => match result {
+                Ok(Some(event)) => {
+                    handle
+                        .send_event(event)
+                        .await
+                        .context("the group actor inbox closed during the replay")?;
+                    events_replayed += 1;
+                }
+                Ok(None) => break,
+                Err(error) => return Err(error).context("the replay source failed"),
+            },
+            action = outbound_rx.recv() => match action {
+                // The outbound pump: the actor's wake replies execute on
+                // the same mock adapter (it records them for the demo).
+                // The mock never fails; log and continue if it ever does.
+                Some(action) => {
+                    if let Err(error) = adapter.execute(action).await {
+                        error!(chat_id = %chat_id, %error, "outbound action failed in replay mode");
+                    }
+                }
+                // The local sender is alive for the whole run, so the
+                // channel never closes here.
+                None => break,
+            },
+        }
     }
 
     // The snapshot is a FIFO barrier: when it returns, every replayed
     // event is processed and the session state is persisted.
     let session = handle.snapshot().await.context("the snapshot failed")?;
+    // Best-effort drain of the outbound channel: a wake that the last
+    // events spawned can still be in flight at the barrier, so this
+    // drain is NOT a completeness guarantee for the demo. The
+    // integration tests (tamako/tests/wake_replay.rs) assert the wake
+    // behavior deterministically.
+    while let Ok(action) = outbound_rx.try_recv() {
+        if let Err(error) = adapter.execute(action).await {
+            error!(chat_id = %chat_id, %error, "outbound action failed in replay mode");
+        }
+    }
     handle
         .shutdown()
         .await
@@ -419,7 +521,11 @@ fn log_chat_status(chat_id: &str, status: BotChatStatus, warned: &mut HashSet<St
 /// Intake tolerance: no code path complains about absent reaction
 /// events. For a non-administrator bot the polling stream simply never
 /// carries them; the single startup warning is the only notice.
-async fn run_live(setup: &SharedSetup) -> Result<()> {
+async fn run_live(
+    setup: &SharedSetup,
+    outbound_tx: tokio::sync::mpsc::Sender<OutboundAction>,
+    mut outbound_rx: tokio::sync::mpsc::Receiver<OutboundAction>,
+) -> Result<()> {
     // The binary never logs the token.
     let token = std::env::var("TELOXIDE_TOKEN")
         .ok()
@@ -488,14 +594,28 @@ async fn run_live(setup: &SharedSetup) -> Result<()> {
                                 log_chat_status(&chat_id, status, &mut warned);
                             }
                             let group_config = setup.bot_config.for_group(&chat_id);
+                            let endpoints = match resolve_endpoints(&group_config) {
+                                Ok(endpoints) => endpoints,
+                                Err(error) => {
+                                    fatal = Some(error);
+                                    break;
+                                }
+                            };
                             let digest =
-                                match build_digest_pipeline(&setup.store, &setup.memory, &group_config) {
+                                match build_digest_pipeline(&setup.store, &setup.memory, &endpoints.digest) {
                                     Ok(digest) => digest,
                                     Err(error) => {
                                         fatal = Some(error);
                                         break;
                                     }
                                 };
+                            let wake = match build_wake_services(&endpoints) {
+                                Ok(wake) => wake,
+                                Err(error) => {
+                                    fatal = Some(error);
+                                    break;
+                                }
+                            };
                             info!(chat_id = %chat_id, "first event of a configured group; spawning the actor");
                             entry.insert(spawn_group_actor(GroupActorParams {
                                 chat_id: chat_id.clone(),
@@ -509,11 +629,9 @@ async fn run_live(setup: &SharedSetup) -> Result<()> {
                                 preamble: setup.preamble.clone(),
                                 digest,
                                 post_digest_hook: None,
-                                // The M4 wake wiring enters in a later
-                                // subtask.
-                                wake: None,
-                                outbound: None,
-                                bot_name: None,
+                                wake,
+                                outbound: Some(outbound_tx.clone()),
+                                bot_name: Some(setup.bot_name.clone()),
                             }))
                         }
                     };
@@ -537,6 +655,25 @@ async fn run_live(setup: &SharedSetup) -> Result<()> {
                     warn!(%error, "fatal telegram adapter error; stopping the event loop");
                     break;
                 }
+            },
+            action = outbound_rx.recv() => match action {
+                Some(action) => {
+                    // specs.md Section 4.2: outbound failures are
+                    // tolerated. Warn with the chat id and continue;
+                    // never fatal. The raw-log row of the reply is
+                    // already persisted actor-side (Rules B1/P1).
+                    let action_chat_id = match &action {
+                        OutboundAction::SendText { chat_id, .. }
+                        | OutboundAction::SendMedia { chat_id, .. }
+                        | OutboundAction::React { chat_id, .. } => chat_id.clone(),
+                    };
+                    if let Err(error) = adapter.execute(action).await {
+                        warn!(chat_id = %action_chat_id, %error, "outbound action failed; continuing");
+                    }
+                }
+                // The local sender is alive for the whole run, so the
+                // channel never closes here.
+                None => break,
             },
             _ = tokio::signal::ctrl_c() => {
                 info!("ctrl-c received; shutting down");
