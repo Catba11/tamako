@@ -10,6 +10,7 @@ members = [
     "tamako-agent",
     "tamako-persona",
     "tamako-adapter-mock",
+    "tamako-adapter-teloxide",
 ]
 
 [workspace.dependencies]
@@ -62,6 +63,11 @@ rig = { package = "rig-core", version = "0.41" }
 # anywhere in the workspace.
 schemars = { version = "1", features = ["preserve_order"] }
 
+# Telegram adapter: the first real platform adapter (rule A5). Pin 0.17;
+# it requires rustc >= 1.85. Rule A1: no teloxide type crosses the adapter
+# boundary.
+teloxide = "0.17"
+
 # Internal crates.
 tamako-core = { path = "tamako-core" }
 tamako-store = { path = "tamako-store" }
@@ -69,3 +75,4 @@ tamako-memory = { path = "tamako-memory" }
 tamako-agent = { path = "tamako-agent" }
 tamako-persona = { path = "tamako-persona" }
 tamako-adapter-mock = { path = "tamako-adapter-mock" }
+tamako-adapter-teloxide = { path = "tamako-adapter-teloxide" }
