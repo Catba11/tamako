@@ -281,6 +281,28 @@ impl Store {
             Ok(u32::try_from(count).unwrap_or(u32::MAX))
         })
     }
+    /// Returns (sender_id, sender_display_name) of the message with the
+    /// given platform id, newest row first when duplicates exist.
+    /// Read-path support of the M5 recall worker (Section 8.1 step 1 of
+    /// the database spec: replies resolve to Person entries).
+    pub fn find_sender_by_platform_msg_id(
+        &self,
+        chat_id: &str,
+        platform_msg_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.with_conn(chat_id, |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT sender_id, sender_display_name FROM messages
+                     WHERE platform_msg_id = ?1 ORDER BY id DESC LIMIT 1",
+                    rusqlite::params![platform_msg_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })
+    }
+
     //
     // --- Session state KV (specs.md Sections 5.2 and 6.1) ---
     //
@@ -705,6 +727,59 @@ mod tests {
         assert_eq!(store.count_inbound_after("c1", ids[2]).expect("count"), 0);
         // The outbound tail row counts nothing.
         assert_eq!(store.count_inbound_after("c1", ids[3]).expect("count"), 0);
+    }
+
+    #[test]
+    fn find_sender_by_platform_msg_id_returns_the_newest_matching_row() {
+        // The M5 recall worker resolves a reply target to its sender
+        // (Section 8.1 step 1 of the database spec). Duplicates of one
+        // platform id exist (an edit appends a row, specs.md Section 15);
+        // the newest row wins.
+        let (_dir, store) = temp_store();
+        assert_eq!(
+            store
+                .find_sender_by_platform_msg_id("c1", "m-missing")
+                .expect("missing lookup"),
+            None
+        );
+
+        let base = sample_message();
+        let first = NewMessage {
+            platform_msg_id: "m-dup".to_string(),
+            sender_id: "u1".to_string(),
+            sender_display_name: "Alice".to_string(),
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
+            ..base.clone()
+        };
+        let second = NewMessage {
+            platform_msg_id: "m-dup".to_string(),
+            sender_id: "u1".to_string(),
+            sender_display_name: "Alice (renamed)".to_string(),
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("valid timestamp"),
+            ..base
+        };
+        assert!(matches!(
+            store.insert_message("c1", &first).expect("insert first"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &second).expect("insert second"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        assert_eq!(
+            store
+                .find_sender_by_platform_msg_id("c1", "m-dup")
+                .expect("lookup"),
+            Some(("u1".to_string(), "Alice (renamed)".to_string()))
+        );
+        // Rule P5: one group's data never crosses into another group.
+        assert_eq!(
+            store
+                .find_sender_by_platform_msg_id("c2", "m-dup")
+                .expect("other group lookup"),
+            None
+        );
     }
 
     #[test]

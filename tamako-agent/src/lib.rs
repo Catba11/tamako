@@ -13,6 +13,12 @@
 //!   cheap `gate_model`, structured output via JSON schema. Forced
 //!   wakes (mention/reply, Section 8.1) bypass the gate. The live
 //!   implementation is `RigGate`; tests use `ScriptedGate`.
+//! - The relevance gate of the recall worker (`recall`): the shallow
+//!   recall of the wake procedure (specs.md Section 9 step 2, Sections
+//!   9.1-9.4). Deterministic candidate extraction, exact alias match,
+//!   a cheap-model relevance decision, post-validated in plain Rust.
+//!   The live implementation is `RigRelevanceGate`; tests use
+//!   `ScriptedRelevanceGate`.
 //! - Reply generation (`reply`): on participate, the reply text with
 //!   the main `reply_model` over the live context (specs.md Section 9
 //!   step 4). The live implementation is `RigReplyGenerator`; tests use
@@ -101,6 +107,7 @@ pub mod gate;
 pub mod graph;
 pub mod pipeline;
 pub mod prompt;
+pub mod recall;
 pub mod reply;
 pub mod resolve;
 pub mod rig_impl;
@@ -118,6 +125,10 @@ pub use gate::{GateOutput, RigGate, ScriptedGate};
 pub use graph::{ExtractedEdge, ExtractedNode, ExtractedNodeType, KnowledgeGraph};
 pub use pipeline::{AgentDigestPipeline, PipelineConfig};
 pub use prompt::{render_extraction_prompt, EXTRACTION_PREAMBLE};
+pub use recall::{
+    candidate_terms, render_recall_prompt, RecallCandidate, RecallSelection, RelevanceGate,
+    RelevanceInput, RigRelevanceGate, ScriptedRelevanceGate, ShallowRecall, RECALL_PREAMBLE,
+};
 pub use reply::{context_messages_to_rig, RigReplyGenerator, ScriptedReplyGenerator};
 pub use resolve::resolve_batch;
 pub use rig_impl::{ExtractorConfig, RigExtractor};
