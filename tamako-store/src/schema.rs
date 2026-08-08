@@ -13,9 +13,10 @@ use crate::error::{Result, StoreError};
 
 /// Ordered list of schema migrations. Append only. Never edit an entry
 /// after it has shipped.
-pub const MIGRATIONS: &[(u32, &str)] = &[(
-    1,
-    "\
+pub const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        1,
+        "\
 CREATE TABLE messages (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     platform_msg_id         TEXT NOT NULL,
@@ -63,7 +64,18 @@ CREATE TABLE dead_letter (
     created_at     TEXT NOT NULL
 );
 ",
-)];
+    ),
+    (
+        2,
+        "\
+-- The live context rebuild (Rule P1, specs.md Section 7.1) must restore
+-- injection items bit-identically after a restart. The rendered injection
+-- text is not derivable from the graph, so it is persisted with the dedup
+-- row.
+ALTER TABLE injected_memories ADD COLUMN content TEXT NOT NULL DEFAULT '';
+",
+    ),
+];
 
 /// Applies all pending migrations. Each version runs in one transaction.
 pub fn run_migrations(conn: &mut Connection) -> Result<()> {

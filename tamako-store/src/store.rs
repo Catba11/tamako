@@ -123,6 +123,10 @@ pub struct InjectedMemoryRow {
     pub injection_position: i64,
     /// Message-id range tag of the current chunk.
     pub range_tag: String,
+    /// The rendered injection text. Persisted for the bit-identical
+    /// context rebuild of specs.md Section 7.1 (Rule P1): the text is not
+    /// derivable from the graph.
+    pub content: String,
 }
 
 /// A row of the `dead_letter` table. Refer to specs.md Section 10.3.
@@ -237,7 +241,8 @@ impl Store {
     // The state table is a generic key-value store. The design uses these
     // keys (the actor in tamako-core writes them; this crate does not
     // hard-code accessors):
-    //   last_digest_boundary_msg_id, muted_flag, consecutive_bot_msgs,
+    //   last_digest_boundary_msg_id, prev_digest_boundary_msg_id,
+    //   last_digest_at, muted_flag, consecutive_bot_msgs,
     //   wake_msgs_since_wake, wake_last_wake_at, wake_current_interval_ms.
     // Counter keys of specs.md Section 12 (used with increment_counter):
     //   wakes_total, participations_total, injection_wakes_total,
@@ -320,23 +325,27 @@ impl Store {
 
     // --- injected_memories (specs.md Sections 5.2 and 9.3; anti-defer list) ---
 
-    /// Records one injected recall item. Returns the new rowid.
+    /// Records one injected recall item. `content` holds the rendered
+    /// injection text for the context rebuild (specs.md Section 7.1).
+    /// Returns the new rowid.
     pub fn insert_injected_memory(
         &self,
         chat_id: &str,
         edge_id: &str,
         injection_position: i64,
         range_tag: &str,
+        content: &str,
     ) -> Result<i64> {
         self.with_conn(chat_id, |conn| {
             conn.execute(
                 "INSERT INTO injected_memories
-                    (edge_id, injection_position, range_tag, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                    (edge_id, injection_position, range_tag, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     edge_id,
                     injection_position,
                     range_tag,
+                    content,
                     schema::now_rfc3339()?,
                 ],
             )?;
@@ -347,7 +356,7 @@ impl Store {
     pub fn list_injected_memories(&self, chat_id: &str) -> Result<Vec<InjectedMemoryRow>> {
         self.with_conn(chat_id, |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, edge_id, injection_position, range_tag
+                "SELECT id, edge_id, injection_position, range_tag, content
                  FROM injected_memories ORDER BY id",
             )?;
             let rows = stmt
@@ -357,10 +366,25 @@ impl Store {
                         edge_id: row.get("edge_id")?,
                         injection_position: row.get("injection_position")?,
                         range_tag: row.get("range_tag")?,
+                        content: row.get("content")?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+    }
+
+    /// Deletes all rows with `injection_position <= msg_id`. Returns the
+    /// number of deleted rows. Refer to specs.md Section 10.2 step 4: at
+    /// digest time the dedup set is pruned together with the Rule C3
+    /// context removal. Rows at or below the previous digest boundary go.
+    pub fn delete_injected_memories_up_to(&self, chat_id: &str, msg_id: i64) -> Result<usize> {
+        self.with_conn(chat_id, |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM injected_memories WHERE injection_position <= ?1",
+                rusqlite::params![msg_id],
+            )?;
+            Ok(deleted)
         })
     }
 
@@ -528,13 +552,17 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 1);
-        let version: u32 = conn
-            .query_row("SELECT version FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .expect("read version");
-        assert_eq!(version, 1);
+        assert_eq!(count, 2);
+        let versions: Vec<u32> = {
+            let mut stmt = conn
+                .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .expect("prepare versions");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query versions")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect versions")
+        };
+        assert_eq!(versions, vec![1, 2]);
     }
 
     #[test]
@@ -769,10 +797,10 @@ mod tests {
     fn injected_memories_insert_and_list_round_trip() {
         let (_dir, store) = temp_store();
         let id1 = store
-            .insert_injected_memory("c1", "edge-1", 42, "m1-m10")
+            .insert_injected_memory("c1", "edge-1", 42, "m1-m10", "Alice likes tea")
             .expect("insert 1");
         let id2 = store
-            .insert_injected_memory("c1", "edge-2", 99, "m11-m20")
+            .insert_injected_memory("c1", "edge-2", 99, "m11-m20", "Bob plays go")
             .expect("insert 2");
         assert!(id2 > id1);
 
@@ -785,15 +813,69 @@ mod tests {
                     edge_id: "edge-1".to_string(),
                     injection_position: 42,
                     range_tag: "m1-m10".to_string(),
+                    content: "Alice likes tea".to_string(),
                 },
                 InjectedMemoryRow {
                     id: id2,
                     edge_id: "edge-2".to_string(),
                     injection_position: 99,
                     range_tag: "m11-m20".to_string(),
+                    content: "Bob plays go".to_string(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn injected_memory_content_round_trips_bit_identically() {
+        // The content column feeds the bit-identical context rebuild of
+        // specs.md Section 7.1 (Rule P1). Unicode and newlines must survive
+        // the round trip.
+        let (_dir, store) = temp_store();
+        let content = "- Alice: likes お茶\n- Bob: \"quoted\" text\n";
+        store
+            .insert_injected_memory("c1", "edge-1", 10, "m1-m10", content)
+            .expect("insert");
+
+        let rows = store.list_injected_memories("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, content);
+    }
+
+    #[test]
+    fn delete_injected_memories_up_to_removes_rows_at_or_below_the_boundary() {
+        // specs.md Section 10.2 step 4 / Rule C3: at digest time the dedup
+        // set is pruned. Rows at or below the previous boundary go; rows
+        // above stay.
+        let (_dir, store) = temp_store();
+        store
+            .insert_injected_memory("c1", "edge-1", 10, "m1-m10", "a")
+            .expect("insert 1");
+        store
+            .insert_injected_memory("c1", "edge-2", 20, "m11-m20", "b")
+            .expect("insert 2");
+        store
+            .insert_injected_memory("c1", "edge-3", 30, "m21-m30", "c")
+            .expect("insert 3");
+
+        // The boundary is inclusive: rows at 10 and 20 go, the row at 30
+        // stays.
+        let deleted = store
+            .delete_injected_memories_up_to("c1", 20)
+            .expect("delete up to 20");
+        assert_eq!(deleted, 2);
+
+        let rows = store.list_injected_memories("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].edge_id, "edge-3");
+        assert_eq!(rows[0].injection_position, 30);
+        assert_eq!(rows[0].content, "c");
+
+        // Deleting the same boundary again deletes nothing.
+        let deleted_again = store
+            .delete_injected_memories_up_to("c1", 20)
+            .expect("delete again");
+        assert_eq!(deleted_again, 0);
     }
 
     #[test]
