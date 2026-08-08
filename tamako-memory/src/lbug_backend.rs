@@ -30,7 +30,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
-use crate::backend::{AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NodeType, Result};
+use crate::backend::{
+    AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NeighborEdge, NodeType, Result,
+    NEIGHBOR_EXPANSION_LIMIT,
+};
 
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
 const DDL_NODE: &str = "CREATE NODE TABLE IF NOT EXISTS Node(
@@ -83,6 +86,21 @@ ON MATCH SET r.edge_text = $edge_text, r.invalid_at = $invalid_at, r.updated_at 
 const ALIAS_TARGETS: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node {id: $alias_id})
 WHERE r.relationship_name IN ['known_as', 'also_known_as']
 RETURN s.id, s.type";
+
+// Read path, Section 8.2: the valid direct neighbors of one entry node,
+// both directions in one query. The filter drops invalid edges and the
+// `contains` provenance edges (Section 6.3/8.2). The query enters the
+// graph through the node identifier (Rule R5); the node id is a $param
+// (Section 5.2 rule 4). The LIMIT is interpolated at the call site from
+// the trusted const NEIGHBOR_EXPANSION_LIMIT, the same "trusted values
+// only" policy as `query_rows`.
+const NEIGHBORS: &str = "MATCH (s:Node)-[r:EDGE]->(t:Node)
+WHERE (s.id = $node_id OR t.id = $node_id)
+  AND r.invalid_at IS NULL
+  AND r.relationship_name <> 'contains'
+RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at, r.created_at
+ORDER BY r.created_at DESC
+LIMIT ";
 
 fn backend(error: lbug::Error) -> MemoryError {
     MemoryError::Backend(error.to_string())
@@ -324,6 +342,70 @@ impl MemoryBackend for LbugBackend {
         .await
     }
 
+    async fn neighbors(&self, chat_id: &str, node_id: &str) -> Result<Vec<NeighborEdge>> {
+        // Section 8.2. An empty result means the node id is unknown or
+        // has no valid non-contains edges.
+        let node_id = node_id.to_string();
+        let cypher = format!("{NEIGHBORS}{NEIGHBOR_EXPANSION_LIMIT}");
+        self.with_conn(chat_id, move |conn| {
+            let mut statement = conn.prepare(&cypher).map_err(backend)?;
+            let result = conn
+                .execute(
+                    &mut statement,
+                    vec![("node_id", Value::String(node_id.clone()))],
+                )
+                .map_err(backend)?;
+            let mut edges = Vec::new();
+            for row in result {
+                let mut columns = row.into_iter();
+                let decoded = (
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                );
+                // A row with an unexpected shape is skipped, it does not
+                // fail the query (same policy as `alias_targets`).
+                let (
+                    Some(Value::String(source_id)),
+                    Some(Value::String(source_name)),
+                    Some(Value::String(target_id)),
+                    Some(Value::String(target_name)),
+                    Some(Value::String(relationship_name)),
+                    Some(Value::String(edge_text)),
+                    Some(Value::Timestamp(valid_at)),
+                    Some(Value::Timestamp(created_at)),
+                ) = decoded
+                else {
+                    continue;
+                };
+                // Section 8.2: the caller expands FROM the entry node, so
+                // report the endpoint that is not the queried node.
+                let (other_node_id, other_node_name) = if source_id == node_id {
+                    (target_id.clone(), target_name)
+                } else {
+                    (source_id.clone(), source_name)
+                };
+                edges.push(NeighborEdge {
+                    source_id,
+                    target_id,
+                    relationship_name,
+                    edge_text,
+                    valid_at,
+                    created_at,
+                    other_node_id,
+                    other_node_name,
+                });
+            }
+            Ok(edges)
+        })
+        .await
+    }
+
     async fn close(&self, chat_id: &str) -> Result<()> {
         validate_chat_id(chat_id)?;
         let db = self.databases.lock().await.remove(chat_id);
@@ -358,6 +440,7 @@ mod tests {
     use super::*;
     use crate::backend::{MemoryEdge, MemoryNode, NodeType};
     use time::macros::datetime;
+    use time::Duration;
 
     fn sample_batch() -> MemoryBatch {
         let person = MemoryNode {
@@ -556,5 +639,197 @@ mod tests {
             .await
             .unwrap();
         assert!(targets.is_empty());
+    }
+
+    fn concept_node(name: &str, created_at: OffsetDateTime) -> MemoryNode {
+        MemoryNode {
+            id: crate::identifiers::concept_id(name),
+            name: name.to_string(),
+            node_type: NodeType::Concept,
+            created_at,
+            updated_at: created_at,
+            properties: None,
+        }
+    }
+
+    fn fact_edge(
+        source_id: &str,
+        target_id: &str,
+        relationship_name: &str,
+        invalid_at: Option<OffsetDateTime>,
+        created_at: OffsetDateTime,
+    ) -> MemoryEdge {
+        MemoryEdge {
+            source_id: source_id.to_string(),
+            target_id: target_id.to_string(),
+            relationship_name: relationship_name.to_string(),
+            valid_at: created_at,
+            invalid_at,
+            edge_text: format!("{source_id} {relationship_name} {target_id}"),
+            created_at,
+            updated_at: created_at,
+            properties: None,
+        }
+    }
+
+    /// Section 8.2 test graph: B -likes-> A -dislikes-> C, with one
+    /// invalid edge D -likes-> A and one `contains` edge A -> C.
+    fn neighbor_batch() -> (MemoryBatch, MemoryNode, MemoryNode, MemoryNode) {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let a = concept_node("Alpha", base);
+        let b = concept_node("Beta", base);
+        let c = concept_node("Gamma", base);
+        let d = concept_node("Delta", base);
+        let edges = vec![
+            fact_edge(&b.id, &a.id, "likes", None, base + Duration::seconds(1)),
+            fact_edge(&a.id, &c.id, "dislikes", None, base + Duration::seconds(2)),
+            // Invalid edge: excluded by the `invalid_at IS NULL` filter.
+            fact_edge(
+                &d.id,
+                &a.id,
+                "likes",
+                Some(base + Duration::seconds(3)),
+                base + Duration::seconds(3),
+            ),
+            // Provenance edge: excluded (Section 6.3/8.2).
+            fact_edge(&a.id, &c.id, "contains", None, base + Duration::seconds(4)),
+        ];
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(2, 60),
+            nodes: vec![a.clone(), b.clone(), c.clone(), d],
+            edges,
+        };
+        (batch, a, b, c)
+    }
+
+    #[tokio::test]
+    async fn neighbors_returns_valid_edges_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, a, b, c) = neighbor_batch();
+        backend.upsert_batch("chat_g", &batch).await.unwrap();
+
+        let edges = backend.neighbors("chat_g", &a.id).await.unwrap();
+        // Two valid non-contains edges: one incoming, one outgoing.
+        assert_eq!(edges.len(), 2);
+        // Truncation order of Section 8.2: created_at descending.
+        assert_eq!(edges[0].relationship_name, "dislikes");
+        assert_eq!(edges[0].other_node_id, c.id);
+        assert_eq!(edges[0].other_node_name, "Gamma");
+        assert_eq!(edges[0].source_id, a.id);
+        assert_eq!(edges[0].target_id, c.id);
+        assert_eq!(edges[1].relationship_name, "likes");
+        assert_eq!(edges[1].other_node_id, b.id);
+        assert_eq!(edges[1].other_node_name, "Beta");
+        assert_eq!(edges[1].source_id, b.id);
+        assert_eq!(edges[1].target_id, a.id);
+    }
+
+    #[tokio::test]
+    async fn neighbors_excludes_invalid_and_contains_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, _a, _b, c) = neighbor_batch();
+        backend.upsert_batch("chat_h", &batch).await.unwrap();
+
+        // Gamma has one valid edge (dislikes). The contains edge Alpha ->
+        // Gamma and the invalid edge into Alpha must not occur here.
+        let edges = backend.neighbors("chat_h", &c.id).await.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].relationship_name, "dislikes");
+    }
+
+    #[tokio::test]
+    async fn neighbors_of_an_unknown_node_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, _a, _b, _c) = neighbor_batch();
+        backend.upsert_batch("chat_i", &batch).await.unwrap();
+
+        // Section 8.2: an unknown node id yields an empty vec.
+        let edges = backend
+            .neighbors("chat_i", &crate::identifiers::concept_id("nobody"))
+            .await
+            .unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn neighbors_truncates_to_the_expansion_limit_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let hub = concept_node("Hub", base);
+        // 505 valid edges on one node, distinct targets, increasing
+        // created_at. The natural key (source, target, rel, valid_at)
+        // stays distinct because the targets differ.
+        let over = NEIGHBOR_EXPANSION_LIMIT + 5;
+        let mut nodes = vec![hub.clone()];
+        let mut edges = Vec::with_capacity(over);
+        for i in 0..over {
+            let target = concept_node(&format!("Target{i:04}"), base);
+            edges.push(fact_edge(
+                &hub.id,
+                &target.id,
+                "mentions",
+                None,
+                base + Duration::seconds(i as i64),
+            ));
+            nodes.push(target);
+        }
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(3, 70),
+            nodes,
+            edges,
+        };
+        backend.upsert_batch("chat_j", &batch).await.unwrap();
+
+        let edges = backend.neighbors("chat_j", &hub.id).await.unwrap();
+        assert_eq!(edges.len(), NEIGHBOR_EXPANSION_LIMIT);
+        // Section 8.2: the 500 NEWEST edges, created_at descending.
+        for (rank, edge) in edges.iter().enumerate() {
+            let index = over - 1 - rank;
+            assert_eq!(
+                edge.other_node_id,
+                crate::identifiers::concept_id(&format!("Target{index:04}")),
+                "rank {rank} must be Target{index:04}"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbor_edge_id_is_stable_and_distinct() {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let edge = NeighborEdge {
+            source_id: "s".to_string(),
+            target_id: "t".to_string(),
+            relationship_name: "likes".to_string(),
+            edge_text: "text".to_string(),
+            valid_at: base,
+            created_at: base,
+            other_node_id: "t".to_string(),
+            other_node_name: "T".to_string(),
+        };
+        // Stable across calls; RFC 3339 rendering of valid_at.
+        let first = edge.edge_id();
+        assert_eq!(first, edge.edge_id());
+        assert_eq!(
+            first,
+            format!("s|likes|t|{}", base.format(&Rfc3339).unwrap())
+        );
+        // Distinct for each part of the natural key (Section 6.1).
+        let mut other = edge.clone();
+        other.target_id = "u".to_string();
+        assert_ne!(first, other.edge_id());
+        let mut other = edge.clone();
+        other.relationship_name = "dislikes".to_string();
+        assert_ne!(first, other.edge_id());
+        let mut other = edge.clone();
+        other.valid_at = base + Duration::seconds(1);
+        assert_ne!(first, other.edge_id());
+        // Display fields are not part of the key.
+        let mut other = edge.clone();
+        other.edge_text = "other text".to_string();
+        assert_eq!(first, other.edge_id());
     }
 }

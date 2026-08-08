@@ -81,6 +81,14 @@ impl MemoryBackend for NoopMemory {
         Ok(vec![])
     }
 
+    async fn neighbors(
+        &self,
+        _chat_id: &str,
+        _node_id: &str,
+    ) -> tamako_memory::Result<Vec<tamako_memory::NeighborEdge>> {
+        Ok(vec![])
+    }
+
     async fn close(&self, _chat_id: &str) -> tamako_memory::Result<()> {
         Ok(())
     }

@@ -12,8 +12,18 @@
 //! 1. The monologue lock (Section 8.5): a muted, unforced wake resets
 //!    and returns. `wake_last_row_id` stays put, so messages of the
 //!    muted period remain "new" for the next real wake.
-//! 2. Recall (the seam): the wake calls the `RecallProvider` before the
-//!    gate. M4 wires `NoopRecall`; M5 replaces it.
+//! 2. Recall (M5, Sections 9.1-9.5): the wake calls the
+//!    `RecallProvider` before the gate. The rendered injections enter
+//!    the gate input (Section 9.6) and the reply-model snapshot (the
+//!    injection is part of the context from step 2 on, so the reply
+//!    model of step 4 sees it). The completion handler records the
+//!    Section 9.3 dedup rows and appends the injections to the context
+//!    (Rule C2) BEFORE the participation outcome is applied: a gate-no
+//!    wake still injects (the memory was genuinely remembered; a silent
+//!    pet can still remember). `injection_wakes_total` (Section 12)
+//!    counts the wakes with at least one injection; it is best effort
+//!    like the other counters. `NoopRecall` keeps the no-injection
+//!    behavior when no LLM key is configured.
 //! 3. The participation decision (Section 9.6) over the new messages of
 //!    this wake. Forced wakes (mention/reply, Section 8.1) bypass the
 //!    gate. Documented decision: the resets of spec steps 1 and 5
@@ -64,14 +74,16 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
-use crate::context::{render_human_content, ContextItem, ContextMessage, LiveContext};
+use crate::context::{
+    render_human_content, ContextItem, ContextMessage, ContextRole, LiveContext, RangeTag,
+};
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
 use crate::event::{InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent};
 use crate::session::{round_to_millis, SessionState};
 use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeScheduler};
 use crate::wake::{
-    GateDecision, GateInput, GateMessage, ParticipationGate, RecallProvider, ReplyGenerator,
-    ReplyRequest, WakeServices,
+    GateDecision, GateInput, GateMessage, ParticipationGate, PlannedInjection, RecallProvider,
+    ReplyGenerator, ReplyRequest, WakeServices,
 };
 
 /// Errors of tamako-core.
@@ -110,6 +122,15 @@ pub struct WakeReport {
     pub target: Option<GateMessage>,
     /// The generated reply text. `Some` only when `target` is `Some`.
     pub reply_text: Option<String>,
+    /// The planned recall injections of this wake (Section 9.4). The
+    /// completion handler applies them (Section 9.3 dedup rows, Rule C2
+    /// context append) regardless of the gate outcome: the injection
+    /// happens as part of recall (step 2), BEFORE the participation
+    /// decision consumes the memories.
+    pub injections: Vec<PlannedInjection>,
+    /// The injection position: the tail raw-log row id computed at
+    /// wake start (Rule C2: the injection directly follows this row).
+    pub injection_position: i64,
 }
 
 /// Commands of the per-group actor inbox. specs.md Section 6.1, rule 1:
@@ -848,6 +869,9 @@ async fn handle_message(
             row_id,
             platform_msg_id: msg.platform_msg_id.clone(),
             content: render_human_content(&msg.sender_display_name, msg.timestamp, &msg.text),
+            sender_id: msg.sender_id.clone(),
+            reply_to_platform_msg_id: msg.reply_to_platform_msg_id.clone(),
+            text: msg.text.clone(),
         });
     if let Some(forcing) = forcing {
         if *wake_in_flight {
@@ -1021,6 +1045,12 @@ async fn start_wake(
             row_id: row.id,
             platform_msg_id: row.platform_msg_id.clone(),
             content: render_human_content(&row.sender_display_name, row.timestamp, &row.text),
+            // The recall worker needs the raw fields for deterministic
+            // candidate extraction (proposed-graph-database-specs.md
+            // Section 8.1 step 1); the gate prompt keeps `content`.
+            sender_id: row.sender_id.clone(),
+            reply_to_platform_msg_id: row.reply_to_platform_msg_id.clone(),
+            text: row.text.clone(),
         })
         .collect();
 
@@ -1063,6 +1093,7 @@ async fn start_wake(
             new_messages,
             snapshot,
             forced,
+            tail_id,
         )
         .await;
         // A failed send means the actor is shutting down; the result is
@@ -1075,22 +1106,40 @@ async fn start_wake(
 /// The LLM calls of one wake: recall (step 2), the participation
 /// decision (step 3), and the reply generation (step 4). Runs in a
 /// spawned task over owned data; touches NO actor state (specs.md
-/// Section 6.1, rule 2).
+/// Section 6.1, rule 2). `injection_position` is the tail raw-log row
+/// id computed at wake start; the completion handler uses it as the
+/// Rule C2 position of the injections.
+#[allow(clippy::too_many_arguments)]
 async fn run_wake_calls(
     chat_id: &str,
     recall: Arc<dyn RecallProvider>,
     gate: Arc<dyn ParticipationGate>,
     reply: Arc<dyn ReplyGenerator>,
     new_messages: Vec<GateMessage>,
-    snapshot: Vec<ContextMessage>,
+    mut snapshot: Vec<ContextMessage>,
     forced: Option<GateMessage>,
+    injection_position: i64,
 ) -> Result<WakeReport, CoreError> {
-    // Step 2 (the M4 seam): recall before the gate. M4 wires
-    // `NoopRecall`, so `injections` is empty. M4 does not append
-    // injections to the context (appending zero items is identity); M5
-    // implements the context append and the `injected_memories` dedup
-    // persistence. The injections DO enter the gate input (Section 9.6).
-    let injections = recall.recall(chat_id, &new_messages).await?;
+    // Step 2 (Sections 9.1-9.5): recall before the gate. The rendered
+    // injection texts enter the gate input (Section 9.6: the recall
+    // result is gate input on purpose) AND the reply-model snapshot:
+    // the injection is part of the context from step 2 on, so the
+    // reply model of step 4 sees it (Section 9.4, Rule C2 tail
+    // position). The dedup rows and the context append happen in the
+    // completion handler (Section 9.3), regardless of the gate
+    // outcome.
+    let recall_outcome = recall.recall(chat_id, &new_messages).await?;
+    let injections = recall_outcome.injections;
+    let injection_texts: Vec<String> = injections
+        .iter()
+        .map(|injection| injection.content.clone())
+        .collect();
+    for text in &injection_texts {
+        snapshot.push(ContextMessage {
+            role: ContextRole::Assistant,
+            content: text.clone(),
+        });
+    }
     let forced_flag = forced.is_some();
     // Step 3 (Section 9.6). Forced wakes BYPASS the gate (Section 8.1):
     // `decide` is never called for them.
@@ -1102,7 +1151,7 @@ async fn run_wake_calls(
         None => {
             gate.decide(&GateInput {
                 new_messages: new_messages.clone(),
-                injections,
+                injections: injection_texts,
                 forced: false,
             })
             .await?
@@ -1141,11 +1190,16 @@ async fn run_wake_calls(
         forced: forced_flag,
         target,
         reply_text,
+        injections,
+        injection_position,
     })
 }
 
 /// The completion side of the wake procedure (specs.md Section 9 step 4
 /// send path). Runs inside the actor loop on `WakeCompleted(Ok(..))`.
+/// Applies the recall injections FIRST (Section 9 step 2): a gate-no
+/// wake still injects — the memory was genuinely remembered; a silent
+/// pet can still remember.
 #[allow(clippy::too_many_arguments)]
 async fn handle_wake_report(
     store: &Arc<Store>,
@@ -1157,9 +1211,51 @@ async fn handle_wake_report(
     bot_name: &str,
     report: WakeReport,
 ) -> Result<(), CoreError> {
+    // The injection lifecycle of Section 9. The injections were planned
+    // in step 2 (recall), BEFORE the participation decision, so they
+    // are applied here regardless of the gate outcome.
+    let position = report.injection_position;
+    // The range tag string is uniform with the context item tags
+    // (RangeTag::single(position)).
+    let range_tag = RangeTag::single(position).as_string();
+    for injection in &report.injections {
+        // Section 9.3: the dedup is per edge id — one `injected_memories`
+        // row per injected edge (specs.md Section 5.2: one row per
+        // injected recall).
+        for edge_id in &injection.edge_ids {
+            let insert_chat_id = chat_id.to_string();
+            let edge_id_owned = edge_id.clone();
+            let row_range_tag = range_tag.clone();
+            let content = injection.content.clone();
+            let result = blocking_store(store, move |store| {
+                store.insert_injected_memory(
+                    &insert_chat_id,
+                    &edge_id_owned,
+                    position,
+                    &row_range_tag,
+                    &content,
+                )
+            })
+            .await;
+            if let Err(error) = result {
+                // The same tolerance as the send path: an insert failure
+                // logs an error and continues with the next injection;
+                // it is never fatal.
+                tracing::error!(chat_id = %chat_id, %error, edge_id, "failed to record an injected memory; continuing");
+            }
+        }
+        // Rule C2: the injection is appended at the tail, directly
+        // after the messages that triggered it.
+        context.append_recall_injection(position, injection.content.clone());
+    }
+    if !report.injections.is_empty() {
+        // Section 12: the injection-rate metric — wakes with at least
+        // one injection. Best effort like the other counters.
+        bump_counter(store, chat_id, "injection_wakes_total").await;
+    }
     let (Some(target), Some(text)) = (report.target, report.reply_text) else {
-        // The gate said no: nothing is sent. Only `wakes_total` was
-        // counted at the start of the wake.
+        // The gate said no: nothing is sent. Only `wakes_total` (and
+        // possibly `injection_wakes_total` above) was counted.
         return Ok(());
     };
     // The recency re-check (Section 6.2): when too many newer human
@@ -1326,6 +1422,14 @@ mod tests {
         ) -> tamako_memory::Result<Vec<tamako_memory::AliasTarget>> {
             // Records nothing; an empty result means the alias is unknown
             // (Section 7.4 step 2).
+            Ok(vec![])
+        }
+
+        async fn neighbors(
+            &self,
+            _chat_id: &str,
+            _node_id: &str,
+        ) -> tamako_memory::Result<Vec<tamako_memory::NeighborEdge>> {
             Ok(vec![])
         }
 
@@ -2221,10 +2325,11 @@ mod tests {
 
     /// A scripted reply generator. With `hold` set, the FIRST `generate`
     /// call waits on the notify (the in-flight hold of the queueing
-    /// tests). Every call is counted.
+    /// tests). Every call is counted and every request recorded.
     struct ScriptedReply {
         text: String,
         calls: Mutex<usize>,
+        requests: Mutex<Vec<ReplyRequest>>,
         hold: Option<Arc<Notify>>,
     }
 
@@ -2233,6 +2338,7 @@ mod tests {
             Arc::new(Self {
                 text: text.to_string(),
                 calls: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
                 hold: None,
             })
         }
@@ -2241,6 +2347,7 @@ mod tests {
             Arc::new(Self {
                 text: text.to_string(),
                 calls: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
                 hold: Some(hold),
             })
         }
@@ -2251,12 +2358,19 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
+
+        fn requests(&self) -> Vec<ReplyRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
     }
 
     impl ReplyGenerator for ScriptedReply {
         fn generate<'a>(
             &'a self,
-            _request: &'a ReplyRequest,
+            request: &'a ReplyRequest,
         ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
             let call = {
                 let mut calls = self
@@ -2266,6 +2380,10 @@ mod tests {
                 *calls += 1;
                 *calls
             };
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
             Box::pin(async move {
                 if call == 1 {
                     if let Some(hold) = &self.hold {
@@ -2274,6 +2392,51 @@ mod tests {
                 }
                 Ok(self.text.clone())
             })
+        }
+    }
+
+    /// A scripted recall provider (the `ScriptedGate` pattern). Each
+    /// `recall` call pops one queued `RecallOutcome` (an empty queue
+    /// yields the empty outcome) and records its input.
+    struct ScriptedRecall {
+        outcomes: Mutex<std::collections::VecDeque<crate::wake::RecallOutcome>>,
+        calls: Mutex<Vec<(String, Vec<GateMessage>)>>,
+    }
+
+    impl ScriptedRecall {
+        fn with_outcomes(outcomes: Vec<crate::wake::RecallOutcome>) -> Arc<Self> {
+            Arc::new(Self {
+                outcomes: Mutex::new(outcomes.into()),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, Vec<GateMessage>)> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl RecallProvider for ScriptedRecall {
+        fn recall<'a>(
+            &'a self,
+            chat_id: &'a str,
+            new_messages: &'a [GateMessage],
+        ) -> Pin<Box<dyn Future<Output = Result<crate::wake::RecallOutcome, CoreError>> + Send + 'a>>
+        {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((chat_id.to_string(), new_messages.to_vec()));
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(outcome) })
         }
     }
 
@@ -2290,18 +2453,18 @@ mod tests {
         }
     }
 
-    /// Spawns an actor with the M4 wake services over the scripted
-    /// doubles and the real `NoopRecall`. Returns the outbound receiver
-    /// for the sent actions.
+    /// Spawns an actor with the M5 wake services over the scripted
+    /// doubles. Returns the outbound receiver for the sent actions.
     fn spawn_with_wake(
         fixture: &Fixture,
         config: TriggerConfig,
+        recall: Arc<dyn RecallProvider>,
         gate: Arc<ScriptedGate>,
         reply: Arc<ScriptedReply>,
     ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let services = WakeServices {
-            recall: Arc::new(NoopRecall),
+            recall,
             gate,
             reply,
         };
@@ -2434,6 +2597,7 @@ mod tests {
         let (handle, mut outbound) = spawn_with_wake(
             &fixture,
             wake_config(3),
+            Arc::new(NoopRecall),
             Arc::clone(&gate),
             Arc::clone(&reply),
         );
@@ -2498,6 +2662,7 @@ mod tests {
         let (handle, mut outbound) = spawn_with_wake(
             &fixture,
             wake_config(3),
+            Arc::new(NoopRecall),
             Arc::clone(&gate),
             Arc::clone(&reply),
         );
@@ -2538,6 +2703,7 @@ mod tests {
         let (handle, mut outbound) = spawn_with_wake(
             &fixture,
             wake_config(100),
+            Arc::new(NoopRecall),
             Arc::clone(&gate),
             Arc::clone(&reply),
         );
@@ -2579,6 +2745,7 @@ mod tests {
         let (handle, mut outbound) = spawn_with_wake(
             &fixture,
             wake_config(3),
+            Arc::new(NoopRecall),
             Arc::clone(&gate),
             Arc::clone(&reply),
         );
@@ -2651,8 +2818,13 @@ mod tests {
         config.reply_staleness_threshold = 0;
         let gate = ScriptedGate::yes(GateTarget::First);
         let reply = ScriptedReply::new("stale reply");
-        let (handle, mut outbound) =
-            spawn_with_wake(&fixture, config, Arc::clone(&gate), Arc::clone(&reply));
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            config,
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
         for index in 1..=3 {
             handle
                 .send_event(InboundEvent::Message(message(
@@ -2697,8 +2869,13 @@ mod tests {
         let fixture = make_fixture();
         let gate = ScriptedGate::yes(GateTarget::Last);
         let reply = ScriptedReply::new("timer reply");
-        let (handle, mut outbound) =
-            spawn_with_wake(&fixture, config, Arc::clone(&gate), Arc::clone(&reply));
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            config,
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
         handle
             .send_event(InboundEvent::Message(message("m1", 0, false)))
             .await
@@ -2734,6 +2911,7 @@ mod tests {
         let (handle, mut outbound) = spawn_with_wake(
             &fixture,
             wake_config(3),
+            Arc::new(NoopRecall),
             Arc::clone(&gate),
             Arc::clone(&reply),
         );
@@ -2768,6 +2946,224 @@ mod tests {
         // (Section 8.1).
         assert_eq!(gate.call_count(), 1);
         assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- M5 injection-protocol tests ---
+
+    /// Lists the injected_memories rows through a blocking call, like
+    /// the actor does.
+    async fn list_injected_memories(store: &Arc<Store>) -> Vec<tamako_store::InjectedMemoryRow> {
+        blocking_store_call(store, move |store| store.list_injected_memories(CHAT_ID)).await
+    }
+
+    /// Opens the group store BEFORE the actor spawns: a concurrent
+    /// lazy `open_group` (from a test-side store call) of the same
+    /// store.db races the migration of the actor startup. The same
+    /// note as `forced_wake_does_not_panic_when_muted`.
+    async fn pre_open_group(store: &Arc<Store>) {
+        blocking_store_call(store, |store| store.open_group(CHAT_ID)).await;
+    }
+
+    #[tokio::test]
+    async fn gate_no_still_applies_the_planned_injection() {
+        // Section 9 step 2: the injection happens as part of recall,
+        // BEFORE the participation decision (the decision itself
+        // consumes the memories). A gate-no wake still injects: the
+        // memory was genuinely remembered; a silent pet can still
+        // remember.
+        let fixture = make_fixture();
+        pre_open_group(&fixture.store).await;
+        let recall = ScriptedRecall::with_outcomes(vec![crate::wake::RecallOutcome {
+            injections: vec![PlannedInjection {
+                edge_ids: vec!["edge-1".to_string(), "edge-2".to_string()],
+                content: "I remember: Alice likes GRPO".to_string(),
+            }],
+        }]);
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("never used");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&recall) as Arc<dyn RecallProvider>,
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        // The counter lands at the END of the injection application in
+        // the completion handler, so this wait covers it (Section 12).
+        wait_for_counter(&fixture.store, "injection_wakes_total", 1).await;
+
+        // The gate said no: nothing is sent, the reply model never ran.
+        assert_eq!(reply.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            None
+        );
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+
+        // Rule C2: the injection is appended to the context at the tail
+        // anyway, at the position of the tail row id at wake start (row
+        // 3, the last new message).
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 5);
+        let injection = items.last().expect("items exist");
+        assert_eq!(injection.kind, ContextItemKind::RecallInjection);
+        assert_eq!(injection.role, ContextRole::Assistant);
+        assert_eq!(injection.content, "I remember: Alice likes GRPO");
+        assert_eq!(injection.range_tag, Some(RangeTag::single(3)));
+
+        // Section 9.3: one dedup row per edge id, with the position,
+        // the range tag string, and the rendered content.
+        let rows = list_injected_memories(&fixture.store).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].edge_id, "edge-1");
+        assert_eq!(rows[1].edge_id, "edge-2");
+        for row in &rows {
+            assert_eq!(row.injection_position, 3);
+            assert_eq!(row.range_tag, "3-3");
+            assert_eq!(row.content, "I remember: Alice likes GRPO");
+        }
+
+        // Section 9.6: the recall result is gate input on purpose.
+        let gate_calls = gate.calls.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(gate_calls.len(), 1);
+        assert_eq!(
+            gate_calls[0].injections,
+            vec!["I remember: Alice likes GRPO".to_string()]
+        );
+
+        // The recall worker received the new messages with the raw
+        // fields populated (deterministic candidate extraction,
+        // proposed-graph-database-specs.md Section 8.1 step 1).
+        let recall_calls = recall.calls();
+        assert_eq!(recall_calls.len(), 1);
+        assert_eq!(recall_calls[0].0, CHAT_ID);
+        let presented = &recall_calls[0].1;
+        assert_eq!(presented.len(), 3);
+        assert_eq!(presented[0].sender_id, "u1");
+        assert_eq!(presented[0].text, "text of m1");
+        assert_eq!(presented[0].reply_to_platform_msg_id, None);
+        assert_eq!(presented[0].content, "[Alice 22:13] text of m1");
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn gate_yes_reply_request_includes_the_injection_text() {
+        // The injection is part of the context from step 2 on, so the
+        // reply model of step 4 sees it as an assistant message
+        // (Section 9.4, Rule C2 tail position).
+        let fixture = make_fixture();
+        pre_open_group(&fixture.store).await;
+        let recall = ScriptedRecall::with_outcomes(vec![crate::wake::RecallOutcome {
+            injections: vec![PlannedInjection {
+                edge_ids: vec!["edge-1".to_string()],
+                content: "I remember: Alice likes espresso".to_string(),
+            }],
+        }]);
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("a reply with context");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            recall,
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "a reply with context");
+
+        // The reply request: preamble + the three new messages + the
+        // injection as an assistant message at the tail.
+        let requests = reply.requests();
+        assert_eq!(requests.len(), 1);
+        let messages = &requests[0].messages;
+        assert_eq!(messages.len(), 5);
+        let injection = messages.last().expect("messages exist");
+        assert_eq!(injection.role, ContextRole::Assistant);
+        assert_eq!(injection.content, "I remember: Alice likes espresso");
+
+        // The normal injection bookkeeping still ran.
+        wait_for_counter(&fixture.store, "injection_wakes_total", 1).await;
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        let rows = list_injected_memories(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].edge_id, "edge-1");
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn empty_recall_outcome_injects_nothing() {
+        // Section 9.2: an empty injection is forbidden — nothing is
+        // injected. No context item, no dedup rows, no counter.
+        let fixture = make_fixture();
+        pre_open_group(&fixture.store).await;
+        let recall = ScriptedRecall::with_outcomes(vec![crate::wake::RecallOutcome::default()]);
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("never used");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&recall) as Arc<dyn RecallProvider>,
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_gate_calls(&gate, 1).await;
+        // The recall provider ran and returned the empty outcome.
+        assert_eq!(recall.calls().len(), 1);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+
+        // No injection item in the context (preamble + 3 human items).
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 4);
+        assert!(items
+            .iter()
+            .all(|item| item.kind != ContextItemKind::RecallInjection));
+        // No dedup rows.
+        assert!(list_injected_memories(&fixture.store).await.is_empty());
+        // The counter key is absent (the same counter assertion style
+        // as `participations_total` in `gate_no_sends_nothing`).
+        assert_eq!(
+            counter_value(&fixture.store, "injection_wakes_total").await,
+            None
+        );
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
         handle.shutdown().await.expect("shutdown succeeds");
     }
 }

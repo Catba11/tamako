@@ -7,6 +7,7 @@
 
 use std::future::Future;
 
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Errors of the memory backend.
@@ -110,6 +111,45 @@ pub struct MemoryBatch {
     pub edges: Vec<MemoryEdge>,
 }
 
+/// The expansion limit of Section 8.2: at most this many edges per node
+/// on one fetch. The fetch truncates by `created_at` descending.
+pub const NEIGHBOR_EXPANSION_LIMIT: usize = 500;
+
+/// Read path, Section 8.2: one valid edge of a resolved entry node with
+/// its endpoints. `contains` edges never occur here (provenance only,
+/// Section 6.3/8.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighborEdge {
+    pub source_id: String,
+    pub target_id: String,
+    /// System name or open-vocabulary snake_case name. Section 6.3.
+    pub relationship_name: String,
+    pub edge_text: String,
+    pub valid_at: OffsetDateTime,
+    pub created_at: OffsetDateTime,
+    /// The endpoint that is NOT the queried node.
+    pub other_node_id: String,
+    pub other_node_name: String,
+}
+
+impl NeighborEdge {
+    /// The stable dedup key of the natural key of the edge. The EDGE
+    /// table has no id column (Section 6.1), so the key is
+    /// `{source_id}|{relationship_name}|{target_id}|{valid_at}` with
+    /// `valid_at` rendered RFC 3339. This string is the `edge_id` that
+    /// the `injected_memories` dedup table stores (specs.md Section 9.3).
+    pub fn edge_id(&self) -> String {
+        let valid_at = self
+            .valid_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| format!("{:?}", self.valid_at));
+        format!(
+            "{}|{}|{}|{}",
+            self.source_id, self.relationship_name, self.target_id, valid_at
+        )
+    }
+}
+
 /// The graph memory backend. One database file per group at
 /// `{data_root}/{chat_id}/memory.lbug` (Section 5.1, Rule P5).
 ///
@@ -148,6 +188,24 @@ pub trait MemoryBackend: Send + Sync {
         chat_id: &'a str,
         alias_node_id: &'a str,
     ) -> impl Future<Output = Result<Vec<AliasTarget>>> + Send + 'a;
+
+    /// Read path, Section 8.2: the valid direct neighbors of one resolved
+    /// entry node, one hop. Enters through the node identifier (Rule R5).
+    /// `contains` edges are excluded (provenance only, Section 6.3/8.2).
+    /// At most NEIGHBOR_EXPANSION_LIMIT edges, truncated by `created_at`
+    /// descending. An unknown node id yields an empty vec.
+    ///
+    /// Documented Phase 1 simplifications of Section 8.2:
+    /// - Hub marking (degree above 1000) is SKIPPED. The 500-edge
+    ///   truncation applies unconditionally to every node, which is
+    ///   strictly stronger than the hub rule requires.
+    /// - The 90-day default time window is NOT applied. The graphs are
+    ///   young; the window exists for year-scale deployments.
+    fn neighbors<'a>(
+        &'a self,
+        chat_id: &'a str,
+        node_id: &'a str,
+    ) -> impl Future<Output = Result<Vec<NeighborEdge>>> + Send + 'a;
 
     /// Closes the cached handle of the group. Later calls reopen it.
     fn close<'a>(&'a self, chat_id: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;

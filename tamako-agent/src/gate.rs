@@ -281,6 +281,11 @@ mod tests {
             row_id,
             platform_msg_id: format!("m{row_id}"),
             content: content.to_string(),
+            // The M5 recall fields; the gate prompt reads `content`
+            // only, so plausible stand-ins suffice here.
+            sender_id: format!("u{row_id}"),
+            reply_to_platform_msg_id: None,
+            text: content.to_string(),
         }
     }
 

@@ -243,6 +243,11 @@ mod tests {
             row_id: 42,
             platform_msg_id: "m42".to_string(),
             content: "[Bob 13:02] what should we eat?".to_string(),
+            // The M5 recall fields; the reply path reads `content` and
+            // `platform_msg_id` only, so plausible stand-ins suffice.
+            sender_id: "u2".to_string(),
+            reply_to_platform_msg_id: None,
+            text: "what should we eat?".to_string(),
         }
     }
 

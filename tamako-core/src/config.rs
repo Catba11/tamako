@@ -84,6 +84,10 @@ pub struct TriggerConfig {
     /// Deviation of Phase 1 M4: this key is not yet in specs.md
     /// Section 13; it is reported for spec backfill.
     pub reply_staleness_threshold: u32,
+    /// The hard cap of injected memories per wake (Section 9.2
+    /// conservative default). Default 5. Deviation: specs.md Section 13
+    /// has no such key; reported for spec backfill (Phase 1 M5).
+    pub recall_injection_cap: u32,
     /// specs.md Section 8.4. Lower bound of the daily quota. Default 1.
     pub warmup_quota_min: u32,
     /// specs.md Section 8.4. Upper bound of the daily quota. Default 3.
@@ -121,6 +125,7 @@ impl Default for TriggerConfig {
             gate_model: None,
             reply_model: None,
             reply_staleness_threshold: 20,
+            recall_injection_cap: 5,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
             warmup_silence: Duration::from_secs(4 * 60 * 60),
@@ -175,6 +180,9 @@ pub struct TriggerConfigToml {
     /// The recency re-check threshold. Refer to
     /// `TriggerConfig::reply_staleness_threshold`.
     pub reply_staleness_threshold: Option<u32>,
+    /// The injection cap of one wake. Refer to
+    /// `TriggerConfig::recall_injection_cap`.
+    pub recall_injection_cap: Option<u32>,
     pub warmup_quota_min: Option<u32>,
     pub warmup_quota_max: Option<u32>,
     pub warmup_silence_secs: Option<u64>,
@@ -252,6 +260,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.reply_staleness_threshold {
             base.reply_staleness_threshold = value;
+        }
+        if let Some(value) = self.recall_injection_cap {
+            base.recall_injection_cap = value;
         }
         if let Some(value) = self.warmup_quota_min {
             base.warmup_quota_min = value;
@@ -365,6 +376,32 @@ wake_floor_secs = 60
         assert_eq!(config.gate_model, None);
         assert_eq!(config.reply_model, None);
         assert_eq!(config.reply_staleness_threshold, 20);
+        // The M5 key: the injection cap defaults to 5 (Section 9.2
+        // conservative default; deviation reported for spec backfill).
+        assert_eq!(config.recall_injection_cap, 5);
+    }
+
+    #[test]
+    fn toml_override_sets_recall_injection_cap() {
+        // The M5 deviation key follows the same per-key overlay pattern
+        // as every other key (AGENT.md Section 6.3: overridable per
+        // group).
+        let text = r#"
+[global]
+recall_injection_cap = 9
+
+[groups."-100777"]
+recall_injection_cap = 2
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the M5 TOML loads");
+        assert_eq!(config.global.recall_injection_cap, 9);
+        // A group override applies over the global value.
+        assert_eq!(config.for_group("-100777").recall_injection_cap, 2);
+        // A group without an override receives the global value.
+        assert_eq!(config.for_group("-100999").recall_injection_cap, 9);
+        // A key the TOML does not set keeps the default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(plain.global.recall_injection_cap, 5);
     }
 
     #[test]
