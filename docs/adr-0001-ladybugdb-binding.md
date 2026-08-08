@@ -59,3 +59,25 @@ cheap.
 - API documentation comes from the local crate source, not docs.rs.
 - Driver errors map to `MemoryError::Backend`. Synchronous driver calls
   stay inside `tokio::task::spawn_blocking` (AGENT.md Section 6.2).
+
+## Addendum 2026-08-08: `Send + Sync` does not imply read-during-write safety
+
+The `Send + Sync` markers of lbug 0.18 (`Database`, `Connection`) do
+NOT make a read concurrent with a write on the same database safe. In
+the C++ storage layer, readers walk `FileHandle::pageStates` (a
+`common::ConcurrentVector`) lock-free, while writers
+(`FileHandle::addNewPages`, `ConcurrentVector::resize`, annotated "Not
+thread-safe" upstream) and the CHECKPOINT truncate path mutate it. The
+null-block guard is a debug-only `DASSERT`; release builds dereference
+null. Reproduced 5/5 unserialized runs: SIGSEGV (signal 11) in the
+storage layer (observed frames: `BufferManager::optimisticRead`,
+`CSRNodeGroup::scanCommittedInMem`).
+
+Tamako serializes ALL per-group operations in
+`LbugBackend::with_conn`, reads and CHECKPOINT included, as a
+binding-level requirement (proposed-graph-database-specs.md Section 6.1
+rule 3). The regression test is
+`tamako-memory/tests/lbug_concurrent_access.rs`.
+
+An upstream bug report against LadybugDB is recommended. Not filed at
+the time of this addendum.

@@ -20,6 +20,18 @@
 //!   Timestamps use the native `Value::Timestamp` parameter of the driver.
 //!   NULL values use `Value::Null` with the matching logical type.
 //! - `CHECKPOINT` runs after each batch write (Section 5.2 rule 5).
+//!
+//! Concurrency: `Send + Sync` on the lbug types does NOT imply
+//! read-during-write safety in lbug 0.18. The C++ storage layer races a
+//! lock-free reader of `FileHandle::pageStates` against writer-side
+//! `ConcurrentVector::resize` (annotated "Not thread-safe" upstream) and
+//! the CHECKPOINT truncate path. The crash signature is a SIGSEGV in the
+//! storage layer (`BufferManager::optimisticRead`,
+//! `CSRNodeGroup::scanCommittedInMem`). Refer to
+//! docs/adr-0001-ladybugdb-binding.md (addendum 2026-08-08). Tamako
+//! serializes ALL per-group operations in `LbugBackend::with_conn`,
+//! reads and CHECKPOINT included, as a binding-level requirement
+//! (proposed-graph-database-specs.md Section 6.1 rule 3).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -156,6 +168,13 @@ pub struct LbugBackend {
     // mutex serializes open and close. One writer per group file is
     // guaranteed by LadybugDB itself (Section 5.1).
     databases: Mutex<HashMap<String, Arc<Database>>>,
+    // Section 6.1 rule 3 / adr-0001 addendum 2026-08-08: one async mutex
+    // per group. lbug 0.18 `Send + Sync` does not make a read concurrent
+    // with a write safe, so `with_conn` holds this lock for the full
+    // duration of each operation, reads and CHECKPOINT included. Entries
+    // are never removed: a `close` with in-flight operations must not
+    // create a second lock for the same group.
+    op_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl LbugBackend {
@@ -164,6 +183,7 @@ impl LbugBackend {
         LbugBackend {
             data_root: data_root.into(),
             databases: Mutex::new(HashMap::new()),
+            op_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -194,14 +214,30 @@ impl LbugBackend {
         Ok(db)
     }
 
+    /// Returns the per-group operation lock. Section 6.1 rule 3 and
+    /// adr-0001 addendum 2026-08-08: all operations of one group run
+    /// serialized, reads included.
+    async fn op_lock(&self, chat_id: &str) -> Arc<Mutex<()>> {
+        self.op_locks
+            .lock()
+            .await
+            .entry(chat_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Runs `f` on a fresh connection of the group database, inside
-    /// `tokio::task::spawn_blocking` (Section 5.2 rule 3).
+    /// `tokio::task::spawn_blocking` (Section 5.2 rule 3). The per-group
+    /// operation lock is held from before the spawn until the blocking
+    /// join completes (Section 6.1 rule 3, adr-0001 addendum 2026-08-08).
     async fn with_conn<F, T>(&self, chat_id: &str, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let db = self.database(chat_id).await?;
+        let op_lock = self.op_lock(chat_id).await;
+        let _guard = op_lock.lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let conn = Connection::new(&db).map_err(backend)?;
             f(&conn)
