@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 16 (8 integration + 8 CLI unit) |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract. | 57 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 17 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 21 (13 integration + 8 CLI unit) |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 73 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 18 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 12 |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter). | 42 (+1 ignored live test) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator. | 78 (+3 ignored live tests) |
 
-Total: 207 tests (+2 ignored live tests). Build, test,
+Total: 265 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -113,7 +113,8 @@ never fatal. `TELOXIDE_API_URL` is honored only by
 
 - One tokio task and one mpsc inbox per group (`ActorCommand`:
   `Inbound`, `Tick`, `Snapshot`, `ContextSnapshot`, `DigestCompleted`,
-  `Shutdown`). All events enter one FIFO inbox (Section 6.1, rule 1).
+  `WakeCompleted`, `Shutdown`). All events enter one FIFO inbox
+  (Section 6.1, rule 1).
 - Startup runs inside the spawned task: open the group store, ensure the
   graph schema, load and decode the session state. The handle returns
   immediately; `snapshot()` acts as a FIFO barrier and `shutdown()`
@@ -138,8 +139,43 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   the digest pipeline as a task that reports back through the inbox
   (`ActorCommand::DigestCompleted`), so extraction and backoff never
   block the FIFO queue (Section 6.1, rule 3). Session mutations stay
-  serialized in the loop. The wake trigger still logs a stub; the wake
-  procedure is M4.
+  serialized in the loop.
+- The wake procedure of specs.md Section 9 is live (M4). Steps 1–5
+  actor side: (1) the monologue lock suppresses an unforced wake while
+  muted (a forced wake is never suppressed, Section 8.1) without
+  advancing `wake_last_row_id`; (2) the new messages of the wake are
+  the inbound raw-log rows above `wake_last_row_id`, rendered with the
+  same speaker-label helper as the live context; (3) the resets of spec
+  steps 1 and 5 collapse into ONE reset at wake START plus the
+  best-effort `wakes_total` increment, so messages arriving during a
+  running wake count toward the next one; (4) the recall/gate/reply
+  calls run in a spawned task over a context snapshot (the Section 6.1
+  rule 3 analog; the task touches no actor state) and report back as
+  `WakeCompleted`; (5) done at start. A wake over a silent group exits
+  before the gate call. Forced wakes (mention/reply, Section 8.1)
+  bypass the gate; a forced wake during a running wake queues in
+  `forced_pending` with the intake timestamp of its forcing message
+  (Section 6.2, deterministic replay clock) and starts immediately
+  after the current wake completes.
+- The `WakeCompleted` send path: the recency re-check of Section 6.2
+  DISCARDS the reply when more than `reply_staleness_threshold` newer
+  human messages arrived after the target (discard, not regenerate);
+  otherwise the outbound raw-log row persists FIRST (Rules B1/P1,
+  synthetic id `bot-out:{nanos}` — Rule A3 returns no platform id),
+  then the `SendText` action goes into the outbound channel with
+  `try_send` (a full or closed channel degrades to a logged drop — the
+  row is already the source of truth), the bot speech enters the live
+  context (Rule C1), `record_bot_message` drives the monologue lock
+  (Section 8.5), and `participations_total` increments best effort.
+- The timer driver (M4): a tokio interval inside the actor task emits
+  `Tick(now_utc)` on `timer_cadence` (`wake_interval / 8` clamped to
+  [1 s, min(wake_floor, 5 min)]; a zero cadence falls back to 1 s so
+  `interval` never panics) with `MissedTickBehavior::Delay` — a delayed
+  tick loses at most cadence time while Burst could storm the FIFO
+  evaluation. The explicit `Tick` command and the timer tick share one
+  handler, so the two paths cannot diverge. The driver also evaluates
+  the Section 8.2 digest-timeout fallback of a silent group. Shutdown
+  is structural: the ticker lives and dies inside the actor task.
 - On digest completion the actor performs the Rule C3 context removal
   (M2): every context item with a range tag at or below the PREVIOUS
   boundary goes (the one-chunk lag of Section 7.1 — the chunk just
@@ -222,8 +258,9 @@ The session state (`tamako-core::session`) encodes to state-table keys
 (`last_digest_boundary_msg_id`, `prev_digest_boundary_msg_id`,
 `last_digest_at`, `muted_flag`, `consecutive_bot_msgs`, `wake_*`). The
 actor persists it after every mutation and rebuilds it on restart. The
-monologue lock mechanism (`record_human_message`,
-`record_bot_message`) exists; live bot speech arrives in Phase 1.
+monologue lock (`record_human_message`, `record_bot_message`) is live
+since M4: the wake send path records bot speech and the lock suppresses
+unforced wakes while muted.
 
 ## 7. The MemoryBackend design
 
@@ -316,12 +353,45 @@ built end to end against the replayed log:
    `dead_letters_total` counters increment (best effort), and the batch
    is SKIPPED — the boundary advances and later batches proceed.
 
-Provider configuration: the extraction model defaults to
-`claude-haiku-4-5` (cheap tier), overridable by the env var
-`TAMAKO_DIGEST_MODEL` or the config-file key `digest_model` (env wins;
-deviation: specs.md Section 13 has no LLM keys yet). The API key is
-`ANTHROPIC_API_KEY`, read by rig's `Client::from_env()`. Without the
-key, the binary runs with the digest pipeline disabled.
+Provider configuration: the `endpoint` module (M4) implements the
+endpoint portability of specs.md Section 13. `LlmEndpoints::resolve`
+maps the plain `LlmConfigValues` (the config-file keys `llm_api`,
+`llm_base_url`, the per-purpose `digest`/`gate`/`reply` overrides, and
+the three model keys) plus the environment into one `EndpointConfig`
+per purpose; env wins at every level (`TAMAKO_LLM_API`,
+`TAMAKO_LLM_BASE_URL`, `TAMAKO_{DIGEST,GATE,REPLY}_MODEL`), and an
+unknown family string is `AgentError::ProviderConfig`, never a silent
+default. `EndpointClient` hides the two rig model types behind one
+async `complete` call. What rig 0.41 can and cannot do (verified
+against its sources; the module docs carry the full list): custom base
+URLs and free-form model names on every provider through the explicit
+builder (so rig's own `*_BASE_URL` env vars deliberately do NOT apply);
+Anthropic native structured output without a beta header; OpenAI
+structured output with a hardcoded `strict: true` json_schema (a limit
+for some openai-compatible endpoints); the default `openai::Client`
+speaks the first-party-only Responses API, so the openai-compatible
+path uses `CompletionsClient` (`POST {base}/chat/completions`); base
+URL handling differs per family (Anthropic normalizes, OpenAI is
+verbatim). API keys come from the environment only (`ANTHROPIC_API_KEY`
+/ `OPENAI_API_KEY`); a missing key is `AgentError::ProviderConfig`. The
+default models are `claude-haiku-4-5` (digest, gate) and
+`claude-sonnet-4-5` (reply — a string literal; rig 0.41 has no
+`CLAUDE_SONNET_4_5` constant). Without the family key, the binary runs
+with the digest pipeline and the wake procedure disabled.
+
+The wake LLM implementations (M4): `RigGate` (specs.md Section 9.6)
+runs the binary participation decision over the cheap `gate_model`
+with structured output (`GateOutput` — participate, target id, reason)
+post-validated in plain Rust (a target outside the presented set falls
+back to silence; never trust the model). `RigReplyGenerator`
+(Section 9 step 4) generates the reply over the main `reply_model`;
+its `context_messages_to_rig` is the ONLY core→rig conversion seam
+(tamako-core stays model-agnostic), and an empty model output is a wake
+error — the bot never sends an empty message. Both have scripted
+doubles (`ScriptedGate`, `ScriptedReplyGenerator`) for hermetic tests.
+The recall step of Section 9 is the M4 seam: tamako-core wires
+`NoopRecall` (no injections; an empty injection is forbidden,
+Section 9.2); M5 replaces it with shallow recall.
 
 ## 9. The binary
 
@@ -330,12 +400,29 @@ the configuration (Section 13 defaults with per-group overrides from
 `[groups.<chat_id>]` TOML tables), loads the persona (`{data_root}/
 persona.toml`, then the repo-root example, then a built-in default),
 renders the preamble through the `PreambleRenderer` trait (the actor
-stores it as item 0 of the live context, Rule C4), spawns one actor for
-the fixture's group, feeds the mock replay, and prints a summary
+stores it as item 0 of the live context, Rule C4), resolves the three
+LLM endpoints from the group configuration and the environment (a bad
+`llm_api` family string is a hard startup error), builds the digest
+pipeline and the wake services from them (a missing family API key
+degrades each to one warning and silence), spawns one actor for the
+fixture's group, feeds the mock replay, and prints a summary
 (including the digest boundary and the dead-letter count). CLI parsing
-is hand-rolled; no clap. When `ANTHROPIC_API_KEY` is set, the binary
-wires the live `RigExtractor` digest pipeline; without the key, digests
-are disabled and the replay stays offline.
+is hand-rolled; no clap.
+
+The wake wiring (M4) is symmetric in both modes: ONE
+`mpsc::channel::<OutboundAction>(100)` per run serves every actor (the
+actions carry their chat id), and the binary pumps it into
+`PlatformAdapter::execute`. In replay mode the event loop is a
+`tokio::select!` over `next_event()` and the outbound channel; after
+the fixture ends and the snapshot barrier returns, the channel drains
+with `try_recv` until empty (best effort for the demo — a wake spawned
+by the last events can still be in flight; the integration tests, not
+the replay demo, assert the wake behavior deterministically). In live
+mode the pump is an arm of the main `select!`; an `AdapterError` warns
+with the chat id and continues (Section 4.2 tolerance, never fatal).
+Every spawn site passes the wake services, a clone of the outbound
+sender, and the persona name (the sender display name of outbound
+raw-log rows).
 
 `tamako --live [--data-root <dir>] [--config <file>]` (mutually
 exclusive with `--replay`) connects the teloxide adapter: the token
@@ -356,14 +443,14 @@ extractor and prints the resulting graph.
 
 ## 10. Phase 1 outlook
 
-The context lifecycle (M2) and the teloxide adapter with live intake
-(M3, including the `reactions` table of specs.md Section 5.2 — store
-migration v3) are built and tested (Sections 3 and 5). Phase 1
-continues with the wake procedure with a real timer driver and
-counters (M4 consumes `LiveContext::messages_for_llm` and
-`append_bot_speech`), shallow recall with the full injection protocol
-(M5 produces the `RecallInjection` items through
-`append_recall_injection` and the `injected_memories` dedup table),
-and the monologue lock in live operation (M6). Refer to
-`current-state.md` for the milestone breakdown and to
-`dev-roadmap.md` Section 3 for the phase scope.
+The wake procedure with the real timer driver, the counters, and the
+endpoint-portability layer (M4) are built and tested (Sections 4, 8,
+and 9): the bot answers mentions and replies directly, joins
+conversations when the participation gate says yes, and degrades to
+silence without an LLM key. Phase 1 continues with shallow recall and
+the full injection protocol (M5 produces the `RecallInjection` items
+through `append_recall_injection` and the `injected_memories` dedup
+table, replacing the `NoopRecall` seam), and the monologue lock
+verified under live traffic (M6). Refer to `current-state.md` for the
+milestone breakdown and to `dev-roadmap.md` Section 3 for the phase
+scope.

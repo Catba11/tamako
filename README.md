@@ -2,7 +2,7 @@
 
 Tamako is a Telegram group-pet bot with persistent memory. It lives in chat groups, speaks rarely, and remembers facts about group members in a per-group graph database. It is a pet, not an assistant: one global persona, per-group private memories, and a scarce-attention behavior model.
 
-Status: Phase 1 in progress. The bot currently intakes messages, stores reactions, and digests conversations into long-term memory. It does not speak yet — speech arrives in milestone M4. Refer to `current-state.md`.
+Status: Phase 1 in progress. The bot intakes messages, stores reactions, digests conversations into long-term memory, and SPEAKS: it answers mentions and replies directly, and it joins conversations when the participation gate says yes (M4). Refer to `current-state.md`.
 
 ## Documents
 
@@ -40,7 +40,7 @@ cargo run -- --replay tamako-adapter-mock/fixtures/replay_chat.json
 cargo run -p tamako-agent --example digest_demo
 ```
 
-With `ANTHROPIC_API_KEY` set, the replay runs live extraction against the configured endpoint. Without it, a scripted extractor stands in.
+With `ANTHROPIC_API_KEY` set, the replay runs live extraction and live wake replies against the configured endpoint. Without it, digests are disabled and the bot stays silent; the replay still works. The demo example uses a scripted extractor either way.
 
 ## Live bring-up (Telegram)
 
@@ -80,10 +80,15 @@ Environment variables:
 |---|---|
 | `TELOXIDE_TOKEN` | Telegram bot token. Required for `--live`. |
 | `TELOXIDE_API_URL` | Optional custom Bot API server URL. |
-| `ANTHROPIC_API_KEY` | LLM key for the anthropic-compatible endpoint. Without it, digests use the scripted extractor. |
+| `ANTHROPIC_API_KEY` | LLM key for anthropic-compatible endpoints. Without it, digests and speech are disabled for the run. |
+| `OPENAI_API_KEY` | LLM key for openai-compatible endpoints. |
 | `TAMAKO_DIGEST_MODEL` | Extraction model override. Default `claude-haiku-4-5`. |
+| `TAMAKO_GATE_MODEL` | Participation-gate model override. Default `claude-haiku-4-5`. |
+| `TAMAKO_REPLY_MODEL` | Reply-generation model override. Default `claude-sonnet-4-5`. |
+| `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
+| `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
 
-Endpoint portability note: `specs.md` Section 13 defines the `llm_api` / `llm_base_url` configuration for arbitrary anthropic-compatible and openai-compatible endpoints (proxies, aggregators, self-hosted). That configuration lands with milestone M4; the current build speaks to the Anthropic-format endpoint only.
+Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_` and `reply_`). API keys come from the environment only, never from the config file.
 
 ### 4. Expected behavior right now
 
@@ -92,7 +97,8 @@ Endpoint portability note: `specs.md` Section 13 defines the `llm_api` / `llm_ba
 - The first message in a configured group creates `{data-root}/{chat_id}/store.db` and `memory.lbug`.
 - Every message lands in the raw log before any other processing. Reactions land in the `reactions` table; reaction collection is active only in groups where the bot is an administrator.
 - Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. Watch the logs for batch outcomes.
-- The bot does not send messages yet. Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
+- The bot speaks: it answers mentions and replies to itself directly, and it joins the conversation when the participation gate says yes. Every reply is a reply-to of its target message and lands in the raw log before it is sent. Two consecutive bot messages engage the monologue lock; any human message unlocks. Without an LLM key for the configured endpoint family the bot stays silent (the wake procedure logs one warning at startup).
+- Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
 
 ## Verification commands
 
