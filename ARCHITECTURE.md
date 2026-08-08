@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 21 (13 integration + 8 CLI unit) |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 73 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 18 |
-| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 12 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 26 (18 integration + 8 CLI unit) |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 77 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 19 |
+| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 17 |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator. | 78 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 103 (+3 ignored live tests) |
 
-Total: 265 tests (+4 ignored live tests). Build, test,
+Total: 305 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -140,8 +140,8 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   (`ActorCommand::DigestCompleted`), so extraction and backoff never
   block the FIFO queue (Section 6.1, rule 3). Session mutations stay
   serialized in the loop.
-- The wake procedure of specs.md Section 9 is live (M4). Steps 1–5
-  actor side: (1) the monologue lock suppresses an unforced wake while
+- The wake procedure of specs.md Section 9 is live (M4; the recall
+  step is live since M5). Steps 1–5 actor side: (1) the monologue lock suppresses an unforced wake while
   muted (a forced wake is never suppressed, Section 8.1) without
   advancing `wake_last_row_id`; (2) the new messages of the wake are
   the inbound raw-log rows above `wake_last_row_id`, rendered with the
@@ -213,8 +213,9 @@ only inside the actor loop (Section 6.1, rule 2).
   (user role, speaker label `[{display_name} {HH:MM}] {text}`, HH:MM in
   UTC — Section 7.2 step 4), `BotSpeech` (assistant role, verbatim
   text; the label distinguishes group members, not the bot — Rule B1),
-  `RecallInjection` (assistant role; the kind exists now, only M5
-  produces these items), `ToolOutput` (reserved, no producer).
+   `RecallInjection` (assistant role; produced by the M5 recall
+   worker through `append_recall_injection`, Rule C2), `ToolOutput`
+   (reserved, no producer).
 - **Append-only by construction (Rules C1, C2)**: the item vector is
   private and the public API permits appends at the tail ONLY. No
   method inserts into, removes from, or mutates the middle of the
@@ -290,11 +291,20 @@ crate. Key decisions:
   twice yields the same graph. Timestamps travel as native `TIMESTAMP`
   parameters; all user data goes through `$param` parameters.
 - Every driver call runs inside `spawn_blocking` (Section 5.2, rule 3).
-- The backend exposes two read operations (Section 8 entry resolution):
-  `MemoryBackend::alias_targets` (entity resolution step 2: the targets
-  of one alias node, entered through the deterministic alias identifier,
-  Rule R5) and `LbugBackend::query_rows`, a display-string Cypher helper
-  for tests and the demo.
+- The backend exposes the read path of Section 8 in its Phase 1 form
+  (M5): `MemoryBackend::alias_targets` (entry resolution step 2: the
+  targets of one alias node, entered through the deterministic alias
+  identifier, Rule R5), `MemoryBackend::neighbors` (the Section 8.2
+  direct-neighbor fetch: both directions in one query, the filter
+  `invalid_at IS NULL`, `contains` edges excluded as provenance-only,
+  the 500-edge expansion limit truncated by `created_at` descending,
+  one hop only; hub marking and the 90-day window are documented
+  Phase 1 simplifications — the unconditional truncation is strictly
+  stronger than the hub rule requires), and `LbugBackend::query_rows`,
+  a display-string Cypher helper for tests and the demo.
+  `NeighborEdge::edge_id()` renders the edge natural key
+  (`{source_id}|{relationship_name}|{target_id}|{valid_at}`); it is the
+  Section 9.3 dedup key of the `injected_memories` table.
 
 ## 8. The digest pipeline (tamako-agent, M1)
 
@@ -389,9 +399,29 @@ its `context_messages_to_rig` is the ONLY core→rig conversion seam
 (tamako-core stays model-agnostic), and an empty model output is a wake
 error — the bot never sends an empty message. Both have scripted
 doubles (`ScriptedGate`, `ScriptedReplyGenerator`) for hermetic tests.
-The recall step of Section 9 is the M4 seam: tamako-core wires
-`NoopRecall` (no injections; an empty injection is forbidden,
-Section 9.2); M5 replaces it with shallow recall.
+The recall step of Section 9 is live (M5, the `recall` module):
+`ShallowRecall` implements the tamako-core `RecallProvider` contract
+over the shared store and graph. Candidate extraction is deterministic
+(no LLM term extraction, Phase 1): the Person identifiers of the
+senders and of the reply targets (Section 8.1 step 1 — reply targets
+resolve through `Store::find_sender_by_platform_msg_id`), plus exact
+alias matches of the candidate terms (step 2; a pure tokenizer — split
+on non-alphanumerics, Section 7.1 normalization, stopword and
+short-token drops, 20 terms per wake; documented limits: no multi-word
+terms, no synonyms, English-only stopwords). An alias with several
+targets enters through the Alias node itself (the Section 7.4 step 4
+ambiguity fallback, mirrored); an unknown term yields no entry
+(step 4, Rule R5). The Section 9.3 dedup drops candidates whose edge
+id has an `injected_memories` row. Zero candidates never call the
+cheap model (Section 9.1). The relevance gate `RigRelevanceGate`
+(Section 9.2) runs on the cheap `gate` endpoint with structured output
+(`RecallSelection`), post-validated in plain Rust (in-range indices
+only, deduped, hard cap `recall_injection_cap`, default 5 — reported
+for spec backfill); conservative by default, and ANY failure means
+inject nothing — a wake never fails on a recall-gate error. The render
+is exactly one "I remember: ..." assistant message (Section 9.4); an
+empty injection is forbidden. `ScriptedRelevanceGate` is the test
+double (same pattern as `ScriptedGate`).
 
 ## 9. The binary
 
@@ -404,7 +434,11 @@ stores it as item 0 of the live context, Rule C4), resolves the three
 LLM endpoints from the group configuration and the environment (a bad
 `llm_api` family string is a hard startup error), builds the digest
 pipeline and the wake services from them (a missing family API key
-degrades each to one warning and silence), spawns one actor for the
+degrades each to one warning and silence; the M5 recall wires
+`ShallowRecall` over the shared store and graph with the relevance
+gate on the cheap `gate` endpoint and `recall_injection_cap` from the
+group configuration — a missing key degrades the recall alone to
+`NoopRecall`), spawns one actor for the
 fixture's group, feeds the mock replay, and prints a summary
 (including the digest boundary and the dead-letter count). CLI parsing
 is hand-rolled; no clap.
@@ -445,12 +479,13 @@ extractor and prints the resulting graph.
 
 The wake procedure with the real timer driver, the counters, and the
 endpoint-portability layer (M4) are built and tested (Sections 4, 8,
-and 9): the bot answers mentions and replies directly, joins
-conversations when the participation gate says yes, and degrades to
-silence without an LLM key. Phase 1 continues with shallow recall and
-the full injection protocol (M5 produces the `RecallInjection` items
-through `append_recall_injection` and the `injected_memories` dedup
-table, replacing the `NoopRecall` seam), and the monologue lock
-verified under live traffic (M6). Refer to `current-state.md` for the
-milestone breakdown and to `dev-roadmap.md` Section 3 for the phase
-scope.
+and 9), and the shallow recall with the full injection protocol (M5)
+is live: the bot answers mentions and replies directly, joins
+conversations when the participation gate says yes, remembers relevant
+facts as "I remember: ..." injections (Sections 9.1–9.5 — Rule C2
+tail append, Section 9.3 dedup, the digest-time prune of the M2
+lifecycle), and degrades to silence without an LLM key. Phase 1
+continues with hardening (M6): the monologue lock verified under live
+traffic, the persona strict startup policy, integration hardening,
+dead-letter visibility. Refer to `current-state.md` for the milestone
+breakdown and to `dev-roadmap.md` Section 3 for the phase scope.

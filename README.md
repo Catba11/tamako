@@ -2,7 +2,7 @@
 
 Tamako is a Telegram group-pet bot with persistent memory. It lives in chat groups, speaks rarely, and remembers facts about group members in a per-group graph database. It is a pet, not an assistant: one global persona, per-group private memories, and a scarce-attention behavior model.
 
-Status: Phase 1 in progress. The bot intakes messages, stores reactions, digests conversations into long-term memory, and SPEAKS: it answers mentions and replies directly, and it joins conversations when the participation gate says yes (M4). Refer to `current-state.md`.
+Status: Phase 1 in progress. The bot intakes messages, stores reactions, digests conversations into long-term memory, and SPEAKS: it answers mentions and replies directly, and it joins conversations when the participation gate says yes (M4). It also REMEMBERS out loud: a wake with relevant graph memories injects them as one "I remember: ..." assistant message before the participation decision (M5). Refer to `current-state.md`.
 
 ## Documents
 
@@ -98,6 +98,7 @@ Endpoint portability (specs.md Section 13): every LLM call uses one of the two A
 - Every message lands in the raw log before any other processing. Reactions land in the `reactions` table; reaction collection is active only in groups where the bot is an administrator.
 - Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. Watch the logs for batch outcomes.
 - The bot speaks: it answers mentions and replies to itself directly, and it joins the conversation when the participation gate says yes. Every reply is a reply-to of its target message and lands in the raw log before it is sent. Two consecutive bot messages engage the monologue lock; any human message unlocks. Without an LLM key for the configured endpoint family the bot stays silent (the wake procedure logs one warning at startup).
+- The bot remembers: every wake runs a shallow recall over the group graph (exact alias matches and the people of the new messages; no fuzzy scans). A conservative relevance gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one "I remember: ..." assistant message — visible to the participation gate and the reply model, and present even when the bot stays silent. Injected memories are deduplicated per digest chunk and removed at digest time.
 - Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
 
 ## Verification commands
