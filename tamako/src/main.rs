@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tamako_adapter_mock::MockAdapter;
-use tamako_adapter_teloxide::{GroupEvent, TeloxideAdapter};
+use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, ExtractorConfig, PipelineConfig, RigExtractor,
 };
@@ -338,8 +338,82 @@ async fn run_replay(data_root: &Path, setup: &SharedSetup, fixture: &Path) -> Re
     Ok(())
 }
 
+/// What the bot can do in one group, derived from its membership status
+/// (specs.md Section 4.2). Cached in memory per group and re-evaluated
+/// on each startup; never persisted, because membership can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capability {
+    /// Administrator: every feature works, reaction collection included.
+    Full,
+    /// Member or restricted: everything works except reaction collection.
+    NoReactions,
+    /// The status could not be determined.
+    Indeterminate,
+}
+
+/// Maps the membership status of the bot to the group capability.
+fn capability_of(status: BotChatStatus) -> Capability {
+    match status {
+        BotChatStatus::Administrator => Capability::Full,
+        BotChatStatus::Member | BotChatStatus::RestrictedOrOther => Capability::NoReactions,
+        BotChatStatus::Unknown => Capability::Indeterminate,
+    }
+}
+
+/// The per-group guidance line for a non-administrator status. `None`
+/// for an administrator: full functionality needs no guidance. These
+/// texts are the operator contract; the README repeats them verbatim.
+fn status_guidance(status: BotChatStatus) -> Option<&'static str> {
+    match status {
+        BotChatStatus::Administrator => None,
+        BotChatStatus::Member | BotChatStatus::RestrictedOrOther => Some(
+            "the bot is not an administrator of this group: Telegram delivers reaction updates \
+             to administrators only, so reaction collection is OFF for this group. Everything \
+             else works normally. To enable reactions, make the bot a group administrator. \
+             Note: privacy mode OFF alone suffices for reading all group messages; if privacy \
+             mode is still ON (the BotFather default) the bot receives only commands and \
+             replies to itself, which is normal platform behavior.",
+        ),
+        BotChatStatus::Unknown => Some(
+            "could not determine the bot's status in this group (the getChatMember call failed \
+             — the bot may not be a member yet). Reaction collection needs administrator \
+             status; the status is re-checked when the first event of this group arrives.",
+        ),
+    }
+}
+
+/// Logs the capability guidance of one group (specs.md Section 4.2).
+/// An administrator logs at info level every time and never warns.
+/// A non-administrator status warns once per group per run: `warned`
+/// holds the chat ids already warned about. An unknown status logs at
+/// info level when the group has no warning yet, but does not consume
+/// the warning slot: a later member result still warns.
+fn log_chat_status(chat_id: &str, status: BotChatStatus, warned: &mut HashSet<String>) {
+    match capability_of(status) {
+        Capability::Full => {
+            info!(chat_id = %chat_id, "bot is an administrator of this group; full functionality (reaction collection active).");
+        }
+        Capability::NoReactions => {
+            if warned.insert(chat_id.to_string()) {
+                let guidance = status_guidance(status).expect("non-admin statuses have guidance");
+                warn!(chat_id = %chat_id, "{}", guidance);
+            }
+        }
+        Capability::Indeterminate => {
+            if !warned.contains(chat_id) {
+                let guidance = status_guidance(status).expect("non-admin statuses have guidance");
+                info!(chat_id = %chat_id, "{}", guidance);
+            }
+        }
+    }
+}
+
 /// The `--live` run: one group actor per configured group, fed from the
 /// Telegram update stream (specs.md Section 4.2).
+///
+/// Intake tolerance: no code path complains about absent reaction
+/// events. For a non-administrator bot the polling stream simply never
+/// carries them; the single startup warning is the only notice.
 async fn run_live(setup: &SharedSetup) -> Result<()> {
     // The binary never logs the token.
     let token = std::env::var("TELOXIDE_TOKEN")
@@ -359,6 +433,19 @@ async fn run_live(setup: &SharedSetup) -> Result<()> {
             "no [groups.<chat_id>] table in the config file; the bot will ignore every group. \
              The config file is not watched: add a table and restart the bot to serve a group"
         );
+    }
+
+    // Capability detection (specs.md Section 4.2): one getChatMember
+    // call per configured group. These calls happen once per startup,
+    // sequentially, so the pass stays fast and simple. The cache is
+    // in-memory only: membership can change, so each startup
+    // re-evaluates it. `warned` guarantees one warning per group.
+    let mut chat_statuses: HashMap<String, BotChatStatus> = HashMap::new();
+    let mut warned: HashSet<String> = HashSet::new();
+    for chat_id in &configured {
+        let status = adapter.bot_chat_status(chat_id).await;
+        chat_statuses.insert(chat_id.clone(), status);
+        log_chat_status(chat_id, status, &mut warned);
     }
 
     let mut actors: HashMap<String, GroupActorHandle> = HashMap::new();
@@ -385,6 +472,16 @@ async fn run_live(setup: &SharedSetup) -> Result<()> {
                     let handle = match actors.entry(chat_id.clone()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
+                            // Spawn-time re-check: a missing or unknown
+                            // cached status (example: the bot joined the
+                            // group after startup) is re-queried now.
+                            // The one-warning-per-group rule still holds.
+                            let cached = chat_statuses.get(&chat_id).copied();
+                            if cached.is_none() || cached == Some(BotChatStatus::Unknown) {
+                                let status = adapter.bot_chat_status(&chat_id).await;
+                                chat_statuses.insert(chat_id.clone(), status);
+                                log_chat_status(&chat_id, status, &mut warned);
+                            }
                             let group_config = setup.bot_config.for_group(&chat_id);
                             let digest =
                                 match build_digest_pipeline(&setup.store, &setup.memory, &group_config) {
@@ -517,5 +614,47 @@ mod tests {
     fn unknown_argument_is_a_usage_error() {
         let error = parse(&["--wat"]).expect_err("an unknown argument must fail");
         assert!(error.contains("unknown argument: --wat"));
+    }
+
+    #[test]
+    fn capability_of_maps_every_status() {
+        assert_eq!(
+            capability_of(BotChatStatus::Administrator),
+            Capability::Full
+        );
+        assert_eq!(
+            capability_of(BotChatStatus::Member),
+            Capability::NoReactions
+        );
+        assert_eq!(
+            capability_of(BotChatStatus::RestrictedOrOther),
+            Capability::NoReactions
+        );
+        assert_eq!(
+            capability_of(BotChatStatus::Unknown),
+            Capability::Indeterminate
+        );
+    }
+
+    #[test]
+    fn status_guidance_matches_the_capability_mapping() {
+        // Full functionality needs no guidance.
+        assert!(status_guidance(BotChatStatus::Administrator).is_none());
+        // Every non-administrator status carries a non-empty guidance
+        // line. Member and restricted share the reaction-collection
+        // guidance; the unknown status has its own.
+        for status in [
+            BotChatStatus::Member,
+            BotChatStatus::RestrictedOrOther,
+            BotChatStatus::Unknown,
+        ] {
+            assert_ne!(capability_of(status), Capability::Full);
+            let guidance = status_guidance(status).expect("non-admin statuses have guidance");
+            assert!(!guidance.is_empty());
+        }
+        assert_eq!(
+            status_guidance(BotChatStatus::Member),
+            status_guidance(BotChatStatus::RestrictedOrOther)
+        );
     }
 }
