@@ -197,8 +197,8 @@ fn build_digest_pipeline(
 async fn run(cli: Cli) -> Result<()> {
     let bot_config = load_bot_config(cli.config.as_deref())?;
 
-    // Rule C4: the preamble is the prefix of every model context. Phase 0
-    // proves the wiring only; it logs the length of the rendered preamble.
+    // Rule C4: the preamble is the prefix of every model context. The
+    // actor stores the rendered preamble as item 0 of the live context.
     let persona = load_persona_with_fallback(&cli.data_root);
     let preamble = PetPreambleRenderer.render_preamble(&persona);
     info!(persona = %persona.name, preamble_len = preamble.len(), "persona preamble rendered");
@@ -225,8 +225,11 @@ async fn run(cli: Cli) -> Result<()> {
         config: group_config,
         started_at: OffsetDateTime::now_utc(),
         inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        // Rule C4: the rendered preamble seeds item 0 of the live context.
+        preamble,
         digest,
-        // M2 wires the Rule C3 context removal here.
+        // The actor performs the Rule C3 removal itself (M2); the hook
+        // stays a seam for observers that need no actor state.
         post_digest_hook: None,
     });
 

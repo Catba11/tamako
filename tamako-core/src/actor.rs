@@ -5,6 +5,12 @@
 //! the trigger fires, the actor launches the digest pipeline as a
 //! spawned task and the result returns through the FIFO inbox. The wake
 //! procedure stays a stub (M4).
+//!
+//! The actor owns the live context of specs.md Section 7: a
+//! materialized view of the raw log (Rule P1). Intake appends items
+//! (Rule C1), a completed digest removes the previous chunk with the
+//! one-chunk lag (Rule C3), and startup rebuilds the context from the
+//! persisted rows (specs.md Section 6.1, rule 4).
 
 use std::sync::Arc;
 
@@ -18,6 +24,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
+use crate::context::{ContextItem, LiveContext};
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
 use crate::event::{InboundEvent, NormalizedMessage};
 use crate::session::{round_to_millis, SessionState};
@@ -52,6 +59,9 @@ pub enum ActorCommand {
     Tick(OffsetDateTime),
     /// Returns a snapshot of the session state (tests, restart checks).
     Snapshot(oneshot::Sender<SessionState>),
+    /// Returns a clone of the live context items (tests; M4 reads the
+    /// context through the actor too). A FIFO barrier like `Snapshot`.
+    ContextSnapshot(oneshot::Sender<Vec<ContextItem>>),
     /// The spawned digest task reports its result through this command
     /// (internal plumbing). Every session mutation stays serialized in
     /// the actor loop — specs.md Section 6.1, rule 2.
@@ -92,6 +102,13 @@ impl GroupActorHandle {
         rx.await.map_err(|_| CoreError::InboxClosed)
     }
 
+    /// Returns a clone of the current live context items.
+    pub async fn context_snapshot(&self) -> Result<Vec<ContextItem>, CoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ActorCommand::ContextSnapshot(tx)).await?;
+        rx.await.map_err(|_| CoreError::InboxClosed)
+    }
+
     /// Sends Shutdown and awaits the task. Graceful.
     ///
     /// A startup failure aborts the actor task before the loop runs. Such a
@@ -119,11 +136,17 @@ pub struct GroupActorParams<M: MemoryBackend> {
     pub started_at: OffsetDateTime,
     /// Inbox capacity. Refer to `DEFAULT_INBOX_CAPACITY`.
     pub inbox_capacity: usize,
+    /// The rendered persona preamble. The caller renders it through
+    /// tamako-persona's `PreambleRenderer`; the actor stores it as
+    /// item 0 of the live context (Rule C4).
+    pub preamble: String,
     /// The digest pipeline. `None` keeps the Phase 0 stub behavior
     /// (the trigger logs only). The tamako binary wires the live
     /// implementation; tests wire a scripted one.
     pub digest: Option<Arc<dyn DigestPipeline>>,
-    /// The M2 hook point (Rule C3 context removal). `None` = no-op.
+    /// A seam for post-digest observers that need no actor state.
+    /// `None` = no-op. The actor itself performs the Rule C3 context
+    /// removal BEFORE it calls this hook (M2).
     pub post_digest_hook: Option<Arc<dyn PostDigestHook>>,
 }
 
@@ -144,6 +167,8 @@ pub struct GroupActorParams<M: MemoryBackend> {
 ///    (specs.md Section 5.1).
 /// 3. `store.load_all_state` → `SessionState::decode` — the rebuild of
 ///    specs.md Section 6.1, rule 4.
+/// 4. `store.list_messages_after` + `store.list_injected_memories` →
+///    `LiveContext::rebuild` — the Rule P1 rebuild of the live context.
 ///
 /// The `MemoryBackend` trait promises `Send` futures, so the actor task
 /// runs under any tokio runtime flavor.
@@ -280,6 +305,7 @@ async fn run_actor<M: MemoryBackend>(
         memory,
         config,
         started_at,
+        preamble,
         digest,
         post_digest_hook,
         ..
@@ -300,6 +326,27 @@ async fn run_actor<M: MemoryBackend>(
     let mut rng = StdRng::from_rng(&mut rand::rng());
     let mut session = SessionState::decode(&persisted, &config, started_at, &mut rng);
     let mut wake = WakeScheduler::from_state(session.wake.clone());
+
+    // --- Startup rebuild of the live context (Rule P1) ---
+    // specs.md Section 6.1, rule 4: the rebuild is bit-identical to the
+    // pre-restart context. The removal cutoff R is the one-chunk-lag
+    // cutoff: every row above the PREVIOUS boundary is still live.
+    let removal_cutoff = session.prev_digest_boundary_msg_id.unwrap_or(0);
+    let rebuild_chat_id = chat_id.clone();
+    let rows = blocking_store(&store, move |store| {
+        store.list_messages_after(&rebuild_chat_id, removal_cutoff)
+    })
+    .await?;
+    let injections_chat_id = chat_id.clone();
+    let mut injections = blocking_store(&store, move |store| {
+        store.list_injected_memories(&injections_chat_id)
+    })
+    .await?;
+    // Defensive filter: the Rule C3 prune normally already deleted the
+    // rows at or below the cutoff.
+    injections.retain(|row| row.injection_position > removal_cutoff);
+    let mut context = LiveContext::rebuild(preamble, &rows, &injections);
+
     // One digest at a time per group (Section 6.1, rule 2).
     let mut digest_in_flight = false;
 
@@ -314,6 +361,7 @@ async fn run_actor<M: MemoryBackend>(
                     &mut session,
                     &mut wake,
                     &mut rng,
+                    &mut context,
                     digest.as_ref(),
                     &mut digest_in_flight,
                     &inbox_sender,
@@ -327,10 +375,22 @@ async fn run_actor<M: MemoryBackend>(
                 // retraction. No other processing in Phase 0.
                 let row = to_new_message(&msg, EventType::Edit);
                 let edit_chat_id = chat_id.clone();
-                blocking_store(&store, move |store| {
+                let outcome = blocking_store(&store, move |store| {
                     store.insert_message(&edit_chat_id, &row)
                 })
                 .await?;
+                // Rule C1: every new raw-log row enters the context. An
+                // edit is just a new row; `LiveContext::rebuild` renders
+                // edits identically, so this append is uniform with the
+                // restart rebuild.
+                if let InsertOutcome::Inserted(id) = outcome {
+                    context.append_human_message(
+                        id,
+                        &msg.sender_display_name,
+                        msg.timestamp,
+                        &msg.text,
+                    );
+                }
             }
             // Phase 0 stores message rows only. Reaction processing is
             // Phase 2 (warmup backoff, specs.md Section 8.5). Member events
@@ -383,18 +443,50 @@ async fn run_actor<M: MemoryBackend>(
                             new_boundary = outcome.new_boundary(),
                             "digest completed"
                         );
-                        // Every variant advances the boundary: a
-                        // dead-lettered batch is SKIPPED (specs.md
-                        // Section 10.3).
-                        session.last_digest_boundary_msg_id = outcome.new_boundary();
+                        // Rule C3 context removal with the one-chunk
+                        // lag. Only items at or below the PREVIOUS
+                        // boundary go; the chunk just digested,
+                        // (b_old, b_new], stays as the new overlap
+                        // buffer (specs.md Section 7.1). This runs for
+                        // EVERY outcome variant, matching the boundary
+                        // advancement: a dead-lettered batch is skipped
+                        // (specs.md Section 10.3) — the skipped range
+                        // stays in the raw log and its content lags out
+                        // of the context mechanically at the next
+                        // digest.
+                        let b_old = session.last_digest_boundary_msg_id;
+                        let b_new = outcome.new_boundary();
+                        context.remove_at_or_below(b_old);
+                        // Prune the dedup set (specs.md Section 10.2
+                        // step 4) at the same cutoff.
+                        let prune_chat_id = chat_id.clone();
+                        let deleted = blocking_store(&store, move |store| {
+                            store.delete_injected_memories_up_to(&prune_chat_id, b_old)
+                        })
+                        .await?;
+                        debug!(chat_id = %chat_id, deleted, "injected_memories pruned");
+                        // The session boundaries. Read `last_digest_at`
+                        // BEFORE it is overwritten below: the FIRST
+                        // completed digest has no previous chunk, so
+                        // prev stays None; from the second digest on,
+                        // prev is the boundary that was current before
+                        // this digest.
+                        session.prev_digest_boundary_msg_id = if session.last_digest_at.is_some() {
+                            Some(b_old)
+                        } else {
+                            None
+                        };
+                        session.last_digest_boundary_msg_id = b_new;
                         // The wall-clock completion time: the timeout
                         // fallback of Section 8.2 measures real time
                         // since the last digest.
                         session.last_digest_at = Some(OffsetDateTime::now_utc());
                         persist_session(&store, &chat_id, &session).await?;
                         if let Some(hook) = &post_digest_hook {
-                            // M2 performs the Rule C3 context removal
-                            // here. M1 ships a no-op.
+                            // The hook runs AFTER the built-in Rule C3
+                            // removal and the dedup prune. It stays a
+                            // seam for observers that need no actor
+                            // state.
                             hook.after_digest(&chat_id, &outcome).await;
                         }
                         // Re-evaluate once: the tail can still exceed the
@@ -428,6 +520,11 @@ async fn run_actor<M: MemoryBackend>(
                 // an actor failure.
                 let _ = reply.send(session.clone());
             }
+            ActorCommand::ContextSnapshot(reply) => {
+                // Same rule as Snapshot: a dropped receiver is not an
+                // actor failure.
+                let _ = reply.send(context.items().to_vec());
+            }
             ActorCommand::Shutdown => break,
         }
     }
@@ -443,6 +540,7 @@ async fn handle_message(
     session: &mut SessionState,
     wake: &mut WakeScheduler,
     rng: &mut StdRng,
+    context: &mut LiveContext,
     digest: Option<&Arc<dyn DigestPipeline>>,
     digest_in_flight: &mut bool,
     inbox_sender: &mpsc::Sender<ActorCommand>,
@@ -456,12 +554,20 @@ async fn handle_message(
         store.insert_message(&intake_chat_id, &row)
     })
     .await?;
-    if outcome == InsertOutcome::Duplicate {
-        // Idempotent intake (AGENT.md Section 6.2): a replay after a crash
-        // can re-see a message. The row exists already; the counters below
-        // still update, so the wake counter can count one delivery twice.
-        // The log row — the source of truth — is not duplicated.
-        debug!(chat_id = %chat_id, platform_msg_id = %msg.platform_msg_id, "duplicate delivery");
+    match outcome {
+        InsertOutcome::Inserted(id) => {
+            // Rule C1: the log row exists first (Rule P1), then the
+            // materialized view gets the same item.
+            context.append_human_message(id, &msg.sender_display_name, msg.timestamp, &msg.text);
+        }
+        InsertOutcome::Duplicate => {
+            // Idempotent intake (AGENT.md Section 6.2): a replay after a
+            // crash can re-see a message. The row exists already; the
+            // counters below still update, so the wake counter can count
+            // one delivery twice. The log row — the source of truth — is
+            // not duplicated, and the view must not duplicate either.
+            debug!(chat_id = %chat_id, platform_msg_id = %msg.platform_msg_id, "duplicate delivery");
+        }
     }
 
     // Update the session in memory.
@@ -518,10 +624,15 @@ fn reset_wake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use tamako_memory::MemoryBatch;
     use tempfile::TempDir;
+
+    use crate::context::{ContextItemKind, ContextRole, RangeTag};
 
     /// A memory backend double. All calls succeed; `ensure_schema` records
     /// the chat_id values it receives.
@@ -582,6 +693,91 @@ mod tests {
 
     const CHAT_ID: &str = "-1001234567890";
 
+    /// The preamble of every actor spawned in this module.
+    const TEST_PREAMBLE: &str = "You are Tamako, a test pet.";
+
+    /// A scripted digest pipeline for the M2 context tests. It is
+    /// store-backed: `run_digest` lists the tail above the given
+    /// boundary and returns an `Extracted` outcome whose new boundary
+    /// is the last row id. An empty tail returns `Ok(None)`.
+    struct ScriptedDigest {
+        store: Arc<Store>,
+    }
+
+    impl DigestPipeline for ScriptedDigest {
+        fn run_digest<'a>(
+            &'a self,
+            chat_id: &'a str,
+            last_digest_boundary_msg_id: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let store = Arc::clone(&self.store);
+                let chat_id = chat_id.to_string();
+                let rows = tokio::task::spawn_blocking(move || {
+                    store.list_messages_after(&chat_id, last_digest_boundary_msg_id)
+                })
+                .await
+                .map_err(|error| CoreError::Join(error.to_string()))?
+                .map_err(CoreError::Store)?;
+                let Some(last) = rows.last() else {
+                    return Ok(None);
+                };
+                Ok(Some(DigestOutcome::Extracted {
+                    batch_id: format!("batch-{}", last.id),
+                    new_boundary: last.id,
+                    node_count: 0,
+                    edge_count: 0,
+                }))
+            })
+        }
+    }
+
+    /// The trigger config of the digest tests: the trigger fires every
+    /// two messages (specs.md Section 8.2).
+    fn digest_config() -> TriggerConfig {
+        TriggerConfig {
+            digest_max_messages: 2,
+            ..TriggerConfig::default()
+        }
+    }
+
+    /// Polls `snapshot()` until the digest boundary reaches `min` or the
+    /// 5 s deadline passes (the pattern of tamako/tests/digest_replay.rs).
+    /// The snapshot is a FIFO barrier, and the spawned digest task reports
+    /// through the inbox: a snapshot that shows the boundary proves the
+    /// whole `DigestCompleted` handler already ran.
+    async fn wait_for_boundary(handle: &GroupActorHandle, min: i64) -> i64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let session = handle.snapshot().await.expect("snapshot succeeds");
+            if session.last_digest_boundary_msg_id >= min {
+                return session.last_digest_boundary_msg_id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the digest boundary to reach {min} \
+                 (current boundary: {})",
+                session.last_digest_boundary_msg_id
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Runs one blocking store call, like the actor does (AGENT.md
+    /// Section 6.2).
+    async fn blocking_store_call<T, F>(store: &Arc<Store>, call: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Store>) -> Result<T, StoreError> + Send + 'static,
+    {
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || call(store))
+            .await
+            .expect("the blocking task joins")
+            .expect("the store call succeeds")
+    }
+
     /// Fixed base time for deterministic replay.
     fn t0() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid unix timestamp")
@@ -626,7 +822,27 @@ mod tests {
             config,
             started_at: t0(),
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
             digest: None,
+            post_digest_hook: None,
+        })
+    }
+
+    /// Spawns an actor with the scripted digest pipeline of the M2
+    /// context tests.
+    fn spawn_with_scripted_digest(fixture: &Fixture, config: TriggerConfig) -> GroupActorHandle {
+        let digest = Arc::new(ScriptedDigest {
+            store: Arc::clone(&fixture.store),
+        });
+        spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config,
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: Some(digest),
             post_digest_hook: None,
         })
     }
@@ -741,6 +957,7 @@ mod tests {
             config,
             started_at: t0(),
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
             digest: None,
             post_digest_hook: None,
         });
@@ -845,5 +1062,309 @@ mod tests {
         handle.snapshot().await.expect("snapshot succeeds");
         assert_eq!(fixture.memory.ensured_chat_ids(), vec![CHAT_ID.to_string()]);
         handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn intake_appends_human_messages_to_the_context() {
+        // Rule C1: every new raw-log row enters the live context.
+        let (_fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, false)))
+            .await
+            .expect("send succeeds");
+        // A FIFO barrier: when it returns, both messages are processed.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        assert_eq!(items.len(), 3);
+        let preamble = &items[0];
+        assert_eq!(preamble.kind, ContextItemKind::Preamble);
+        assert_eq!(preamble.role, ContextRole::System);
+        assert_eq!(preamble.content, TEST_PREAMBLE);
+        assert_eq!(preamble.range_tag, None);
+
+        let first = &items[1];
+        assert_eq!(first.kind, ContextItemKind::HumanMessage);
+        assert_eq!(first.role, ContextRole::User);
+        assert_eq!(first.content, "[Alice 22:13] text of m1");
+        assert_eq!(first.range_tag, Some(RangeTag::single(1)));
+
+        let second = &items[2];
+        assert_eq!(second.kind, ContextItemKind::HumanMessage);
+        assert_eq!(second.role, ContextRole::User);
+        assert_eq!(second.content, "[Alice 22:13] text of m2");
+        assert_eq!(second.range_tag, Some(RangeTag::single(2)));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn duplicate_delivery_does_not_append_twice() {
+        // The log row is not duplicated; the view must not duplicate
+        // either (Rule P1).
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        for _ in 0..2 {
+            handle
+                .send_event(InboundEvent::Message(message("m1", 1, false)))
+                .await
+                .expect("send succeeds");
+        }
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].kind, ContextItemKind::HumanMessage);
+        assert_eq!(items[1].range_tag, Some(RangeTag::single(1)));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn edit_appends_a_context_item() {
+        // specs.md Section 15, open item 4: an edit is just a new row.
+        let (_fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let mut edited = message("m1", 1, false);
+        edited.text = "edited text".to_string();
+        handle
+            .send_event(InboundEvent::EditedMessage(edited))
+            .await
+            .expect("send succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].content, "[Alice 22:13] text of m1");
+        assert_eq!(items[1].range_tag, Some(RangeTag::single(1)));
+        assert_eq!(items[2].content, "[Alice 22:13] edited text");
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(2)));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_a_bit_identical_context() {
+        // Rule P1: the startup rebuild from the persisted rows is
+        // bit-identical to the pre-restart context.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        handle.snapshot().await.expect("snapshot succeeds");
+        // M5 shallow recall inserts injection rows through the actor; the
+        // test drives the store directly. The actor owns the live
+        // context, so the injected row becomes visible only through the
+        // rebuild of a NEW actor below.
+        blocking_store_call(&fixture.store, move |store| {
+            store.insert_injected_memory(
+                CHAT_ID,
+                "edge-1",
+                2,
+                "1-2",
+                "I remember: Alice likes GRPO",
+            )
+        })
+        .await;
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        // The hand-computed rebuild over the same persisted rows.
+        let (rows, injections) = blocking_store_call(&fixture.store, move |store| {
+            let rows = store.list_messages_after(CHAT_ID, 0)?;
+            let injections = store.list_injected_memories(CHAT_ID)?;
+            Ok((rows, injections))
+        })
+        .await;
+        let expected = LiveContext::rebuild(TEST_PREAMBLE.to_string(), &rows, &injections);
+        assert_eq!(rebuilt, expected.items());
+
+        // Rule C2 placement: the injection sits directly after row 2.
+        assert_eq!(rebuilt.len(), 5);
+        assert_eq!(rebuilt[2].kind, ContextItemKind::HumanMessage);
+        assert_eq!(rebuilt[2].range_tag, Some(RangeTag::single(2)));
+        assert_eq!(rebuilt[3].kind, ContextItemKind::RecallInjection);
+        assert_eq!(rebuilt[3].content, "I remember: Alice likes GRPO");
+        assert_eq!(rebuilt[3].range_tag, Some(RangeTag::single(2)));
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn digest_removes_the_previous_chunk_with_one_chunk_lag() {
+        // Rule C3, specs.md Section 7.1: at a digest only the chunk at or
+        // below the PREVIOUS boundary leaves the context.
+        let fixture = make_fixture();
+        let handle = spawn_with_scripted_digest(&fixture, digest_config());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, false)))
+            .await
+            .expect("send succeeds");
+        // Digest 1: the boundary advances 0 -> 2.
+        wait_for_boundary(&handle, 2).await;
+        // Nothing is at or below the old boundary 0: the full tail stays.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].range_tag, Some(RangeTag::single(1)));
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(2)));
+        // The FIRST completed digest has no previous chunk: prev is None.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.prev_digest_boundary_msg_id, None);
+
+        handle
+            .send_event(InboundEvent::Message(message("m3", 3, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m4", 4, false)))
+            .await
+            .expect("send succeeds");
+        // Digest 2: the boundary advances 2 -> 4.
+        wait_for_boundary(&handle, 4).await;
+        // Chunk (0, 2] leaves; chunk (2, 4] stays as the overlap buffer.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, ContextItemKind::Preamble);
+        assert_eq!(items[1].range_tag, Some(RangeTag::single(3)));
+        assert_eq!(items[1].content, "[Alice 22:13] text of m3");
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(4)));
+        assert_eq!(items[2].content, "[Alice 22:13] text of m4");
+        // From the second digest on, prev is the boundary that was
+        // current before this digest.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.prev_digest_boundary_msg_id, Some(2));
+        assert_eq!(session.last_digest_boundary_msg_id, 4);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn digest_prunes_injected_memories_at_or_below_the_previous_boundary() {
+        // specs.md Section 10.2 step 4: the dedup set is pruned at the
+        // same cutoff as the Rule C3 context removal.
+        let fixture = make_fixture();
+        let handle = spawn_with_scripted_digest(&fixture, digest_config());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, false)))
+            .await
+            .expect("send succeeds");
+        wait_for_boundary(&handle, 2).await;
+
+        // Injections at the boundary (2) and above it (3).
+        blocking_store_call(&fixture.store, move |store| {
+            store.insert_injected_memory(CHAT_ID, "edge-1", 2, "1-2", "memory at 2")?;
+            store.insert_injected_memory(CHAT_ID, "edge-2", 3, "1-3", "memory at 3")?;
+            Ok(())
+        })
+        .await;
+
+        handle
+            .send_event(InboundEvent::Message(message("m3", 3, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m4", 4, false)))
+            .await
+            .expect("send succeeds");
+        // Digest 2 (boundary 4) prunes at the previous boundary 2.
+        wait_for_boundary(&handle, 4).await;
+
+        let injections = blocking_store_call(&fixture.store, move |store| {
+            store.list_injected_memories(CHAT_ID)
+        })
+        .await;
+        let positions: Vec<i64> = injections
+            .iter()
+            .map(|row| row.injection_position)
+            .collect();
+        assert_eq!(positions, vec![3]);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn restart_after_digest_rebuilds_the_lagged_view() {
+        // Rule P1 after the Rule C3 removal: the startup rebuild is
+        // bit-identical to the pre-shutdown (already lagged) context.
+        let fixture = make_fixture();
+        let handle = spawn_with_scripted_digest(&fixture, digest_config());
+        // Two digests, driven in steps: the scripted pipeline reads the
+        // live store, so the second pair goes in only after digest 1
+        // completed (otherwise digest 1 could swallow the whole tail).
+        for index in 1..=2 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_boundary(&handle, 2).await;
+        for index in 3..=4 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        // Boundary 0 -> 2 -> 4.
+        wait_for_boundary(&handle, 4).await;
+        let before = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted = spawn_with_scripted_digest(&fixture, digest_config());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, before);
+
+        // The rebuilt session keeps the lagged boundaries.
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.prev_digest_boundary_msg_id, Some(2));
+        assert_eq!(session.last_digest_boundary_msg_id, 4);
+        restarted.shutdown().await.expect("shutdown succeeds");
     }
 }

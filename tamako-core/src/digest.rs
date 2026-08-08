@@ -58,9 +58,12 @@ pub trait DigestPipeline: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>;
 }
 
-/// The hook point for M2 (context lifecycle). The actor calls it after
-/// every successful digest run. M2 implements the context removal of
-/// Rule C3 (specs.md Section 7.2) here. M1 ships a no-op.
+/// A seam for post-digest observers that need no actor state. The
+/// context is actor-owned state (specs.md Section 6.1), so the actor
+/// itself performs the Rule C3 context removal and the
+/// `injected_memories` prune (specs.md Section 10.2 step 4) in its
+/// `DigestCompleted` handler BEFORE it calls this hook. The actor calls
+/// the hook after every successful digest run.
 pub trait PostDigestHook: Send + Sync {
     fn after_digest<'a>(
         &'a self,
@@ -69,7 +72,9 @@ pub trait PostDigestHook: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
-/// The M1 no-op hook. M2 replaces it with the context manager (Rule C3).
+/// The no-op hook. The Rule C3 context removal lives in the actor (the
+/// context is actor-owned state, specs.md Section 6.1); this hook stays
+/// a seam for observers that need no actor state.
 pub struct NoopPostDigestHook;
 
 impl PostDigestHook for NoopPostDigestHook {

@@ -84,6 +84,7 @@ fn spawn_on(store: &Arc<Store>, memory: &Arc<LbugBackend>, chat_id: &str) -> Gro
         config: TriggerConfig::default(),
         started_at: started_at(),
         inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        preamble: "test preamble".to_string(),
         // Phase 0 replay: no digest pipeline (specs.md Section 8.2 stub).
         digest: None,
         post_digest_hook: None,

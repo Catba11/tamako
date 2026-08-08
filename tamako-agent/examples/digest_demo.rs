@@ -155,6 +155,9 @@ async fn main() {
         config,
         started_at: time::OffsetDateTime::now_utc(),
         inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        // A small static preamble; the demo has no persona file. Rule C4:
+        // it seeds item 0 of the live context.
+        preamble: "You are Tamako, a test pet.\n".to_string(),
         digest: Some(pipeline),
         post_digest_hook: None,
     });

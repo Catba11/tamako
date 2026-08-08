@@ -131,6 +131,7 @@ fn spawn_with_digest(
         config,
         started_at: t0(),
         inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        preamble: "test preamble".to_string(),
         digest: Some(digest),
         post_digest_hook: None,
     })
