@@ -14,7 +14,10 @@
 //!   to be added).
 //! - Privacy mode must be off (`/setprivacy` -> Disable) so the bot sees
 //!   all group messages.
-//! - The bot must be a group administrator. Reaction updates require it.
+//! - The bot SHOULD be a group administrator. Reaction updates require it.
+//!   A plain member also works; reaction collection is then off (specs.md
+//!   Section 4.2). Set TAMAKO_LIVE_EXPECT_ADMIN=1 to assert administrator
+//!   status explicitly.
 //!
 //! Send a message in the group while the test waits (60 s timeout).
 
@@ -47,9 +50,32 @@ async fn live_smoke() {
     assert!(!event.chat_id.is_empty());
     eprintln!("received: {event:?}");
 
-    // Capability detection smoke path: the BotFather checklist above makes
-    // the bot a group administrator.
+    // Capability detection smoke path. Both administrator and plain member
+    // are supported deployment shapes (specs.md Section 4.2): the test
+    // verifies that DETECTION works, not that a specific status holds.
+    // TAMAKO_LIVE_EXPECT_ADMIN=1 tightens the check for reaction testing.
     let status = adapter.bot_chat_status(&event.chat_id).await;
     eprintln!("bot chat status: {status:?}");
-    assert_eq!(status, BotChatStatus::Administrator);
+    if std::env::var("TAMAKO_LIVE_EXPECT_ADMIN").as_deref() == Ok("1") {
+        assert_eq!(
+            status,
+            BotChatStatus::Administrator,
+            "TAMAKO_LIVE_EXPECT_ADMIN=1 but the bot is not an administrator; \
+             reaction updates require admin status"
+        );
+    } else {
+        assert!(
+            matches!(status, BotChatStatus::Administrator | BotChatStatus::Member),
+            "unexpected bot chat status: {status:?}"
+        );
+        match status {
+            BotChatStatus::Administrator => {
+                eprintln!("reaction collection is ON (administrator)")
+            }
+            BotChatStatus::Member => {
+                eprintln!("reaction collection is OFF (plain member); this is supported")
+            }
+            other => unreachable!("covered by the assertion above: {other:?}"),
+        }
+    }
 }
