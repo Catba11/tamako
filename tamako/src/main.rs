@@ -4,8 +4,9 @@
 //! through the teloxide adapter (specs.md Section 4.2) and routes the
 //! events of every configured group to its own actor. Phase 1 wires the
 //! digest pipeline of specs.md Section 10 (M1) and the wake procedure of
-//! specs.md Section 9 (M4) from the resolved LLM endpoints of Section 13;
-//! without the family API key the pipelines degrade to silence.
+//! specs.md Section 9 (M4) with the shallow recall of Sections 9.1-9.5
+//! (M5) from the resolved LLM endpoints of Section 13; without the
+//! family API key the pipelines degrade to silence.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -18,7 +19,7 @@ use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
-    RigExtractor, RigGate, RigReplyGenerator,
+    RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, ShallowRecall,
 };
 use tamako_core::actor::{
     spawn_group_actor, GroupActorHandle, GroupActorParams, DEFAULT_INBOX_CAPACITY,
@@ -27,7 +28,7 @@ use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::{BotConfig, TriggerConfig};
 use tamako_core::digest::DigestPipeline;
 use tamako_core::event::OutboundAction;
-use tamako_core::wake::{NoopRecall, WakeServices};
+use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
 use tamako_memory::LbugBackend;
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
 use tamako_store::Store;
@@ -255,21 +256,54 @@ fn build_digest_pipeline(
 /// behavior and the bot stays silent. A missing family API key in
 /// EITHER endpoint (reported as `AgentError::ProviderConfig`) degrades
 /// to `None` with one warning; every other build error propagates.
-fn build_wake_services(endpoints: &LlmEndpoints) -> Result<Option<WakeServices>> {
+///
+/// The recall seam (Section 9 step 2, M5) wires the shallow recall
+/// worker over the shared store and graph. Its relevance gate runs on
+/// the cheap `gate` endpoint (Section 9.1) and the injection cap comes
+/// from the group configuration (`recall_injection_cap`, Section 9.2).
+/// A missing key for the relevance gate degrades the recall ALONE to
+/// the no-op (the wake still runs; the injection list stays empty);
+/// every other recall build error propagates.
+fn build_wake_services(
+    store: &Arc<Store>,
+    memory: &Arc<LbugBackend>,
+    endpoints: &LlmEndpoints,
+    recall_injection_cap: u32,
+) -> Result<Option<WakeServices>> {
     match (
         RigGate::from_endpoint(&endpoints.gate),
         RigReplyGenerator::from_endpoint(&endpoints.reply),
     ) {
         (Ok(gate), Ok(reply)) => {
+            // specs.md Section 9 step 2 (M5): the shallow recall worker
+            // over the shared store and graph.
+            let recall: Arc<dyn RecallProvider> = match RigRelevanceGate::from_endpoint(
+                &endpoints.gate,
+            ) {
+                Ok(relevance_gate) => Arc::new(ShallowRecall::new(
+                    Arc::clone(store),
+                    Arc::clone(memory),
+                    relevance_gate,
+                    recall_injection_cap,
+                )),
+                // The same degrade-to-silence policy as the whole
+                // wake build: no provider key, no recall.
+                Err(AgentError::ProviderConfig(error)) => {
+                    warn!(%error, "recall disabled: no provider configuration; wakes inject nothing");
+                    Arc::new(NoopRecall)
+                }
+                Err(error) => {
+                    return Err(error).context("failed to build the recall relevance gate")
+                }
+            };
             info!(
                 gate_model = %endpoints.gate.model,
                 reply_model = %endpoints.reply.model,
-                "wake procedure wired (live gate and reply)"
+                recall_injection_cap,
+                "wake procedure wired (live recall, gate, and reply)"
             );
             Ok(Some(WakeServices {
-                // specs.md Section 9 step 2: the recall seam. M4 wires
-                // the no-op; M5 replaces it with shallow recall.
-                recall: Arc::new(NoopRecall),
+                recall,
                 gate: Arc::new(gate),
                 reply: Arc::new(reply),
             }))
@@ -346,7 +380,12 @@ async fn run_replay(
     // built after the chat_id is known and before the actor spawns.
     let endpoints = resolve_endpoints(&group_config)?;
     let digest = build_digest_pipeline(&store, &memory, &endpoints.digest)?;
-    let wake = build_wake_services(&endpoints)?;
+    let wake = build_wake_services(
+        &store,
+        &memory,
+        &endpoints,
+        group_config.recall_injection_cap,
+    )?;
     let handle = spawn_group_actor(GroupActorParams {
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
@@ -609,7 +648,12 @@ async fn run_live(
                                         break;
                                     }
                                 };
-                            let wake = match build_wake_services(&endpoints) {
+                            let wake = match build_wake_services(
+                                &setup.store,
+                                &setup.memory,
+                                &endpoints,
+                                group_config.recall_injection_cap,
+                            ) {
                                 Ok(wake) => wake,
                                 Err(error) => {
                                     fatal = Some(error);
