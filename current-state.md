@@ -1,7 +1,8 @@
 # current-state.md — Tamako progress
 
 A living document. Update it at every milestone. Last update: Phase 1
-M5 (shallow recall + full injection protocol) complete.
+M6 (hardening) complete. Phase 1 is COMPLETE pending the two-week
+test-group soak (`docs/soak-runbook.md`).
 
 ## 1. Where we are
 
@@ -9,8 +10,10 @@ M5 (shallow recall + full injection protocol) complete.
   `dev-roadmap.md` Section 2 is met and tested: the scripted mock
   adapter replays a recorded chat log, the actor persists the raw log
   and the session state, and a restart rebuilds the identical state.
-- **Phase 1 (a living pet, MVP): IN PROGRESS.** Scope in
-  `dev-roadmap.md` Section 3.
+- **Phase 1 (a living pet, MVP): COMPLETE pending the soak.** Scope in
+  `dev-roadmap.md` Section 3. All six milestones are done; the Phase 1
+  exit is the two-week test-group soak (`docs/soak-runbook.md`), run by
+  the operator.
   - **M1 (digest pipeline end to end): COMPLETE.** The pipeline runs
     against the replayed log before any live traffic: batch assembly,
     skeleton skip, rig extraction with the `KnowledgeGraph` schema,
@@ -105,9 +108,28 @@ M5 (shallow recall + full injection protocol) complete.
     referenced, not duplicated. The `injection_wakes_total` counter
     (Section 12) is wired. The gate input and the reply-model snapshot
     both carry the injections.
-  - M6: NOT STARTED. Milestones in Section 5 below.
+  - **M6 (hardening): COMPLETE.** The persona strict startup policy is
+    live (decision 45): `--live` requires `{data_root}/persona.toml`,
+    `--allow-default-persona` is the escape hatch, `--replay` keeps the
+    lenient chain. The operator mode `--status <chat_id>` /
+    `--status-all` opens store.db read-only (verified safe against a
+    live writer) and prints the Section 12 counters and rates, the
+    boundaries, the muted state, and the most recent dead letters with
+    batch id, attempts, error, and timestamp (decision 46); the M1
+    dead-letter path already logs at ERROR with chat id and batch id
+    (verified, unchanged). The monologue lock now has an
+    integration test across a restart (`monologue_restart.rs`: engage,
+    persisted muted state after respawn, tick-driven suppression,
+    unlock on a human message). A production-critical race is fixed
+    (decision 47): lbug 0.18 read-during-write on one group's Database
+    SIGSEGVs; `LbugBackend` now serializes ALL per-group operations.
+    The stability run (`stability_replay.rs`) loops 10 iterations of
+    digests, wakes, injections, and interleaved restarts in ~1.4 s,
+    asserting bit-identical rebuilds and zero dead letters. The
+    tail-stats cost is measured and documented (Section 4, gap 7).
+    `docs/soak-runbook.md` prepares the Phase 1 exit.
 - Verification: `cargo build --workspace`, `cargo test --workspace`
-  (305 tests, 0 failures, 4 ignored live tests: the live-API smoke
+  (323 tests, 0 failures, 4 ignored live tests: the live-API smoke
   tests of tamako-agent — extraction and wake — and the live Telegram
   smoke test),
   `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -123,10 +145,10 @@ M5 (shallow recall + full injection protocol) complete.
 
 | Crate | Content | Tests |
 |---|---|---|
-| `tamako` | CLI (`--replay`, `--live` — mutually exclusive, `--data-root`, `--config`), wiring: endpoint resolution of specs.md Section 13 (`TriggerConfig` → `LlmConfigValues` → `LlmEndpoints::resolve`; a bad family string is a hard startup error), the live digest pipeline and the wake services (recall + gate + reply) built from the resolved endpoints (M5: `ShallowRecall` over the shared store and graph, `RigRelevanceGate` on the cheap gate endpoint, `recall_injection_cap` from the group config; a missing family API key degrades each to a warning and silence — the recall alone falls back to `NoopRecall`) — a missing family API key degrades each to a warning and silence — and ONE shared outbound channel (capacity 100) pumped into the platform adapter in both modes (replay: `select!` over the fixture stream plus a best-effort drain after the barrier; live: an arm of the main `select!`, failures warn and continue per Section 4.2). Live mode (M3): token from `TELOXIDE_TOKEN`, configured groups from `[groups.<chat_id>]` config tables, lazy actor spawn on the first event per group, non-configured groups logged once and ignored (Rule P5), capability detection at startup (one `getChatMember` call per configured group, in-memory cache, spawn-time re-check, one warning per non-administrator group, admin INFO / unknown INFO guidance), ctrl-c graceful shutdown of every actor with a summary log. Integration tests: `replay_restart` (Phase 0 exit criterion), `digest_replay` (end-to-end digest, idempotency, dead-letter then recovery, skeleton-only batch, restart keeps the boundary), `context_replay` (M2: context growth on intake, one-chunk-lag removal across two digests, bit-identical restart rebuild with injections, dedup prune), `wake_replay` (M4: threshold wake end to end over the replay fixture, gate-no silence, forced bypass of a muted group, live monologue lock with tick-driven suppression, recency discard), and `recall_replay` (M5: injection end to end over a seeded graph — format/position/rows, Section 9.3 dedup across wakes of one chunk, zero candidates never call the cheap model, bit-identical restart rebuild, digest-time prune of the injection rows at the boundary) against the real store, the real graph, and scripted doubles. Plus CLI and capability-mapping unit tests. | 26 |
+| `tamako` | CLI (`--replay`, `--live`, `--status <chat_id>`, `--status-all` — mutually exclusive, `--allow-default-persona`, `--data-root`, `--config`), wiring: endpoint resolution of specs.md Section 13 (`TriggerConfig` → `LlmConfigValues` → `LlmEndpoints::resolve`; a bad family string is a hard startup error), the live digest pipeline and the wake services (recall + gate + reply) built from the resolved endpoints (M5: `ShallowRecall` over the shared store and graph, `RigRelevanceGate` on the cheap gate endpoint, `recall_injection_cap` from the group config; a missing family API key degrades each to a warning and silence — the recall alone falls back to `NoopRecall`) — a missing family API key degrades each to a warning and silence — and ONE shared outbound channel (capacity 100) pumped into the platform adapter in both modes (replay: `select!` over the fixture stream plus a best-effort drain after the barrier; live: an arm of the main `select!`, failures warn and continue per Section 4.2). Live mode (M3): token from `TELOXIDE_TOKEN`, configured groups from `[groups.<chat_id>]` config tables, lazy actor spawn on the first event per group, non-configured groups logged once and ignored (Rule P5), capability detection at startup (one `getChatMember` call per configured group, in-memory cache, spawn-time re-check, one warning per non-administrator group, admin INFO / unknown INFO guidance), ctrl-c graceful shutdown of every actor with a summary log. M6: the persona strict startup policy (`--live` requires `{data_root}/persona.toml`, decision 45) and the read-only operator modes `--status` / `--status-all` over `Store::read_group_status` (Section 12 counters and rates, boundaries, muted state, recent dead letters with derived attempts, decision 46). Integration tests: `replay_restart` (Phase 0 exit criterion), `digest_replay` (end-to-end digest, idempotency, dead-letter then recovery, skeleton-only batch, restart keeps the boundary), `context_replay` (M2: context growth on intake, one-chunk-lag removal across two digests, bit-identical restart rebuild with injections, dedup prune), `wake_replay` (M4: threshold wake end to end over the replay fixture, gate-no silence, forced bypass of a muted group, live monologue lock with tick-driven suppression, recency discard), `recall_replay` (M5: injection end to end over a seeded graph — format/position/rows, Section 9.3 dedup across wakes of one chunk, zero candidates never call the cheap model, bit-identical restart rebuild, digest-time prune of the injection rows at the boundary) against the real store, the real graph, and scripted doubles, `monologue_restart` (M6: the Section 8.5 lock engages, persists across a restart, suppresses a tick-driven wake, unlocks on a human message), and `stability_replay` (M6: 10 iterations of digests, wakes, injections, and interleaved restarts — bit-identical rebuilds, no dead letters, ~1.4 s). Plus CLI, persona-policy, and status-rendering unit tests. | 39 (20 integration + 19 unit) |
 | `tamako-core` | Normalized events/actions (A1–A4), `PlatformAdapter` trait, typed config with Section 13 defaults and per-group TOML overrides, wake/digest trigger scheduling, `tail_stats` over the raw-log tail, session state encode/decode incl. `last_digest_at` and `prev_digest_boundary_msg_id`, the `context` module (M2: `LiveContext` ordered item model with range tags, structurally append-only per C1/C2, C3 `remove_at_or_below`, C4 `reload_preamble`, bit-identical `rebuild`, `messages_for_llm` view, stats), per-group actor with raw-log-first intake (P1), context appends at intake (messages and edits), reaction intake (M3: persist into `reactions` through `Store::insert_reaction` at intake, idempotent under redelivery, passive collection — no context item, no wake-counter advance, no session mutation; member join/leave stay debug-only), startup context rebuild, C3 removal + dedup prune in the digest-completion handler, edit appends, forced-wake and wake stubs, LIVE digest wiring (spawn + `DigestCompleted` through the inbox, digest before wake, one digest in flight per group), the `digest` contract module (`DigestPipeline`, `DigestOutcome`, `PostDigestHook` — a seam for stateless post-digest observers; the actor performs C3 itself before the hook), the `wake` contract module (`GateMessage` (with sender id, reply target, and raw text for the recall), `GateInput`, `GateDecision`, `RecallProvider` returning `RecallOutcome`/`PlannedInjection` (M5) + `NoopRecall`, `ParticipationGate`, `ReplyGenerator`, `WakeServices` — same contract-in-core pattern as the digest), the LIVE wake procedure of specs.md Section 9 (gather new messages above `wake_last_row_id`, reset-at-start + `wakes_total`, spawned task for the recall/gate/reply calls, `WakeCompleted` handler with the Section 6.2 recency discard, outbound row first per Rule B1 with the synthetic id `bot-out:{nanos}`, `try_send` into the outbound channel, context append, monologue-lock bookkeeping, `participations_total`; M5: the `WakeCompleted` handler applies the planned injections BEFORE the participation outcome is known — one `injected_memories` row per edge id, `append_recall_injection` at the tail (Rule C2), `injection_wakes_total` — and the reply-model snapshot carries the injections from step 2 on), the M4 timer driver (tokio interval at `timer_cadence` inside the actor task, `MissedTickBehavior::Delay`, zero-cadence guard), and the forced-wake queueing of Section 6.2. | 77 |
-| `tamako-store` | `store.db`: embedded migration runner (v1–v3), `messages` (idempotent insert, range read `list_messages_after`), `state` KV with atomic multi-write and counters, `injected_memories` (with the rendered `content` column since v2; `delete_injected_memories_up_to` for the Section 10.2 step 4 prune), `dead_letter`, `reactions` (migration v3, Section 5.2: `insert_reaction` with dedup UNIQUE INDEX with COALESCE → Duplicate). `find_sender_by_platform_msg_id` (M5: reply-target entry resolution of the recall, Section 8.1 step 1). WAL + `synchronous=NORMAL`. `chat_id` validation. | 19 |
-| `tamako-memory` | `MemoryBackend` trait (`Send` futures) with `alias_targets` (entity resolution step 2) and `neighbors` (M5: the Section 8.2 direct-neighbor read path — valid edges only, `contains` excluded, 500-edge expansion limit truncated by `created_at` descending, one hop, Rule R5 identifier entry; `NeighborEdge::edge_id` is the Section 9.3 dedup key), `LbugBackend` on `lbug 0.18` (schema creation, transactional idempotent `upsert_batch`, `CHECKPOINT`, per-group isolation, `query_rows` read helper), deterministic UUID5 identifiers with NFKC normalization. Tested against the real driver. | 17 |
+| `tamako-store` | `store.db`: embedded migration runner (v1–v3), `messages` (idempotent insert, range read `list_messages_after`), `state` KV with atomic multi-write and counters, `injected_memories` (with the rendered `content` column since v2; `delete_injected_memories_up_to` for the Section 10.2 step 4 prune), `dead_letter`, `reactions` (migration v3, Section 5.2: `insert_reaction` with dedup UNIQUE INDEX with COALESCE → Duplicate). `find_sender_by_platform_msg_id` (M5: reply-target entry resolution of the recall, Section 8.1 step 1). `read_group_status` (M6: the read-only status query of the `--status` modes — SQLITE_OPEN_READ_ONLY, no create, no migrate, 2 s busy timeout; specs.md Sections 10.3 and 12). WAL + `synchronous=NORMAL`. `chat_id` validation. | 23 |
+| `tamako-memory` | `MemoryBackend` trait (`Send` futures) with `alias_targets` (entity resolution step 2) and `neighbors` (M5: the Section 8.2 direct-neighbor read path — valid edges only, `contains` excluded, 500-edge expansion limit truncated by `created_at` descending, one hop, Rule R5 identifier entry; `NeighborEdge::edge_id` is the Section 9.3 dedup key), `LbugBackend` on `lbug 0.18` (schema creation, transactional idempotent `upsert_batch`, `CHECKPOINT`, per-group isolation, `query_rows` read helper; M6: ALL per-group operations serialized on a per-group async mutex — lbug 0.18 `Send + Sync` does not imply read-during-write safety, decision 47), deterministic UUID5 identifiers with NFKC normalization. Tested against the real driver. | 17 (+1 concurrent-access regression test) |
 | `tamako-persona` | `persona.toml` loading, `PreambleRenderer` trait, `PetPreambleRenderer` with the Section 9.4 injection guardrail, example persona at the repo root. | 7 |
 | `tamako-adapter-mock` | JSON replay fixture format, `MockAdapter` (event replay, action recording), 14-event demo fixture. | 6 |
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide 0.17). Pure `normalize` module (bot identity from get_me, display-name fallback chain, message/service/reaction/count normalization; synthetic `chat:{id}` for anonymous actors) plus the live `TeloxideAdapter` (polling task + bounded mpsc channel of 100, `next_group_event() -> GroupEvent { chat_id, event }` for multi-group routing per Rule P5, `PlatformAdapter` impl as the Rule A5 substitutability proof). Capability model (specs.md Section 4.2): `bot_chat_status` classifies the per-group membership (`BotChatStatus`: `Administrator` — owner counts as administrator — `Member`, `RestrictedOrOther`, `Unknown`; query failures map to `Unknown`). Outbound: `SendText` (optional reply via ReplyParameters), `React` (setMessageReaction); `SendMedia` → `AdapterError::Unsupported` (Phase 3). Outbound permission failures (missing rights or access) are tolerated: logged with the chat id, never fatal. Live Telegram smoke test ignored by default (`TAMAKO_LIVE_TELEGRAM=1` + `TELOXIDE_TOKEN`). | 50 (+1 ignored) |
@@ -356,8 +378,51 @@ M5 (shallow recall + full injection protocol) complete.
     Documented limits: no multi-word terms, no synonyms, no
     cross-language merging (Section 7.1 CAUTION), English-only
     stopwords.
+45. **Persona strict startup policy (M6).** `--live` requires a
+    persona file at `{data_root}/persona.toml`: a missing file is a
+    hard startup error that points at the repo-root example as the
+    template, and a malformed file is a hard error with the parse
+    context — never a silent fallback (Rule C4: the preamble is the
+    provider cache anchor; its source must be deliberate). The
+    `--allow-default-persona` flag restores the lenient fallback
+    chain for experiments; `--replay` always keeps the lenient chain
+    (offline demos must not require setup). A spec-level clarification
+    of specs.md Section 5.3, reported for spec backfill. Supersedes
+    decision 8.
+46. **The `--status` modes are read-only; capability is not printed;
+    attempts are derived (M6).** `--status <chat_id>` / `--status-all`
+    open store.db with `SQLITE_OPEN_READ_ONLY` (2 s busy timeout, no
+    create, no migrate). Verified against primary sources: rusqlite
+    0.32.1 bundles SQLite 3.46.0, and since SQLite 3.22.0 a read-only
+    open of a WAL database is reliable while a live writer holds it
+    (`-shm`/`-wal` present). Caveats surfaced to operators: after a
+    CLEAN shutdown the WAL files are gone and a read-only query can
+    fail on a read-only directory (an operator hint is printed);
+    `immutable=1` is never used (it ignores the WAL). The per-group
+    capability is never persisted (decision 29) and an offline
+    inspection tool must not call Telegram, so it is not printed. The
+    dead-letter row does not store an attempts count; a dead-lettered
+    batch by definition exhausted `digest_max_retries` total attempts
+    (specs.md Section 10.3 item 2), so the display prints the
+    effective per-group value as `attempts=N (exhausted)`.
+47. **All per-group LadybugDB operations are serialized inside
+    `LbugBackend` (M6).** The `Send + Sync` markers of lbug 0.18 do
+    NOT imply read-during-write safety: the C++ storage layer races
+    lock-free readers of `FileHandle::pageStates` against writer-side
+    `ConcurrentVector::resize` (annotated "Not thread-safe" upstream)
+    and the CHECKPOINT truncate path — SIGSEGV in
+    `BufferManager::optimisticRead` / `CSRNodeGroup::scanCommittedInMem`.
+    Reproduced 5/5 unserialized; clean 5/5 with the fix. The actor
+    spawns the digest pipeline and the wake procedure as concurrent
+    tasks, so a recall `neighbors` scan could overlap an in-flight
+    MERGE — a production-critical race found by the M6 stability run.
+    `LbugBackend::with_conn` now holds a per-group async mutex for the
+    full duration of every operation, reads and CHECKPOINT included
+    (Section 6.1 rule 3; ADR-0001 addendum 2026-08-08; regression test
+    `tamako-memory/tests/lbug_concurrent_access.rs`). An upstream
+    report to LadybugDB is recommended, not filed.
 
-## 4. Known gaps carried into Phase 1 (after M4)
+## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
 
@@ -370,33 +435,49 @@ Deliberately not done, in priority order:
    `participations_total` increment best effort (log and swallow on
    failure). DONE in M5: `injection_wakes_total` increments on every
    wake with at least one applied injection. DONE earlier:
-   `digest_failures_total` and `dead_letters_total` (M1).
+   `digest_failures_total` and `dead_letters_total` (M1). DONE in M6:
+   all counters are VISIBLE through the `--status` modes.
 3. **Reaction events are not stored.** DONE: migration v3 (the
    `reactions` table of specs.md Section 5.2) plus the intake wiring
    shipped in M3. `InboundEvent::Reaction` persists at intake
    (Rule P1), idempotent under redelivery, as passive collection.
    NOTE: the Phase 2 warmup backoff will consume the table.
-4. **Persona strict startup policy.** The Phase 0 fallback chain is
-   lenient. M6 decides whether a missing persona file is an error.
+4. **Persona strict startup policy.** DONE in M6 (decision 45):
+   `--live` requires `{data_root}/persona.toml`, with
+   `--allow-default-persona` as the escape hatch and the lenient
+   chain kept for `--replay`.
 5. **Member join/leave events have no consumer** and are not stored.
-   No spec requirement yet; revisit if the digest needs membership
-   history.
-6. **lbug 0.19 upgrade check.** Before any upgrade past 0.18, verify
-   storage-version compatibility (ADR-0001).
-7. **Tail statistics cost one tail scan per digest evaluation.** The
-   tail is bounded by the size thresholds in practice; a very long
-   never-digested tail re-scans on every message. Acceptable at Phase 1
-   scale; revisit with real traffic data (M6).
+   RE-DEFERRED (M6): no spec requirement exists; the events stay
+   debug-only. Revisit if the digest needs membership history.
+6. **lbug 0.19 upgrade check.** RE-DEFERRED (M6): the workspace stays
+   on `lbug = "0.18"`. Before any upgrade, verify storage-version
+   compatibility and re-run the concurrent-access regression test
+   (ADR-0001 and its 2026-08-08 addendum).
+7. **Tail statistics cost one tail scan per digest evaluation.** DONE
+   in M6 (measured, not optimized): `tail_stats` costs ~12 µs at the
+   trigger-bounded tail (100 rows), ~1 ms at 10k rows, ~11 ms at 100k
+   rows; the full actor path (`list_messages_after` + `tail_stats`)
+   costs ~21 ms at 20k rows. With digests enabled the trigger keeps
+   the tail bounded (~100 rows), so the cost is negligible. The
+   pathological case is a long never-digested tail (pipeline disabled
+   without an API key): ~1 ms per evaluation at 10k rows is still
+   acceptable at Phase 1 scale. Revisit with real traffic data.
 8. **Concept alias ambiguity collapses to the deterministic id.** An
    alias with several Concept targets falls back to
    `concept_id(normalized_name)` (fragmentation, the accepted Phase 1
    defect of dev-roadmap.md Section 3). Phase 2 merges.
-9. **No producer for bot-speech context items yet.** DONE in M4: the
-   wake send path appends `BotSpeech` items (Rule C1) after persisting
-   the outbound raw-log row (Rule B1). DONE in M5: the recall worker
-   produces the `RecallInjection` items through
-   `append_recall_injection` and the `injected_memories` dedup table;
-   the M2 lifecycle (bit-identical rebuild, C3 prune) covers them.
+9. **`ChatMember` updates are ignored.** RE-DEFERRED (M6): the poller
+   does not request `chat_member` updates, so Telegram never sends
+   them and the adapter has nothing to consume. Membership is
+   re-evaluated with `getChatMember` at every startup (decision 29).
+   No Phase 1 consumer exists; the soak runbook watches capability
+   through the startup log lines.
+10. **No producer for bot-speech context items yet.** DONE in M4: the
+    wake send path appends `BotSpeech` items (Rule C1) after persisting
+    the outbound raw-log row (Rule B1). DONE in M5: the recall worker
+    produces the `RecallInjection` items through
+    `append_recall_injection` and the `injected_memories` dedup table;
+    the M2 lifecycle (bit-identical rebuild, C3 prune) covers them.
 
 ## 5. Phase 1 milestones
 
@@ -410,7 +491,7 @@ for the dependency order. Build order:
 | **M3: teloxide adapter + live intake — COMPLETE** | New crate `tamako-adapter-teloxide`: pure normalization (messages with mention/reply resolution at intake per Section 4.2, edits, member join/leave service messages, named/anonymous/aggregated reactions, bot identity from get_me, synthetic `chat:{id}` for anonymous actors), long polling through a spawned listener task and a bounded mpsc channel (teloxide 0.17 builder API), `next_group_event` chat-id routing (Rule P5). `reactions` table migration v3 + idempotent reaction intake at intake time (Section 5.2, Rule P1, passive collection). Outbound `SendText`/`React` (`SendMedia` → Unsupported, Phase 3). `--live` binary mode: `TELOXIDE_TOKEN`, configured groups, lazy actor spawn, log-once ignore, ctrl-c graceful shutdown. | M1 (M2 not required) |
 | **M4: Wake procedure + timer driver + counters — COMPLETE** | Wake contracts in tamako-core (`GateMessage`, `GateInput`, `GateDecision`, `RecallProvider`/`NoopRecall` seam, `ParticipationGate`, `ReplyGenerator`, `WakeServices`), the wake procedure of specs.md Section 9 in the actor (gather above `wake_last_row_id`, reset-at-start, spawned recall/gate/reply task, `WakeCompleted` send path with the Section 6.2 recency discard, outbound row first per Rule B1, monologue lock live), forced-wake queueing per Section 6.2, real tokio timer driver (`timer_cadence`, `MissedTickBehavior::Delay`), counters (`wakes_total`, `participations_total`), endpoint portability of Section 13 (`LlmEndpoints::resolve`, `EndpointClient` over both API families, env-wins overrides), gate and reply implementations in tamako-agent (`RigGate`, `RigReplyGenerator`, scripted doubles), binary wiring in both modes (one shared outbound channel; degrade to silence without a family API key). | M2, M3 |
 | **M5: Shallow recall + injection protocol — COMPLETE** | The Section 8 read path in its Phase 1 form (`MemoryBackend::neighbors`: valid edges only, `contains` excluded, 500-edge truncation by `created_at` descending, one hop, Rule R5 entry; entry resolution steps 1–2 only — deterministic Person ids and the exact alias match, no vector search), the `ShallowRecall` worker (deterministic candidate extraction + pure tokenizer, Section 9.3 dedup against `injected_memories`, conservative cheap-model relevance gate with post-validated structured output, hard cap `recall_injection_cap` default 5 — reported for spec backfill, zero candidates never call the cheap model, gate failure means inject nothing), and the full injection protocol: exactly one "I remember: ..." assistant message per wake at the tail (Rule C2, applied regardless of the participation outcome), one `injected_memories` row per edge id (edge natural key as the dedup key), C3 prune at the previous boundary (M2 path, verified), digest exclusion of injections (Section 9.5), the preamble guardrail referenced (Section 9.4), and the `injection_wakes_total` counter (Section 12). | M2, M1 |
-| **M6: Hardening** | Monologue lock verified under live traffic, persona strict startup policy, integration hardening, dead-letter visibility. Prepares the two-week test-group soak (Phase 1 exit). | M3–M5 |
+| **M6: Hardening — COMPLETE** | Persona strict startup policy (decision 45: `--live` requires `{data_root}/persona.toml`, `--allow-default-persona` escape hatch, `--replay` stays lenient; spec backfill for Section 5.3). Operator mode `--status <chat_id>` / `--status-all` (read-only store open, Section 12 counters and rates, boundaries, muted state, recent dead letters with batch id, derived attempts, error, timestamp; decision 46; the M1 dead-letter ERROR log with chat id and batch id verified). Monologue lock integration test across a restart (`monologue_restart.rs`). Production-critical fix: per-group serialization of ALL LadybugDB operations (lbug 0.18 read-during-write SIGSEGV, decision 47, ADR-0001 addendum, `lbug_concurrent_access.rs` regression test). Stability run (`stability_replay.rs`: 10 iterations of digests, wakes, injections, restarts; bit-identical rebuilds; zero dead letters; ~1.4 s). Tail-stats cost measured and documented (Section 4, gap 7). Dependency audit: no new dependencies; schemars stays 1.x. `docs/soak-runbook.md` prepares the two-week test-group soak (Phase 1 exit). | M3–M5 |
 
 Phase 1 exit criteria: `dev-roadmap.md` Section 3 (two weeks in one
 test group without operator intervention; restart loses no message and

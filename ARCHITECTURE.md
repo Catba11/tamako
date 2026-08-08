@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 26 (18 integration + 8 CLI unit) |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 39 (20 integration + 19 unit) |
 | `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 77 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 19 |
-| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 17 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 23 |
+| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 17 (+1 concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
 | `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 103 (+3 ignored live tests) |
 
-Total: 305 tests (+4 ignored live tests). Build, test,
+Total: 323 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -291,6 +291,17 @@ crate. Key decisions:
   twice yields the same graph. Timestamps travel as native `TIMESTAMP`
   parameters; all user data goes through `$param` parameters.
 - Every driver call runs inside `spawn_blocking` (Section 5.2, rule 3).
+- **All per-group operations are serialized (M6).** The `Send + Sync`
+  markers of lbug 0.18 do NOT imply read-during-write safety: the C++
+  storage layer races lock-free readers of `FileHandle::pageStates`
+  against writer-side `ConcurrentVector::resize` and the CHECKPOINT
+  truncate path (SIGSEGV; reproduced 5/5). `LbugBackend::with_conn`
+  holds a per-group async mutex for the full duration of every
+  operation, reads and CHECKPOINT included — the actor spawns the
+  digest pipeline and the wake procedure as concurrent tasks, so a
+  recall scan could otherwise overlap an in-flight MERGE. Refer to
+  `docs/adr-0001-ladybugdb-binding.md` (addendum 2026-08-08); the
+  regression test is `tamako-memory/tests/lbug_concurrent_access.rs`.
 - The backend exposes the read path of Section 8 in its Phase 1 form
   (M5): `MemoryBackend::alias_targets` (entry resolution step 2: the
   targets of one alias node, entered through the deterministic alias
@@ -427,8 +438,9 @@ double (same pattern as `ScriptedGate`).
 
 `tamako --replay <fixture> [--data-root <dir>] [--config <file>]` loads
 the configuration (Section 13 defaults with per-group overrides from
-`[groups.<chat_id>]` TOML tables), loads the persona (`{data_root}/
-persona.toml`, then the repo-root example, then a built-in default),
+`[groups.<chat_id>]` TOML tables), loads the persona with the lenient
+fallback chain (`{data_root}/persona.toml`, then the repo-root example,
+then a built-in default — offline demos must not require setup),
 renders the preamble through the `PreambleRenderer` trait (the actor
 stores it as item 0 of the live context, Rule C4), resolves the three
 LLM endpoints from the group configuration and the environment (a bad
@@ -458,10 +470,17 @@ Every spawn site passes the wake services, a clone of the outbound
 sender, and the persona name (the sender display name of outbound
 raw-log rows).
 
-`tamako --live [--data-root <dir>] [--config <file>]` (mutually
+`tamako --live [--allow-default-persona] [--data-root <dir>] [--config <file>]` (mutually
 exclusive with `--replay`) connects the teloxide adapter: the token
 comes from `TELOXIDE_TOKEN`, and the served groups come from the
-`[groups.<chat_id>]` tables of the config file. An actor spawns lazily
+`[groups.<chat_id>]` tables of the config file. The persona policy is
+STRICT in live mode (M6, specs.md Section 5.3): a missing
+`{data_root}/persona.toml` is a hard startup error that points at the
+repo-root example as the template, and a malformed file is a hard
+error — a silent fallback to a default persona in production would hide
+configuration mistakes (Rule C4: the preamble is the provider cache
+anchor; its source must be deliberate). The `--allow-default-persona`
+flag restores the lenient fallback chain for experiments. An actor spawns lazily
 on the first event of each configured group; events from
 non-configured groups are logged once and ignored (Rule P5). The
 binary routes events by the chat id of `next_group_event`. Ctrl-c
@@ -470,6 +489,21 @@ a summary log. An adapter error that escapes `next_group_event` is
 fatal: graceful shutdown, then the error propagates. The config file
 is not watched; restart to pick up new groups.
 
+`tamako --status <chat_id>` and `tamako --status-all` (M6) are the
+offline operator modes (specs.md Sections 10.3 and 12): they open the
+group store.db READ-ONLY (`SQLITE_OPEN_READ_ONLY` through
+`Store::read_group_status` — no directory creation, no migrations, a
+2 s busy timeout; verified safe against a live writer on the bundled
+SQLite 3.46.0) and print the Section 12 counters and derived rates
+(participation, injection), the digest boundaries, the muted state,
+and the five most recent dead letters with batch id, derived attempts
+(`digest_max_retries`, exhausted by definition), error, and timestamp.
+No persona load, no token, no LLM endpoints, no actor spawn. The
+per-group capability is not printed: it is never persisted and an
+offline tool must not call Telegram. After a CLEAN bot shutdown the
+WAL files are gone, so a read-only query can fail on a read-only
+directory; the error carries an operator hint.
+
 An offline digest demo lives at `tamako-agent/examples/digest_demo.rs`:
 `cargo run -p tamako-agent --example digest_demo` replays the fixture
 through the real actor and the real LadybugDB backend with a scripted
@@ -477,15 +511,14 @@ extractor and prints the resulting graph.
 
 ## 10. Phase 1 outlook
 
-The wake procedure with the real timer driver, the counters, and the
-endpoint-portability layer (M4) are built and tested (Sections 4, 8,
-and 9), and the shallow recall with the full injection protocol (M5)
-is live: the bot answers mentions and replies directly, joins
-conversations when the participation gate says yes, remembers relevant
-facts as "I remember: ..." injections (Sections 9.1–9.5 — Rule C2
-tail append, Section 9.3 dedup, the digest-time prune of the M2
-lifecycle), and degrades to silence without an LLM key. Phase 1
-continues with hardening (M6): the monologue lock verified under live
-traffic, the persona strict startup policy, integration hardening,
-dead-letter visibility. Refer to `current-state.md` for the milestone
-breakdown and to `dev-roadmap.md` Section 3 for the phase scope.
+Phase 1 is feature-complete (M1–M6). Hardening (M6) added the persona
+strict startup policy for `--live`, the read-only `--status` operator
+modes (Section 9), the monologue-lock integration test across a
+restart, the per-group serialization of all LadybugDB operations
+(Section 7 — a production-critical read-during-write race), and the
+stability replay loop (10 iterations of digests, wakes, injections,
+and interleaved restarts, bit-identical rebuilds, zero dead letters).
+The remaining Phase 1 step is the two-week test-group soak, operated
+with `docs/soak-runbook.md`. Refer to `current-state.md` for the
+milestone breakdown and to `dev-roadmap.md` Section 3 for the phase
+scope.
