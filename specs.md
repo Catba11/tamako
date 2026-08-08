@@ -79,6 +79,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 ### 5.3 Persona configuration
 
 - One global persona configuration at `{data_root}/persona.toml`. Hot-reloadable.
+- In live mode the persona file is required. A missing or invalid file fails startup with a clear error. An explicit operator flag permits the lenient fallback chain for experiments. Replay mode is always lenient. The preamble is the cache anchor. Its source must be deliberate. Rule C4 applies.
 - The persona service renders the system preamble. The preamble is the prefix of every model context and never changes inside a context lifetime. Rule C4 applies.
 - The persona rendering layer is an interface. The pet persona is one implementation. This decoupling permits reuse of the runtime for other personas or purposes.
 
@@ -243,6 +244,8 @@ Metrics per group:
 | Dead-letter count | Skipped batches. Requires operator attention. |
 | Fallback attachment rate | Refer to `proposed-graph-database-specs.md` Section 10. Primary entity-resolution quality metric. |
 | Wake rate | Wakes per hour. Watch against the floor configuration. |
+
+The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the counters, the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
 ## 13. Configuration
 

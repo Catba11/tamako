@@ -83,6 +83,7 @@ NOTE: An update to a value that exists in the string dictionary is almost free. 
 3. Wrap the synchronous `Connection.execute()` call in a thread pool. Give an asynchronous interface to callers.
 4. Send all user data as `$param` parameters. Permit string interpolation for structural fragments only. Validate interpolated field names against a whitelist.
 5. Run `CHECKPOINT` after each batch write. Keep `CHECKPOINT_THRESHOLD` at the default value of 16 MB. Decrease the value during high write load to compact the string dictionary more frequently.
+6. Serialize all operations of one group database through one lock per group. Reads and `CHECKPOINT` are included. With lbug 0.18, a read concurrent with a write can crash the process (upstream defect). Refer to `docs/adr-0001-ladybugdb-binding.md`, addendum 2026-08-08.
 
 ## 6. Schema
 
