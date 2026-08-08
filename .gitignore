@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Runtime data. One directory per group lives here at runtime
+# (store.db, memory.lbug, media/). Never commit group data.
+/data
+
+# Local demo and scratch data
+/demo-data
+
+# OS noise
+.DS_Store

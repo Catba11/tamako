@@ -1,0 +1,58 @@
+# Tamako workspace. Refer to AGENT.md Section 4 for the crate layout.
+
+[workspace]
+resolver = "2"
+members = [
+    "tamako",
+    "tamako-core",
+    "tamako-store",
+    "tamako-memory",
+    "tamako-persona",
+    "tamako-adapter-mock",
+]
+
+[workspace.dependencies]
+# Async runtime. Rule of AGENT.md Section 6.2: synchronous storage calls
+# run inside tokio::task::spawn_blocking.
+tokio = { version = "1", features = ["full"] }
+
+# SQLite for store.db. The bundled feature builds SQLite from source.
+# No system SQLite dependency.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling. Rule of AGENT.md Section 6.4: libraries use thiserror,
+# the binary uses anyhow.
+thiserror = "2"
+anyhow = "1"
+
+# LadybugDB graph database, official Rust binding (cxx FFI over a bundled
+# C++ core, built with CMake). Pin 0.18: storage-format v42 (magic bytes
+# "LBUG") compatibility with the pinned Python ladybug>=0.16.0,<=0.18.2
+# (proposed-graph-database-specs.md Section 10). docs.rs builds fail for
+# lbug >= 0.17 (sandbox limitation); read the API from the local crate
+# source or build cargo doc locally. Refer to docs/adr-0001-ladybugdb-binding.md.
+lbug = "0.18"
+
+# Deterministic node identifiers. Refer to
+# proposed-graph-database-specs.md Section 7.1.
+uuid = { version = "1", features = ["v5", "serde"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Wake-trigger jitter. Refer to specs.md Section 8.3.
+rand = "0.9"
+
+# Timestamps. The project uses the time crate, not chrono.
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+
+# Internal crates.
+tamako-core = { path = "tamako-core" }
+tamako-store = { path = "tamako-store" }
+tamako-memory = { path = "tamako-memory" }
+tamako-persona = { path = "tamako-persona" }
+tamako-adapter-mock = { path = "tamako-adapter-mock" }

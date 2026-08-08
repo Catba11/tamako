@@ -1,0 +1,13 @@
+[package]
+name = "tamako-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

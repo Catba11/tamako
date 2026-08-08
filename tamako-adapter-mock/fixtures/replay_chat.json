@@ -1,0 +1,145 @@
+{
+  "chat_id": "-1001234567890",
+  "events": [
+    {
+      "type": "member_join",
+      "timestamp": "2026-08-01T13:00:00Z",
+      "user_id": "100003",
+      "display_name": "Carol"
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "41",
+      "timestamp": "2026-08-01T13:01:00Z",
+      "sender_id": "100001",
+      "sender_display_name": "Alice",
+      "text": "Anyone up for a hike this weekend?",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "43",
+      "timestamp": "2026-08-01T13:02:00Z",
+      "sender_id": "100002",
+      "sender_display_name": "Bob",
+      "text": "I am in. Where do we go?",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "44",
+      "timestamp": "2026-08-01T13:03:00Z",
+      "sender_id": "100003",
+      "sender_display_name": "Carol",
+      "text": "Same here. Can I bring my cat?",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "45",
+      "timestamp": "2026-08-01T13:04:00Z",
+      "sender_id": "100001",
+      "sender_display_name": "Alice",
+      "text": "@tamako what do you think, should the cat come along?",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": true,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "46",
+      "timestamp": "2026-08-01T13:05:00Z",
+      "sender_id": "100002",
+      "sender_display_name": "Bob",
+      "text": "Cats hate hikes. Leave the cat at home.",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "47",
+      "timestamp": "2026-08-01T13:06:00Z",
+      "sender_id": "100003",
+      "sender_display_name": "Carol",
+      "text": "She is an adventure cat. She has a harness.",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "48",
+      "timestamp": "2026-08-01T13:07:00Z",
+      "sender_id": "100001",
+      "sender_display_name": "Alice",
+      "text": "Good point. We can decide on Friday evening.",
+      "reply_to_platform_msg_id": "42",
+      "mentions_bot": false,
+      "is_reply_to_bot": true
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "49",
+      "timestamp": "2026-08-01T13:08:00Z",
+      "sender_id": "100002",
+      "sender_display_name": "Bob",
+      "text": "The forecast says rain on Sunday. Saturday then?",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "50",
+      "timestamp": "2026-08-01T13:09:00Z",
+      "sender_id": "100003",
+      "sender_display_name": "Carol",
+      "text": "Saturday works for me.",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "message",
+      "platform_msg_id": "51",
+      "timestamp": "2026-08-01T13:10:00Z",
+      "sender_id": "100001",
+      "sender_display_name": "Alice",
+      "text": "It is settled then. Saturday, 9 am, cat included.",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "reaction",
+      "platform_msg_id": "50",
+      "timestamp": "2026-08-01T13:11:00Z",
+      "sender_id": "100002",
+      "emoji": "👍"
+    },
+    {
+      "type": "edited_message",
+      "platform_msg_id": "47",
+      "timestamp": "2026-08-01T13:12:00Z",
+      "sender_id": "100003",
+      "sender_display_name": "Carol",
+      "text": "She is an adventure cat. She has a harness and a tiny backpack.",
+      "reply_to_platform_msg_id": null,
+      "mentions_bot": false,
+      "is_reply_to_bot": false
+    },
+    {
+      "type": "member_leave",
+      "timestamp": "2026-08-01T13:15:00Z",
+      "user_id": "100004",
+      "display_name": "Dave"
+    }
+  ]
+}
