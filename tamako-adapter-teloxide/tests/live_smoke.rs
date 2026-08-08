@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use tamako_adapter_teloxide::TeloxideAdapter;
+use tamako_adapter_teloxide::{BotChatStatus, TeloxideAdapter};
 
 #[tokio::test]
 #[ignore = "live test: needs TAMAKO_LIVE_TELEGRAM=1 and TELOXIDE_TOKEN"]
@@ -46,4 +46,10 @@ async fn live_smoke() {
         .expect("the stream is open");
     assert!(!event.chat_id.is_empty());
     eprintln!("received: {event:?}");
+
+    // Capability detection smoke path: the BotFather checklist above makes
+    // the bot a group administrator.
+    let status = adapter.bot_chat_status(&event.chat_id).await;
+    eprintln!("bot chat status: {status:?}");
+    assert_eq!(status, BotChatStatus::Administrator);
 }

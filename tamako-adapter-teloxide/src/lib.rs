@@ -10,7 +10,9 @@
 //! emits only the platform-neutral `tamako_core::event` types.
 
 pub mod adapter;
+pub mod capability;
 pub mod normalize;
 
 pub use adapter::{GroupEvent, TeloxideAdapter};
+pub use capability::BotChatStatus;
 pub use normalize::BotIdentity;

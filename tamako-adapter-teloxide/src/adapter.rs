@@ -22,13 +22,14 @@ use tamako_core::event::{InboundEvent, OutboundAction};
 use teloxide::payloads::{SendMessageSetters as _, SetMessageReactionSetters as _};
 use teloxide::requests::Requester as _;
 use teloxide::types::{
-    AllowedUpdate, ChatId, MessageId, ReactionType, ReplyParameters, Update, UpdateKind,
+    AllowedUpdate, ChatId, MessageId, ReactionType, ReplyParameters, Update, UpdateKind, UserId,
 };
 use teloxide::update_listeners::{AsUpdateStream as _, Polling};
 use teloxide::{Bot, RequestError};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::capability::{self, BotChatStatus};
 use crate::normalize::{self, BotIdentity};
 
 /// One normalized inbound event with its source chat (rule A2). The live
@@ -96,6 +97,37 @@ impl TeloxideAdapter {
         &self.identity
     }
 
+    /// The bot's membership status in one chat, through `get_chat_member`.
+    ///
+    /// Reaction updates arrive only for administrators (specs.md Section
+    /// 4.2). A non-admin bot works normally, except reaction collection is
+    /// absent. Requesting reaction updates without admin status causes no
+    /// error; the updates simply never arrive.
+    ///
+    /// A chat id parse failure gives `Unknown` with a debug log. Any call
+    /// failure (e.g. the bot is not in the chat) gives `Unknown` with a
+    /// debug log; the caller continues normally.
+    pub async fn bot_chat_status(&self, chat_id: &str) -> BotChatStatus {
+        let chat = match chat_id.parse::<i64>() {
+            Ok(id) => ChatId(id),
+            Err(err) => {
+                debug!(chat_id = %chat_id, error = %err, "invalid chat id; status unknown");
+                return BotChatStatus::Unknown;
+            }
+        };
+        match self
+            .bot
+            .get_chat_member(chat, UserId(self.identity.id))
+            .await
+        {
+            Ok(member) => capability::classify_member_kind(&member.kind),
+            Err(err) => {
+                debug!(chat_id = %chat_id, error = %err, "get_chat_member failed; status unknown");
+                BotChatStatus::Unknown
+            }
+        }
+    }
+
     /// Returns the next normalized group event, with its chat id.
     ///
     /// One update can give zero events (a non-text message, an unhandled
@@ -151,10 +183,9 @@ impl PlatformAdapter for TeloxideAdapter {
                     request = request
                         .reply_parameters(ReplyParameters::new(parse_message_id(&reply_to)?));
                 }
-                request
-                    .await
-                    .map_err(|err| AdapterError::Sink(format!("send_message failed: {err}")))?;
-                Ok(())
+                // specs.md Section 4.2: a denied outbound action is
+                // tolerated and logged, never fatal.
+                outbound_result(request.await, &chat_id, "send_message")
             }
             OutboundAction::React {
                 chat_id,
@@ -164,17 +195,19 @@ impl PlatformAdapter for TeloxideAdapter {
                 // Reactions set by bots never generate updates, so this
                 // never loops back into intake (Bot API docs, mirrored in
                 // teloxide-core 0.13.0 `types/update.rs`).
-                self.bot
-                    .set_message_reaction(
-                        parse_chat_id(&chat_id)?,
-                        parse_message_id(&platform_msg_id)?,
-                    )
-                    .reaction(vec![ReactionType::Emoji { emoji }])
-                    .await
-                    .map_err(|err| {
-                        AdapterError::Sink(format!("set_message_reaction failed: {err}"))
-                    })?;
-                Ok(())
+                // specs.md Section 4.2: a denied outbound action is
+                // tolerated and logged, never fatal.
+                outbound_result(
+                    self.bot
+                        .set_message_reaction(
+                            parse_chat_id(&chat_id)?,
+                            parse_message_id(&platform_msg_id)?,
+                        )
+                        .reaction(vec![ReactionType::Emoji { emoji }])
+                        .await,
+                    &chat_id,
+                    "set_message_reaction",
+                )
             }
             OutboundAction::SendMedia { .. } => Err(AdapterError::Unsupported(
                 "SendMedia is Phase 3 territory; the pet's replies are text".to_string(),
@@ -293,6 +326,27 @@ fn parse_message_id(raw: &str) -> Result<MessageId, AdapterError> {
     raw.parse::<i32>()
         .map(MessageId)
         .map_err(|err| AdapterError::Sink(format!("invalid message id {raw:?}: {err}")))
+}
+
+/// Maps an outbound request result to the adapter result.
+///
+/// specs.md Section 4.2: a denied outbound action (the bot lacks the
+/// permission) is tolerated and logged, never fatal. The warn log carries
+/// the chat id. Any other request error keeps the `AdapterError::Sink`
+/// mapping.
+fn outbound_result<T>(
+    result: Result<T, RequestError>,
+    chat_id: &str,
+    action: &str,
+) -> Result<(), AdapterError> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if capability::is_permission_error(&err) => {
+            warn!(chat_id = %chat_id, error = %err, "outbound action denied by Telegram (missing permission); continuing");
+            Ok(())
+        }
+        Err(err) => Err(AdapterError::Sink(format!("{action} failed: {err}"))),
+    }
 }
 
 #[cfg(test)]
