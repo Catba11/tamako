@@ -8,20 +8,21 @@ document records the current implementation.
 
 ## 1. Workspace layout
 
-A Cargo workspace at the repository root with seven crates. Shared
+A Cargo workspace at the repository root with eight crates. Shared
 dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo. | 8 (integration) |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract. | 54 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1 + v2), the raw message log, the session-state table, `injected_memories`, `dead_letter`. | 14 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 14 (8 integration + 6 CLI unit) |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract. | 57 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 17 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 12 |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 39 (+1 ignored live test) |
 | `tamako-agent` | All LLM concerns: the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter). | 42 (+1 ignored live test) |
 
-Total: 143 tests (+1 ignored live-API smoke test). Build, test,
+Total: 194 tests (+2 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -34,7 +35,8 @@ tamako ──▶ tamako-core ──▶ tamako-store
    ├──▶ tamako-memory
    ├──▶ tamako-persona
    ├──▶ tamako-agent ──▶ tamako-core (contract), tamako-store, tamako-memory
-   └──▶ tamako-adapter-mock ──▶ tamako-core (types only)
+   ├──▶ tamako-adapter-mock ──▶ tamako-core (types only)
+   └──▶ tamako-adapter-teloxide ──▶ tamako-core (types only)
 ```
 
 - The binary depends on all crates and does the wiring.
@@ -68,6 +70,36 @@ The mock adapter replays a JSON fixture
 and records outbound actions for test assertions. It is the Phase 0 demo
 and the integration-test harness.
 
+The live adapter is `tamako-adapter-teloxide` (teloxide 0.17, M3). Its
+`normalize` module is pure: it converts Telegram updates into the
+normalized types — messages with mention and reply resolution at intake
+(specs.md Section 4.2, against the bot identity from get_me), edits,
+member join/leave service messages, and reactions (named, anonymous,
+and aggregated counts). Display names fall back "First Last" →
+"@username" → numeric id; a lone first name never wins. Anonymous group
+admins (messages sent as the chat) and anonymous reaction actors get
+the synthetic sender id `chat:{id}`. Aggregated count updates persist
+the emoji set only: `total_count` is dropped and `old_emojis` is empty
+(the Bot API carries no previous state); `CustomEmoji` normalizes to
+its `custom_emoji_id` string and `Paid` is skipped. Because
+`Polling::as_stream` borrows the listener mutably and teloxide 0.17
+has no owned-stream API, a spawned task owns the polling listener and
+forwards updates over a bounded mpsc channel (capacity 100); the
+adapter consumes the channel (no Dispatcher, no dptree; transient
+stream errors are skipped inside the task). The inherent
+`next_group_event()` returns `GroupEvent { chat_id, event }` so the
+binary routes multi-group traffic by chat id (Rule P5); the
+`PlatformAdapter` trait impl is the Rule A5 substitutability proof and
+drops the chat id. Outbound, `SendText` (optional reply through
+ReplyParameters) and `React` (setMessageReaction) are implemented;
+`SendMedia` returns `AdapterError::Unsupported` (Phase 3). The poller
+requests `allowed_updates` = message, edited_message,
+message_reaction, message_reaction_count; reaction updates require the
+bot to be a group administrator (a Telegram Bot API requirement — a
+deployment concern). `TELOXIDE_API_URL` is honored only by
+`Bot::from_env`, not by `Bot::new`, so the adapter applies
+`set_api_url` itself; a custom Bot API server works.
+
 ## 4. The per-group actor
 
 `tamako-core::actor` implements the actor model of specs.md Section 6.
@@ -89,6 +121,11 @@ and the integration-test harness.
   context item like any other new row (uniform with the rebuild, which
   renders edits identically). An edit never retracts (specs.md
   Section 15, open item 4).
+- Reaction intake is passive collection (M3): the reaction row persists
+  first into the `reactions` table (Rule P1, idempotent under
+  redelivery through the dedup unique index). No context item, no
+  wake-counter advance, no session mutation. Member join/leave events
+  stay debug-only.
 - Trigger evaluation (specs.md Section 6.2: Digest before Wake). The
   digest trigger of Section 8.2 is live (M1): on fire, the actor spawns
   the digest pipeline as a task that reports back through the inbox
@@ -161,14 +198,15 @@ Rule P5: one directory per group at `{data_root}/{chat_id}/`.
 
 | File | Content |
 |---|---|
-| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `schema_migrations`. |
+| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `schema_migrations`. |
 | `memory.lbug` | LadybugDB graph. One `Node` table, one `EDGE` rel table (Section 6.1 of the database specification). |
 
 `tamako-store::Store` is rooted at the data root and takes a `chat_id`
 in every API. Connections open lazily and are cached in a
 `Mutex<HashMap>`. Migrations are an ordered constant array (v1: the
 Phase 0 tables; v2: `injected_memories.content` for the bit-identical
-context rebuild) applied through a minimal runner; the raw-log insert
+context rebuild; v3: the `reactions` table) applied through a minimal
+runner; the raw-log insert
 is idempotent (`INSERT OR IGNORE` on `(platform_msg_id, direction,
 event_type, timestamp)`). `chat_id` values with path separators or
 `..` are rejected.
@@ -292,6 +330,18 @@ is hand-rolled; no clap. When `ANTHROPIC_API_KEY` is set, the binary
 wires the live `RigExtractor` digest pipeline; without the key, digests
 are disabled and the replay stays offline.
 
+`tamako --live [--data-root <dir>] [--config <file>]` (mutually
+exclusive with `--replay`) connects the teloxide adapter: the token
+comes from `TELOXIDE_TOKEN`, and the served groups come from the
+`[groups.<chat_id>]` tables of the config file. An actor spawns lazily
+on the first event of each configured group; events from
+non-configured groups are logged once and ignored (Rule P5). The
+binary routes events by the chat id of `next_group_event`. Ctrl-c
+shuts every actor down gracefully (session flush per group) and prints
+a summary log. An adapter error that escapes `next_group_event` is
+fatal: graceful shutdown, then the error propagates. The config file
+is not watched; restart to pick up new groups.
+
 An offline digest demo lives at `tamako-agent/examples/digest_demo.rs`:
 `cargo run -p tamako-agent --example digest_demo` replays the fixture
 through the real actor and the real LadybugDB backend with a scripted
@@ -299,13 +349,14 @@ extractor and prints the resulting graph.
 
 ## 10. Phase 1 outlook
 
-The context lifecycle (M2) is built and tested (Section 5). Phase 1
-continues with the teloxide adapter with live intake (including the
-`reactions` table of specs.md Section 5.2 — store migration v3), the
-wake procedure with a real timer driver and counters (M4 consumes
-`LiveContext::messages_for_llm` and `append_bot_speech`), shallow
-recall with the full injection protocol (M5 produces the
-`RecallInjection` items through `append_recall_injection` and the
-`injected_memories` dedup table), and the monologue lock in live
-operation. Refer to `current-state.md` for the milestone breakdown and
-to `dev-roadmap.md` Section 3 for the phase scope.
+The context lifecycle (M2) and the teloxide adapter with live intake
+(M3, including the `reactions` table of specs.md Section 5.2 — store
+migration v3) are built and tested (Sections 3 and 5). Phase 1
+continues with the wake procedure with a real timer driver and
+counters (M4 consumes `LiveContext::messages_for_llm` and
+`append_bot_speech`), shallow recall with the full injection protocol
+(M5 produces the `RecallInjection` items through
+`append_recall_injection` and the `injected_memories` dedup table),
+and the monologue lock in live operation (M6). Refer to
+`current-state.md` for the milestone breakdown and to
+`dev-roadmap.md` Section 3 for the phase scope.

@@ -39,9 +39,10 @@ The workspace is a Cargo workspace at the repository root. Crates:
 | `tamako-memory` | Graph backend trait and its implementation (or stub). |
 | `tamako-persona` | Global persona configuration and preamble rendering. |
 | `tamako-adapter-mock` | Mock platform adapter and the replay fixture for tests. |
+| `tamako-adapter-teloxide` | Live Telegram adapter (teloxide). Pure normalization plus polling intake and outbound actions. |
 | `tamako-agent` | All LLM concerns: the extraction call (rig) and the digest pipeline. The only crate that depends on rig. |
 
-Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. Adapter crates depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, and `tamako-memory`. No cycles.
+Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, and `tamako-memory`. No cycles.
 
 ## 5. Commands
 
