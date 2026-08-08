@@ -46,10 +46,16 @@ M3 (teloxide adapter + live intake) complete.
     as passive collection: no context item, no wake-counter advance, no
     session mutation. Outbound: `SendText` (with optional reply) and
     `React` implemented; `SendMedia` returns
-    `AdapterError::Unsupported` (Phase 3).
+    `AdapterError::Unsupported` (Phase 3). Graceful capability model
+    (specs.md Section 4.2): administrator status is recommended, not
+    required. The binary detects the per-group membership status at
+    startup (`getChatMember`, in-memory cache, never persisted —
+    re-evaluated on each startup) and degrades to
+    no-reaction-collection with one warning per non-administrator
+    group.
   - M4–M6: NOT STARTED. Milestones in Section 5 below.
 - Verification: `cargo build --workspace`, `cargo test --workspace`
-  (194 tests, 0 failures, 2 ignored live tests: the live-API smoke
+  (207 tests, 0 failures, 2 ignored live tests: the live-API smoke
   test and the live Telegram smoke test),
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` — all clean.
@@ -64,13 +70,13 @@ M3 (teloxide adapter + live intake) complete.
 
 | Crate | Content | Tests |
 |---|---|---|
-| `tamako` | CLI (`--replay`, `--live` — mutually exclusive, `--data-root`, `--config`), wiring incl. the live digest pipeline when `ANTHROPIC_API_KEY` is set, demo summary with digest boundary and dead-letter count. Live mode (M3): token from `TELOXIDE_TOKEN`, configured groups from `[groups.<chat_id>]` config tables, lazy actor spawn on the first event per group, non-configured groups logged once and ignored (Rule P5), ctrl-c graceful shutdown of every actor with a summary log. Integration tests: `replay_restart` (Phase 0 exit criterion), `digest_replay` (end-to-end digest, idempotency, dead-letter then recovery, skeleton-only batch, restart keeps the boundary), and `context_replay` (M2: context growth on intake, one-chunk-lag removal across two digests, bit-identical restart rebuild with injections, dedup prune) against the real LadybugDB backend. Plus CLI `parse_args` unit tests. | 14 |
+| `tamako` | CLI (`--replay`, `--live` — mutually exclusive, `--data-root`, `--config`), wiring incl. the live digest pipeline when `ANTHROPIC_API_KEY` is set, demo summary with digest boundary and dead-letter count. Live mode (M3): token from `TELOXIDE_TOKEN`, configured groups from `[groups.<chat_id>]` config tables, lazy actor spawn on the first event per group, non-configured groups logged once and ignored (Rule P5), capability detection at startup (one `getChatMember` call per configured group, in-memory cache, spawn-time re-check, one warning per non-administrator group, admin INFO / unknown INFO guidance), ctrl-c graceful shutdown of every actor with a summary log. Integration tests: `replay_restart` (Phase 0 exit criterion), `digest_replay` (end-to-end digest, idempotency, dead-letter then recovery, skeleton-only batch, restart keeps the boundary), and `context_replay` (M2: context growth on intake, one-chunk-lag removal across two digests, bit-identical restart rebuild with injections, dedup prune) against the real LadybugDB backend. Plus CLI and capability-mapping unit tests. | 16 |
 | `tamako-core` | Normalized events/actions (A1–A4), `PlatformAdapter` trait, typed config with Section 13 defaults and per-group TOML overrides, wake/digest trigger scheduling, `tail_stats` over the raw-log tail, session state encode/decode incl. `last_digest_at` and `prev_digest_boundary_msg_id`, the `context` module (M2: `LiveContext` ordered item model with range tags, structurally append-only per C1/C2, C3 `remove_at_or_below`, C4 `reload_preamble`, bit-identical `rebuild`, `messages_for_llm` view, stats), per-group actor with raw-log-first intake (P1), context appends at intake (messages and edits), reaction intake (M3: persist into `reactions` through `Store::insert_reaction` at intake, idempotent under redelivery, passive collection — no context item, no wake-counter advance, no session mutation; member join/leave stay debug-only), startup context rebuild, C3 removal + dedup prune in the digest-completion handler, edit appends, forced-wake and wake stubs, LIVE digest wiring (spawn + `DigestCompleted` through the inbox, digest before wake, one digest in flight per group), the `digest` contract module (`DigestPipeline`, `DigestOutcome`, `PostDigestHook` — a seam for stateless post-digest observers; the actor performs C3 itself before the hook). | 57 |
 | `tamako-store` | `store.db`: embedded migration runner (v1–v3), `messages` (idempotent insert, range read `list_messages_after`), `state` KV with atomic multi-write and counters, `injected_memories` (with the rendered `content` column since v2; `delete_injected_memories_up_to` for the Section 10.2 step 4 prune), `dead_letter`, `reactions` (migration v3, Section 5.2: `insert_reaction` with dedup UNIQUE INDEX with COALESCE → Duplicate). WAL + `synchronous=NORMAL`. `chat_id` validation. | 17 |
 | `tamako-memory` | `MemoryBackend` trait (`Send` futures) with `alias_targets` (entity resolution step 2), `LbugBackend` on `lbug 0.18` (schema creation, transactional idempotent `upsert_batch`, `CHECKPOINT`, per-group isolation, `query_rows` read helper), deterministic UUID5 identifiers with NFKC normalization. Tested against the real driver. | 12 |
 | `tamako-persona` | `persona.toml` loading, `PreambleRenderer` trait, `PetPreambleRenderer` with the Section 9.4 injection guardrail, example persona at the repo root. | 7 |
 | `tamako-adapter-mock` | JSON replay fixture format, `MockAdapter` (event replay, action recording), 14-event demo fixture. | 6 |
-| `tamako-adapter-teloxide` | Live Telegram adapter (teloxide 0.17). Pure `normalize` module (bot identity from get_me, display-name fallback chain, message/service/reaction/count normalization; synthetic `chat:{id}` for anonymous actors) plus the live `TeloxideAdapter` (polling task + bounded mpsc channel of 100, `next_group_event() -> GroupEvent { chat_id, event }` for multi-group routing per Rule P5, `PlatformAdapter` impl as the Rule A5 substitutability proof). Outbound: `SendText` (optional reply via ReplyParameters), `React` (setMessageReaction); `SendMedia` → `AdapterError::Unsupported` (Phase 3). Live Telegram smoke test ignored by default (`TAMAKO_LIVE_TELEGRAM=1` + `TELOXIDE_TOKEN`). | 39 (+1 ignored) |
+| `tamako-adapter-teloxide` | Live Telegram adapter (teloxide 0.17). Pure `normalize` module (bot identity from get_me, display-name fallback chain, message/service/reaction/count normalization; synthetic `chat:{id}` for anonymous actors) plus the live `TeloxideAdapter` (polling task + bounded mpsc channel of 100, `next_group_event() -> GroupEvent { chat_id, event }` for multi-group routing per Rule P5, `PlatformAdapter` impl as the Rule A5 substitutability proof). Capability model (specs.md Section 4.2): `bot_chat_status` classifies the per-group membership (`BotChatStatus`: `Administrator` — owner counts as administrator — `Member`, `RestrictedOrOther`, `Unknown`; query failures map to `Unknown`). Outbound: `SendText` (optional reply via ReplyParameters), `React` (setMessageReaction); `SendMedia` → `AdapterError::Unsupported` (Phase 3). Outbound permission failures (missing rights or access) are tolerated: logged with the chat id, never fatal. Live Telegram smoke test ignored by default (`TAMAKO_LIVE_TELEGRAM=1` + `TELOXIDE_TOKEN`). | 50 (+1 ignored) |
 | `tamako-agent` | All LLM concerns (the only rig consumer). `KnowledgeGraph` extraction types (serde + schemars 1.x), `KnowledgeExtractor` trait with the live `RigExtractor` (rig-core 0.41 completion + `output_schema`, Anthropic native structured output, default model `claude-haiku-4-5`) and the scripted `ScriptedExtractor`, conservative emoji/greeting skeleton detector (Section 7.2 rule 5), plain-Rust relationship-name validation (Section 6.3), entity resolution steps 1/2/4 with the Alias-node fallback (Section 7.4), `AgentDigestPipeline` with exponential backoff and dead-letter (Section 10.3). Live-API smoke test ignored by default (`TAMAKO_LIVE_TEST=1`). | 42 (+1 ignored) |
 
 ## 3. Key decisions and deviations so far
@@ -191,6 +197,24 @@ M3 (teloxide adapter + live intake) complete.
 28. **An adapter error that escapes `next_group_event` is fatal.**
     The binary performs a graceful shutdown, then the error propagates.
     The adapter already skips transient stream errors internally.
+29. **Administrator status is recommended, not required.** The
+    capability model of specs.md Section 4.2: `bot_chat_status`
+    classifies the per-group membership from `getChatMember` (an owner
+    counts as administrator; query failures map to `Unknown`). The
+    binary caches the status in memory per group, re-evaluates it on
+    each startup, and never persists it — membership can change at any
+    time.
+30. **Outbound permission failures are tolerated.** The enumerated
+    teloxide `ApiError` rights/access variants (the `NotEnoughRights*`
+    family, `BotBlocked`, `BotKicked`, `BotKickedFromSupergroup`,
+    `BotKickedFromChannel`, `ChatNotFound`) plus
+    a documented text catch on `ApiError::Unknown` ("not enough
+    rights", "administrator rights") classify a denied outbound action.
+    The adapter logs the failure with the chat id and continues —
+    never fatal (specs.md Section 4.2).
+31. **Privacy mode is not queryable through the Bot API.** The
+    non-administrator + privacy-mode-on combination is operator
+    guidance in the logs and the README, not runtime detection.
 
 ## 4. Known gaps carried into Phase 1 (after M3)
 

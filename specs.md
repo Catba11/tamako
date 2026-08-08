@@ -50,6 +50,9 @@ LLM access is endpoint-portable. Every LLM call uses one of two API families: `a
 
 - The Telegram Bot API does not provide history before the bot joins a group. The bot receives messages only through the update stream. Rule P1 applies: every inbound message is persisted to the raw log at intake time, before any processing.
 - Mention and reply metadata is resolved at intake time and stored with the log row. The digest pipeline uses this stored map. Refer to `proposed-graph-database-specs.md` Section 7.3.
+- Administrator status is OPTIONAL. The bot works as a plain group member when privacy mode is disabled; only reaction collection is absent. Reaction collection requires administrator status: reaction updates (`message_reaction`, `message_reaction_count`) are delivered to administrators only. Requesting these update kinds in `allowed_updates` without administrator status causes no error — the updates never arrive.
+- Privacy mode cannot be queried through the Bot API. The combination non-administrator + privacy mode on (only commands and replies to the bot arrive) is normal platform behavior. The runtime surfaces it as operator guidance in the logs, not as runtime detection.
+- Outbound permission failures are tolerated. Example: `setMessageReaction` without the needed rights. Such a failure is logged with the chat id and is never fatal.
 
 ## 5. Persistence layout
 

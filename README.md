@@ -48,7 +48,11 @@ With `ANTHROPIC_API_KEY` set, the replay runs live extraction against the config
 
 1. In BotFather: `/newbot`, note the token.
 2. In BotFather: `/setprivacy` → **Disable** for the bot. Default privacy mode restricts the bot to commands and replies to itself; the pet must read all group messages. The change takes effect only after you remove the bot from the group and add it back.
-3. Add the bot to your group as an **administrator**. Admin status is a hard platform requirement for reaction updates (`message_reaction`), and it also lifts the privacy read restriction.
+3. Add the bot to your group. Admin status is **recommended**, not required: the bot works as a plain group member once privacy mode is disabled. Administrator status adds reaction collection (Telegram delivers `message_reaction` / `message_reaction_count` to administrators only) and also lifts the privacy read restriction. The working combinations:
+   - privacy OFF + administrator: full functionality.
+   - privacy OFF + plain member: everything except reaction collection.
+   - privacy ON + plain member: only commands and replies to the bot reach it — normal platform behavior; fix with BotFather `/setprivacy`. Remember that a privacy change takes effect only after you remove the bot from the group and add it back.
+   - privacy ON + administrator: the bot reads everything, but this combination is not the intended deployment.
 
 ### 2. Configure groups
 
@@ -84,8 +88,9 @@ Endpoint portability note: `specs.md` Section 13 defines the `llm_api` / `llm_ba
 ### 4. Expected behavior right now
 
 - Startup logs the bot identity and the configured groups.
+- Startup runs a capability check: one `getChatMember` call per configured group. An administrator group logs at INFO: `bot is an administrator of this group; full functionality (reaction collection active).` A non-administrator group logs one WARN per run: `the bot is not an administrator of this group: Telegram delivers reaction updates to administrators only, so reaction collection is OFF for this group. Everything else works normally. To enable reactions, make the bot a group administrator. Note: privacy mode OFF alone suffices for reading all group messages; if privacy mode is still ON (the BotFather default) the bot receives only commands and replies to itself, which is normal platform behavior.` If the check fails (the bot may not be a member yet), an INFO line explains that the status is re-checked when the first event of the group arrives.
 - The first message in a configured group creates `{data-root}/{chat_id}/store.db` and `memory.lbug`.
-- Every message lands in the raw log before any other processing. Reactions land in the `reactions` table.
+- Every message lands in the raw log before any other processing. Reactions land in the `reactions` table; reaction collection is active only in groups where the bot is an administrator.
 - Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. Watch the logs for batch outcomes.
 - The bot does not send messages yet. Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
 

@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 14 (8 integration + 6 CLI unit) |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode. | 16 (8 integration + 8 CLI unit) |
 | `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract. | 57 |
 | `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`. | 17 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 12 |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
-| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 39 (+1 ignored live test) |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
 | `tamako-agent` | All LLM concerns: the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter). | 42 (+1 ignored live test) |
 
-Total: 194 tests (+2 ignored live tests). Build, test,
+Total: 207 tests (+2 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -94,9 +94,16 @@ drops the chat id. Outbound, `SendText` (optional reply through
 ReplyParameters) and `React` (setMessageReaction) are implemented;
 `SendMedia` returns `AdapterError::Unsupported` (Phase 3). The poller
 requests `allowed_updates` = message, edited_message,
-message_reaction, message_reaction_count; reaction updates require the
-bot to be a group administrator (a Telegram Bot API requirement — a
-deployment concern). `TELOXIDE_API_URL` is honored only by
+message_reaction, message_reaction_count; reaction updates are
+delivered to administrators only, so a non-administrator bot simply
+never receives them — administrator status is optional, not required
+(specs.md Section 4.2). `bot_chat_status` classifies the per-group
+membership from `getChatMember` (`BotChatStatus`: `Administrator` —
+owner counts — `Member`, `RestrictedOrOther`, `Unknown` on query
+failure); the binary runs the detection pass at startup and logs one
+warning per non-administrator group. Outbound permission failures
+(missing rights or access) are tolerated: logged with the chat id,
+never fatal. `TELOXIDE_API_URL` is honored only by
 `Bot::from_env`, not by `Bot::new`, so the adapter applies
 `set_api_url` itself; a custom Bot API server works.
 
