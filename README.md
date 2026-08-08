@@ -66,7 +66,18 @@ Create a config file, for example `tamako.toml`:
 
 The bot ignores every group not in the config and logs such groups once, so first start also reveals the group id. The id of a supergroup starts with `-100`.
 
-### 3. Run
+### 3. Create the data root and the persona file
+
+`--live` requires a persona file at `<data-root>/persona.toml` (specs.md Section 5.3). The preamble is the provider cache anchor; its source must be deliberate (Rule C4). A missing file fails the startup with a clear error; a broken file does the same. The repo-root `persona.toml` is the template:
+
+```sh
+mkdir -p ./data && cp persona.toml ./data/persona.toml
+# Edit ./data/persona.toml if you want a different persona.
+```
+
+For experiments, `--allow-default-persona` restores the old lenient fallback chain (repo-root example, then the built-in default). `--replay` never needs the file.
+
+### 4. Run
 
 ```sh
 TELOXIDE_TOKEN=<telegram token> \
@@ -90,7 +101,7 @@ Environment variables:
 
 Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_` and `reply_`). API keys come from the environment only, never from the config file.
 
-### 4. Expected behavior right now
+### 5. Expected behavior right now
 
 - Startup logs the bot identity and the configured groups.
 - Startup runs a capability check: one `getChatMember` call per configured group. An administrator group logs at INFO: `bot is an administrator of this group; full functionality (reaction collection active).` A non-administrator group logs one WARN per run: `the bot is not an administrator of this group: Telegram delivers reaction updates to administrators only, so reaction collection is OFF for this group. Everything else works normally. To enable reactions, make the bot a group administrator. Note: privacy mode OFF alone suffices for reading all group messages; if privacy mode is still ON (the BotFather default) the bot receives only commands and replies to itself, which is normal platform behavior.` If the check fails (the bot may not be a member yet), an INFO line explains that the status is re-checked when the first event of the group arrives.
@@ -100,6 +111,21 @@ Endpoint portability (specs.md Section 13): every LLM call uses one of the two A
 - The bot speaks: it answers mentions and replies to itself directly, and it joins the conversation when the participation gate says yes. Every reply is a reply-to of its target message and lands in the raw log before it is sent. Two consecutive bot messages engage the monologue lock; any human message unlocks. Without an LLM key for the configured endpoint family the bot stays silent (the wake procedure logs one warning at startup).
 - The bot remembers: every wake runs a shallow recall over the group graph (exact alias matches and the people of the new messages; no fuzzy scans). A conservative relevance gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one "I remember: ..." assistant message — visible to the participation gate and the reply model, and present even when the bot stays silent. Injected memories are deduplicated per digest chunk and removed at digest time.
 - Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
+
+## Operator commands
+
+The status modes inspect the group stores read-only. They are safe while the bot runs (the store is a WAL-mode SQLite database), and they never need a persona file, a Telegram token, or an LLM key.
+
+```sh
+# One group: counters and rates (specs.md Section 12), digest boundaries,
+# muted state, and the most recent dead letters (specs.md Section 10.3).
+cargo run -- --status -1001234567890 --data-root ./data
+
+# Every group store under the data root, sorted by chat id.
+cargo run -- --status-all --data-root ./data
+```
+
+`--status` exits with an error when the group has no `store.db` yet. `--status-all` with no group stores prints a note and exits successfully. Caveat: after a CLEAN shutdown the bot removes the WAL files; a read-only status run then still opens the database, but the first query can fail when the directory is not writable — the error message carries a hint. Make the data-root directory writable, or start the bot once and stop it.
 
 ## Verification commands
 

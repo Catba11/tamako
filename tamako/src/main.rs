@@ -10,6 +10,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -31,7 +32,8 @@ use tamako_core::event::OutboundAction;
 use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
 use tamako_memory::LbugBackend;
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
-use tamako_store::Store;
+use tamako_store::{read_group_status, GroupStatus, Store, StoreError};
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -39,7 +41,9 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "\
 Usage:
   tamako --replay <fixture.json> [--data-root <dir>] [--config <config.toml>]
-  tamako --live [--data-root <dir>] [--config <config.toml>]
+  tamako --live [--allow-default-persona] [--data-root <dir>] [--config <config.toml>]
+  tamako --status <chat_id> [--data-root <dir>] [--config <config.toml>]
+  tamako --status-all [--data-root <dir>] [--config <config.toml>]
   tamako --help
 
 Options:
@@ -48,17 +52,35 @@ Options:
                            TELOXIDE_TOKEN environment variable. The served
                            groups are the [groups.<chat_id>] tables of the
                            config file. The bot must be a group admin with
-                           privacy mode off.
+                           privacy mode off. Live mode requires a persona
+                           file at <data-root>/persona.toml (specs.md
+                           Section 5.3).
+  --status <chat_id>       Print a read-only status snapshot of one group:
+                           the counters of specs.md Section 12, the digest
+                           boundaries, the muted state, and the most recent
+                           dead letters (specs.md Section 10.3). Opens
+                           store.db read-only; safe while the bot runs.
+  --status-all             Print the status snapshot of every group store
+                           under the data root, sorted by chat id.
+  --allow-default-persona  Only affects --live: restores the lenient
+                           persona fallback chain (repo-root example, then
+                           the built-in default) instead of requiring
+                           <data-root>/persona.toml. For experiments.
   --data-root <dir>        Data root of the bot. Default: ./data
   --config <config.toml>   Bot configuration file. Optional. A missing file
-                           keeps the global defaults.
+                           keeps the global defaults. In the status modes it
+                           supplies the per-group digest_max_retries of the
+                           attempts display.
   --help                   Show this text.";
 
-/// The run mode. Exactly one of `--replay` / `--live` is required.
+/// The run mode. Exactly one of `--replay` / `--live` / `--status` /
+/// `--status-all` is required.
 #[derive(Debug)]
 enum Mode {
     Replay { fixture: PathBuf },
     Live,
+    Status { chat_id: String },
+    StatusAll,
 }
 
 /// The parsed command line.
@@ -67,6 +89,7 @@ struct Cli {
     mode: Mode,
     data_root: PathBuf,
     config: Option<PathBuf>,
+    allow_default_persona: bool,
 }
 
 /// The result of the command-line parse.
@@ -80,6 +103,9 @@ enum ParseOutcome {
 fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseOutcome, String> {
     let mut fixture = None;
     let mut live = false;
+    let mut status = None;
+    let mut status_all = false;
+    let mut allow_default_persona = false;
     let mut data_root = None;
     let mut config = None;
     let mut args = args;
@@ -91,6 +117,12 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
                 fixture = Some(PathBuf::from(value));
             }
             "--live" => live = true,
+            "--status" => {
+                let value = args.next().ok_or("the --status flag needs a value")?;
+                status = Some(value);
+            }
+            "--status-all" => status_all = true,
+            "--allow-default-persona" => allow_default_persona = true,
             "--data-root" => {
                 let value = args.next().ok_or("the --data-root flag needs a value")?;
                 data_root = Some(PathBuf::from(value));
@@ -102,18 +134,31 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    let mode = match (fixture, live) {
-        (Some(fixture), false) => Mode::Replay { fixture },
-        (None, true) => Mode::Live,
-        (Some(_), true) => return Err("use either --replay or --live, not both".to_string()),
-        (None, false) => {
-            return Err("one of --replay <fixture.json> or --live is required".to_string())
+    let mode = match (fixture, live, status, status_all) {
+        (Some(fixture), false, None, false) => Mode::Replay { fixture },
+        (None, true, None, false) => Mode::Live,
+        (None, false, Some(chat_id), false) => Mode::Status { chat_id },
+        (None, false, None, true) => Mode::StatusAll,
+        (None, false, None, false) => {
+            return Err(
+                "one of --replay <fixture.json>, --live, --status <chat_id>, or --status-all \
+                 is required"
+                    .to_string(),
+            )
+        }
+        _ => {
+            return Err(
+                "the run modes are mutually exclusive: pick exactly one of --replay \
+                 <fixture.json>, --live, --status <chat_id>, or --status-all"
+                    .to_string(),
+            )
         }
     };
     Ok(ParseOutcome::Run(Cli {
         mode,
         data_root: data_root.unwrap_or_else(|| PathBuf::from("./data")),
         config,
+        allow_default_persona,
     }))
 }
 
@@ -188,6 +233,33 @@ fn load_persona_with_fallback(data_root: &Path) -> PersonaConfig {
     }
     warn!("no persona file found; using the built-in default persona");
     PersonaConfig::default()
+}
+
+/// The strict persona policy of --live (specs.md Section 5.3). A silent
+/// fallback to a default persona in production hides configuration
+/// mistakes, so a missing file is a hard startup error, and a present
+/// but unparseable file is a hard startup error with the parse context.
+/// Rule C4 context: the preamble is the provider cache anchor; its
+/// source must be deliberate. The `--allow-default-persona` escape hatch
+/// restores the lenient chain of `load_persona_with_fallback`.
+fn load_persona_strict(data_root: &Path) -> Result<PersonaConfig> {
+    let path = data_root.join("persona.toml");
+    if !path.exists() {
+        anyhow::bail!(
+            "--live mode requires a persona file at {} (specs.md Section 5.3). \
+             The preamble is the provider cache anchor; its source must be deliberate \
+             (Rule C4). Create the file from the repo-root example: cp persona.toml {}. \
+             For experiments, --allow-default-persona restores the lenient fallback chain.",
+            path.display(),
+            path.display()
+        );
+    }
+    // A broken persona file in live mode is a configuration mistake;
+    // never silently fall back.
+    let persona = load_persona(&path)
+        .with_context(|| format!("the persona file {} is invalid", path.display()))?;
+    info!(path = %path.display(), "persona configuration loaded");
+    Ok(persona)
 }
 
 /// Maps a `TriggerConfig` to the endpoint-resolution input of
@@ -334,7 +406,14 @@ struct SharedSetup {
 /// model context; the actor stores it as item 0 of the live context.
 fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     let bot_config = load_bot_config(cli.config.as_deref())?;
-    let persona = load_persona_with_fallback(&cli.data_root);
+    // specs.md Section 5.3 / Rule C4: --live requires a deliberate
+    // persona file unless the escape hatch is set. --replay ALWAYS uses
+    // the lenient chain, flag or not: offline demos must not require
+    // setup.
+    let persona = match (&cli.mode, cli.allow_default_persona) {
+        (Mode::Live, false) => load_persona_strict(&cli.data_root)?,
+        _ => load_persona_with_fallback(&cli.data_root),
+    };
     let preamble = PetPreambleRenderer.render_preamble(&persona);
     info!(persona = %persona.name, preamble_len = preamble.len(), "persona preamble rendered");
     Ok(SharedSetup {
@@ -346,17 +425,27 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     })
 }
 
-/// Dispatches to the selected run mode after the shared setup. One
-/// outbound channel serves every actor of the run (Rule A3): the actions
-/// carry their chat id, so one pump into the platform adapter is enough.
+/// Dispatches to the selected run mode. The status modes are offline
+/// inspection: no persona load, no TELOXIDE_TOKEN, no LLM endpoints, no
+/// actor spawn — status NEVER fails for a missing persona file. The run
+/// modes share one outbound channel for every actor (Rule A3): the
+/// actions carry their chat id, so one pump into the platform adapter is
+/// enough.
 async fn run(cli: Cli) -> Result<()> {
+    match &cli.mode {
+        Mode::Status { chat_id } => return run_status(&cli, chat_id),
+        Mode::StatusAll => return run_status_all(&cli),
+        Mode::Replay { .. } | Mode::Live => {}
+    }
     let setup = shared_setup(&cli)?;
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<OutboundAction>(100);
-    match cli.mode {
+    match &cli.mode {
         Mode::Replay { fixture } => {
-            run_replay(&cli.data_root, &setup, &fixture, outbound_tx, outbound_rx).await
+            run_replay(&cli.data_root, &setup, fixture, outbound_tx, outbound_rx).await
         }
         Mode::Live => run_live(&setup, outbound_tx, outbound_rx).await,
+        // The status modes returned above.
+        Mode::Status { .. } | Mode::StatusAll => unreachable!(),
     }
 }
 
@@ -482,6 +571,210 @@ async fn run_replay(
     println!("  wake msgs since wake:   {}", session.wake.msgs_since_wake);
     println!("  group directory:        {}", group_dir.display());
     Ok(())
+}
+
+/// The dead-letter display limit of the status modes: the 5 most recent
+/// entries (specs.md Section 10.3).
+const STATUS_RECENT_DEAD_LETTERS: usize = 5;
+
+/// The `--status` run: a read-only snapshot of one group store
+/// (specs.md Sections 10.3 and 12).
+fn run_status(cli: &Cli, chat_id: &str) -> Result<()> {
+    // The config supplies the per-group digest_max_retries of the
+    // attempts display.
+    let bot_config = load_bot_config(cli.config.as_deref())?;
+    let status = read_group_status(&cli.data_root, chat_id, STATUS_RECENT_DEAD_LETTERS)
+        .map_err(status_read_hint)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no store.db for group {chat_id} under {} (the group has not been served yet)",
+                cli.data_root.display()
+            )
+        })?;
+    let store_path = cli.data_root.join(chat_id).join("store.db");
+    print!(
+        "{}",
+        format_group_status(
+            chat_id,
+            &store_path,
+            &status,
+            bot_config.for_group(chat_id).digest_max_retries
+        )
+    );
+    Ok(())
+}
+
+/// The `--status-all` run: one status block per group store under the
+/// data root, sorted by chat id. No stores at all is not an error.
+fn run_status_all(cli: &Cli) -> Result<()> {
+    let bot_config = load_bot_config(cli.config.as_deref())?;
+    let mut chat_ids: Vec<String> = Vec::new();
+    if cli.data_root.is_dir() {
+        for entry in std::fs::read_dir(&cli.data_root)
+            .with_context(|| format!("failed to list the data root {}", cli.data_root.display()))?
+        {
+            let entry = entry?;
+            // Rule P5: a group store is a subdirectory that contains
+            // store.db. Other files of the data root (persona.toml) are
+            // skipped.
+            let path = entry.path();
+            if path.is_dir() && path.join("store.db").is_file() {
+                chat_ids.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    if chat_ids.is_empty() {
+        println!("no group stores under {}", cli.data_root.display());
+        return Ok(());
+    }
+    chat_ids.sort();
+    let mut blocks = Vec::new();
+    for chat_id in &chat_ids {
+        let status = read_group_status(&cli.data_root, chat_id, STATUS_RECENT_DEAD_LETTERS)
+            .map_err(status_read_hint)?
+            .expect("the store.db existence was checked above");
+        let store_path = cli.data_root.join(chat_id).join("store.db");
+        blocks.push(format_group_status(
+            chat_id,
+            &store_path,
+            &status,
+            bot_config.for_group(chat_id).digest_max_retries,
+        ));
+    }
+    print!("{}", blocks.join("\n"));
+    Ok(())
+}
+
+/// Adds the operator hint for the clean-shutdown SQLITE_READONLY case of
+/// `read_group_status`: after a clean shutdown the -wal/-shm files are
+/// gone, and the first read-only query can fail when the directory is
+/// not writable.
+fn status_read_hint(error: StoreError) -> anyhow::Error {
+    let is_readonly = error.to_string().contains("readonly");
+    let error = anyhow::Error::new(error);
+    if is_readonly {
+        error.context(
+            "the bot shut down cleanly and removed the WAL files; the directory must be \
+             writable to read a WAL database after a clean shutdown",
+        )
+    } else {
+        error
+    }
+}
+
+/// Renders one group status snapshot as aligned text (specs.md Sections
+/// 10.3 and 12). Pure: the unit tests assert the exact shape. Counter
+/// keys absent from the state table print as 0; the rates print only
+/// when wakes_total > 0.
+///
+/// The per-group capability of specs.md Section 4.2 is NOT printed: it
+/// is never persisted by design (current-state.md decision 29) and
+/// querying Telegram from an offline inspection tool would be
+/// surprising.
+fn format_group_status(
+    chat_id: &str,
+    store_path: &Path,
+    status: &GroupStatus,
+    digest_max_retries: u32,
+) -> String {
+    // A state value is a string; a missing or corrupt numeric key
+    // reads as 0.
+    let counter = |key: &str| -> u64 {
+        status
+            .state
+            .get(key)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let wakes = counter("wakes_total");
+    let participations = counter("participations_total");
+    let injection_wakes = counter("injection_wakes_total");
+    let digest_failures = counter("digest_failures_total");
+    let dead_letters_counter = counter("dead_letters_total");
+    let last_boundary = counter("last_digest_boundary_msg_id");
+    let prev_boundary = counter("prev_digest_boundary_msg_id");
+    let consecutive = counter("consecutive_bot_msgs");
+    let muted = status.state.get("muted_flag").map(String::as_str) == Some("1");
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Group status: {chat_id}");
+    let _ = writeln!(out, "  {:<29}{}", "store:", store_path.display());
+    let _ = writeln!(out, "  counters (specs.md Section 12):");
+    let _ = writeln!(out, "    {:<27}{wakes}", "wakes_total:");
+    let _ = writeln!(out, "    {:<27}{participations}", "participations_total:");
+    let _ = writeln!(out, "    {:<27}{injection_wakes}", "injection_wakes_total:");
+    let _ = writeln!(out, "    {:<27}{digest_failures}", "digest_failures_total:");
+    let _ = writeln!(
+        out,
+        "    {:<27}{dead_letters_counter}",
+        "dead_letters_total:"
+    );
+    // The rates are meaningful only once the bot woke at least once.
+    if wakes > 0 {
+        let participation_rate = participations as f64 * 100.0 / wakes as f64;
+        let injection_rate = injection_wakes as f64 * 100.0 / wakes as f64;
+        let _ = writeln!(out, "  rates:");
+        let _ = writeln!(
+            out,
+            "    {:<27}{participation_rate:.1}% ({participations}/{wakes}) \
+             (healthy target: below 50%)",
+            "participation rate:"
+        );
+        let _ = writeln!(
+            out,
+            "    {:<27}{injection_rate:.1}% ({injection_wakes}/{wakes}) \
+             (expected band: 20 to 40%)",
+            "injection rate:"
+        );
+    }
+    let _ = writeln!(out, "  boundaries:");
+    let _ = writeln!(
+        out,
+        "    {:<31}{last_boundary}",
+        "last_digest_boundary_msg_id:"
+    );
+    let _ = writeln!(
+        out,
+        "    {:<31}{prev_boundary}",
+        "prev_digest_boundary_msg_id:"
+    );
+    let _ = writeln!(out, "  session:");
+    let _ = writeln!(out, "    {:<27}{muted}", "muted:");
+    let _ = writeln!(out, "    {:<27}{consecutive}", "consecutive_bot_msgs:");
+    match status.dead_letter_count {
+        0 => {
+            let _ = writeln!(out, "  dead letters: 0 total");
+        }
+        count => {
+            let _ = writeln!(out, "  dead letters: {count} total (most recent first)");
+            if dead_letters_counter != count {
+                // The table count is authoritative; the counter can
+                // drift (a manual cleanup, a bug).
+                let _ = writeln!(
+                    out,
+                    "  note: the dead_letters_total counter reads {dead_letters_counter} \
+                     but the table holds {count} rows; the table count is shown above"
+                );
+            }
+            for row in &status.recent_dead_letters {
+                let at = row
+                    .created_at
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "<invalid timestamp>".to_string());
+                // The dead_letter row does not store attempts: a
+                // dead-lettered batch BY DEFINITION exhausted
+                // digest_max_retries total attempts (specs.md Section
+                // 10.3 item 2). The effective per-group value prints.
+                let _ = writeln!(
+                    out,
+                    "    id={}  batch={}  attempts={digest_max_retries} (exhausted)  at {at}",
+                    row.id, row.batch_id
+                );
+                let _ = writeln!(out, "      error: {}", row.error);
+            }
+        }
+    }
+    out
 }
 
 /// What the bot can do in one group, derived from its membership status
@@ -772,10 +1065,11 @@ mod tests {
         };
         match cli.mode {
             Mode::Replay { fixture } => assert_eq!(fixture, PathBuf::from("fixture.json")),
-            Mode::Live => panic!("expected the replay mode"),
+            _ => panic!("expected the replay mode"),
         }
         assert_eq!(cli.data_root, PathBuf::from("./data"));
         assert!(cli.config.is_none());
+        assert!(!cli.allow_default_persona);
     }
 
     #[test]
@@ -786,13 +1080,82 @@ mod tests {
         };
         assert!(matches!(cli.mode, Mode::Live));
         assert_eq!(cli.data_root, PathBuf::from("./data"));
+        assert!(!cli.allow_default_persona);
+    }
+
+    #[test]
+    fn live_with_allow_default_persona() {
+        // The escape hatch is accepted in any mode; it only affects
+        // --live.
+        let outcome = parse(&["--live", "--allow-default-persona"])
+            .expect("a valid live command line with the escape hatch");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::Live));
+        assert!(cli.allow_default_persona);
+    }
+
+    #[test]
+    fn status_only() {
+        let outcome = parse(&["--status", "-1001234567890"]).expect("a valid status command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::Status { chat_id } => assert_eq!(chat_id, "-1001234567890"),
+            _ => panic!("expected the status mode"),
+        }
+        assert_eq!(cli.data_root, PathBuf::from("./data"));
+    }
+
+    #[test]
+    fn status_all_only() {
+        let outcome = parse(&["--status-all"]).expect("a valid status-all command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::StatusAll));
+    }
+
+    #[test]
+    fn status_needs_a_value() {
+        let error = parse(&["--status"]).expect_err("a missing --status value must fail");
+        assert!(error.contains("--status"));
     }
 
     #[test]
     fn both_modes_is_a_usage_error() {
         let error =
             parse(&["--replay", "fixture.json", "--live"]).expect_err("both flags must fail");
-        assert!(error.contains("not both"));
+        assert!(error.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn every_pair_of_modes_is_a_usage_error() {
+        // Exactly one mode is required; all combinations of two modes
+        // are usage errors.
+        let replay = ["--replay", "fixture.json"];
+        let live = ["--live", ""];
+        let status = ["--status", "-1001"];
+        let status_all = ["--status-all", ""];
+        for (first, second) in [
+            (replay, live),
+            (replay, status),
+            (replay, status_all),
+            (live, status),
+            (live, status_all),
+            (status, status_all),
+        ] {
+            let args: Vec<&str> = first
+                .iter()
+                .chain(second.iter())
+                .copied()
+                .filter(|arg| !arg.is_empty())
+                .collect();
+            let error = parse(&args).expect_err(&format!("the combination {args:?} must fail"));
+            assert!(error.contains("mutually exclusive"), "message: {error}");
+        }
     }
 
     #[test]
@@ -847,5 +1210,202 @@ mod tests {
             status_guidance(BotChatStatus::Member),
             status_guidance(BotChatStatus::RestrictedOrOther)
         );
+    }
+
+    #[test]
+    fn strict_persona_missing_file_is_a_hard_error_with_the_cp_hint() {
+        // specs.md Section 5.3 / Rule C4: --live must not silently fall
+        // back to a default persona.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = load_persona_strict(dir.path()).expect_err("a missing persona file must fail");
+        let text = format!("{error:#}");
+        assert!(text.contains("persona.toml"), "message: {text}");
+        assert!(text.contains(&dir.path().join("persona.toml").display().to_string()));
+        assert!(text.contains("cp persona.toml"), "message: {text}");
+        assert!(text.contains("--allow-default-persona"), "message: {text}");
+    }
+
+    #[test]
+    fn strict_persona_valid_file_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("persona.toml"),
+            "name = \"Mochi\"\nidentity = \"a calm dog who lives in this chat group\"\n",
+        )
+        .expect("write persona");
+        let persona = load_persona_strict(dir.path()).expect("a valid persona file must load");
+        assert_eq!(persona.name, "Mochi");
+    }
+
+    #[test]
+    fn strict_persona_malformed_file_is_a_hard_error() {
+        // A broken persona file in live mode is a configuration
+        // mistake; there is no silent fallback.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("persona.toml"), "name = [unclosed").expect("write");
+        let error =
+            load_persona_strict(dir.path()).expect_err("a malformed persona file must fail");
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid"), "message: {text}");
+    }
+
+    /// Builds a status snapshot with the given state pairs, table count,
+    /// and dead-letter rows.
+    fn status_fixture(
+        pairs: &[(&str, &str)],
+        dead_letter_count: u64,
+        recent_dead_letters: Vec<tamako_store::DeadLetterRow>,
+    ) -> GroupStatus {
+        let state = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        GroupStatus {
+            state,
+            dead_letter_count,
+            recent_dead_letters,
+        }
+    }
+
+    /// A dead-letter row with a fixed timestamp for the render tests.
+    fn dead_letter(
+        id: i64,
+        batch_id: &str,
+        error: &str,
+        unix_ts: i64,
+    ) -> tamako_store::DeadLetterRow {
+        tamako_store::DeadLetterRow {
+            id,
+            batch_id: batch_id.to_string(),
+            batch_skeleton: "{\"items\":[]}".to_string(),
+            error: error.to_string(),
+            created_at: OffsetDateTime::from_unix_timestamp(unix_ts).expect("valid timestamp"),
+        }
+    }
+
+    #[test]
+    fn format_group_status_with_zero_counters_prints_no_rates() {
+        let status = status_fixture(&[], 0, Vec::new());
+        let text = format_group_status(
+            "-1001234567890",
+            Path::new("./data/-1001234567890/store.db"),
+            &status,
+            5,
+        );
+        // Counter keys absent from the state table print as 0.
+        assert!(
+            text.contains("wakes_total:               0"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("dead_letters_total:        0"),
+            "text:\n{text}"
+        );
+        // The rates print only when wakes_total > 0.
+        assert!(!text.contains("rates:"), "text:\n{text}");
+        assert!(
+            text.contains("last_digest_boundary_msg_id:   0"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("muted:                     false"),
+            "text:\n{text}"
+        );
+        assert!(text.contains("  dead letters: 0 total\n"), "text:\n{text}");
+    }
+
+    #[test]
+    fn format_group_status_renders_counters_rates_boundaries_and_dead_letters() {
+        let status = status_fixture(
+            &[
+                ("wakes_total", "30"),
+                ("participations_total", "12"),
+                ("injection_wakes_total", "6"),
+                ("digest_failures_total", "0"),
+                ("dead_letters_total", "2"),
+                ("last_digest_boundary_msg_id", "91"),
+                ("prev_digest_boundary_msg_id", "82"),
+                ("muted_flag", "1"),
+                ("consecutive_bot_msgs", "0"),
+            ],
+            2,
+            vec![
+                dead_letter(
+                    7,
+                    "batch:10:20",
+                    "provider timeout after 30 s",
+                    1_785_528_000,
+                ),
+                dead_letter(3, "batch:1:9", "schema validation failed", 1_785_348_764),
+            ],
+        );
+        let text = format_group_status(
+            "-1001234567890",
+            Path::new("./data/-1001234567890/store.db"),
+            &status,
+            5,
+        );
+        assert!(
+            text.starts_with("Group status: -1001234567890\n"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("  store:                       ./data/-1001234567890/store.db\n"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("participation rate:        40.0% (12/30) (healthy target: below 50%)"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("injection rate:            20.0% (6/30) (expected band: 20 to 40%)"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("last_digest_boundary_msg_id:   91"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("prev_digest_boundary_msg_id:   82"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("muted:                     true"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("  dead letters: 2 total (most recent first)\n"),
+            "text:\n{text}"
+        );
+        // The attempts display: a dead-lettered batch exhausted
+        // digest_max_retries (specs.md Section 10.3 item 2).
+        assert!(text.contains("attempts=5 (exhausted)"), "text:\n{text}");
+        // Newest first: id=7 before id=3.
+        let first = text.find("id=7 ").expect("id=7 line");
+        let second = text.find("id=3 ").expect("id=3 line");
+        assert!(first < second, "text:\n{text}");
+        assert!(
+            text.contains("      error: provider timeout after 30 s\n"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("      error: schema validation failed\n"),
+            "text:\n{text}"
+        );
+        // The counter and the table count agree: no note.
+        assert!(!text.contains("note:"), "text:\n{text}");
+    }
+
+    #[test]
+    fn format_group_status_notes_a_counter_table_disagreement() {
+        // The table count is authoritative; the note explains the drift.
+        let status = status_fixture(&[("dead_letters_total", "5")], 2, Vec::new());
+        let text = format_group_status("-1", Path::new("./data/-1/store.db"), &status, 5);
+        assert!(
+            text.contains("  dead letters: 2 total (most recent first)\n"),
+            "text:\n{text}"
+        );
+        assert!(text.contains("note:"), "text:\n{text}");
+        assert!(text.contains("counter reads 5"), "text:\n{text}");
     }
 }

@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use time::OffsetDateTime;
 
 use crate::error::{Result, StoreError};
@@ -138,6 +139,22 @@ pub struct DeadLetterRow {
     pub batch_skeleton: String,
     pub error: String,
     pub created_at: OffsetDateTime,
+}
+
+/// A read-only status snapshot of one group (specs.md Sections 10.3 and
+/// 12). The operator-facing --status mode renders this.
+#[derive(Debug)]
+pub struct GroupStatus {
+    /// The state-table keys of the session (present ones only):
+    /// last_digest_boundary_msg_id, prev_digest_boundary_msg_id,
+    /// muted_flag, consecutive_bot_msgs, plus the counters of
+    /// specs.md Section 12 (wakes_total, participations_total,
+    /// injection_wakes_total, digest_failures_total, dead_letters_total).
+    pub state: HashMap<String, String>,
+    /// The number of rows of the dead_letter table.
+    pub dead_letter_count: u64,
+    /// Newest first, up to the requested limit.
+    pub recent_dead_letters: Vec<DeadLetterRow>,
 }
 
 /// A new reaction event row. Refer to specs.md Section 5.2.
@@ -486,16 +503,7 @@ impl Store {
                  FROM dead_letter ORDER BY id",
             )?;
             let rows = stmt
-                .query_map([], |row| {
-                    let created_at: String = row.get("created_at")?;
-                    Ok(DeadLetterRow {
-                        id: row.get("id")?,
-                        batch_id: row.get("batch_id")?,
-                        batch_skeleton: row.get("batch_skeleton")?,
-                        error: row.get("error")?,
-                        created_at: schema::parse_rfc3339(&created_at)?,
-                    })
-                })?
+                .query_map([], dead_letter_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -585,6 +593,81 @@ impl Store {
 const MESSAGE_COLUMNS: &str = "id, platform_msg_id, direction, event_type, timestamp,
         sender_id, sender_display_name, text,
         reply_to_platform_msg_id, mentions_bot, is_reply_to_bot";
+
+/// Maps one row of a dead_letter SELECT to a `DeadLetterRow`.
+/// `list_dead_letters` and `read_group_status` share it.
+fn dead_letter_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {
+    let created_at: String = row.get("created_at")?;
+    Ok(DeadLetterRow {
+        id: row.get("id")?,
+        batch_id: row.get("batch_id")?,
+        batch_skeleton: row.get("batch_skeleton")?,
+        error: row.get("error")?,
+        created_at: schema::parse_rfc3339(&created_at)?,
+    })
+}
+
+/// Opens the group store.db READ-ONLY (SQLITE_OPEN_READ_ONLY, no
+/// directory creation, no migrations) and reads the status snapshot of
+/// specs.md Sections 10.3 and 12. Returns `Ok(None)` when store.db does
+/// not exist (the group was never served). Validates chat_id with the
+/// same rules as Store.
+///
+/// The read is safe while the live bot holds the store: a WAL-mode
+/// database (specs.md Section 5.1) accepts read-only connections as long
+/// as the -shm/-wal files exist. The 2 s busy timeout covers the brief
+/// SQLITE_BUSY windows of a bot shutdown or recovery.
+///
+/// Caveat: after a CLEAN shutdown of the bot the -wal/-shm files are
+/// removed. The read-only open still succeeds, but the FIRST QUERY can
+/// fail with SQLITE_READONLY when the containing directory is not
+/// writable. The caller surfaces this with an operator hint.
+pub fn read_group_status(
+    data_root: &Path,
+    chat_id: &str,
+    recent_dead_letters: usize,
+) -> Result<Option<GroupStatus>> {
+    validate_chat_id(chat_id)?;
+    let path = data_root.join(chat_id).join("store.db");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // Brief SQLITE_BUSY windows exist while the bot shuts down or
+    // recovers; wait up to 2 s before failing.
+    conn.busy_timeout(Duration::from_secs(2))?;
+
+    // The state-table key set is open: read all pairs, never an
+    // enumerated key list.
+    let state = {
+        let mut stmt = conn.prepare("SELECT key, value FROM state")?;
+        let pairs = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+        pairs
+    };
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM dead_letter", [], |row| row.get(0))?;
+    let limit = i64::try_from(recent_dead_letters).unwrap_or(i64::MAX);
+    let recent = {
+        let mut stmt = conn.prepare(
+            "SELECT id, batch_id, batch_skeleton, error, created_at
+             FROM dead_letter ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], dead_letter_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    Ok(Some(GroupStatus {
+        state,
+        // COUNT(*) is never negative; the conversion saturates on the
+        // theoretical overflow.
+        dead_letter_count: u64::try_from(count).unwrap_or(u64::MAX),
+        recent_dead_letters: recent,
+    }))
+}
 
 /// Maps one row of a raw-log SELECT to a `MessageRow`.
 fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
@@ -1283,5 +1366,86 @@ mod tests {
         assert_eq!(row.error, "boom");
         // The timestamp is written by the store. It must parse back.
         assert!(row.created_at.unix_timestamp() > 0);
+    }
+
+    #[test]
+    fn read_group_status_returns_none_when_store_db_is_missing() {
+        // A group that was never served has no store.db.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_group_status(dir.path(), "c1", 5)
+            .expect("read")
+            .is_none());
+    }
+
+    #[test]
+    fn read_group_status_rejects_invalid_chat_ids() {
+        // The same path-safety rules as Store apply (Rule P5).
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in ["../evil", "a/b", "a\\b", "a\0b", "", ".."] {
+            match read_group_status(dir.path(), bad, 5) {
+                Err(StoreError::InvalidChatId(_)) => {}
+                other => panic!("expected InvalidChatId for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_group_status_reads_the_state_and_the_newest_dead_letters() {
+        let (dir, store) = temp_store();
+        store
+            .set_state_many(
+                "c1",
+                &[
+                    ("muted_flag".to_string(), "1".to_string()),
+                    ("last_digest_boundary_msg_id".to_string(), "91".to_string()),
+                ],
+            )
+            .expect("set state");
+        store
+            .increment_counter("c1", "wakes_total", 30)
+            .expect("counter");
+        for index in 1..=3 {
+            store
+                .insert_dead_letter(
+                    "c1",
+                    &format!("batch-{index}"),
+                    "{\"items\":[]}",
+                    &format!("boom {index}"),
+                )
+                .expect("insert dead letter");
+        }
+
+        let status = read_group_status(dir.path(), "c1", 2)
+            .expect("read")
+            .expect("the group store exists");
+        assert_eq!(status.state.get("muted_flag"), Some(&"1".to_string()));
+        assert_eq!(
+            status.state.get("last_digest_boundary_msg_id"),
+            Some(&"91".to_string())
+        );
+        assert_eq!(status.state.get("wakes_total"), Some(&"30".to_string()));
+        assert_eq!(status.dead_letter_count, 3);
+        // The limit is respected and the order is newest first.
+        assert_eq!(status.recent_dead_letters.len(), 2);
+        assert_eq!(status.recent_dead_letters[0].batch_id, "batch-3");
+        assert_eq!(status.recent_dead_letters[1].batch_id, "batch-2");
+    }
+
+    #[test]
+    fn read_group_status_works_while_a_store_holds_the_group_open() {
+        // The live-bot case: the -shm/-wal files exist while the writer
+        // runs, so the read-only open sees the committed data. No WAL
+        // write is needed for the read itself.
+        let (dir, store) = temp_store();
+        store
+            .set_state("c1", "wakes_total", "7")
+            .expect("set state");
+        // `store` still holds its connection open.
+        let status = read_group_status(dir.path(), "c1", 5)
+            .expect("read")
+            .expect("the group store exists");
+        assert_eq!(status.state.get("wakes_total"), Some(&"7".to_string()));
+        assert_eq!(status.dead_letter_count, 0);
+        assert!(status.recent_dead_letters.is_empty());
     }
 }
