@@ -171,8 +171,9 @@ One wake executes these steps in this sequence:
 
 ### 9.2 Relevance gate
 
-- The recall returns memories only if an omitted memory would materially reduce the reply quality or the participation decision quality.
+- The recall returns memories only if an omitted memory would materially reduce the reply quality or the participation decision quality. When in doubt, inject nothing.
 - If nothing is relevant, nothing is injected. An empty injection is forbidden.
+- At most `recall_injection_cap` (5) memories are injected per wake.
 - The injection rate is a metric. The expected healthy range is 20 to 40 percent of wakes.
 
 ### 9.3 Deduplication
@@ -277,6 +278,7 @@ API keys come from the environment only, never from a config file: `ANTHROPIC_AP
 | `warmup_silence` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
 | `reply_staleness_threshold` | 20 newer human messages | 6.2 |
+| `recall_injection_cap` | 5 per wake | 9.2 |
 
 ## 14. Deferred items
 
