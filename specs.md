@@ -32,7 +32,7 @@ Components:
 | Digest worker | Shared | Extraction and entity resolution. Graph writes are serialized per group. Refer to Section 10. |
 | Persona service | One, global | Render the system preamble from the persona configuration. Refer to Section 5.3. |
 
-The agent harness is rig.rs. The extraction call uses the rig `Extractor` with a typed `KnowledgeGraph` schema. The reply generation uses a rig `Agent` with a manually maintained message history. Relationship-name validation and all memory-side rules run in plain Rust after the extractor returns.
+The agent harness is rig.rs. The extraction call is a rig completion request with a JSON output schema (schemars) for a typed `KnowledgeGraph` struct; the Anthropic provider uses native structured output. NOTE: rig-core 0.41 has no `Extractor` type; earlier drafts referenced it. The reply generation uses a rig completion with a manually maintained message history. Relationship-name validation and all memory-side rules run in plain Rust after the extraction returns.
 
 ## 4. Platform abstraction
 
@@ -126,7 +126,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 ### 8.2 Digest trigger
 
 - Fire when the undigested tail reaches the first of: 5000 CJK characters, 100 messages, 2500 words, or 20 kB.
-- Fallback: fire when the tail is non-empty and the last digest is older than the digest timeout (6 h). If no digest has ever run for the group, the fallback does not fire. The tail right after the bot joins grows until it reaches a size threshold.
+- Fallback: fire when the tail is non-empty and the last digest is older than the digest timeout (6 h). "Last digest" means the wall-clock completion time of the last successful digest. If no digest has ever run for the group, the fallback does not fire. The tail right after the bot joins grows until it reaches a size threshold.
 - On fire, run the digest pipeline. Refer to Section 10.
 
 ### 8.3 Wake trigger
@@ -210,7 +210,7 @@ One wake executes these steps in this sequence:
 ### 10.3 Failure handling
 
 1. On failure, retry with exponential backoff. The retry uses the same batch identifier. The `MERGE` operations are idempotent under the deterministic identifiers of `proposed-graph-database-specs.md` Section 7.1.
-2. After `digest_max_retries` failures, write the batch skeleton and the error to a dead-letter table, emit the failure metric, and skip the batch. A failed batch never blocks later batches.
+2. After `digest_max_retries` total attempts (the count includes the first attempt), write the batch skeleton and the error to a dead-letter table, emit the failure metric, and skip the batch. A failed batch never blocks later batches.
 3. The skipped range stays in the raw log. A later repair tool can reprocess it.
 
 ### 10.4 Bot self-memory
@@ -253,8 +253,10 @@ Global defaults. Every item is overridable per group.
 | `digest_max_words` | 2500 | 8.2 |
 | `digest_max_bytes` | 20 kB | 8.2 |
 | `digest_timeout` | 6 h | 8.2 |
-| `digest_max_retries` | 5 | 10.3 |
+| `digest_max_retries` | 5 total attempts, including the first | 10.3 |
 | `warmup_quota` | 1–3 per day | 8.4 |
+
+Model selection is also configuration, but it is global (not per-group): `digest_model` (default `claude-haiku-4-5`) for extraction, with environment-variable override `TAMAKO_DIGEST_MODEL`. API keys come from the environment only, never from a config file.
 | `warmup_silence` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
 

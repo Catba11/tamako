@@ -30,7 +30,7 @@ Scope:
 1. teloxide adapter, long polling, mention and reply resolution at intake. Refer to `specs.md` Section 4.
 2. Trigger set: message intake, `Wake` with jitter and floor, `Digest` with size thresholds and timeout. Refer to `specs.md` Section 8. Warmup is excluded.
 3. Context lifecycle: rolling window with one-chunk lag, append-only between digests. Refer to `specs.md` Section 7.
-4. Digest pipeline: rig `Extractor` with the `KnowledgeGraph` schema, deterministic identifiers, entity resolution steps 1, 2, and 4 only (mention binding, exact alias match, ambiguity fallback to the Alias node), single-transaction write, `CHECKPOINT`, exponential backoff, dead-letter. Refer to `specs.md` Section 10.
+4. Digest pipeline: rig extraction (completion request plus JSON output schema; rig-core 0.41 has no `Extractor` type) with the `KnowledgeGraph` schema, deterministic identifiers, entity resolution steps 1, 2, and 4 only (mention binding, exact alias match, ambiguity fallback to the Alias node), single-transaction write, `CHECKPOINT`, exponential backoff, dead-letter. Refer to `specs.md` Section 10.
 5. Fact storage without invalidation: all predicates behave as multi-value. `valid_at` is written; `invalid_at` stays NULL. Read-side ordering takes the latest edge per subject and predicate.
 6. Wake procedure: participation decision with a cheap model, reply generation with the main model, monologue lock. Refer to `specs.md` Sections 8.5 and 9.
 7. Shallow recall: exact alias match only. The full injection protocol is built here: format, guardrail, deduplication table, lifecycle. Refer to `specs.md` Section 9. The recall worker's query depth is the only part deferred.

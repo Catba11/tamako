@@ -196,7 +196,7 @@ Do these steps in this sequence for each extracted entity:
    - If the top score is 0.92 or more, reuse the node identifier.
    - If the top score is between 0.80 and 0.92, do one LLM confirmation call.
    - If the top score is below 0.80, create a new node.
-4. If two or more persons in the group share the alias, use the context: recent speakers and topic relevance. If the ambiguity remains, attach the fact to the Alias node. Do not guess. A wrong binding is worse than a missing fact.
+4. If two or more persons in the group share the alias, use the context: recent speakers and topic relevance. If the ambiguity remains, attach the fact to the Alias node. Do not guess. A wrong binding is worse than a missing fact. A person with no mention binding and no alias match (zero-target person) receives the same treatment: attach the fact to the Alias node with an `attachment: "fallback"` mark. This rate feeds the fallback attachment metric of Section 10.
 5. After the binding or the creation, add new surface forms as Alias nodes with alias edges.
 
 NOTE: The vector pre-screen at write time is the primary defense against graph fragmentation. Without this step, one concept becomes many isolated nodes with different surface forms.
