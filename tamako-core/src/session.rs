@@ -18,6 +18,7 @@ use crate::trigger::{WakeScheduler, WakeSchedulerState};
 // state table as a generic key-value store; these keys are the contract
 // between encode/decode here and the rows in store.db.
 const KEY_DIGEST_BOUNDARY: &str = "last_digest_boundary_msg_id";
+const KEY_PREV_DIGEST_BOUNDARY: &str = "prev_digest_boundary_msg_id";
 const KEY_LAST_DIGEST_AT: &str = "last_digest_at";
 const KEY_MUTED: &str = "muted_flag";
 const KEY_CONSECUTIVE_BOT: &str = "consecutive_bot_msgs";
@@ -31,6 +32,12 @@ const KEY_WAKE_INTERVAL_MS: &str = "wake_current_interval_ms";
 pub struct SessionState {
     /// specs.md Section 7.1: splits the previous digested chunk from the tail.
     pub last_digest_boundary_msg_id: i64,
+    /// specs.md Section 7.1: the boundary BEFORE the last completed digest.
+    /// This is the removal cutoff of the Rule C3 one-chunk lag.
+    /// `None` means no digest has completed yet, OR exactly one digest has
+    /// completed: after the FIRST digest this stays `None` (no previous
+    /// chunk exists); after the second digest it is `Some(first_boundary)`.
+    pub prev_digest_boundary_msg_id: Option<i64>,
     /// The time of the last successful digest. `None` means the tail was
     /// never digested (specs.md Section 8.2, timeout fallback).
     pub last_digest_at: Option<OffsetDateTime>,
@@ -63,6 +70,7 @@ impl SessionState {
         wake.current_interval = round_to_millis(wake.current_interval);
         Self {
             last_digest_boundary_msg_id: 0,
+            prev_digest_boundary_msg_id: None,
             last_digest_at: None,
             muted: false,
             consecutive_bot_msgs: 0,
@@ -73,7 +81,8 @@ impl SessionState {
     /// Encodes the state as state-table key-value pairs.
     ///
     /// Keys (specs.md Section 5.2):
-    /// `last_digest_boundary_msg_id` (decimal), `last_digest_at` (RFC 3339;
+    /// `last_digest_boundary_msg_id` (decimal), `prev_digest_boundary_msg_id`
+    /// (decimal; `None` encodes as the empty string), `last_digest_at` (RFC 3339;
     /// `None` encodes as the empty string), `muted_flag` ("0"/"1"),
     /// `consecutive_bot_msgs` (decimal), `wake_msgs_since_wake` (decimal),
     /// `wake_last_wake_at` (RFC 3339), `wake_current_interval_ms` (decimal
@@ -89,10 +98,20 @@ impl SessionState {
             .last_digest_at
             .map(|at| at.format(&Rfc3339).unwrap_or_else(|_| String::new()))
             .unwrap_or_default();
+        // The same pattern as last_digest_at: None encodes as the empty
+        // string, Some(v) as decimal.
+        let prev_digest_boundary_msg_id = self
+            .prev_digest_boundary_msg_id
+            .map(|value| value.to_string())
+            .unwrap_or_default();
         vec![
             (
                 KEY_DIGEST_BOUNDARY.to_string(),
                 self.last_digest_boundary_msg_id.to_string(),
+            ),
+            (
+                KEY_PREV_DIGEST_BOUNDARY.to_string(),
+                prev_digest_boundary_msg_id,
             ),
             (KEY_LAST_DIGEST_AT.to_string(), last_digest_at),
             (
@@ -138,6 +157,12 @@ impl SessionState {
                 .get(KEY_DIGEST_BOUNDARY)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(fresh.last_digest_boundary_msg_id),
+            // A missing, empty, or malformed value means no previous
+            // digest boundary exists: None is the fresh default.
+            prev_digest_boundary_msg_id: map
+                .get(KEY_PREV_DIGEST_BOUNDARY)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse().ok()),
             // A missing, empty, or malformed value means the tail was
             // never digested: None is the fresh default.
             last_digest_at: map
@@ -275,6 +300,58 @@ mod tests {
             state.last_digest_boundary_msg_id
         );
         assert_eq!(decoded.wake.current_interval, state.wake.current_interval);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_with_prev_digest_boundary() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(23);
+
+        // Some boundary (after the second digest).
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.prev_digest_boundary_msg_id = Some(137);
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.prev_digest_boundary_msg_id, Some(137));
+        assert_eq!(decoded, state);
+
+        // No boundary (before the first digest, or exactly one digest done).
+        let state = SessionState::new(&config, fixed_now(), &mut rng);
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.prev_digest_boundary_msg_id, None);
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn decode_of_missing_empty_or_malformed_prev_digest_boundary_is_none() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(29);
+        let state = SessionState::new(&config, fixed_now(), &mut rng);
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Missing key.
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(29),
+        );
+        assert_eq!(decoded.prev_digest_boundary_msg_id, None);
+
+        // Empty value (the encoding of None).
+        assert_eq!(map.get(KEY_PREV_DIGEST_BOUNDARY), Some(&String::new()));
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.prev_digest_boundary_msg_id, None);
+
+        // Malformed value falls back to the fresh default (None).
+        let mut corrupt = map;
+        corrupt.insert(
+            KEY_PREV_DIGEST_BOUNDARY.to_string(),
+            "not-a-number".to_string(),
+        );
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.prev_digest_boundary_msg_id, None);
     }
 
     #[test]
