@@ -6,6 +6,11 @@
 //! spawned task and the result returns through the FIFO inbox. The wake
 //! procedure stays a stub (M4).
 //!
+//! Reaction intake (Phase 1, M3) is passive collection: the actor
+//! persists one reaction row per event (specs.md Section 5.2) and
+//! touches nothing else — no context item, no counter, no session
+//! mutation.
+//!
 //! The actor owns the live context of specs.md Section 7: a
 //! materialized view of the raw log (Rule P1). Intake appends items
 //! (Rule C1), a completed digest removes the previous chunk with the
@@ -17,7 +22,9 @@ use std::sync::Arc;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tamako_memory::{MemoryBackend, MemoryError};
-use tamako_store::{Direction, EventType, InsertOutcome, NewMessage, Store, StoreError};
+use tamako_store::{
+    Direction, EventType, InsertOutcome, NewMessage, NewReaction, Store, StoreError,
+};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -26,7 +33,7 @@ use tracing::{debug, info};
 use crate::config::TriggerConfig;
 use crate::context::{ContextItem, LiveContext};
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
-use crate::event::{InboundEvent, NormalizedMessage};
+use crate::event::{InboundEvent, NormalizedMessage, ReactionEvent};
 use crate::session::{round_to_millis, SessionState};
 use crate::trigger::{digest_should_fire, tail_stats, WakeScheduler};
 
@@ -223,6 +230,20 @@ fn to_new_message(msg: &NormalizedMessage, event_type: EventType) -> NewMessage 
     }
 }
 
+/// Builds the reaction row for one reaction event (specs.md
+/// Section 5.2). The event carries every field the row needs.
+fn to_new_reaction(reaction: &ReactionEvent) -> NewReaction {
+    NewReaction {
+        platform_msg_id: reaction.platform_msg_id.clone(),
+        reactor_user_id: reaction.reactor_id.clone(),
+        anonymous: reaction.anonymous,
+        aggregated: reaction.aggregated,
+        old_emojis: reaction.old_emojis.clone(),
+        new_emojis: reaction.new_emojis.clone(),
+        timestamp: reaction.timestamp,
+    }
+}
+
 /// Persists the session state. specs.md Section 6.1, rule 4: the actor
 /// persists the session state after every mutation.
 async fn persist_session(
@@ -392,15 +413,15 @@ async fn run_actor<M: MemoryBackend>(
                     );
                 }
             }
-            // Phase 0 stores message rows only. Reaction processing is
-            // Phase 2 (warmup backoff, specs.md Section 8.5). Member events
-            // have no Phase 0 consumer.
+            ActorCommand::Inbound(InboundEvent::Reaction(reaction)) => {
+                handle_reaction(&store, &chat_id, reaction).await?;
+            }
+            // Member join/leave events have no consumer yet (Phase 1
+            // collects reactions only). They stay debug-only.
             ActorCommand::Inbound(
-                event @ (InboundEvent::Reaction(_)
-                | InboundEvent::MemberJoin(_)
-                | InboundEvent::MemberLeave(_)),
+                event @ (InboundEvent::MemberJoin(_) | InboundEvent::MemberLeave(_)),
             ) => {
-                debug!(chat_id = %chat_id, event = ?event, "inbound event ignored in phase 0");
+                debug!(chat_id = %chat_id, event = ?event, "member event ignored (no consumer yet)");
             }
             ActorCommand::Tick(now) => {
                 // specs.md Section 6.2: Digest runs BEFORE Wake.
@@ -527,6 +548,31 @@ async fn run_actor<M: MemoryBackend>(
             }
             ActorCommand::Shutdown => break,
         }
+    }
+    Ok(())
+}
+
+/// Reaction intake. specs.md Section 5.2: reaction data is not
+/// recoverable later, so collection starts at intake time. Passive
+/// collection: no context item, no wake-counter advance, no session
+/// mutation (no session persist — nothing mutated).
+async fn handle_reaction(
+    store: &Arc<Store>,
+    chat_id: &str,
+    reaction: ReactionEvent,
+) -> Result<(), CoreError> {
+    // Rule P1: persist the reaction before anything else.
+    let row = to_new_reaction(&reaction);
+    let reaction_chat_id = chat_id.to_string();
+    let outcome = blocking_store(store, move |store| {
+        store.insert_reaction(&reaction_chat_id, &row)
+    })
+    .await?;
+    if let InsertOutcome::Duplicate = outcome {
+        // Idempotent intake (AGENT.md Section 6.2): a reconnect can
+        // redeliver the same reaction update. The dedup index makes the
+        // second insert a Duplicate. That is not an error.
+        debug!(chat_id = %chat_id, platform_msg_id = %reaction.platform_msg_id, "duplicate reaction delivery");
     }
     Ok(())
 }
@@ -796,6 +842,20 @@ mod tests {
         }
     }
 
+    /// A named reaction event on message `platform_msg_id` (reactor
+    /// identity known, one second after t0).
+    fn reaction(platform_msg_id: &str) -> ReactionEvent {
+        ReactionEvent {
+            platform_msg_id: platform_msg_id.to_string(),
+            timestamp: t0() + time::Duration::seconds(1),
+            reactor_id: Some("u1".to_string()),
+            anonymous: false,
+            aggregated: false,
+            old_emojis: vec![],
+            new_emojis: vec!["👍".to_string()],
+        }
+    }
+
     struct Fixture {
         // The TempDir must outlive the store.
         _dir: TempDir,
@@ -860,6 +920,16 @@ mod tests {
             .await
             .expect("the blocking task joins")
             .expect("list_messages succeeds")
+    }
+
+    /// Lists the reaction rows through a blocking call, like the actor
+    /// does.
+    async fn list_reactions(store: &Arc<Store>) -> Vec<tamako_store::ReactionRow> {
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || store.list_reactions(CHAT_ID))
+            .await
+            .expect("the blocking task joins")
+            .expect("list_reactions succeeds")
     }
 
     #[tokio::test]
@@ -1366,5 +1436,105 @@ mod tests {
         assert_eq!(session.prev_digest_boundary_msg_id, Some(2));
         assert_eq!(session.last_digest_boundary_msg_id, 4);
         restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn reaction_intake_persists_the_row() {
+        // specs.md Section 5.2: reaction data is not recoverable later,
+        // so intake collects it. Rule P1: the row persists first.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Reaction(reaction("m1")))
+            .await
+            .expect("send succeeds");
+        // An aggregated count update: no reactor identity.
+        let mut aggregated = reaction("m1");
+        aggregated.reactor_id = None;
+        aggregated.aggregated = true;
+        aggregated.old_emojis = vec!["👍".to_string()];
+        aggregated.new_emojis = vec!["👍".to_string(), "❤️".to_string()];
+        aggregated.timestamp = t0() + time::Duration::seconds(2);
+        handle
+            .send_event(InboundEvent::Reaction(aggregated))
+            .await
+            .expect("send succeeds");
+        // A FIFO barrier: when it returns, both reactions are processed.
+        handle.snapshot().await.expect("snapshot succeeds");
+
+        let rows = list_reactions(&fixture.store).await;
+        assert_eq!(rows.len(), 2);
+
+        // The named reaction: every field round-trips.
+        let named = &rows[0];
+        assert_eq!(named.platform_msg_id, "m1");
+        assert_eq!(named.reactor_user_id, Some("u1".to_string()));
+        assert!(!named.anonymous);
+        assert!(!named.aggregated);
+        assert_eq!(named.old_emojis, Vec::<String>::new());
+        assert_eq!(named.new_emojis, vec!["👍".to_string()]);
+        assert_eq!(named.timestamp, t0() + time::Duration::seconds(1));
+
+        // The aggregated reaction: the reactor stays None.
+        let aggregate = &rows[1];
+        assert_eq!(aggregate.platform_msg_id, "m1");
+        assert_eq!(aggregate.reactor_user_id, None);
+        assert!(!aggregate.anonymous);
+        assert!(aggregate.aggregated);
+        assert_eq!(aggregate.old_emojis, vec!["👍".to_string()]);
+        assert_eq!(
+            aggregate.new_emojis,
+            vec!["👍".to_string(), "❤️".to_string()]
+        );
+        assert_eq!(aggregate.timestamp, t0() + time::Duration::seconds(2));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn reaction_redelivery_is_idempotent() {
+        // AGENT.md Section 6.2: a reconnect can redeliver the same
+        // update. The dedup index makes the second insert a Duplicate;
+        // intake does not fail.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        for _ in 0..2 {
+            handle
+                .send_event(InboundEvent::Reaction(reaction("m1")))
+                .await
+                .expect("send succeeds");
+        }
+        handle.snapshot().await.expect("snapshot succeeds");
+
+        let rows = list_reactions(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn reaction_intake_is_passive_collection() {
+        // Reactions are passive: no context item and no wake-counter
+        // advance. Only the message counts.
+        let (_fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Reaction(reaction("m1")))
+            .await
+            .expect("send succeeds");
+        // FIFO barriers: both events are processed when these return.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        // The reaction did not advance the wake counter.
+        assert_eq!(session.wake.msgs_since_wake, 1);
+        // Preamble + the message item; the reaction appended nothing.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, ContextItemKind::Preamble);
+        assert_eq!(items[1].kind, ContextItemKind::HumanMessage);
+        assert_eq!(items[1].range_tag, Some(RangeTag::single(1)));
+        handle.shutdown().await.expect("shutdown succeeds");
     }
 }
