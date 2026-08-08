@@ -70,7 +70,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 
 - `messages` table: one row per normalized inbound or outbound message. Outbound rows store the bot's own speech. Rule B1 applies.
 - `reactions` table: one row per reaction event on a group message. The Phase 2 warmup backoff consumes this table. Reaction data is not recoverable later, so collection starts at intake time in Phase 1.
-- `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`.
+- `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `prev_digest_boundary_msg_id`, `wake_last_row_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`.
 - `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag, rendered content. The rendered content is stored so a restart rebuild is bit-identical without graph queries. Refer to Section 9.5.
 - Vector index: sqlite-vec virtual tables in the same file. The embeddings of Person, Alias, and Concept names and descriptions live here. Refer to `proposed-graph-database-specs.md` Section 7.6.
 
@@ -95,7 +95,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 
 - If several triggers are pending, `Digest` runs before `Wake`. Recall sees the freshest graph.
 - A forced `Wake` (mention or reply to the bot) moves to the head of the queue. It does not preempt a running call.
-- Inbound messages during a running `Wake` are logged and appended to the context. They do not interrupt the running call. Before the bot sends a reply, the actor re-checks the recency of the target message. If the conversation has moved on, the reply is discarded or regenerated.
+- Inbound messages during a running `Wake` are logged and appended to the context. They do not interrupt the running call. Before the bot sends a reply, the actor re-checks the recency of the target message. If the number of newer human messages after the target exceeds `reply_staleness_threshold` (20), the reply is discarded, not regenerated. The next wake is the natural retry.
 
 ## 7. Context lifecycle
 
@@ -276,6 +276,7 @@ A purpose (`digest`, `gate`, `reply`) may override `llm_api` and `llm_base_url` 
 API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well.
 | `warmup_silence` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
+| `reply_staleness_threshold` | 20 newer human messages | 6.2 |
 
 ## 14. Deferred items
 
