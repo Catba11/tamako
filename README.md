@@ -1,0 +1,102 @@
+# Tamako
+
+Tamako is a Telegram group-pet bot with persistent memory. It lives in chat groups, speaks rarely, and remembers facts about group members in a per-group graph database. It is a pet, not an assistant: one global persona, per-group private memories, and a scarce-attention behavior model.
+
+Status: Phase 1 in progress. The bot currently intakes messages, stores reactions, and digests conversations into long-term memory. It does not speak yet — speech arrives in milestone M4. Refer to `current-state.md`.
+
+## Documents
+
+| Document | Content |
+|---|---|
+| `specs.md` | Agent behavior: event loop, triggers, context lifecycle, configuration. |
+| `proposed-graph-database-specs.md` | Memory backend: graph schema, write and read paths. |
+| `dev-roadmap.md` | Phase plan. |
+| `ARCHITECTURE.md` | The implementation as built. |
+| `current-state.md` | Current progress, decisions, known gaps. |
+| `AGENT.md` | Conventions for LLM coding agents. |
+
+## Prerequisites
+
+- Rust toolchain, rustc ≥ 1.85 (teloxide requirement).
+- A C/C++ toolchain with CMake. The `lbug` crate compiles or downloads the LadybugDB core; refer to `docs/adr-0001-ladybugdb-binding.md`.
+- For live operation: a Telegram bot token and an LLM API key.
+
+## Build and verify
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+## Offline demo (no tokens needed)
+
+```sh
+# Replay a recorded chat log end to end (adapter, actor, storage, graph).
+cargo run -- --replay tamako-adapter-mock/fixtures/replay_chat.json
+
+# Watch the digest pipeline write a knowledge graph from the replay.
+cargo run -p tamako-agent --example digest_demo
+```
+
+With `ANTHROPIC_API_KEY` set, the replay runs live extraction against the configured endpoint. Without it, a scripted extractor stands in.
+
+## Live bring-up (Telegram)
+
+### 1. Create and configure the bot
+
+1. In BotFather: `/newbot`, note the token.
+2. In BotFather: `/setprivacy` → **Disable** for the bot. Default privacy mode restricts the bot to commands and replies to itself; the pet must read all group messages. The change takes effect only after you remove the bot from the group and add it back.
+3. Add the bot to your group as an **administrator**. Admin status is a hard platform requirement for reaction updates (`message_reaction`), and it also lifts the privacy read restriction.
+
+### 2. Configure groups
+
+Create a config file, for example `tamako.toml`:
+
+```toml
+[groups."-1001234567890"]
+# Empty table registers the group. Per-group trigger overrides go here.
+# Refer to specs.md Section 13 for the keys.
+```
+
+The bot ignores every group not in the config and logs such groups once, so first start also reveals the group id. The id of a supergroup starts with `-100`.
+
+### 3. Run
+
+```sh
+TELOXIDE_TOKEN=<telegram token> \
+ANTHROPIC_API_KEY=<llm key> \
+cargo run --release -- --live --config tamako.toml --data-root ./data
+```
+
+Environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `TELOXIDE_TOKEN` | Telegram bot token. Required for `--live`. |
+| `TELOXIDE_API_URL` | Optional custom Bot API server URL. |
+| `ANTHROPIC_API_KEY` | LLM key for the anthropic-compatible endpoint. Without it, digests use the scripted extractor. |
+| `TAMAKO_DIGEST_MODEL` | Extraction model override. Default `claude-haiku-4-5`. |
+
+Endpoint portability note: `specs.md` Section 13 defines the `llm_api` / `llm_base_url` configuration for arbitrary anthropic-compatible and openai-compatible endpoints (proxies, aggregators, self-hosted). That configuration lands with milestone M4; the current build speaks to the Anthropic-format endpoint only.
+
+### 4. Expected behavior right now
+
+- Startup logs the bot identity and the configured groups.
+- The first message in a configured group creates `{data-root}/{chat_id}/store.db` and `memory.lbug`.
+- Every message lands in the raw log before any other processing. Reactions land in the `reactions` table.
+- Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. Watch the logs for batch outcomes.
+- The bot does not send messages yet. Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
+
+## Verification commands
+
+```sh
+# Optional live smoke test (needs a token; send a group message within 60 s).
+TAMAKO_LIVE_TELEGRAM=1 TELOXIDE_TOKEN=<token> \
+  cargo test -p tamako-adapter-teloxide --test live_smoke -- --ignored
+
+# Optional live LLM smoke test.
+TAMAKO_LIVE_TEST=1 ANTHROPIC_API_KEY=<key> \
+  cargo test -p tamako-agent -- --ignored
+```

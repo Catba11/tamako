@@ -34,7 +34,7 @@ Components:
 
 The agent harness is rig.rs. The extraction call is a rig completion request with a JSON output schema (schemars) for a typed `KnowledgeGraph` struct; the Anthropic provider uses native structured output. NOTE: rig-core 0.41 has no `Extractor` type; earlier drafts referenced it. The reply generation uses a rig completion with a manually maintained message history. Relationship-name validation and all memory-side rules run in plain Rust after the extraction returns.
 
-LLM access is endpoint-portable. Every LLM call uses one of two API families: an Anthropic-compatible endpoint or an OpenAI-compatible endpoint. The base URL of the endpoint is a user configuration item, so proxies and self-hosted endpoints work. Model names are configuration items. Refer to Section 13.
+LLM access is endpoint-portable. Every LLM call uses one of two API families: `anthropic-compatible` or `openai-compatible`. "Compatible" describes the wire format only, never the vendor. Any endpoint that speaks one of these two formats qualifies: first-party APIs, proxies, aggregators, and self-hosted servers. The base URL of the endpoint is a user configuration item. Model names are configuration items. Refer to Section 13.
 
 ## 4. Platform abstraction
 
@@ -262,11 +262,15 @@ LLM access is global configuration, not per-group:
 
 | Key | Default | Notes |
 |---|---|---|
-| `llm_api` | `anthropic` | API family: `anthropic` or `openai-compatible`. Environment override: `TAMAKO_LLM_API`. |
-| `llm_base_url` | The canonical URL of the selected family | User-specified endpoint base URL. Permits proxies and self-hosted endpoints. Environment override: `TAMAKO_LLM_BASE_URL`. |
-| `digest_model` | `claude-haiku-4-5` | Extraction model. Environment override: `TAMAKO_DIGEST_MODEL`. |
+| `llm_api` | `anthropic-compatible` | API family: `anthropic-compatible` or `openai-compatible`. The family selects the wire format only, not the vendor. Environment override: `TAMAKO_LLM_API`. |
+| `llm_base_url` | The canonical URL of the selected family | Base URL of the endpoint. Any endpoint that speaks the family format works: first-party, proxy, aggregator, self-hosted. Environment override: `TAMAKO_LLM_BASE_URL`. |
+| `digest_model` | `claude-haiku-4-5` | Extraction (Section 10). Environment override: `TAMAKO_DIGEST_MODEL`. |
+| `gate_model` | `claude-haiku-4-5` | Participation decision (Section 9.6). Environment override: `TAMAKO_GATE_MODEL`. |
+| `reply_model` | `claude-sonnet-4-5` | Reply generation (Section 9, step 4). Environment override: `TAMAKO_REPLY_MODEL`. |
 
-API keys come from the environment only, never from a config file (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` per the selected family).
+A purpose (`digest`, `gate`, `reply`) may override `llm_api` and `llm_base_url` individually. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
+
+API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well.
 | `warmup_silence` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
 
