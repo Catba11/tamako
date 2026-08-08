@@ -41,6 +41,12 @@ pub struct TriggerConfig {
     pub digest_timeout: Duration,
     /// specs.md Section 10.3. Default 5.
     pub digest_max_retries: u32,
+    /// Extraction model override for the digest pipeline. `None` (the
+    /// default) means the agent crate's built-in default model. The env
+    /// var TAMAKO_DIGEST_MODEL takes precedence at wiring time.
+    /// Deviation: specs.md Section 13 has no LLM keys; this key is
+    /// reported as a deviation of Phase 1 M1.
+    pub digest_model: Option<String>,
     /// specs.md Section 8.4. Lower bound of the daily quota. Default 1.
     pub warmup_quota_min: u32,
     /// specs.md Section 8.4. Upper bound of the daily quota. Default 3.
@@ -66,6 +72,7 @@ impl Default for TriggerConfig {
             digest_max_bytes: 20 * 1024,
             digest_timeout: Duration::from_secs(6 * 60 * 60),
             digest_max_retries: 5,
+            digest_model: None,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
             warmup_silence: Duration::from_secs(4 * 60 * 60),
@@ -89,6 +96,8 @@ pub struct TriggerConfigToml {
     pub digest_max_bytes: Option<usize>,
     pub digest_timeout_secs: Option<u64>,
     pub digest_max_retries: Option<u32>,
+    /// Extraction model override. Refer to `TriggerConfig::digest_model`.
+    pub digest_model: Option<String>,
     pub warmup_quota_min: Option<u32>,
     pub warmup_quota_max: Option<u32>,
     pub warmup_silence_secs: Option<u64>,
@@ -130,6 +139,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.digest_max_retries {
             base.digest_max_retries = value;
+        }
+        if let Some(value) = &self.digest_model {
+            base.digest_model = Some(value.clone());
         }
         if let Some(value) = self.warmup_quota_min {
             base.warmup_quota_min = value;

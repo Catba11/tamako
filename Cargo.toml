@@ -7,6 +7,7 @@ members = [
     "tamako-core",
     "tamako-store",
     "tamako-memory",
+    "tamako-agent",
     "tamako-persona",
     "tamako-adapter-mock",
 ]
@@ -50,9 +51,21 @@ rand = "0.9"
 # Timestamps. The project uses the time crate, not chrono.
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 
+# LLM client for the digest extraction (tamako-agent only). rig entered in
+# Phase 1 (AGENT.md Section 3). rig-core 0.41 has no Extractor type:
+# structured extraction is a completion request with an output schema
+# (Anthropic native structured output). tamako-core must NOT depend on rig.
+rig = { package = "rig-core", version = "0.41" }
+
+# JSON Schema for the rig output schema. rig-core 0.41 uses schemars 1.x;
+# a schemars 0.8 Schema type is incompatible. Do not use schemars 0.8
+# anywhere in the workspace.
+schemars = { version = "1", features = ["preserve_order"] }
+
 # Internal crates.
 tamako-core = { path = "tamako-core" }
 tamako-store = { path = "tamako-store" }
 tamako-memory = { path = "tamako-memory" }
+tamako-agent = { path = "tamako-agent" }
 tamako-persona = { path = "tamako-persona" }
 tamako-adapter-mock = { path = "tamako-adapter-mock" }

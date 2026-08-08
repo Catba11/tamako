@@ -1,6 +1,8 @@
-//! Tamako binary. Phase 0 scope (dev-roadmap.md Section 2): CLI wiring
-//! and the `--replay` demo. The demo replays a recorded chat log through
-//! the mock adapter into one group actor and prints a summary.
+//! Tamako binary. CLI wiring and the `--replay` demo. The demo replays
+//! a recorded chat log through the mock adapter into one group actor and
+//! prints a summary. Phase 1 (M1) wires the digest pipeline of specs.md
+//! Section 10 when `ANTHROPIC_API_KEY` is present; without the key the
+//! replay still works and digests simply do not run.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,9 +10,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tamako_adapter_mock::MockAdapter;
+use tamako_agent::{
+    AgentDigestPipeline, AgentError, ExtractorConfig, PipelineConfig, RigExtractor,
+};
 use tamako_core::actor::{spawn_group_actor, GroupActorParams, DEFAULT_INBOX_CAPACITY};
 use tamako_core::adapter::PlatformAdapter;
-use tamako_core::config::BotConfig;
+use tamako_core::config::{BotConfig, TriggerConfig};
+use tamako_core::digest::DigestPipeline;
 use tamako_memory::LbugBackend;
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
 use tamako_store::Store;
@@ -148,6 +154,45 @@ fn load_persona_with_fallback(data_root: &Path) -> PersonaConfig {
     PersonaConfig::default()
 }
 
+/// Builds the digest pipeline (specs.md Section 10) when
+/// `ANTHROPIC_API_KEY` is present. `Ok(None)` means digests are disabled
+/// for this run: the replay still works, the digest trigger stays a
+/// stub. A provider configuration error degrades to `None` with a
+/// warning; every other build error propagates.
+fn build_digest_pipeline(
+    store: &Arc<Store>,
+    memory: &Arc<LbugBackend>,
+    config: &TriggerConfig,
+) -> Result<Option<Arc<dyn DigestPipeline>>> {
+    // rig reads ANTHROPIC_API_KEY itself (Client::from_env); the binary
+    // never reads the key. The check only decides whether to try.
+    if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
+        info!("ANTHROPIC_API_KEY is not set; the digest pipeline is disabled for this run");
+        return Ok(None);
+    }
+    // Override order: TAMAKO_DIGEST_MODEL, then the config-file
+    // digest_model (specs.md Section 13), then the default.
+    let extractor_config = ExtractorConfig::resolve(config.digest_model.as_deref());
+    let model = extractor_config.model.clone();
+    match RigExtractor::from_env(extractor_config) {
+        Ok(extractor) => {
+            info!(model = %model, "digest pipeline wired (live extraction)");
+            Ok(Some(Arc::new(AgentDigestPipeline::new(
+                Arc::clone(store),
+                Arc::clone(memory),
+                Arc::new(extractor),
+                // specs.md Section 13: max_retries = 5.
+                PipelineConfig::default(),
+            )) as Arc<dyn DigestPipeline>))
+        }
+        Err(AgentError::ProviderConfig(error)) => {
+            warn!(%error, "digest pipeline disabled: no provider configuration; digests will not run");
+            Ok(None)
+        }
+        Err(error) => Err(error).context("failed to build the digest pipeline"),
+    }
+}
+
 /// The `--replay` run. Refer to dev-roadmap.md Section 2.
 async fn run(cli: Cli) -> Result<()> {
     let bot_config = load_bot_config(cli.config.as_deref())?;
@@ -169,13 +214,20 @@ async fn run(cli: Cli) -> Result<()> {
 
     let store = Arc::new(Store::new(cli.data_root.clone()));
     let memory = Arc::new(LbugBackend::new(cli.data_root.clone()));
+    let group_config = bot_config.for_group(&chat_id);
+    // The digest pipeline is built after the chat_id is known and before
+    // the actor spawns (Phase 1, M1).
+    let digest = build_digest_pipeline(&store, &memory, &group_config)?;
     let handle = spawn_group_actor(GroupActorParams {
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
         memory,
-        config: bot_config.for_group(&chat_id),
+        config: group_config,
         started_at: OffsetDateTime::now_utc(),
         inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        digest,
+        // M2 wires the Rule C3 context removal here.
+        post_digest_hook: None,
     });
 
     let mut events_replayed = 0_usize;
@@ -200,13 +252,17 @@ async fn run(cli: Cli) -> Result<()> {
         .context("the actor reported an error")?;
 
     // AGENT.md Section 6.2: the synchronous store call runs in spawn_blocking.
-    let rows = {
+    let (rows, dead_letters) = {
         let store = Arc::clone(&store);
         let chat_id = chat_id.clone();
-        tokio::task::spawn_blocking(move || store.list_messages(&chat_id))
-            .await
-            .context("the blocking list_messages task failed to join")?
-            .context("failed to read the raw log")?
+        tokio::task::spawn_blocking(move || {
+            let rows = store.list_messages(&chat_id)?;
+            let dead_letters = store.list_dead_letters(&chat_id)?;
+            Ok::<_, tamako_store::StoreError>((rows, dead_letters))
+        })
+        .await
+        .context("the blocking store task failed to join")?
+        .context("failed to read the raw log")?
     };
 
     let group_dir = cli.data_root.join(&chat_id);
@@ -214,10 +270,12 @@ async fn run(cli: Cli) -> Result<()> {
     println!("  chat_id:                {chat_id}");
     println!("  events replayed:        {events_replayed}");
     println!("  raw log rows:           {}", rows.len());
+    // A boundary above 0 means at least one digest ran.
     println!(
         "  digest boundary msg id: {}",
         session.last_digest_boundary_msg_id
     );
+    println!("  dead letters:           {}", dead_letters.len());
     println!("  muted:                  {}", session.muted);
     println!("  consecutive bot msgs:   {}", session.consecutive_bot_msgs);
     println!("  wake msgs since wake:   {}", session.wake.msgs_since_wake);

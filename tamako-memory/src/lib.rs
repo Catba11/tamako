@@ -6,6 +6,6 @@ pub mod identifiers;
 mod lbug_backend;
 
 pub use backend::{
-    MemoryBackend, MemoryBatch, MemoryEdge, MemoryError, MemoryNode, NodeType, Result,
+    AliasTarget, MemoryBackend, MemoryBatch, MemoryEdge, MemoryError, MemoryNode, NodeType, Result,
 };
 pub use lbug_backend::LbugBackend;

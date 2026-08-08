@@ -1,10 +1,10 @@
 //! The per-group actor. Refer to specs.md Section 6.
 //!
-//! Phase 0 scope (dev-roadmap.md Section 2): inbox, trigger state,
-//! persistence and rebuild of the session state. Message intake appends to
-//! the raw log and updates the counters — no LLM call, no context
-//! materialization, no wake or digest procedure. Those enter in Phase 1;
-//! the trigger evaluation here only logs a stub message.
+//! Message intake appends to the raw log and updates the counters. The
+//! digest trigger (specs.md Section 8.2) is wired in Phase 1 (M1): when
+//! the trigger fires, the actor launches the digest pipeline as a
+//! spawned task and the result returns through the FIFO inbox. The wake
+//! procedure stays a stub (M4).
 
 use std::sync::Arc;
 
@@ -18,9 +18,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
+use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
 use crate::event::{InboundEvent, NormalizedMessage};
 use crate::session::{round_to_millis, SessionState};
-use crate::trigger::WakeScheduler;
+use crate::trigger::{digest_should_fire, tail_stats, WakeScheduler};
 
 /// Errors of tamako-core.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +34,10 @@ pub enum CoreError {
     Join(String),
     #[error("actor inbox closed")]
     InboxClosed,
+    /// A failure of the digest pipeline (specs.md Section 10). A failed
+    /// batch never blocks later batches (Section 10.3).
+    #[error("digest error: {0}")]
+    Digest(String),
 }
 
 /// The default inbox capacity when the caller has no preference.
@@ -47,6 +52,10 @@ pub enum ActorCommand {
     Tick(OffsetDateTime),
     /// Returns a snapshot of the session state (tests, restart checks).
     Snapshot(oneshot::Sender<SessionState>),
+    /// The spawned digest task reports its result through this command
+    /// (internal plumbing). Every session mutation stays serialized in
+    /// the actor loop — specs.md Section 6.1, rule 2.
+    DigestCompleted(std::result::Result<Option<DigestOutcome>, CoreError>),
     Shutdown,
 }
 
@@ -110,6 +119,12 @@ pub struct GroupActorParams<M: MemoryBackend> {
     pub started_at: OffsetDateTime,
     /// Inbox capacity. Refer to `DEFAULT_INBOX_CAPACITY`.
     pub inbox_capacity: usize,
+    /// The digest pipeline. `None` keeps the Phase 0 stub behavior
+    /// (the trigger logs only). The tamako binary wires the live
+    /// implementation; tests wire a scripted one.
+    pub digest: Option<Arc<dyn DigestPipeline>>,
+    /// The M2 hook point (Rule C3 context removal). `None` = no-op.
+    pub post_digest_hook: Option<Arc<dyn PostDigestHook>>,
 }
 
 /// Spawns the actor task and returns the handle immediately.
@@ -137,7 +152,9 @@ pub fn spawn_group_actor<M: MemoryBackend + 'static>(
 ) -> GroupActorHandle {
     let (tx, rx) = mpsc::channel(params.inbox_capacity);
     let chat_id = params.chat_id.clone();
-    let join = tokio::spawn(run_actor(params, rx));
+    // The spawned digest task posts `DigestCompleted` back through this
+    // sender (specs.md Section 6.1, rule 1: one FIFO inbox).
+    let join = tokio::spawn(run_actor(params, tx.clone(), rx));
     GroupActorHandle {
         chat_id,
         inbox: tx,
@@ -193,11 +210,68 @@ async fn persist_session(
     blocking_store(store, move |store| store.set_state_many(&chat_id, &pairs)).await
 }
 
+/// Evaluates the digest trigger (specs.md Section 8.2). On fire, spawns
+/// the pipeline task; the result returns through the FIFO inbox as
+/// `DigestCompleted`. No-op when no pipeline is wired or a digest is
+/// already in flight (one digest at a time per group; Section 6.1
+/// rule 2 serializes the graph writes of one group).
+///
+/// Cost note: one tail scan (`list_messages_after`) per evaluation. The
+/// tail is bounded by the size thresholds in practice — a never-digested
+/// tail grows until a size threshold fires (Section 8.2). Phase 1
+/// accepts this.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_launch_digest(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &SessionState,
+    digest: Option<&Arc<dyn DigestPipeline>>,
+    digest_in_flight: &mut bool,
+    inbox_sender: &mpsc::Sender<ActorCommand>,
+    now: OffsetDateTime,
+) -> Result<(), CoreError> {
+    let Some(pipeline) = digest else {
+        return Ok(());
+    };
+    if *digest_in_flight {
+        return Ok(());
+    }
+    let tail_chat_id = chat_id.to_string();
+    let boundary = session.last_digest_boundary_msg_id;
+    let rows = blocking_store(store, move |store| {
+        store.list_messages_after(&tail_chat_id, boundary)
+    })
+    .await?;
+    // The timeout fallback of Section 8.2 needs the time of the last
+    // digest; it comes from the persisted session state.
+    let stats = tail_stats(&rows, session.last_digest_at);
+    if !digest_should_fire(&stats, now, config) {
+        return Ok(());
+    }
+    // Section 6.1, rule 3: a blocked batch must not block the queue. The
+    // extraction and its backoff run in a spawned task; the inbox keeps
+    // moving while the digest is in flight.
+    *digest_in_flight = true;
+    let pipeline = Arc::clone(pipeline);
+    let chat_id = chat_id.to_string();
+    let sender = inbox_sender.clone();
+    tokio::spawn(async move {
+        let result = pipeline.run_digest(&chat_id, boundary).await;
+        // A failed send means the actor is shutting down. The result is
+        // dropped; the boundary did not advance, so the next run redoes
+        // the batch (the MERGEs are idempotent, Section 10.3).
+        let _ = sender.send(ActorCommand::DigestCompleted(result)).await;
+    });
+    Ok(())
+}
+
 /// The actor task. Owns the session state and the live wake scheduler.
 /// specs.md Section 6.1, rule 2: session-state mutations are strictly
 /// serialized inside this loop.
 async fn run_actor<M: MemoryBackend>(
     params: GroupActorParams<M>,
+    inbox_sender: mpsc::Sender<ActorCommand>,
     mut inbox: mpsc::Receiver<ActorCommand>,
 ) -> Result<(), CoreError> {
     let GroupActorParams {
@@ -206,6 +280,8 @@ async fn run_actor<M: MemoryBackend>(
         memory,
         config,
         started_at,
+        digest,
+        post_digest_hook,
         ..
     } = params;
 
@@ -224,6 +300,8 @@ async fn run_actor<M: MemoryBackend>(
     let mut rng = StdRng::from_rng(&mut rand::rng());
     let mut session = SessionState::decode(&persisted, &config, started_at, &mut rng);
     let mut wake = WakeScheduler::from_state(session.wake.clone());
+    // One digest at a time per group (Section 6.1, rule 2).
+    let mut digest_in_flight = false;
 
     // --- Inbox loop ---
     while let Some(command) = inbox.recv().await {
@@ -236,6 +314,9 @@ async fn run_actor<M: MemoryBackend>(
                     &mut session,
                     &mut wake,
                     &mut rng,
+                    digest.as_ref(),
+                    &mut digest_in_flight,
+                    &inbox_sender,
                     msg,
                 )
                 .await?;
@@ -262,10 +343,84 @@ async fn run_actor<M: MemoryBackend>(
                 debug!(chat_id = %chat_id, event = ?event, "inbound event ignored in phase 0");
             }
             ActorCommand::Tick(now) => {
+                // specs.md Section 6.2: Digest runs BEFORE Wake.
+                maybe_launch_digest(
+                    &store,
+                    &chat_id,
+                    &config,
+                    &session,
+                    digest.as_ref(),
+                    &mut digest_in_flight,
+                    &inbox_sender,
+                    now,
+                )
+                .await?;
                 if wake.should_fire(now, &config) {
                     info!(chat_id = %chat_id, "wake timer fired (stub)");
                     reset_wake(&config, &mut session, &mut wake, &mut rng, now);
                     persist_session(&store, &chat_id, &session).await?;
+                }
+            }
+            ActorCommand::DigestCompleted(result) => {
+                digest_in_flight = false;
+                match result {
+                    Ok(Some(outcome)) => {
+                        let (batch_id, kind) = match &outcome {
+                            DigestOutcome::Extracted { batch_id, .. } => {
+                                (batch_id.as_str(), "extracted")
+                            }
+                            DigestOutcome::Skeleton { batch_id, .. } => {
+                                (batch_id.as_str(), "skeleton")
+                            }
+                            DigestOutcome::DeadLettered { batch_id, .. } => {
+                                (batch_id.as_str(), "dead_lettered")
+                            }
+                        };
+                        info!(
+                            chat_id = %chat_id,
+                            batch_id,
+                            outcome_kind = kind,
+                            new_boundary = outcome.new_boundary(),
+                            "digest completed"
+                        );
+                        // Every variant advances the boundary: a
+                        // dead-lettered batch is SKIPPED (specs.md
+                        // Section 10.3).
+                        session.last_digest_boundary_msg_id = outcome.new_boundary();
+                        // The wall-clock completion time: the timeout
+                        // fallback of Section 8.2 measures real time
+                        // since the last digest.
+                        session.last_digest_at = Some(OffsetDateTime::now_utc());
+                        persist_session(&store, &chat_id, &session).await?;
+                        if let Some(hook) = &post_digest_hook {
+                            // M2 performs the Rule C3 context removal
+                            // here. M1 ships a no-op.
+                            hook.after_digest(&chat_id, &outcome).await;
+                        }
+                        // Re-evaluate once: the tail can still exceed the
+                        // thresholds (it grew during a long extraction).
+                        maybe_launch_digest(
+                            &store,
+                            &chat_id,
+                            &config,
+                            &session,
+                            digest.as_ref(),
+                            &mut digest_in_flight,
+                            &inbox_sender,
+                            OffsetDateTime::now_utc(),
+                        )
+                        .await?;
+                    }
+                    // The tail was empty; no state change.
+                    Ok(None) => {}
+                    Err(error) => {
+                        // The pipeline dead-letters extraction failures
+                        // itself; an escaping Err is an infrastructure
+                        // failure (example: the store read failed). Do
+                        // NOT advance the boundary and do NOT retry here:
+                        // the next evaluation point retries naturally.
+                        tracing::error!(chat_id = %chat_id, %error, "digest pipeline failed");
+                    }
                 }
             }
             ActorCommand::Snapshot(reply) => {
@@ -280,6 +435,7 @@ async fn run_actor<M: MemoryBackend>(
 }
 
 /// Message intake. specs.md Section 8.1.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     store: &Arc<Store>,
     chat_id: &str,
@@ -287,6 +443,9 @@ async fn handle_message(
     session: &mut SessionState,
     wake: &mut WakeScheduler,
     rng: &mut StdRng,
+    digest: Option<&Arc<dyn DigestPipeline>>,
+    digest_in_flight: &mut bool,
+    inbox_sender: &mpsc::Sender<ActorCommand>,
     msg: NormalizedMessage,
 ) -> Result<(), CoreError> {
     // Rule P1 (specs.md Section 8.1): FIRST persist to the raw log. The
@@ -311,9 +470,22 @@ async fn handle_message(
     session.wake = wake.snapshot();
     persist_session(store, chat_id, session).await?;
 
-    // Trigger evaluation. The procedures are Phase 1 stubs; only the
-    // scheduling runs here. `msg.timestamp` is `now`: deterministic replay.
+    // Trigger evaluation. The wake procedure is a stub (M4); only the
+    // scheduling runs here. `msg.timestamp` is `now`: deterministic
+    // replay. specs.md Section 6.2: Digest runs BEFORE Wake, so the
+    // digest trigger is evaluated first.
     let now = msg.timestamp;
+    maybe_launch_digest(
+        store,
+        chat_id,
+        config,
+        session,
+        digest,
+        digest_in_flight,
+        inbox_sender,
+        now,
+    )
+    .await?;
     if msg.mentions_bot || msg.is_reply_to_bot {
         // specs.md Section 8.1: the bot must respond when addressed
         // directly. The muted state does not suppress a forced wake.
@@ -393,6 +565,16 @@ mod tests {
             Ok(())
         }
 
+        async fn alias_targets(
+            &self,
+            _chat_id: &str,
+            _alias_node_id: &str,
+        ) -> tamako_memory::Result<Vec<tamako_memory::AliasTarget>> {
+            // Records nothing; an empty result means the alias is unknown
+            // (Section 7.4 step 2).
+            Ok(vec![])
+        }
+
         async fn close(&self, _chat_id: &str) -> tamako_memory::Result<()> {
             Ok(())
         }
@@ -444,6 +626,8 @@ mod tests {
             config,
             started_at: t0(),
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            digest: None,
+            post_digest_hook: None,
         })
     }
 
@@ -557,6 +741,8 @@ mod tests {
             config,
             started_at: t0(),
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            digest: None,
+            post_digest_hook: None,
         });
         let rebuilt = restarted.snapshot().await.expect("snapshot succeeds");
         assert_eq!(first, rebuilt);

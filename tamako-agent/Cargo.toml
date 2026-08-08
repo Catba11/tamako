@@ -1,0 +1,26 @@
+[package]
+name = "tamako-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tamako-core.workspace = true
+tamako-store.workspace = true
+tamako-memory.workspace = true
+# LLM client. Structured extraction is a completion request with an
+# output schema (rig-core 0.41 has no Extractor type).
+rig.workspace = true
+# Must stay on 1.x: rig-core 0.41 depends on schemars 1.x.
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# The offline demo example replays the shipped fixture through the mock
+# adapter (examples/digest_demo.rs).
+tamako-adapter-mock.workspace = true

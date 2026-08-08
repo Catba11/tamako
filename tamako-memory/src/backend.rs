@@ -43,6 +43,29 @@ impl NodeType {
             NodeType::MessageBatch => "MessageBatch",
         }
     }
+
+    /// Parses the value of the `type` column back. Returns `None` for an
+    /// unknown string; read paths skip such rows instead of failing.
+    // Not std::str::FromStr: a closed-set lookup that returns Option reads
+    // better at the call sites than a Result with an empty error type.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Person" => Some(NodeType::Person),
+            "Alias" => Some(NodeType::Alias),
+            "Concept" => Some(NodeType::Concept),
+            "MessageBatch" => Some(NodeType::MessageBatch),
+            _ => None,
+        }
+    }
+}
+
+/// One target of an alias node: the source node of a `known_as` or
+/// `also_known_as` edge that points to the alias (Section 7.4 step 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasTarget {
+    pub node_id: String,
+    pub node_type: NodeType,
 }
 
 /// One node of a digest batch.
@@ -116,6 +139,15 @@ pub trait MemoryBackend: Send + Sync {
 
     /// Runs `CHECKPOINT` on the database of the group.
     fn checkpoint<'a>(&'a self, chat_id: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;
+
+    /// Entity resolution, Section 7.4 step 2: returns the target nodes of
+    /// one alias node. Enters the graph through the deterministic alias
+    /// identifier (Rule R5). An empty result means the alias is unknown.
+    fn alias_targets<'a>(
+        &'a self,
+        chat_id: &'a str,
+        alias_node_id: &'a str,
+    ) -> impl Future<Output = Result<Vec<AliasTarget>>> + Send + 'a;
 
     /// Closes the cached handle of the group. Later calls reopen it.
     fn close<'a>(&'a self, chat_id: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;

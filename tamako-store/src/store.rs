@@ -207,31 +207,26 @@ impl Store {
     /// Refer to specs.md Section 6.1, rule 4.
     pub fn list_messages(&self, chat_id: &str) -> Result<Vec<MessageRow>> {
         self.with_conn(chat_id, |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, platform_msg_id, direction, event_type, timestamp,
-                        sender_id, sender_display_name, text,
-                        reply_to_platform_msg_id, mentions_bot, is_reply_to_bot
-                 FROM messages ORDER BY id",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY id"
+            ))?;
             let rows = stmt
-                .query_map([], |row| {
-                    let direction: String = row.get("direction")?;
-                    let event_type: String = row.get("event_type")?;
-                    let timestamp: String = row.get("timestamp")?;
-                    Ok(MessageRow {
-                        id: row.get("id")?,
-                        platform_msg_id: row.get("platform_msg_id")?,
-                        direction: Direction::from_str(&direction)?,
-                        event_type: EventType::from_str(&event_type)?,
-                        timestamp: schema::parse_rfc3339(&timestamp)?,
-                        sender_id: row.get("sender_id")?,
-                        sender_display_name: row.get("sender_display_name")?,
-                        text: row.get("text")?,
-                        reply_to_platform_msg_id: row.get("reply_to_platform_msg_id")?,
-                        mentions_bot: row.get("mentions_bot")?,
-                        is_reply_to_bot: row.get("is_reply_to_bot")?,
-                    })
-                })?
+                .query_map([], message_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// All log rows with `id > after_id`, ordered by `id`. The digest
+    /// pipeline reads the range `(last_digest_boundary_msg_id, tail]` with
+    /// this method (specs.md Section 10.1).
+    pub fn list_messages_after(&self, chat_id: &str, after_id: i64) -> Result<Vec<MessageRow>> {
+        self.with_conn(chat_id, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id > ?1 ORDER BY id"
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params![after_id], message_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -440,6 +435,32 @@ impl Store {
     }
 }
 
+// The column list of the raw-log SELECT queries. `list_messages` and
+// `list_messages_after` share it.
+const MESSAGE_COLUMNS: &str = "id, platform_msg_id, direction, event_type, timestamp,
+        sender_id, sender_display_name, text,
+        reply_to_platform_msg_id, mentions_bot, is_reply_to_bot";
+
+/// Maps one row of a raw-log SELECT to a `MessageRow`.
+fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    let direction: String = row.get("direction")?;
+    let event_type: String = row.get("event_type")?;
+    let timestamp: String = row.get("timestamp")?;
+    Ok(MessageRow {
+        id: row.get("id")?,
+        platform_msg_id: row.get("platform_msg_id")?,
+        direction: Direction::from_str(&direction)?,
+        event_type: EventType::from_str(&event_type)?,
+        timestamp: schema::parse_rfc3339(&timestamp)?,
+        sender_id: row.get("sender_id")?,
+        sender_display_name: row.get("sender_display_name")?,
+        text: row.get("text")?,
+        reply_to_platform_msg_id: row.get("reply_to_platform_msg_id")?,
+        mentions_bot: row.get("mentions_bot")?,
+        is_reply_to_bot: row.get("is_reply_to_bot")?,
+    })
+}
+
 /// Rejects chat_id values that could escape the per-group directory.
 /// Rule P5: one group's data never crosses into another group.
 fn validate_chat_id(chat_id: &str) -> Result<()> {
@@ -582,6 +603,48 @@ mod tests {
         assert_eq!(rows[2].event_type, EventType::Edit);
         assert_eq!(rows[1].text, "hello (edited)");
         assert_eq!(rows[2].text, "hello (edited again)");
+    }
+
+    #[test]
+    fn list_messages_after_returns_the_tail_range_in_order() {
+        // The digest pipeline reads the range (boundary, tail] with this
+        // method (specs.md Section 10.1).
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let mut ids = Vec::new();
+        for index in 1..=3_i64 {
+            let msg = NewMessage {
+                platform_msg_id: format!("m{index}"),
+                timestamp: base.timestamp + time::Duration::seconds(index),
+                text: format!("text {index}"),
+                ..base.clone()
+            };
+            match store.insert_message("c1", &msg).expect("insert") {
+                InsertOutcome::Inserted(id) => ids.push(id),
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+
+        // The full log from a zero boundary.
+        let all = store.list_messages_after("c1", 0).expect("list all");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].text, "text 1");
+        assert_eq!(all[2].text, "text 3");
+
+        // The range (first_row_id, tail] holds the remaining two rows, in
+        // id order.
+        let tail = store.list_messages_after("c1", ids[0]).expect("list tail");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].id, ids[1]);
+        assert_eq!(tail[1].id, ids[2]);
+        assert_eq!(tail[0].text, "text 2");
+        assert_eq!(tail[1].text, "text 3");
+
+        // An empty tail returns an empty vec.
+        let empty = store
+            .list_messages_after("c1", ids[2])
+            .expect("list empty tail");
+        assert!(empty.is_empty());
     }
 
     #[test]

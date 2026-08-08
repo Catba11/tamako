@@ -10,6 +10,7 @@
 pub mod actor;
 pub mod adapter;
 pub mod config;
+pub mod digest;
 pub mod event;
 pub mod session;
 pub mod trigger;

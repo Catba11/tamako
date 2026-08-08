@@ -138,6 +138,48 @@ impl TailStats {
     }
 }
 
+/// True for a CJK ideograph (U+4E00..=U+9FFF and extension A
+/// U+3400..=U+4DBF), a kana character (U+3040..=U+30FF), or a hangul
+/// syllable (U+AC00..=U+D7AF).
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{3040}'..='\u{30FF}' | '\u{AC00}'..='\u{D7AF}'
+    )
+}
+
+/// Computes the tail statistics of specs.md Section 8.2 from the raw-log
+/// rows of the tail (rows with id > last_digest_boundary_msg_id) and the
+/// time of the last successful digest.
+///
+/// Counting rules:
+/// - chars_cjk: count of CJK ideographs and kana/hangul syllables in all
+///   texts;
+/// - words: whitespace-separated tokens (CJK text counts through
+///   chars_cjk);
+/// - messages: row count; bytes: sum of text UTF-8 lengths;
+/// - last_digest_at: passed through from the session.
+pub fn tail_stats(
+    rows: &[tamako_store::MessageRow],
+    last_digest_at: Option<OffsetDateTime>,
+) -> TailStats {
+    let mut stats = TailStats {
+        last_digest_at,
+        ..TailStats::default()
+    };
+    for row in rows {
+        // Counters saturate; a counter overflow must never panic.
+        stats.messages = stats.messages.saturating_add(1);
+        stats.bytes = stats.bytes.saturating_add(row.text.len());
+        stats.chars_cjk = stats
+            .chars_cjk
+            .saturating_add(row.text.chars().filter(|ch| is_cjk(*ch)).count());
+        let words = u32::try_from(row.text.split_whitespace().count()).unwrap_or(u32::MAX);
+        stats.words = stats.words.saturating_add(words);
+    }
+    stats
+}
+
 /// specs.md Section 8.2: fire when the FIRST threshold is reached, or
 /// (fallback) the tail is non-empty and the last digest is older than
 /// `digest_timeout`.
@@ -167,9 +209,70 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use tamako_store::{Direction, EventType, MessageRow};
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid unix timestamp")
+    }
+
+    /// A raw-log row with the given id and text. Only `id` and `text`
+    /// matter for tail_stats.
+    fn row(id: i64, text: &str) -> MessageRow {
+        MessageRow {
+            id,
+            platform_msg_id: format!("m{id}"),
+            direction: Direction::Inbound,
+            event_type: EventType::Message,
+            timestamp: now(),
+            sender_id: "u1".to_string(),
+            sender_display_name: "Alice".to_string(),
+            text: text.to_string(),
+            reply_to_platform_msg_id: None,
+            mentions_bot: false,
+            is_reply_to_bot: false,
+        }
+    }
+
+    #[test]
+    fn tail_stats_of_empty_rows_is_empty() {
+        let stats = tail_stats(&[], Some(now()));
+        assert_eq!(
+            stats,
+            TailStats {
+                last_digest_at: Some(now()),
+                ..TailStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn tail_stats_counts_mixed_english_and_cjk_text() {
+        let rows = vec![
+            row(1, "hello world"), // 2 words, 0 CJK, 11 bytes
+            row(2, "你好世界"),    // 1 token, 4 CJK, 12 bytes
+            row(3, "猫 cat ねこ"), // 3 tokens, 3 CJK, 14 bytes
+        ];
+        let stats = tail_stats(&rows, None);
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.words, 6);
+        assert_eq!(stats.chars_cjk, 7);
+        assert_eq!(stats.bytes, 11 + 12 + 14);
+        assert_eq!(stats.last_digest_at, None);
+    }
+
+    #[test]
+    fn tail_stats_counts_kana_and_hangul_as_cjk() {
+        let rows = vec![row(1, "ひらがな カタカナ"), row(2, "한국어")];
+        let stats = tail_stats(&rows, Some(now()));
+        assert_eq!(stats.chars_cjk, 4 + 4 + 3);
+        assert_eq!(stats.words, 2 + 1);
+    }
+
+    #[test]
+    fn tail_stats_passes_last_digest_at_through() {
+        let at = now();
+        assert_eq!(tail_stats(&[], Some(at)).last_digest_at, Some(at));
+        assert_eq!(tail_stats(&[], None).last_digest_at, None);
     }
 
     #[test]

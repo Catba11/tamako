@@ -26,10 +26,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
-use crate::backend::{MemoryBackend, MemoryBatch, MemoryError, Result};
+use crate::backend::{AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NodeType, Result};
 
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
 const DDL_NODE: &str = "CREATE NODE TABLE IF NOT EXISTS Node(
@@ -74,6 +75,15 @@ MERGE (s)-[r:EDGE {relationship_name: $rel, valid_at: $valid_at}]->(t)
 ON CREATE SET r.edge_text = $edge_text, r.invalid_at = $invalid_at, r.created_at = $created_at, r.updated_at = $updated_at, r.properties = $properties
 ON MATCH SET r.edge_text = $edge_text, r.invalid_at = $invalid_at, r.updated_at = $updated_at, r.properties = coalesce($properties, r.properties)";
 
+// Entity resolution, Section 7.4 step 2: the targets of one alias node.
+// Alias edges are Person -> Alias (known_as) and Concept -> Alias
+// (also_known_as), so the targets are the SOURCES of the edges into the
+// alias node. The query enters the graph through the deterministic alias
+// identifier (Rule R5); the alias id is a $param (Section 5.2 rule 4).
+const ALIAS_TARGETS: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node {id: $alias_id})
+WHERE r.relationship_name IN ['known_as', 'also_known_as']
+RETURN s.id, s.type";
+
 fn backend(error: lbug::Error) -> MemoryError {
     MemoryError::Backend(error.to_string())
 }
@@ -89,6 +99,21 @@ fn opt_timestamp(value: Option<OffsetDateTime>) -> Value {
     match value {
         Some(value) => Value::Timestamp(value),
         None => Value::Null(LogicalType::Timestamp),
+    }
+}
+
+/// Renders one `lbug::Value` as a display string. Used by the read
+/// helper `LbugBackend::query_rows`.
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Int64(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Timestamp(value) => value
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| format!("{value:?}")),
+        Value::Null(_) => "NULL".to_string(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -165,6 +190,22 @@ impl LbugBackend {
         })
         .await
         .map_err(|error| MemoryError::Backend(format!("task join error: {error}")))?
+    }
+
+    /// Runs a read-only Cypher query and returns each row as display
+    /// strings. Read-path support for tests and the demo. The full read
+    /// path is Phase 1 M5 / Phase 2 (Section 8). Interpolate only
+    /// trusted values into `cypher`.
+    pub async fn query_rows(&self, chat_id: &str, cypher: &str) -> Result<Vec<Vec<String>>> {
+        let cypher = cypher.to_string();
+        self.with_conn(chat_id, move |conn| {
+            let result = conn.query(&cypher).map_err(backend)?;
+            let rows = result
+                .map(|row| row.iter().map(value_to_string).collect())
+                .collect();
+            Ok(rows)
+        })
+        .await
     }
 }
 
@@ -254,6 +295,35 @@ impl MemoryBackend for LbugBackend {
         .await
     }
 
+    async fn alias_targets(&self, chat_id: &str, alias_node_id: &str) -> Result<Vec<AliasTarget>> {
+        // Section 7.4 step 2. An empty result means the alias is unknown.
+        let alias_node_id = alias_node_id.to_string();
+        self.with_conn(chat_id, move |conn| {
+            let mut statement = conn.prepare(ALIAS_TARGETS).map_err(backend)?;
+            let result = conn
+                .execute(
+                    &mut statement,
+                    vec![("alias_id", Value::String(alias_node_id))],
+                )
+                .map_err(backend)?;
+            let mut targets = Vec::new();
+            for row in result {
+                let mut columns = row.into_iter();
+                if let (Some(Value::String(node_id)), Some(Value::String(type_string))) =
+                    (columns.next(), columns.next())
+                {
+                    // A row with an unknown type string is skipped, it
+                    // does not fail the query.
+                    if let Some(node_type) = NodeType::from_str(&type_string) {
+                        targets.push(AliasTarget { node_id, node_type });
+                    }
+                }
+            }
+            Ok(targets)
+        })
+        .await
+    }
+
     async fn close(&self, chat_id: &str) -> Result<()> {
         validate_chat_id(chat_id)?;
         let db = self.databases.lock().await.remove(chat_id);
@@ -270,17 +340,16 @@ impl MemoryBackend for LbugBackend {
 
 #[cfg(test)]
 impl LbugBackend {
-    /// Runs a `RETURN count(...)` query. Test helper.
+    /// Runs a `RETURN count(...)` query. Test helper, delegates to
+    /// `query_rows`.
     async fn count(&self, chat_id: &str, cypher: &str) -> Result<i64> {
-        let cypher = cypher.to_string();
-        self.with_conn(chat_id, move |conn| {
-            let mut result = conn.query(&cypher).map_err(backend)?;
-            match result.next().and_then(|row| row.into_iter().next()) {
-                Some(Value::Int64(count)) => Ok(count),
-                _ => Err(MemoryError::Backend("unexpected count result".to_string())),
-            }
-        })
-        .await
+        let rows = self.query_rows(chat_id, cypher).await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(count) => count
+                .parse::<i64>()
+                .map_err(|_| MemoryError::Backend("unexpected count result".to_string())),
+            None => Err(MemoryError::Backend("unexpected count result".to_string())),
+        }
     }
 }
 
@@ -417,5 +486,75 @@ mod tests {
                 other => panic!("expected InvalidChatId for {bad:?}, got {other:?}"),
             }
         }
+    }
+
+    /// A batch with a Person node, an Alias node, and a `known_as` edge
+    /// Person -> Alias. Section 7.4 step 2 test data.
+    fn alias_batch() -> (MemoryBatch, MemoryNode, MemoryNode) {
+        let person = MemoryNode {
+            id: crate::identifiers::person_id("1001"),
+            name: "Tama".to_string(),
+            node_type: NodeType::Person,
+            created_at: datetime!(2026-08-07 10:00 UTC),
+            updated_at: datetime!(2026-08-07 10:00 UTC),
+            properties: None,
+        };
+        let alias = MemoryNode {
+            id: crate::identifiers::alias_id("tama"),
+            name: "tama".to_string(),
+            node_type: NodeType::Alias,
+            created_at: datetime!(2026-08-07 10:00 UTC),
+            updated_at: datetime!(2026-08-07 10:00 UTC),
+            properties: None,
+        };
+        let edge = MemoryEdge {
+            source_id: person.id.clone(),
+            target_id: alias.id.clone(),
+            relationship_name: "known_as".to_string(),
+            valid_at: datetime!(2026-08-07 10:00 UTC),
+            invalid_at: None,
+            edge_text: "Tama is known as tama.".to_string(),
+            created_at: datetime!(2026-08-07 10:00 UTC),
+            updated_at: datetime!(2026-08-07 10:00 UTC),
+            properties: None,
+        };
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(1, 10),
+            nodes: vec![person.clone(), alias.clone()],
+            edges: vec![edge],
+        };
+        (batch, person, alias)
+    }
+
+    #[tokio::test]
+    async fn alias_targets_returns_the_source_nodes_of_the_alias_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, person, alias) = alias_batch();
+        backend.upsert_batch("chat_e", &batch).await.unwrap();
+
+        let targets = backend.alias_targets("chat_e", &alias.id).await.unwrap();
+        assert_eq!(
+            targets,
+            vec![crate::backend::AliasTarget {
+                node_id: person.id.clone(),
+                node_type: NodeType::Person,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_targets_of_an_unknown_alias_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, _person, _alias) = alias_batch();
+        backend.upsert_batch("chat_f", &batch).await.unwrap();
+
+        // Section 7.4 step 2: an empty result means the alias is unknown.
+        let targets = backend
+            .alias_targets("chat_f", &crate::identifiers::alias_id("nobody"))
+            .await
+            .unwrap();
+        assert!(targets.is_empty());
     }
 }

@@ -18,6 +18,7 @@ use crate::trigger::{WakeScheduler, WakeSchedulerState};
 // state table as a generic key-value store; these keys are the contract
 // between encode/decode here and the rows in store.db.
 const KEY_DIGEST_BOUNDARY: &str = "last_digest_boundary_msg_id";
+const KEY_LAST_DIGEST_AT: &str = "last_digest_at";
 const KEY_MUTED: &str = "muted_flag";
 const KEY_CONSECUTIVE_BOT: &str = "consecutive_bot_msgs";
 const KEY_WAKE_MSGS: &str = "wake_msgs_since_wake";
@@ -30,6 +31,9 @@ const KEY_WAKE_INTERVAL_MS: &str = "wake_current_interval_ms";
 pub struct SessionState {
     /// specs.md Section 7.1: splits the previous digested chunk from the tail.
     pub last_digest_boundary_msg_id: i64,
+    /// The time of the last successful digest. `None` means the tail was
+    /// never digested (specs.md Section 8.2, timeout fallback).
+    pub last_digest_at: Option<OffsetDateTime>,
     /// specs.md Section 8.5: the monologue lock state.
     pub muted: bool,
     pub consecutive_bot_msgs: u32,
@@ -59,6 +63,7 @@ impl SessionState {
         wake.current_interval = round_to_millis(wake.current_interval);
         Self {
             last_digest_boundary_msg_id: 0,
+            last_digest_at: None,
             muted: false,
             consecutive_bot_msgs: 0,
             wake,
@@ -68,7 +73,8 @@ impl SessionState {
     /// Encodes the state as state-table key-value pairs.
     ///
     /// Keys (specs.md Section 5.2):
-    /// `last_digest_boundary_msg_id` (decimal), `muted_flag` ("0"/"1"),
+    /// `last_digest_boundary_msg_id` (decimal), `last_digest_at` (RFC 3339;
+    /// `None` encodes as the empty string), `muted_flag` ("0"/"1"),
     /// `consecutive_bot_msgs` (decimal), `wake_msgs_since_wake` (decimal),
     /// `wake_last_wake_at` (RFC 3339), `wake_current_interval_ms` (decimal
     /// milliseconds).
@@ -79,11 +85,16 @@ impl SessionState {
             .last_wake_at
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::new());
+        let last_digest_at = self
+            .last_digest_at
+            .map(|at| at.format(&Rfc3339).unwrap_or_else(|_| String::new()))
+            .unwrap_or_default();
         vec![
             (
                 KEY_DIGEST_BOUNDARY.to_string(),
                 self.last_digest_boundary_msg_id.to_string(),
             ),
+            (KEY_LAST_DIGEST_AT.to_string(), last_digest_at),
             (
                 KEY_MUTED.to_string(),
                 if self.muted { "1" } else { "0" }.to_string(),
@@ -127,6 +138,12 @@ impl SessionState {
                 .get(KEY_DIGEST_BOUNDARY)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(fresh.last_digest_boundary_msg_id),
+            // A missing, empty, or malformed value means the tail was
+            // never digested: None is the fresh default.
+            last_digest_at: map
+                .get(KEY_LAST_DIGEST_AT)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok()),
             muted,
             consecutive_bot_msgs: map
                 .get(KEY_CONSECUTIVE_BOT)
@@ -185,6 +202,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let mut state = SessionState::new(&config, fixed_now(), &mut rng);
         state.last_digest_boundary_msg_id = 137;
+        state.last_digest_at = Some(fixed_now());
         state.wake.msgs_since_wake = 3;
 
         let encoded = state.encode();
@@ -192,6 +210,34 @@ mod tests {
         let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
 
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn decode_of_missing_empty_or_malformed_last_digest_at_is_none() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(42);
+        let state = SessionState::new(&config, fixed_now(), &mut rng);
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Missing key.
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(42),
+        );
+        assert_eq!(decoded.last_digest_at, None);
+
+        // Empty value (the encoding of None).
+        assert_eq!(map.get(KEY_LAST_DIGEST_AT), Some(&String::new()));
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.last_digest_at, None);
+
+        // Malformed value falls back to the fresh default (None).
+        let mut corrupt = map;
+        corrupt.insert(KEY_LAST_DIGEST_AT.to_string(), "not-a-date".to_string());
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.last_digest_at, None);
     }
 
     #[test]
