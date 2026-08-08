@@ -2544,6 +2544,7 @@ dependencies = [
 name = "tamako-adapter-teloxide"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "serde_json",
  "tamako-core",
  "teloxide",

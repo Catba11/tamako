@@ -10,5 +10,9 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# StreamExt for the polling listener stream (teloxide 0.17 exposes the
+# listener as a futures Stream; there is no owned-stream alternative).
+futures = "0.3"
+
 [dev-dependencies]
 serde_json.workspace = true

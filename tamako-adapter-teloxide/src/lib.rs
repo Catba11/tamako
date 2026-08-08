@@ -9,4 +9,8 @@
 //! This crate therefore keeps all Telegram specifics inside the adapter and
 //! emits only the platform-neutral `tamako_core::event` types.
 
+pub mod adapter;
 pub mod normalize;
+
+pub use adapter::{GroupEvent, TeloxideAdapter};
+pub use normalize::BotIdentity;
