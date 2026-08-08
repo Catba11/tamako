@@ -8,19 +8,21 @@ document records the current implementation.
 
 ## 1. Workspace layout
 
-A Cargo workspace at the repository root with six crates. Shared
+A Cargo workspace at the repository root with seven crates. Shared
 dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo. | 1 (integration) |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the per-group actor. | 26 |
-| `tamako-store` | `store.db`: SQLite access, migrations, the raw message log, the session-state table, `injected_memories`, `dead_letter`. | 11 |
-| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 10 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo. | 6 (integration) |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the per-group actor, the digest pipeline contract. | 34 |
+| `tamako-store` | `store.db`: SQLite access, migrations, the raw message log, the session-state table, `injected_memories`, `dead_letter`. | 12 |
+| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 12 |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
+| `tamako-agent` | All LLM concerns: the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter). | 42 (+1 ignored live test) |
 
-Total: 61 tests. Build, test, clippy (`-D warnings`), and fmt are clean.
+Total: 119 tests (+1 ignored live-API smoke test). Build, test,
+clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
 
@@ -31,13 +33,18 @@ tamako ──▶ tamako-core ──▶ tamako-store
    ├──▶ tamako-store  ──── (all lower crates are independent)
    ├──▶ tamako-memory
    ├──▶ tamako-persona
+   ├──▶ tamako-agent ──▶ tamako-core (contract), tamako-store, tamako-memory
    └──▶ tamako-adapter-mock ──▶ tamako-core (types only)
 ```
 
 - The binary depends on all crates and does the wiring.
 - `tamako-core` depends on the storage and persona crates. No crate
-  depends on `tamako-core` except adapters, and adapters use the
-  normalized types only (Rule A1, Rule P7).
+  depends on `tamako-core` except adapters and `tamako-agent`, and
+  adapters use the normalized types only (Rule A1, Rule P7).
+- `tamako-agent` owns every LLM concern and is the only crate that
+  depends on `rig` (rig-core 0.41). `tamako-core` defines the digest
+  pipeline CONTRACT (`tamako_core::digest`) so the actor drives the
+  pipeline without a dependency on the agent crate. No cycles.
 - `tamako-store`, `tamako-memory`, and `tamako-persona` do not depend on
   each other. There are no cycles.
 
@@ -79,14 +86,26 @@ and the integration-test harness.
   Section 8.1).
 - Edited messages append a new log row with `event_type = 'edit'`. An
   edit never retracts (specs.md Section 15, open item 4).
-- Trigger evaluation is scheduling only. A mention or a reply logs a
-  forced-wake stub; a fired wake or digest condition logs a stub and
-  resets the scheduler. The procedures themselves are Phase 1.
+- Trigger evaluation (specs.md Section 6.2: Digest before Wake). The
+  digest trigger of Section 8.2 is live (M1): on fire, the actor spawns
+  the digest pipeline as a task that reports back through the inbox
+  (`ActorCommand::DigestCompleted`), so extraction and backoff never
+  block the FIFO queue (Section 6.1, rule 3). Session mutations stay
+  serialized in the loop. The wake trigger still logs a stub; the wake
+  procedure is M4.
+- On digest completion the actor advances
+  `last_digest_boundary_msg_id` for EVERY outcome — a dead-lettered
+  batch is skipped and never blocks later batches (specs.md
+  Section 10.3) — stamps `last_digest_at`, persists the session, and
+  calls the `PostDigestHook` (the M2 wiring point for the Rule C3
+  context removal; M1 ships `NoopPostDigestHook`).
 - The wake scheduler (`tamako-core::trigger`) is pure logic: fire on the
   first of message count or jittered interval, subject to the floor
   (specs.md Section 8.3). The jittered interval is normalized to whole
   milliseconds so the persisted encoding is lossless. The digest
-  thresholds of Section 8.2 are a pure function over tail statistics.
+  thresholds of Section 8.2 are a pure function over tail statistics
+  (`tail_stats` computes them from the raw-log tail; one tail scan per
+  evaluation, bounded by the fire thresholds in practice).
 
 All synchronous storage calls run inside `tokio::task::spawn_blocking`
 (AGENT.md Section 6.2).
@@ -142,8 +161,77 @@ crate. Key decisions:
   twice yields the same graph. Timestamps travel as native `TIMESTAMP`
   parameters; all user data goes through `$param` parameters.
 - Every driver call runs inside `spawn_blocking` (Section 5.2, rule 3).
+- The backend exposes two read operations (Section 8 entry resolution):
+  `MemoryBackend::alias_targets` (entity resolution step 2: the targets
+  of one alias node, entered through the deterministic alias identifier,
+  Rule R5) and `LbugBackend::query_rows`, a display-string Cypher helper
+  for tests and the demo.
 
-## 7. The binary
+## 7. The digest pipeline (tamako-agent, M1)
+
+specs.md Section 10 and proposed-graph-database-specs.md Section 7,
+built end to end against the replayed log:
+
+1. **Batch assembly** (`pipeline.rs`): the raw-log range
+   `(last_digest_boundary_msg_id, tail]` through
+   `Store::list_messages_after`. Speaker labels
+   `[{display_name} {HH:MM}] {text}` (Section 7.2 step 4, UTC). The
+   mention/reply → `tg_user_id` map comes from the stored log rows
+   (sender bindings plus reply-target bindings, specs.md Section 10.1).
+   The batch id `uuid5("batch:{first}:{last}")` is stable across
+   retries.
+2. **Skeleton skip** (`skeleton.rs`, Section 7.2 rule 5): an
+   emoji/greeting-only batch stores the MessageBatch skeleton without an
+   extraction call. The detector is deterministic and conservative:
+   when in doubt, extract.
+3. **Extraction** (`extract.rs`, `rig_impl.rs`, `prompt.rs`,
+   `graph.rs`): the `KnowledgeExtractor` trait has two implementations —
+   the live `RigExtractor` and the scripted `ScriptedExtractor` for
+   tests and the offline demo. rig-core 0.41 has no `Extractor` type;
+   extraction is a completion request with
+   `output_schema(schemars::schema_for!(KnowledgeGraph))`, which
+   Anthropic serves as native JSON-schema structured output. The
+   `KnowledgeGraph` type (serde + schemars 1.x) constrains nodes to
+   `Person` and `Concept`. The prompt requires snake_case relationship
+   names, one specific description per edge, coreference resolution, no
+   knowledge outside the text, and supplies the mention map as
+   structured context (Section 7.3).
+4. **Post-validation** (`validate.rs`, Section 6.3), in plain Rust:
+   relationship names must be snake_case identifiers and must not be a
+   reserved system name (`contains`, `known_as`, `also_known_as`,
+   `is_a`, `supersedes`). Violations become `related_to` with the
+   original name in the edge properties.
+5. **Entity resolution** (`resolve.rs`, Section 7.4 steps 1, 2, 4
+   only): mention/reply binding to `uuid5("tg_user:{id}")`; exact alias
+   match with exactly one target binds to that target; an ambiguous or
+   unresolvable person attaches its facts to the Alias node (no
+   guessing; the node carries the `"attachment": "fallback"` marker of
+   the primary quality metric). Unresolved concepts get
+   `uuid5("concept:{normalized}")`. Surface forms become Alias nodes
+   with `known_as`/`also_known_as` edges (step 5). Alias-bound nodes
+   carry `properties: None` so the MERGE coalesce keeps the stored
+   identity blob. Fact validity is the Phase 1 multi-value form:
+   `valid_at` = batch end, `invalid_at` NULL (dev-roadmap.md Section 3
+   item 5). Every batch writes its MessageBatch node and `contains`
+   provenance edges (Section 6.3).
+6. **Write**: one transactional idempotent `upsert_batch` with
+   `CHECKPOINT`. No embeddings — the Phase 2 hook point is marked in
+   `pipeline.rs`.
+7. **Failure handling** (specs.md Section 10.3): exponential backoff
+   (base 2 s, doubling, capped at 60 s) with the same batch id; after
+   `digest_max_retries` total attempts (default 5) the skeleton plus
+   error lands in `dead_letter`, `digest_failures_total` and
+   `dead_letters_total` counters increment (best effort), and the batch
+   is SKIPPED — the boundary advances and later batches proceed.
+
+Provider configuration: the extraction model defaults to
+`claude-haiku-4-5` (cheap tier), overridable by the env var
+`TAMAKO_DIGEST_MODEL` or the config-file key `digest_model` (env wins;
+deviation: specs.md Section 13 has no LLM keys yet). The API key is
+`ANTHROPIC_API_KEY`, read by rig's `Client::from_env()`. Without the
+key, the binary runs with the digest pipeline disabled.
+
+## 8. The binary
 
 `tamako --replay <fixture> [--data-root <dir>] [--config <file>]` loads
 the configuration (Section 13 defaults with per-group overrides from
@@ -151,12 +239,20 @@ the configuration (Section 13 defaults with per-group overrides from
 persona.toml`, then the repo-root example, then a built-in default),
 renders the preamble through the `PreambleRenderer` trait, spawns one
 actor for the fixture's group, feeds the mock replay, and prints a
-summary. CLI parsing is hand-rolled; no clap.
+summary (including the digest boundary and the dead-letter count). CLI
+parsing is hand-rolled; no clap. When `ANTHROPIC_API_KEY` is set, the
+binary wires the live `RigExtractor` digest pipeline; without the key,
+digests are disabled and the replay stays offline.
 
-## 8. Phase 1 outlook
+An offline digest demo lives at `tamako-agent/examples/digest_demo.rs`:
+`cargo run -p tamako-agent --example digest_demo` replays the fixture
+through the real actor and the real LadybugDB backend with a scripted
+extractor and prints the resulting graph.
 
-Phase 1 turns the stubs into a living pet: the digest pipeline against
-the replayed log, the context lifecycle, the teloxide adapter with live
+## 9. Phase 1 outlook
+
+Phase 1 continues with the context lifecycle (M2, plugged into the
+actor's `PostDigestHook` of Section 4), the teloxide adapter with live
 intake (including the `reactions` table of specs.md Section 5.2), the
 wake procedure with a real timer driver and counters, shallow recall
 with the full injection protocol, and the monologue lock in live
