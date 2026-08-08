@@ -204,6 +204,20 @@ pub fn digest_should_fire(tail: &TailStats, now: OffsetDateTime, config: &Trigge
     }
 }
 
+/// The tick cadence of the M4 timer driver. Choice: one eighth of the
+/// wake interval, clamped below by 1 s (never a hot loop) and above by
+/// min(wake_floor, 5 min) (the floor already bounds wake spacing; the
+/// digest timeout fallback of Section 8.2 is far coarser than any
+/// cadence this produces). At the defaults (1 h interval, 5 min floor)
+/// the cadence is 5 min: a wake fires at most one cadence period late.
+pub fn timer_cadence(config: &TriggerConfig) -> Duration {
+    let upper = config.wake_floor.min(Duration::from_secs(5 * 60));
+    // A wake_floor below 1 s must not panic: the lower bound never
+    // exceeds the upper bound.
+    let lower = Duration::from_secs(1).min(upper);
+    (config.wake_interval / 8).clamp(lower, upper)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +245,56 @@ mod tests {
             mentions_bot: false,
             is_reply_to_bot: false,
         }
+    }
+
+    #[test]
+    fn timer_cadence_of_the_default_config_is_the_five_minute_cap() {
+        // 1 h / 8 = 7.5 min, clamped above by min(5 min floor, 5 min).
+        let config = TriggerConfig::default();
+        assert_eq!(timer_cadence(&config), Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn timer_cadence_is_never_a_hot_loop() {
+        // 10 ms / 8 = 1.25 ms, clamped below by 1 s.
+        let config = TriggerConfig {
+            wake_interval: Duration::from_millis(10),
+            ..TriggerConfig::default()
+        };
+        assert_eq!(timer_cadence(&config), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timer_cadence_follows_a_sub_second_wake_floor() {
+        // A wake_floor below 1 s becomes the upper bound; the lower bound
+        // stays at or below it (no panic).
+        let config = TriggerConfig {
+            wake_floor: Duration::from_millis(500),
+            ..TriggerConfig::default()
+        };
+        assert_eq!(timer_cadence(&config), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn timer_cadence_honors_a_wake_floor_below_the_cap() {
+        // 1 h / 8 = 7.5 min, upper bound min(2 min floor, 5 min) = 2 min.
+        let config = TriggerConfig {
+            wake_floor: Duration::from_secs(2 * 60),
+            ..TriggerConfig::default()
+        };
+        assert_eq!(timer_cadence(&config), Duration::from_secs(2 * 60));
+    }
+
+    #[test]
+    fn timer_cadence_never_panics_on_tiny_values() {
+        // Very small everything: the cadence stays a valid duration and
+        // never exceeds the floor.
+        let config = TriggerConfig {
+            wake_interval: Duration::from_nanos(1),
+            wake_floor: Duration::from_nanos(1),
+            ..TriggerConfig::default()
+        };
+        assert_eq!(timer_cadence(&config), Duration::from_nanos(1));
     }
 
     #[test]

@@ -25,6 +25,9 @@ const KEY_CONSECUTIVE_BOT: &str = "consecutive_bot_msgs";
 const KEY_WAKE_MSGS: &str = "wake_msgs_since_wake";
 const KEY_WAKE_LAST_AT: &str = "wake_last_wake_at";
 const KEY_WAKE_INTERVAL_MS: &str = "wake_current_interval_ms";
+// specs.md Section 5.2 says the state keys "include" the listed ones —
+// an open list. This M4 key extends it (reported for spec backfill).
+const KEY_WAKE_LAST_ROW_ID: &str = "wake_last_row_id";
 
 /// Session state of one group. The actor persists it after every mutation
 /// (specs.md Section 6.1, rule 4) and rebuilds it on restart.
@@ -45,6 +48,11 @@ pub struct SessionState {
     pub muted: bool,
     pub consecutive_bot_msgs: u32,
     pub wake: WakeSchedulerState,
+    /// The raw-log row id of the tail at the last wake. "The new
+    /// messages of this wake" (specs.md Section 9.6) are the rows above
+    /// it. Fresh default 0 (M4 key, reported for spec backfill: Section
+    /// 5.2 lists an open key set).
+    pub wake_last_row_id: i64,
 }
 
 /// Truncates a duration to whole milliseconds.
@@ -75,6 +83,7 @@ impl SessionState {
             muted: false,
             consecutive_bot_msgs: 0,
             wake,
+            wake_last_row_id: 0,
         }
     }
 
@@ -86,7 +95,8 @@ impl SessionState {
     /// `None` encodes as the empty string), `muted_flag` ("0"/"1"),
     /// `consecutive_bot_msgs` (decimal), `wake_msgs_since_wake` (decimal),
     /// `wake_last_wake_at` (RFC 3339), `wake_current_interval_ms` (decimal
-    /// milliseconds).
+    /// milliseconds), `wake_last_row_id` (decimal; M4 key, reported for
+    /// spec backfill).
     pub fn encode(&self) -> Vec<(String, String)> {
         // Rfc3339 formatting fails only for years outside 0..=9999.
         let last_wake_at = self
@@ -130,6 +140,10 @@ impl SessionState {
             (
                 KEY_WAKE_INTERVAL_MS.to_string(),
                 self.wake.current_interval.as_millis().to_string(),
+            ),
+            (
+                KEY_WAKE_LAST_ROW_ID.to_string(),
+                self.wake_last_row_id.to_string(),
             ),
         ]
     }
@@ -189,6 +203,12 @@ impl SessionState {
                     .map(Duration::from_millis)
                     .unwrap_or(fresh.wake.current_interval),
             },
+            // The same total-function fallback policy as the other
+            // fields: missing or malformed decodes to the fresh default.
+            wake_last_row_id: map
+                .get(KEY_WAKE_LAST_ROW_ID)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fresh.wake_last_row_id),
         }
     }
 
@@ -229,6 +249,7 @@ mod tests {
         state.last_digest_boundary_msg_id = 137;
         state.last_digest_at = Some(fixed_now());
         state.wake.msgs_since_wake = 3;
+        state.wake_last_row_id = 42;
 
         let encoded = state.encode();
         let map: HashMap<String, String> = encoded.into_iter().collect();
@@ -352,6 +373,34 @@ mod tests {
         );
         let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.prev_digest_boundary_msg_id, None);
+    }
+
+    #[test]
+    fn decode_of_missing_or_malformed_wake_last_row_id_is_zero() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(31);
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.wake_last_row_id = 137;
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Round trip.
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.wake_last_row_id, 137);
+
+        // Missing key falls back to the fresh default (0).
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(31),
+        );
+        assert_eq!(decoded.wake_last_row_id, 0);
+
+        // Malformed value falls back to the fresh default.
+        let mut corrupt = map;
+        corrupt.insert(KEY_WAKE_LAST_ROW_ID.to_string(), "not-a-number".to_string());
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.wake_last_row_id, 0);
     }
 
     #[test]

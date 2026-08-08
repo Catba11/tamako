@@ -265,6 +265,23 @@ impl Store {
         })
     }
 
+    /// Counts the INBOUND raw-log rows with `id > after_id`. The M4
+    /// recency re-check (specs.md Section 6.2) uses it: newer human
+    /// messages after the target decide whether a generated reply is
+    /// stale.
+    pub fn count_inbound_after(&self, chat_id: &str, after_id: i64) -> Result<u32> {
+        self.with_conn(chat_id, |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE id > ?1 AND direction = 'inbound'",
+                rusqlite::params![after_id],
+                |row| row.get(0),
+            )?;
+            // COUNT(*) is never negative; the conversion saturates on the
+            // theoretical overflow.
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        })
+    }
+    //
     // --- Session state KV (specs.md Sections 5.2 and 6.1) ---
     //
     // The state table is a generic key-value store. The design uses these
@@ -272,7 +289,8 @@ impl Store {
     // hard-code accessors):
     //   last_digest_boundary_msg_id, prev_digest_boundary_msg_id,
     //   last_digest_at, muted_flag, consecutive_bot_msgs,
-    //   wake_msgs_since_wake, wake_last_wake_at, wake_current_interval_ms.
+    //   wake_msgs_since_wake, wake_last_wake_at, wake_current_interval_ms,
+    //   wake_last_row_id (M4).
     // Counter keys of specs.md Section 12 (used with increment_counter):
     //   wakes_total, participations_total, injection_wakes_total,
     //   digest_failures_total, dead_letters_total.
@@ -648,6 +666,45 @@ mod tests {
             mentions_bot: true,
             is_reply_to_bot: false,
         }
+    }
+
+    #[test]
+    fn count_inbound_after_counts_only_inbound_rows_above_the_boundary() {
+        // The M4 recency re-check (specs.md Section 6.2): newer human
+        // messages after the target decide whether a reply is stale.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let mut ids = Vec::new();
+        for index in 1..=4_i64 {
+            // Rows 1-3 inbound, row 4 outbound (the bot's own speech,
+            // Rule B1). The recency re-check counts human messages only.
+            let direction = if index == 4 {
+                Direction::Outbound
+            } else {
+                Direction::Inbound
+            };
+            let msg = NewMessage {
+                platform_msg_id: format!("m{index}"),
+                direction,
+                timestamp: base.timestamp + time::Duration::seconds(index),
+                text: format!("text {index}"),
+                ..base.clone()
+            };
+            match store.insert_message("c1", &msg).expect("insert") {
+                InsertOutcome::Inserted(id) => ids.push(id),
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+
+        // From a zero boundary: the three inbound rows, not the outbound
+        // row.
+        assert_eq!(store.count_inbound_after("c1", 0).expect("count"), 3);
+        // Exact boundary semantics: `id > after_id` excludes the boundary
+        // row itself.
+        assert_eq!(store.count_inbound_after("c1", ids[0]).expect("count"), 2);
+        assert_eq!(store.count_inbound_after("c1", ids[2]).expect("count"), 0);
+        // The outbound tail row counts nothing.
+        assert_eq!(store.count_inbound_after("c1", ids[3]).expect("count"), 0);
     }
 
     #[test]

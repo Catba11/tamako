@@ -282,10 +282,12 @@ impl LiveContext {
 }
 
 /// Renders the speaker label of specs.md Section 7.2 step 4. This one
-/// helper serves both `append_human_message` and `rebuild`: that is what
-/// makes the rebuild bit-identical. On a format failure the HH:MM part
-/// falls back to "??:??" (the pattern of tamako-agent/src/pipeline.rs).
-fn render_human_content(display_name: &str, timestamp: OffsetDateTime, text: &str) -> String {
+/// helper serves `append_human_message`, `rebuild`, and the M4 gate
+/// input (`wake::GateMessage::content`): one render helper keeps the
+/// gate input consistent with the live context, and makes the rebuild
+/// bit-identical. On a format failure the HH:MM part falls back to
+/// "??:??" (the pattern of tamako-agent/src/pipeline.rs).
+pub fn render_human_content(display_name: &str, timestamp: OffsetDateTime, text: &str) -> String {
     let hhmm = timestamp
         .to_offset(UtcOffset::UTC)
         .format(HHMM_FORMAT)
