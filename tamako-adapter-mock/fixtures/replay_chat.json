@@ -121,8 +121,11 @@
       "type": "reaction",
       "platform_msg_id": "50",
       "timestamp": "2026-08-01T13:11:00Z",
-      "sender_id": "100002",
-      "emoji": "👍"
+      "reactor_id": "100002",
+      "anonymous": false,
+      "aggregated": false,
+      "old_emojis": [],
+      "new_emojis": ["👍"]
     },
     {
       "type": "edited_message",

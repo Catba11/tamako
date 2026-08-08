@@ -13,6 +13,10 @@ pub enum AdapterError {
     /// The outbound action sink failed.
     #[error("adapter sink failed: {0}")]
     Sink(String),
+    /// The adapter does not support this outbound action in this phase
+    /// (example: SendMedia is Phase 3 territory; the pet's replies are text).
+    #[error("outbound action not supported by this adapter: {0}")]
+    Unsupported(String),
 }
 
 /// Rule A1: platform-specific types stay inside the adapter. The actor sees

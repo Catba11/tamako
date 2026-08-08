@@ -140,6 +140,35 @@ pub struct DeadLetterRow {
     pub created_at: OffsetDateTime,
 }
 
+/// A new reaction event row. Refer to specs.md Section 5.2.
+#[derive(Debug, Clone)]
+pub struct NewReaction {
+    pub platform_msg_id: String,
+    /// `None` for aggregated count updates with no reactor identity.
+    pub reactor_user_id: Option<String>,
+    pub anonymous: bool,
+    pub aggregated: bool,
+    /// JSON array of emoji strings before the event.
+    pub old_emojis: Vec<String>,
+    /// JSON array of emoji strings after the event.
+    pub new_emojis: Vec<String>,
+    pub timestamp: OffsetDateTime,
+}
+
+/// A row of the `reactions` table. Refer to specs.md Section 5.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionRow {
+    pub id: i64,
+    pub platform_msg_id: String,
+    /// `None` for aggregated count updates with no reactor identity.
+    pub reactor_user_id: Option<String>,
+    pub anonymous: bool,
+    pub aggregated: bool,
+    pub old_emojis: Vec<String>,
+    pub new_emojis: Vec<String>,
+    pub timestamp: OffsetDateTime,
+}
+
 /// Synchronous store rooted at one data root. One connection per group,
 /// opened lazily and cached. Refer to specs.md Section 5.
 pub struct Store {
@@ -432,6 +461,58 @@ impl Store {
         })
     }
 
+    // --- reactions (specs.md Section 5.2) ---
+
+    /// specs.md Section 5.2: one row per reaction event on a group
+    /// message. Reaction data is not recoverable later, so collection
+    /// starts at intake time in Phase 1. Idempotent: INSERT OR IGNORE
+    /// over the reactions_dedup index (AGENT.md Section 6.2). A
+    /// reconnect redelivers the same reaction update; the redelivery
+    /// lands as a Duplicate.
+    pub fn insert_reaction(&self, chat_id: &str, reaction: &NewReaction) -> Result<InsertOutcome> {
+        self.with_conn(chat_id, |conn| {
+            let timestamp = schema::format_rfc3339(reaction.timestamp)?;
+            let old_emojis = serialize_emojis(&reaction.old_emojis)?;
+            let new_emojis = serialize_emojis(&reaction.new_emojis)?;
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO reactions (
+                    platform_msg_id, reactor_user_id, anonymous, aggregated,
+                    old_emojis, new_emojis, timestamp
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    reaction.platform_msg_id,
+                    reaction.reactor_user_id,
+                    reaction.anonymous,
+                    reaction.aggregated,
+                    old_emojis,
+                    new_emojis,
+                    timestamp,
+                ],
+            )?;
+            if n == 0 {
+                Ok(InsertOutcome::Duplicate)
+            } else {
+                Ok(InsertOutcome::Inserted(conn.last_insert_rowid()))
+            }
+        })
+    }
+
+    /// All reaction rows ordered by rowid. Used by tests and the Phase 2
+    /// warmup backoff. Refer to specs.md Section 5.2.
+    pub fn list_reactions(&self, chat_id: &str) -> Result<Vec<ReactionRow>> {
+        self.with_conn(chat_id, |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, platform_msg_id, reactor_user_id, anonymous, aggregated,
+                        old_emojis, new_emojis, timestamp
+                 FROM reactions ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], reaction_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// Opens the group connection when it is not cached, then runs `f`
     /// on it.
     fn with_conn<T>(
@@ -482,6 +563,39 @@ fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         reply_to_platform_msg_id: row.get("reply_to_platform_msg_id")?,
         mentions_bot: row.get("mentions_bot")?,
         is_reply_to_bot: row.get("is_reply_to_bot")?,
+    })
+}
+
+/// Maps one row of a reactions SELECT to a `ReactionRow`.
+fn reaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReactionRow> {
+    let old_emojis: String = row.get("old_emojis")?;
+    let new_emojis: String = row.get("new_emojis")?;
+    let timestamp: String = row.get("timestamp")?;
+    Ok(ReactionRow {
+        id: row.get("id")?,
+        platform_msg_id: row.get("platform_msg_id")?,
+        reactor_user_id: row.get("reactor_user_id")?,
+        anonymous: row.get("anonymous")?,
+        aggregated: row.get("aggregated")?,
+        old_emojis: parse_emojis(&old_emojis)?,
+        new_emojis: parse_emojis(&new_emojis)?,
+        timestamp: schema::parse_rfc3339(&timestamp)?,
+    })
+}
+
+/// Serializes an emoji set as a JSON array string. A serialization
+/// failure is a storage failure. It is mapped into the Sqlite variant
+/// the same way schema::format_rfc3339 maps formatting failures.
+fn serialize_emojis(emojis: &[String]) -> Result<String> {
+    serde_json::to_string(emojis)
+        .map_err(|e| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
+}
+
+/// Parses a JSON emoji set from the database. A corrupt stored value
+/// becomes a sqlite conversion error.
+fn parse_emojis(s: &str) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
 
@@ -552,7 +666,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -562,7 +676,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
     }
 
     #[test]
@@ -876,6 +990,149 @@ mod tests {
             .delete_injected_memories_up_to("c1", 20)
             .expect("delete again");
         assert_eq!(deleted_again, 0);
+    }
+
+    fn named_reaction() -> NewReaction {
+        NewReaction {
+            platform_msg_id: "m1".to_string(),
+            reactor_user_id: Some("u1".to_string()),
+            anonymous: false,
+            aggregated: false,
+            old_emojis: vec![],
+            new_emojis: vec!["👍".to_string()],
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
+        }
+    }
+
+    #[test]
+    fn insert_reaction_round_trips_all_three_event_kinds() {
+        // specs.md Section 5.2: one row per reaction event. The three
+        // kinds are a named reaction, an anonymous admin reaction, and
+        // an aggregated count update without a reactor identity.
+        let (_dir, store) = temp_store();
+        let named = named_reaction();
+        let anonymous_admin = NewReaction {
+            platform_msg_id: "m2".to_string(),
+            reactor_user_id: Some("chat:-1001234567890".to_string()),
+            anonymous: true,
+            aggregated: false,
+            old_emojis: vec!["👍".to_string()],
+            new_emojis: vec!["👍".to_string(), "❤".to_string()],
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("valid timestamp"),
+        };
+        let aggregated_count = NewReaction {
+            platform_msg_id: "m1".to_string(),
+            reactor_user_id: None,
+            anonymous: false,
+            aggregated: true,
+            old_emojis: vec![],
+            new_emojis: vec!["👍".to_string()],
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_200).expect("valid timestamp"),
+        };
+
+        assert!(matches!(
+            store.insert_reaction("c1", &named).expect("insert named"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store
+                .insert_reaction("c1", &anonymous_admin)
+                .expect("insert anonymous admin"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store
+                .insert_reaction("c1", &aggregated_count)
+                .expect("insert aggregated"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        let rows = store.list_reactions("c1").expect("list");
+        assert_eq!(rows.len(), 3);
+
+        let row = &rows[0];
+        assert_eq!(row.platform_msg_id, named.platform_msg_id);
+        assert_eq!(row.reactor_user_id, named.reactor_user_id);
+        assert_eq!(row.anonymous, named.anonymous);
+        assert_eq!(row.aggregated, named.aggregated);
+        assert_eq!(row.old_emojis, named.old_emojis);
+        assert_eq!(row.new_emojis, named.new_emojis);
+        assert_eq!(row.timestamp, named.timestamp);
+
+        let row = &rows[1];
+        assert_eq!(row.platform_msg_id, anonymous_admin.platform_msg_id);
+        assert_eq!(row.reactor_user_id, anonymous_admin.reactor_user_id);
+        assert_eq!(row.anonymous, anonymous_admin.anonymous);
+        assert_eq!(row.aggregated, anonymous_admin.aggregated);
+        assert_eq!(row.old_emojis, anonymous_admin.old_emojis);
+        assert_eq!(row.new_emojis, anonymous_admin.new_emojis);
+        assert_eq!(row.timestamp, anonymous_admin.timestamp);
+
+        let row = &rows[2];
+        assert_eq!(row.platform_msg_id, aggregated_count.platform_msg_id);
+        assert_eq!(row.reactor_user_id, None);
+        assert_eq!(row.anonymous, aggregated_count.anonymous);
+        assert_eq!(row.aggregated, aggregated_count.aggregated);
+        assert_eq!(row.old_emojis, aggregated_count.old_emojis);
+        assert_eq!(row.new_emojis, aggregated_count.new_emojis);
+        assert_eq!(row.timestamp, aggregated_count.timestamp);
+    }
+
+    #[test]
+    fn insert_reaction_is_idempotent_and_keeps_distinct_reactors() {
+        // AGENT.md Section 6.2: a reconnect redelivers the same reaction
+        // update. The redelivery lands as a Duplicate.
+        let (_dir, store) = temp_store();
+        let reaction = named_reaction();
+
+        let first = store
+            .insert_reaction("c1", &reaction)
+            .expect("first insert");
+        let second = store
+            .insert_reaction("c1", &reaction)
+            .expect("duplicate insert");
+
+        assert!(matches!(first, InsertOutcome::Inserted(_)));
+        assert_eq!(second, InsertOutcome::Duplicate);
+        assert_eq!(store.list_reactions("c1").expect("list").len(), 1);
+
+        // Two different named reactors on the same message, with the same
+        // emoji sets and timestamp, both land. The reactor is part of the
+        // dedup key.
+        let other_reactor = NewReaction {
+            reactor_user_id: Some("u2".to_string()),
+            ..reaction.clone()
+        };
+        assert!(matches!(
+            store
+                .insert_reaction("c1", &other_reactor)
+                .expect("insert second reactor"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        let rows = store.list_reactions("c1").expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].reactor_user_id, Some("u1".to_string()));
+        assert_eq!(rows[1].reactor_user_id, Some("u2".to_string()));
+    }
+
+    #[test]
+    fn negative_telegram_group_chat_id_is_accepted() {
+        // Rule P5: Telegram group chat ids are negative integers. The
+        // path-safety validation must accept them.
+        let (dir, store) = temp_store();
+        let chat_id = "-1001234567890";
+        store.open_group(chat_id).expect("open negative chat id");
+        assert!(dir.path().join(chat_id).join("store.db").is_file());
+
+        let reaction = named_reaction();
+        assert!(matches!(
+            store.insert_reaction(chat_id, &reaction).expect("insert"),
+            InsertOutcome::Inserted(_)
+        ));
+        let rows = store.list_reactions(chat_id).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].platform_msg_id, reaction.platform_msg_id);
     }
 
     #[test]

@@ -75,6 +75,32 @@ CREATE TABLE dead_letter (
 ALTER TABLE injected_memories ADD COLUMN content TEXT NOT NULL DEFAULT '';
 ",
     ),
+    (
+        3,
+        "\
+-- The reactions table of specs.md Section 5.2. One row per reaction
+-- event on a group message. Reaction data is not recoverable later, so
+-- collection starts at intake time in Phase 1. The Phase 2 warmup
+-- backoff consumes this table.
+CREATE TABLE reactions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform_msg_id TEXT NOT NULL,
+    reactor_user_id TEXT,
+    anonymous       INTEGER NOT NULL DEFAULT 0,
+    aggregated      INTEGER NOT NULL DEFAULT 0,
+    old_emojis      TEXT NOT NULL DEFAULT '[]',
+    new_emojis      TEXT NOT NULL DEFAULT '[]',
+    timestamp       TEXT NOT NULL
+);
+
+-- Idempotent intake (AGENT.md Section 6.2): a reconnect redelivers the
+-- same reaction update. COALESCE normalizes the NULL reactor (anonymous
+-- aggregated updates) into the dedup key.
+CREATE UNIQUE INDEX reactions_dedup
+    ON reactions (platform_msg_id, COALESCE(reactor_user_id, ''),
+                  old_emojis, new_emojis, timestamp);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.

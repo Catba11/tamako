@@ -169,8 +169,11 @@ mod tests {
         let reaction: ReactionEvent = serde_json::from_value(serde_json::json!({
             "platform_msg_id": "7",
             "timestamp": "2026-08-01T13:00:00Z",
-            "sender_id": "100002",
-            "emoji": "👍",
+            "reactor_id": "100002",
+            "anonymous": false,
+            "aggregated": false,
+            "old_emojis": [],
+            "new_emojis": ["👍"],
         }))
         .expect("reaction must deserialize");
         let converted = InboundEvent::from(FixtureEvent::Reaction(reaction.clone()));
@@ -179,8 +182,11 @@ mod tests {
         };
         assert_eq!(got.platform_msg_id, reaction.platform_msg_id);
         assert_eq!(got.timestamp, reaction.timestamp);
-        assert_eq!(got.sender_id, reaction.sender_id);
-        assert_eq!(got.emoji, reaction.emoji);
+        assert_eq!(got.reactor_id, reaction.reactor_id);
+        assert_eq!(got.anonymous, reaction.anonymous);
+        assert_eq!(got.aggregated, reaction.aggregated);
+        assert_eq!(got.old_emojis, reaction.old_emojis);
+        assert_eq!(got.new_emojis, reaction.new_emojis);
 
         let member: MemberEvent = serde_json::from_value(serde_json::json!({
             "timestamp": "2026-08-01T13:00:00Z",

@@ -17,14 +17,24 @@ pub struct NormalizedMessage {
     pub is_reply_to_bot: bool,
 }
 
-/// A reaction on a message. Refer to specs.md Section 4.1, rule A2.
+/// A reaction on a message. Refer to specs.md Section 4.1, rule A2, and
+/// Section 5.2 for the reaction table.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReactionEvent {
     pub platform_msg_id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
-    pub sender_id: String,
-    pub emoji: String,
+    /// The reactor. `None` when the platform gives no reactor identity
+    /// (aggregated count updates).
+    pub reactor_id: Option<String>,
+    /// True when the reactor acted anonymously (sent as a chat; the
+    /// reactor_id then carries the synthetic `chat:{id}` form).
+    pub anonymous: bool,
+    /// True for aggregated count updates (weak signal, no per-user data).
+    pub aggregated: bool,
+    /// The emoji sets before and after the event (specs.md Section 5.2).
+    pub old_emojis: Vec<String>,
+    pub new_emojis: Vec<String>,
 }
 
 /// A member join or leave event. Refer to specs.md Section 4.1, rule A2.
@@ -58,18 +68,25 @@ impl InboundEvent {
 }
 
 /// Rule A3: outbound actions.
+///
+/// Every variant carries its target `chat_id` as the first field. The live
+/// adapter serves several groups from one update stream, so the action must
+/// carry its target chat. Rule P5: nothing crosses groups.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutboundAction {
     SendText {
+        chat_id: String,
         text: String,
         reply_to_platform_msg_id: Option<String>,
     },
     SendMedia {
+        chat_id: String,
         media_ref: String,
         caption: Option<String>,
         reply_to_platform_msg_id: Option<String>,
     },
     React {
+        chat_id: String,
         platform_msg_id: String,
         emoji: String,
     },

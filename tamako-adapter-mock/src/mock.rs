@@ -107,8 +107,11 @@ mod tests {
                     "type": "reaction",
                     "platform_msg_id": "1",
                     "timestamp": "2026-08-01T13:01:00Z",
-                    "sender_id": "100002",
-                    "emoji": "👍",
+                    "reactor_id": "100002",
+                    "anonymous": false,
+                    "aggregated": false,
+                    "old_emojis": [],
+                    "new_emojis": ["👍"],
                 },
                 {
                     "type": "member_join",
@@ -159,6 +162,7 @@ mod tests {
 
         adapter
             .execute(OutboundAction::SendText {
+                chat_id: "-1001".to_string(),
                 text: "hello".to_string(),
                 reply_to_platform_msg_id: None,
             })
@@ -166,6 +170,7 @@ mod tests {
             .expect("execute must succeed");
         adapter
             .execute(OutboundAction::React {
+                chat_id: "-1001".to_string(),
                 platform_msg_id: "1".to_string(),
                 emoji: "❤️".to_string(),
             })
@@ -173,6 +178,7 @@ mod tests {
             .expect("execute must succeed");
         adapter
             .execute(OutboundAction::SendMedia {
+                chat_id: "-1001".to_string(),
                 media_ref: "photo:cat".to_string(),
                 caption: Some("a cat".to_string()),
                 reply_to_platform_msg_id: Some("1".to_string()),
