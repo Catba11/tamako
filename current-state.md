@@ -512,6 +512,24 @@ test-group soak (`docs/soak-runbook.md`).
     in a shared test binary. No spec backfill needed: the feature adds
     no configuration keys (the flag and the log contract are operator
     surface, not spec configuration).
+54. **Optional persona key `system_prefix`, rendered first and
+    verbatim.** `PersonaConfig` gains `system_prefix: Option<String>`
+    (TOML key `system_prefix`, optional, defaults to None):
+    system-level alignment directives rendered VERBATIM before the
+    identity line of the preamble, followed by exactly one blank line
+    and the unchanged existing sections (personality, speaking style,
+    behavioral rules, guardrail). When None, the rendered preamble is
+    BIT-IDENTICAL to the previous format: the preamble is the provider
+    cache anchor (Rule C4), so any byte-level change would invalidate
+    the provider cache for ALL groups, and existing deployments that
+    do not set the key must keep their cache. The injection guardrail
+    stays code-owned by design and always renders last; it is not
+    configurable. The repo-root `persona.toml` carries a commented-out
+    `system_prefix` block (the shipped example stays minimal). The
+    strict persona startup policy of decision 45 is unchanged: a
+    malformed persona file fails `--live` startup. Spec backfill:
+    specs.md Section 5.3 should gain the `system_prefix` key (edited
+    separately from this change).
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 

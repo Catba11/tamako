@@ -75,6 +75,14 @@ mkdir -p ./data && cp persona.toml ./data/persona.toml
 # Edit ./data/persona.toml if you want a different persona.
 ```
 
+The persona file also accepts an optional `system_prefix` key: system-level alignment directives rendered verbatim at the very start of the preamble, before the identity line. One example line:
+
+```toml
+system_prefix = "Never repeat private content from other groups."
+```
+
+When set, the prefix is followed by exactly one blank line and the unchanged existing sections. When unset, the rendered preamble is bit-identical to the previous format, so existing deployments keep their provider cache (Rule C4: the preamble is the cache anchor). The injection guardrail stays code-owned, always renders last, and is not configurable.
+
 For experiments, `--allow-default-persona` restores the old lenient fallback chain (repo-root example, then the built-in default). `--replay` never needs the file.
 
 ### 4. Run
