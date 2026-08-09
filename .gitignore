@@ -17,3 +17,4 @@
 .env.*
 !.env.example
 tamako.toml
+*.swp
