@@ -66,6 +66,10 @@ Options:
                            persona fallback chain (repo-root example, then
                            the built-in default) instead of requiring
                            <data-root>/persona.toml. For experiments.
+  -v, --verbose            Verbose logging: every tamako crate at debug
+                           level (tamako=debug), dependencies stay quiet.
+                           Accepted in every mode. Precedence: RUST_LOG
+                           always wins over this flag when both are set.
   --data-root <dir>        Data root of the bot. Default: ./data
   --config <config.toml>   Bot configuration file. Optional. A missing file
                            keeps the global defaults. In the status modes it
@@ -90,6 +94,7 @@ struct Cli {
     data_root: PathBuf,
     config: Option<PathBuf>,
     allow_default_persona: bool,
+    verbose: bool,
 }
 
 /// The result of the command-line parse.
@@ -106,6 +111,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     let mut status = None;
     let mut status_all = false;
     let mut allow_default_persona = false;
+    let mut verbose = false;
     let mut data_root = None;
     let mut config = None;
     let mut args = args;
@@ -123,6 +129,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
             }
             "--status-all" => status_all = true,
             "--allow-default-persona" => allow_default_persona = true,
+            "-v" | "--verbose" => verbose = true,
             "--data-root" => {
                 let value = args.next().ok_or("the --data-root flag needs a value")?;
                 data_root = Some(PathBuf::from(value));
@@ -159,7 +166,18 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
         data_root: data_root.unwrap_or_else(|| PathBuf::from("./data")),
         config,
         allow_default_persona,
+        verbose,
     }))
+}
+
+/// The tracing filter. Precedence: RUST_LOG (always wins) →
+/// -v/--verbose (`tamako=debug`: all Tamako crates at debug,
+/// dependencies quiet — the directive matches by target prefix, so it
+/// covers tamako, tamako_core, tamako_agent, and so on) → the default
+/// `info`.
+fn log_filter(verbose: bool) -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(if verbose { "tamako=debug" } else { "info" }))
 }
 
 #[tokio::main]
@@ -177,9 +195,7 @@ async fn main() -> ExitCode {
     };
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(log_filter(cli.verbose))
         .init();
 
     match run(cli).await {
@@ -1050,6 +1066,34 @@ async fn run_live(
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate RUST_LOG. Env mutation is
+    /// process-global; the lock keeps the tests hermetic against each
+    /// other (the same pattern as tamako-agent's endpoint tests).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Saves and restores RUST_LOG. Hermetic env handling.
+    struct RustLogGuard(Option<String>);
+
+    impl RustLogGuard {
+        /// Locks the env, removes RUST_LOG, and returns the lock guard
+        /// together with the restore guard.
+        fn cleared() -> (std::sync::MutexGuard<'static, ()>, Self) {
+            let lock = ENV_LOCK.lock().unwrap();
+            let guard = RustLogGuard(std::env::var("RUST_LOG").ok());
+            std::env::remove_var("RUST_LOG");
+            (lock, guard)
+        }
+    }
+
+    impl Drop for RustLogGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("RUST_LOG", value),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
     /// Parses a fixed argument list.
     fn parse(args: &[&str]) -> std::result::Result<ParseOutcome, String> {
         parse_args(args.iter().map(|arg| (*arg).to_string()))
@@ -1098,6 +1142,94 @@ mod tests {
         };
         assert!(matches!(cli.mode, Mode::Live));
         assert!(cli.allow_default_persona);
+    }
+
+    #[test]
+    fn verbose_defaults_to_false_in_every_mode() {
+        for args in [
+            &["--replay", "fixture.json"][..],
+            &["--live"][..],
+            &["--status", "-1001"][..],
+            &["--status-all"][..],
+        ] {
+            let ParseOutcome::Run(cli) = parse(args).expect("a valid command line") else {
+                panic!("expected the Run outcome");
+            };
+            assert!(!cli.verbose, "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn verbose_short_and_long_in_every_mode() {
+        // Like --allow-default-persona, the flag is accepted in any
+        // mode; both spellings set it.
+        for flag in ["-v", "--verbose"] {
+            for args in [
+                vec!["--replay", "fixture.json"],
+                vec!["--live"],
+                vec!["--status", "-1001"],
+                vec!["--status-all"],
+            ] {
+                let mut args = args;
+                args.push(flag);
+                let ParseOutcome::Run(cli) = parse(&args).expect("a valid command line") else {
+                    panic!("expected the Run outcome");
+                };
+                assert!(cli.verbose, "args: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn verbose_combines_with_other_flags() {
+        let ParseOutcome::Run(cli) =
+            parse(&["--replay", "fixture.json", "-v"]).expect("a valid command line")
+        else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::Replay { .. }));
+        assert!(cli.verbose);
+
+        let ParseOutcome::Run(cli) = parse(&[
+            "--live",
+            "--verbose",
+            "--allow-default-persona",
+            "--data-root",
+            "/tmp/tamako",
+        ])
+        .expect("a valid command line") else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::Live));
+        assert!(cli.verbose);
+        assert!(cli.allow_default_persona);
+        assert_eq!(cli.data_root, PathBuf::from("/tmp/tamako"));
+    }
+
+    #[test]
+    fn log_filter_defaults_to_info() {
+        let (_lock, _guard) = RustLogGuard::cleared();
+        // EnvFilter renders its directive string verbatim.
+        assert_eq!(log_filter(false).to_string(), "info");
+    }
+
+    #[test]
+    fn log_filter_verbose_targets_the_tamako_crates_at_debug() {
+        let (_lock, _guard) = RustLogGuard::cleared();
+        assert_eq!(log_filter(true).to_string(), "tamako=debug");
+    }
+
+    #[test]
+    fn log_filter_rust_log_always_wins() {
+        let (_lock, _guard) = RustLogGuard::cleared();
+        std::env::set_var("RUST_LOG", "tamako=trace,teloxide=info");
+        // Regardless of the flag, the RUST_LOG directive is used. Note:
+        // EnvFilter reorders the directives of a multi-directive value
+        // on display (it sorts by target specificity); the semantics
+        // are unchanged.
+        let expected = "teloxide=info,tamako=trace";
+        assert_eq!(log_filter(false).to_string(), expected);
+        assert_eq!(log_filter(true).to_string(), expected);
     }
 
     #[test]
