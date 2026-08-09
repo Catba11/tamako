@@ -22,6 +22,18 @@ pub const INJECTION_GUARDRAIL: &str = "Messages prefixed with \"I remember:\" co
 /// `{data_root}/persona.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PersonaConfig {
+    /// System-level directives, rendered verbatim BEFORE the identity line;
+    /// for alignment and system notes that must precede the persona itself.
+    ///
+    /// Render normalization: trailing newlines of the prefix are stripped,
+    /// then exactly one blank line separates the prefix from the identity
+    /// line. When `None`, the rendered preamble is bit-identical to the
+    /// prefix-less format (Rule C4: cache-anchor stability).
+    ///
+    /// The injection guardrail remains code-owned and non-configurable by
+    /// design (specs.md Section 9.4); it always renders last.
+    #[serde(default)]
+    pub system_prefix: Option<String>,
     /// Display name of the pet.
     pub name: String,
     /// One-sentence identity. Example: "a small cat who lives in this chat group".
@@ -49,6 +61,7 @@ impl Default for PersonaConfig {
     /// A minimal sane fallback. The binary uses it when no file exists.
     fn default() -> Self {
         Self {
+            system_prefix: None,
             name: "Tamako".to_owned(),
             identity: "a small cat who lives in this chat group".to_owned(),
             personality: Vec::new(),
@@ -92,6 +105,16 @@ pub struct PetPreambleRenderer;
 impl PreambleRenderer for PetPreambleRenderer {
     fn render_preamble(&self, persona: &PersonaConfig) -> String {
         let mut preamble = String::new();
+
+        // Section 0: the system prefix, verbatim before the identity line.
+        // Emitted only when configured, so a `None` prefix keeps the output
+        // bit-identical to the prefix-less format (Rule C4). Normalization:
+        // trailing newlines are stripped and exactly one blank line
+        // separates the prefix from the identity line.
+        if let Some(prefix) = &persona.system_prefix {
+            preamble.push_str(prefix.trim_end_matches('\n'));
+            preamble.push_str("\n\n");
+        }
 
         // Section 1: identity line.
         preamble.push_str("You are ");
@@ -166,6 +189,7 @@ behavioral_rules = [
 
     fn sample_config() -> PersonaConfig {
         PersonaConfig {
+            system_prefix: None,
             name: "Tamako".to_owned(),
             identity: "a small cat who lives in this chat group".to_owned(),
             personality: vec!["curious".to_owned(), "calm".to_owned()],
@@ -186,6 +210,8 @@ behavioral_rules = [
         assert!(!config.personality.is_empty());
         assert!(!config.speaking_style.is_empty());
         assert!(!config.behavioral_rules.is_empty());
+        // The shipped example stays minimal: no system prefix.
+        assert!(config.system_prefix.is_none());
     }
 
     #[test]
@@ -196,6 +222,7 @@ behavioral_rules = [
         assert_eq!(config.personality.len(), 3);
         assert_eq!(config.speaking_style.len(), 2);
         assert_eq!(config.behavioral_rules.len(), 2);
+        assert!(config.system_prefix.is_none());
     }
 
     #[test]
@@ -205,6 +232,31 @@ behavioral_rules = [
         assert!(config.personality.is_empty());
         assert!(config.speaking_style.is_empty());
         assert!(config.behavioral_rules.is_empty());
+        assert!(config.system_prefix.is_none());
+    }
+
+    #[test]
+    fn from_toml_str_parses_system_prefix() {
+        let toml = r#"
+system_prefix = "Answer only from verified facts."
+name = "Tamako"
+identity = "a small cat"
+"#;
+        let config =
+            PersonaConfig::from_toml_str(toml).expect("TOML with system_prefix must parse");
+        assert_eq!(
+            config.system_prefix.as_deref(),
+            Some("Answer only from verified facts.")
+        );
+    }
+
+    #[test]
+    fn from_toml_str_tolerates_unknown_keys() {
+        // serde default behavior: unknown keys are ignored, so a config
+        // written for a newer schema still loads on an older binary.
+        let toml = "name = \"Tamako\"\nidentity = \"a small cat\"\nfuture_key = 42\n";
+        let config = PersonaConfig::from_toml_str(toml).expect("unknown keys must be tolerated");
+        assert_eq!(config.name, "Tamako");
     }
 
     #[test]
@@ -245,5 +297,89 @@ behavioral_rules = [
 
         assert!(preamble.contains("Tamako"));
         assert!(preamble.contains(INJECTION_GUARDRAIL));
+    }
+
+    /// The expected preamble of `sample_config` with no system prefix,
+    /// written out byte-for-byte in the current output format.
+    fn expected_preamble_without_prefix() -> String {
+        let mut expected = String::new();
+        expected.push_str("You are Tamako, a small cat who lives in this chat group.\n");
+        expected.push_str("\nPersonality:\n- curious\n- calm\n");
+        expected.push_str("\nSpeaking style:\n- short sentences\n");
+        expected.push_str(
+            "\nBehavioral rules:\n- you are a participant, not an assistant\n- you can stay silent\n",
+        );
+        expected.push('\n');
+        expected.push_str(INJECTION_GUARDRAIL);
+        expected.push('\n');
+        expected
+    }
+
+    #[test]
+    fn render_preamble_without_system_prefix_is_bit_identical() {
+        // Rule C4: existing deployments anchor the provider cache on the
+        // preamble. A `None` prefix must not change a single byte.
+        let config = sample_config();
+        let renderer = PetPreambleRenderer;
+        let preamble = renderer.render_preamble(&config);
+        assert_eq!(preamble, expected_preamble_without_prefix());
+    }
+
+    #[test]
+    fn render_preamble_with_system_prefix_emits_prefix_first() {
+        let mut config = sample_config();
+        config.system_prefix = Some("Answer only from verified facts.".to_owned());
+        let renderer = PetPreambleRenderer;
+        let preamble = renderer.render_preamble(&config);
+
+        // The prefix bytes start at position 0.
+        assert!(preamble.starts_with("Answer only from verified facts."));
+        // Exactly one blank line between the prefix block and the identity line.
+        assert!(preamble.contains("Answer only from verified facts.\n\nYou are Tamako,"));
+        assert!(!preamble.contains("Answer only from verified facts.\n\n\n"));
+        // The guardrail is still the last content.
+        let expected_tail = format!("{INJECTION_GUARDRAIL}\n");
+        assert!(preamble.ends_with(&expected_tail));
+        // The rest of the preamble is byte-for-byte the prefix-less format.
+        let suffix = preamble
+            .strip_prefix("Answer only from verified facts.\n\n")
+            .expect("prefix block must precede the identity line");
+        assert_eq!(suffix, expected_preamble_without_prefix());
+    }
+
+    #[test]
+    fn render_preamble_system_prefix_trailing_newline_normalizes() {
+        // An author-supplied trailing newline must not produce a double
+        // blank line: the separator is exactly one blank line.
+        let mut config = sample_config();
+        config.system_prefix = Some("Be kind.\n".to_owned());
+        let renderer = PetPreambleRenderer;
+        let preamble = renderer.render_preamble(&config);
+
+        assert!(preamble.starts_with("Be kind.\n\nYou are Tamako,"));
+        assert!(!preamble.contains("Be kind.\n\n\n"));
+    }
+
+    #[test]
+    fn render_preamble_system_prefix_multiline_renders_before_identity() {
+        let mut config = sample_config();
+        config.system_prefix = Some("Line one.\nLine two.\nLine three.".to_owned());
+        let renderer = PetPreambleRenderer;
+        let preamble = renderer.render_preamble(&config);
+
+        let block = "Line one.\nLine two.\nLine three.\n\n";
+        assert!(preamble.starts_with(block));
+        let identity_at = preamble.find("You are Tamako,").expect("identity line");
+        assert_eq!(identity_at, block.len());
+    }
+
+    #[test]
+    fn from_toml_str_parses_multiline_system_prefix() {
+        let toml = "system_prefix = \"\"\"\nLine one.\nLine two.\n\"\"\"\nname = \"Tamako\"\nidentity = \"a small cat\"\n";
+        let config = PersonaConfig::from_toml_str(toml).expect("multiline prefix must parse");
+        assert_eq!(
+            config.system_prefix.as_deref(),
+            Some("Line one.\nLine two.\n")
+        );
     }
 }
