@@ -11,3 +11,9 @@
 
 # OS noise
 .DS_Store
+
+# Local secrets and real configuration. Never commit keys or group ids.
+.env
+.env.*
+!.env.example
+tamako.toml

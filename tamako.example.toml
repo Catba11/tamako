@@ -1,0 +1,63 @@
+# Tamako configuration template.
+#
+# Copy this file to `tamako.toml` and fill in your values:
+#
+#     cp tamako.example.toml tamako.toml
+#
+# `tamako.toml` is gitignored. Never commit real group ids or endpoints.
+#
+# Precedence, highest first (specs.md Section 13):
+#   1. environment variables (TAMAKO_*)
+#   2. per-purpose keys in this file
+#   3. global keys in this file
+#   4. built-in defaults
+
+[global]
+# ---------------------------------------------------------------- LLM ----
+# API family: "anthropic-compatible" or "openai-compatible".
+# The family selects the wire format only, never the vendor (specs.md 3).
+llm_api = "openai-compatible"
+
+# Base URL of the endpoint, used verbatim.
+# Opencode Go, chat/completions models (Grok, GLM, Kimi, DeepSeek, MiMo, Hy3):
+llm_base_url = "https://opencode.ai/zen/go/v1"
+#
+# Opencode Go, MiniMax/Qwen models (Anthropic Messages format):
+#   llm_api      = "anthropic-compatible"
+#   llm_base_url = "https://opencode.ai/zen/go/v1/messages"
+
+# ------------------------------------------------------------- Models ----
+# One model per purpose. Cheap tiers for the high-frequency purposes:
+# Opencode Go limits are dollar-valued (DeepSeek V4 Flash allows ~31k
+# requests per 5 h, Kimi K3 only ~110). Choose accordingly.
+digest_model = "mimo-v2.5"      # extraction (Section 10)
+gate_model = "mimo-v2.5-pro"    # participation decision + recall gate (9.6)
+reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
+
+# Per-purpose endpoint overrides for mixed deployments. Example:
+# reply_llm_api      = "anthropic-compatible"
+# reply_llm_base_url = "https://opencode.ai/zen/go/v1/messages"
+
+# Structured-output mode per endpoint: schema | json_object | prompt_only
+# (Available once the openai-compatible robustness fix lands; default
+# "schema". Run `cargo run -p tamako-agent --example probe_endpoint`
+# to learn what your endpoint honors.)
+# structured_output = "schema"
+
+# ------------------------------------------------------------ Triggers ----
+# All optional. Defaults in specs.md Section 13.
+# wake_msg_count = 5
+# wake_interval_secs = 3600
+# wake_floor_secs = 300
+# digest_max_messages = 100
+# digest_timeout_secs = 21600
+# digest_max_retries = 5        # total attempts, including the first
+# monologue_limit = 2
+# reply_staleness_threshold = 20
+# recall_injection_cap = 5
+
+# -------------------------------------------------------------- Groups ----
+# One table per group. An empty table registers the group with defaults.
+# Telegram supergroup ids are negative and start with -100. Quote them.
+[groups."-1001234567890"]
+# Per-group trigger overrides go here, same keys as [global].
