@@ -456,6 +456,7 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
         gate: Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
             participate: true,
             target_row_id: Some(3),
+            reason: None,
         }])),
         reply: Arc::new(ScriptedReplyGenerator::with_replies(vec!["r1".to_string()])),
     };
@@ -577,10 +578,12 @@ async fn an_injected_edge_is_not_reinjected_in_the_same_chunk() {
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: None,
             },
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: None,
             },
         ])),
         reply: Arc::new(ScriptedReplyGenerator::failing(
@@ -667,6 +670,7 @@ async fn no_candidates_means_no_injection_and_no_relevance_call() {
         gate: Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
             participate: false,
             target_row_id: None,
+            reason: None,
         }])),
         reply: Arc::new(ScriptedReplyGenerator::failing(
             "a gate-no wake never reaches the reply model",
@@ -720,6 +724,7 @@ async fn a_restart_rebuilds_the_injection_bit_identically() {
         gate: Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
             participate: false,
             target_row_id: None,
+            reason: None,
         }])),
         reply: Arc::new(ScriptedReplyGenerator::failing(
             "a gate-no wake never reaches the reply model",

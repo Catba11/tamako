@@ -82,6 +82,10 @@ pub struct GateDecision {
     /// The raw-log row id of the message the reply targets. `None` when
     /// `participate` is false.
     pub target_row_id: Option<i64>,
+    /// The gate's own reason string (telemetry only; it lands on the
+    /// curated wake log line). `None` for the scripted and forced paths
+    /// that never consulted the gate model.
+    pub reason: Option<String>,
 }
 
 /// The recall seam (Section 9 step 2; Sections 9.1-9.5). The wake

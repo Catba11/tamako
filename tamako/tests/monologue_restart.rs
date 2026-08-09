@@ -406,6 +406,7 @@ async fn monologue_lock_survives_a_restart_and_unlocks_on_a_human_message() {
     let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
         participate: true,
         target_row_id: Some(9),
+        reason: None,
     }]));
     let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec!["r3".to_string()]));
     let harness = spawn_on(&fixture, config, t0, gate, reply);

@@ -117,16 +117,20 @@ pub fn render_gate_prompt(input: &GateInput) -> String {
 ///   than a wrong reply (conservative fallback + debug log).
 /// - Otherwise the decision passes through.
 fn gate_decision_from_output(output: GateOutput, presented: &[GateMessage]) -> GateDecision {
+    // The gate's own reason string rides along on every outcome
+    // (telemetry only: the curated wake log line).
     if !output.participate {
         return GateDecision {
             participate: false,
             target_row_id: None,
+            reason: Some(output.reason),
         };
     }
     match output.target_msg_id {
         Some(row_id) if presented.iter().any(|message| message.row_id == row_id) => GateDecision {
             participate: true,
             target_row_id: Some(row_id),
+            reason: Some(output.reason),
         },
         other => {
             tracing::debug!(
@@ -136,6 +140,7 @@ fn gate_decision_from_output(output: GateOutput, presented: &[GateMessage]) -> G
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: Some(output.reason),
             }
         }
     }
@@ -277,6 +282,9 @@ impl ParticipationGate for ScriptedGate {
                     Ok(decisions.pop_front().unwrap_or(GateDecision {
                         participate: false,
                         target_row_id: None,
+                        // The scripted path never consulted the gate
+                        // model: no reason string.
+                        reason: None,
                     }))
                 }
                 ScriptedGateMode::Failing(message) => Err(CoreError::Wake(message.clone())),
@@ -431,6 +439,7 @@ mod tests {
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: Some("nothing to add".to_string()),
             }
         );
     }
@@ -448,6 +457,7 @@ mod tests {
             GateDecision {
                 participate: true,
                 target_row_id: Some(42),
+                reason: Some("Bob asked for a recommendation".to_string()),
             }
         );
     }
@@ -467,6 +477,7 @@ mod tests {
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: Some("hallucinated id".to_string()),
             }
         );
     }
@@ -484,6 +495,7 @@ mod tests {
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: Some("no target".to_string()),
             }
         );
     }
@@ -493,6 +505,7 @@ mod tests {
         let gate = ScriptedGate::with_decisions(vec![GateDecision {
             participate: true,
             target_row_id: Some(41),
+            reason: None,
         }]);
         let first = gate.decide(&sample_input()).await.expect("first");
         assert_eq!(
@@ -500,6 +513,7 @@ mod tests {
             GateDecision {
                 participate: true,
                 target_row_id: Some(41),
+                reason: None,
             }
         );
         let second = gate.decide(&sample_input()).await.expect("second");
@@ -508,6 +522,7 @@ mod tests {
             GateDecision {
                 participate: false,
                 target_row_id: None,
+                reason: None,
             }
         );
         assert_eq!(gate.inputs().len(), 2);

@@ -344,6 +344,7 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
     let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
         participate: true,
         target_row_id: Some(12),
+        reason: Some("a question the pet can answer".to_string()),
     }]));
     let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
         "r1".to_string(),
@@ -462,6 +463,7 @@ async fn gate_no_sends_nothing() {
     let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
         participate: false,
         target_row_id: None,
+        reason: Some("nothing to add".to_string()),
     }]));
     let reply = Arc::new(ScriptedReplyGenerator::failing(
         "the reply model must not be called on a no",
@@ -602,6 +604,7 @@ async fn monologue_lock_suppresses_unforced_wakes_until_a_human_message() {
     let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
         participate: true,
         target_row_id: Some(7),
+        reason: None,
     }]));
     let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
         "r1".to_string(),
@@ -729,6 +732,7 @@ async fn stale_reply_is_discarded() {
     let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
         participate: true,
         target_row_id: Some(1),
+        reason: None,
     }]));
     let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
         "r1-stale".to_string(),

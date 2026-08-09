@@ -242,7 +242,9 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                     node_count,
                     edge_count,
                 }) => {
-                    tracing::info!(
+                    // The actor's curated `digest` line supersedes this
+                    // one; the extraction detail stays at debug.
+                    tracing::debug!(
                         chat_id,
                         batch_id = %frame.batch_id,
                         nodes = node_count,
@@ -271,7 +273,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                         attempt,
                         delay_ms = delay.as_millis() as u64,
                         error = %error,
-                        "digest attempt failed; retrying with the same batch id"
+                        "digest attempt failed; retry scheduled"
                     );
                     tokio::time::sleep(delay).await;
                 }

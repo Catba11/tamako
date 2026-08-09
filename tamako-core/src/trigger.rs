@@ -30,6 +30,27 @@ pub struct WakeScheduler {
     current_interval: Duration,
 }
 
+/// Which condition of the wake trigger fired (specs.md Section 8.3).
+/// Telemetry only: `fire_reason` reports the reason of a fire; it never
+/// changes the scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireReason {
+    /// `msgs_since_wake >= wake_msg_count`.
+    MessageCount,
+    /// `now - last_wake_at >= current_interval`.
+    Interval,
+}
+
+impl FireReason {
+    /// The telemetry spelling of the reason (the curated wake log line).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FireReason::MessageCount => "message_count",
+            FireReason::Interval => "interval",
+        }
+    }
+}
+
 /// Converts a `std::time::Duration` to a `time::Duration`. A `std` duration
 /// is never negative, so the conversion can only fail on overflow. The
 /// saturating fallback covers that case.
@@ -95,14 +116,27 @@ impl WakeScheduler {
     /// `now - last_wake_at >= current_interval` — AND the floor holds:
     /// `now - last_wake_at >= wake_floor`.
     pub fn should_fire(&self, now: OffsetDateTime, config: &TriggerConfig) -> bool {
+        self.fire_reason(now, config).is_some()
+    }
+
+    /// Like `should_fire`, but reports WHICH condition fired (`None`
+    /// when the trigger does not fire). The count wins when both hold
+    /// (it is checked first). `should_fire` delegates to this method,
+    /// so the two can never diverge.
+    pub fn fire_reason(&self, now: OffsetDateTime, config: &TriggerConfig) -> Option<FireReason> {
         let elapsed = now - self.last_wake_at;
         // The floor caps the cost in very active groups where
         // `wake_msg_count` messages can arrive in seconds.
         if elapsed < to_time_duration(config.wake_floor) {
-            return false;
+            return None;
         }
-        self.msgs_since_wake >= config.wake_msg_count
-            || elapsed >= to_time_duration(self.current_interval)
+        if self.msgs_since_wake >= config.wake_msg_count {
+            Some(FireReason::MessageCount)
+        } else if elapsed >= to_time_duration(self.current_interval) {
+            Some(FireReason::Interval)
+        } else {
+            None
+        }
     }
 
     /// Resets the counter and the timer. Rolls a fresh jitter factor so the
@@ -457,6 +491,103 @@ mod tests {
         // for every possible jitter roll.
         scheduler.record_message(); // one message, far below the count
         assert!(scheduler.should_fire(start + time::Duration::minutes(20), &config));
+    }
+
+    #[test]
+    fn fire_reason_reports_the_count_when_the_count_fires() {
+        // A large interval: only the count can fire inside this test.
+        let config = TriggerConfig {
+            wake_interval: Duration::from_secs(24 * 60 * 60),
+            ..TriggerConfig::default()
+        };
+        let mut rng = StdRng::seed_from_u64(29);
+        let start = now();
+        let mut scheduler = WakeScheduler::new(&config, start, &mut rng);
+        for _ in 0..config.wake_msg_count {
+            scheduler.record_message();
+        }
+        let at = start + config.wake_floor;
+        assert_eq!(
+            scheduler.fire_reason(at, &config),
+            Some(FireReason::MessageCount)
+        );
+        // One message below the count: no fire, no reason.
+        let mut rng = StdRng::seed_from_u64(29);
+        let mut scheduler = WakeScheduler::new(&config, start, &mut rng);
+        for _ in 0..config.wake_msg_count - 1 {
+            scheduler.record_message();
+        }
+        assert_eq!(scheduler.fire_reason(at, &config), None);
+    }
+
+    #[test]
+    fn fire_reason_reports_the_interval_when_the_interval_fires() {
+        // A short interval and a count that stays out of reach.
+        let config = TriggerConfig {
+            wake_interval: Duration::from_secs(10 * 60),
+            ..TriggerConfig::default()
+        };
+        let mut rng = StdRng::seed_from_u64(31);
+        let start = now();
+        let mut scheduler = WakeScheduler::new(&config, start, &mut rng);
+        scheduler.record_message(); // one message, far below the count
+                                    // After 20 minutes the interval has elapsed for every jitter roll.
+        let at = start + time::Duration::minutes(20);
+        assert_eq!(
+            scheduler.fire_reason(at, &config),
+            Some(FireReason::Interval)
+        );
+        // Inside the interval: no fire, no reason.
+        assert_eq!(
+            scheduler.fire_reason(start + config.wake_floor, &config),
+            None
+        );
+    }
+
+    #[test]
+    fn fire_reason_is_none_before_the_floor_elapses() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(37);
+        let start = now();
+        let mut scheduler = WakeScheduler::new(&config, start, &mut rng);
+        for _ in 0..config.wake_msg_count {
+            scheduler.record_message();
+        }
+        // The count threshold is reached, but only one minute elapsed:
+        // the floor suppresses the fire and the reason.
+        assert_eq!(
+            scheduler.fire_reason(start + time::Duration::minutes(1), &config),
+            None
+        );
+    }
+
+    #[test]
+    fn fire_reason_prefers_the_count_when_both_conditions_hold() {
+        // A short interval: after 20 minutes both the count and the
+        // interval hold; the count is checked first, so it wins.
+        let config = TriggerConfig {
+            wake_interval: Duration::from_secs(10 * 60),
+            ..TriggerConfig::default()
+        };
+        let mut rng = StdRng::seed_from_u64(41);
+        let start = now();
+        let mut scheduler = WakeScheduler::new(&config, start, &mut rng);
+        for _ in 0..config.wake_msg_count {
+            scheduler.record_message();
+        }
+        let at = start + time::Duration::minutes(20);
+        assert!(scheduler.should_fire(at, &config));
+        assert_eq!(
+            scheduler.fire_reason(at, &config),
+            Some(FireReason::MessageCount)
+        );
+    }
+
+    #[test]
+    fn fire_reason_spellings_are_stable() {
+        // The telemetry spellings of the curated wake log line.
+        assert_eq!(FireReason::MessageCount.as_str(), "message_count");
+        assert_eq!(FireReason::Interval.as_str(), "interval");
     }
 
     #[test]

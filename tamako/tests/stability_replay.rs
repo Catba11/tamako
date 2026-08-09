@@ -474,10 +474,12 @@ async fn stability_loop_digests_wakes_injections_and_restarts() {
                 GateDecision {
                     participate: true,
                     target_row_id: Some(base + 3),
+                    reason: None,
                 },
                 GateDecision {
                     participate: true,
                     target_row_id: Some(base + 8),
+                    reason: None,
                 },
             ]
         })

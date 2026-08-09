@@ -131,6 +131,16 @@ pub struct WakeReport {
     /// The injection position: the tail raw-log row id computed at
     /// wake start (Rule C2: the injection directly follows this row).
     pub injection_position: i64,
+    /// The trigger that started this wake (telemetry for the curated
+    /// wake log line): `"forced"`, or the `FireReason` spelling of the
+    /// fire site.
+    pub trigger: &'static str,
+    /// The gate outcome of this wake (telemetry for the curated wake
+    /// log line): `"participate"`, `"silent"`, or `"bypassed_forced"`.
+    pub gate: &'static str,
+    /// The gate's own reason string, when the gate ran (telemetry for
+    /// the curated wake log line). `None` for a forced wake.
+    pub gate_reason: Option<String>,
 }
 
 /// Commands of the per-group actor inbox. specs.md Section 6.1, rule 1:
@@ -377,6 +387,33 @@ fn timer_period(config: &TriggerConfig) -> Duration {
     } else {
         cadence
     }
+}
+
+/// The curated wake log line: exactly one `info` line per wake, message
+/// string exactly `wake`, emitted once at wake completion (or at the
+/// point the wake was suppressed/skipped). `reason` (the gate's own
+/// reason string) and `reply_to` (the target's platform message id)
+/// appear only when present.
+#[allow(clippy::too_many_arguments)]
+fn log_wake_line(
+    chat_id: &str,
+    trigger: &'static str,
+    injections: usize,
+    gate: &'static str,
+    reason: Option<&str>,
+    action: &'static str,
+    reply_to: Option<&str>,
+) {
+    info!(
+        chat_id = %chat_id,
+        trigger,
+        injections,
+        gate,
+        reason = reason,
+        action,
+        reply_to = reply_to,
+        "wake"
+    );
 }
 
 /// Evaluates the digest trigger (specs.md Section 8.2). On fire, spawns
@@ -641,6 +678,7 @@ async fn run_actor<M: MemoryBackend>(
                             &inbox_sender,
                             Some(forcing),
                             forced_at,
+                            "forced",
                         )
                         .await?;
                     }
@@ -650,24 +688,48 @@ async fn run_actor<M: MemoryBackend>(
                 digest_in_flight = false;
                 match result {
                     Ok(Some(outcome)) => {
-                        let (batch_id, kind) = match &outcome {
-                            DigestOutcome::Extracted { batch_id, .. } => {
-                                (batch_id.as_str(), "extracted")
-                            }
-                            DigestOutcome::Skeleton { batch_id, .. } => {
-                                (batch_id.as_str(), "skeleton")
-                            }
-                            DigestOutcome::DeadLettered { batch_id, .. } => {
-                                (batch_id.as_str(), "dead_lettered")
-                            }
-                        };
-                        info!(
-                            chat_id = %chat_id,
-                            batch_id,
-                            outcome_kind = kind,
-                            new_boundary = outcome.new_boundary(),
-                            "digest completed"
-                        );
+                        // The boundaries of this digest's range, read
+                        // BEFORE the session mutation below: the curated
+                        // line renders the range `(b_old, b_new]`.
+                        let b_old = session.last_digest_boundary_msg_id;
+                        let b_new = outcome.new_boundary();
+                        // The curated digest line: exactly one `info`
+                        // line per completed digest, message string
+                        // exactly `digest`. A dead-lettered batch keeps
+                        // the pipeline's ERROR line (specs.md Section
+                        // 10.3) as its one line; the actor line drops
+                        // to debug.
+                        let range = format!("({b_old},{b_new}]");
+                        match &outcome {
+                            DigestOutcome::Extracted {
+                                batch_id,
+                                node_count,
+                                edge_count,
+                                ..
+                            } => info!(
+                                chat_id = %chat_id,
+                                batch_id = %batch_id,
+                                range = %range,
+                                outcome = "written",
+                                nodes = node_count,
+                                edges = edge_count,
+                                "digest"
+                            ),
+                            DigestOutcome::Skeleton { batch_id, .. } => info!(
+                                chat_id = %chat_id,
+                                batch_id = %batch_id,
+                                range = %range,
+                                outcome = "skeleton",
+                                "digest"
+                            ),
+                            DigestOutcome::DeadLettered { batch_id, .. } => debug!(
+                                chat_id = %chat_id,
+                                batch_id = %batch_id,
+                                range = %range,
+                                outcome = "dead_lettered",
+                                "digest"
+                            ),
+                        }
                         // Rule C3 context removal with the one-chunk
                         // lag. Only items at or below the PREVIOUS
                         // boundary go; the chunk just digested,
@@ -679,8 +741,6 @@ async fn run_actor<M: MemoryBackend>(
                         // stays in the raw log and its content lags out
                         // of the context mechanically at the next
                         // digest.
-                        let b_old = session.last_digest_boundary_msg_id;
-                        let b_new = outcome.new_boundary();
                         context.remove_at_or_below(b_old);
                         // Prune the dedup set (specs.md Section 10.2
                         // step 4) at the same cutoff.
@@ -847,14 +907,16 @@ async fn handle_message(
     )
     .await?;
     let Some(services) = wake_services else {
-        // The M1-M3 stub behavior, kept EXACTLY for `wake: None`: an
-        // unforced fire logs and resets; a forced wake logs only.
+        // The wake services are disabled (no LLM key wired): an
+        // unforced fire logs and resets, a forced wake logs only. The
+        // startup warning already covers the disabled state, so these
+        // lines stay at debug.
         if msg.mentions_bot || msg.is_reply_to_bot {
             // specs.md Section 8.1: the bot must respond when addressed
             // directly. The muted state does not suppress a forced wake.
-            info!(chat_id = %chat_id, "forced wake requested (stub)");
+            debug!(chat_id = %chat_id, "wake services disabled; forced wake ignored");
         } else if wake.should_fire(now, config) {
-            info!(chat_id = %chat_id, "wake trigger fired (stub)");
+            debug!(chat_id = %chat_id, "wake services disabled; wake trigger ignored");
             reset_wake(config, session, wake, rng, now);
             persist_session(store, chat_id, session).await?;
         }
@@ -878,7 +940,8 @@ async fn handle_message(
             // Section 6.2: a forced Wake moves to the head of the queue;
             // it does not preempt a running call. It starts immediately
             // after the current wake completes. A second forced wake
-            // replaces the queued one (the newest address wins).
+            // replaces the queued one (the newest address wins). The
+            // queued wake gets its own curated line at completion.
             debug!(chat_id = %chat_id, "a wake is in flight; the forced wake is queued");
             *forced_pending = Some((forcing, now));
         } else {
@@ -895,15 +958,25 @@ async fn handle_message(
                 inbox_sender,
                 Some(forcing),
                 now,
+                "forced",
             )
             .await?;
         }
-    } else if wake.should_fire(now, config) {
+    } else if let Some(reason) = wake.fire_reason(now, config) {
         if *wake_in_flight {
             // Section 6.2: inbound messages during a running wake do not
             // interrupt the call. Thanks to reset-at-start their counts
-            // already go toward the next wake, so this fire is a no-op.
-            debug!(chat_id = %chat_id, "wake fired while a wake is in flight; skipped");
+            // already go toward the next wake, so this fire is a no-op;
+            // the curated line reports the skip.
+            log_wake_line(
+                chat_id,
+                reason.as_str(),
+                0,
+                "in_flight_skipped",
+                None,
+                "nothing",
+                None,
+            );
         } else {
             start_wake(
                 store,
@@ -918,6 +991,7 @@ async fn handle_message(
                 inbox_sender,
                 None,
                 now,
+                reason.as_str(),
             )
             .await?;
         }
@@ -958,19 +1032,29 @@ async fn handle_tick(
     )
     .await?;
     let Some(services) = wake_services else {
-        // The M1-M3 stub behavior, kept EXACTLY for `wake: None`.
+        // The wake services are disabled (no LLM key wired); the
+        // behavior matches the intake path exactly.
         if wake.should_fire(now, config) {
-            info!(chat_id = %chat_id, "wake timer fired (stub)");
+            debug!(chat_id = %chat_id, "wake services disabled; wake trigger ignored");
             reset_wake(config, session, wake, rng, now);
             persist_session(store, chat_id, session).await?;
         }
         return Ok(());
     };
-    if wake.should_fire(now, config) {
+    if let Some(reason) = wake.fire_reason(now, config) {
         if *wake_in_flight {
             // Same rule as the intake path: the counts already go toward
-            // the next wake (reset-at-start), so this fire is a no-op.
-            debug!(chat_id = %chat_id, "wake fired while a wake is in flight; skipped");
+            // the next wake (reset-at-start), so this fire is a no-op;
+            // the curated line reports the skip.
+            log_wake_line(
+                chat_id,
+                reason.as_str(),
+                0,
+                "in_flight_skipped",
+                None,
+                "nothing",
+                None,
+            );
         } else {
             start_wake(
                 store,
@@ -985,6 +1069,7 @@ async fn handle_tick(
                 inbox_sender,
                 None,
                 now,
+                reason.as_str(),
             )
             .await?;
         }
@@ -995,7 +1080,9 @@ async fn handle_tick(
 /// The wake procedure of specs.md Section 9, steps 1-5, actor side.
 /// Runs inside the actor loop; only the LLM calls leave the loop (they
 /// run in a spawned task over owned data and report back through the
-/// FIFO inbox as `WakeCompleted`).
+/// FIFO inbox as `WakeCompleted`). `trigger` is the telemetry spelling
+/// of what started this wake (`"forced"` or a `FireReason`); it lands
+/// on the curated wake log line.
 #[allow(clippy::too_many_arguments)]
 async fn start_wake(
     store: &Arc<Store>,
@@ -1010,6 +1097,7 @@ async fn start_wake(
     inbox_sender: &mpsc::Sender<ActorCommand>,
     forced: Option<GateMessage>,
     now: OffsetDateTime,
+    trigger: &'static str,
 ) -> Result<(), CoreError> {
     // Step 1 (Sections 9 and 8.5): the monologue lock suppresses an
     // unforced wake. A forced wake is never suppressed (Section 8.1).
@@ -1020,7 +1108,7 @@ async fn start_wake(
         bump_counter(store, chat_id, "wakes_total").await;
         reset_wake(config, session, wake, rng, now);
         persist_session(store, chat_id, session).await?;
-        info!(chat_id = %chat_id, "wake suppressed by the monologue lock");
+        log_wake_line(chat_id, trigger, 0, "muted", None, "nothing", None);
         return Ok(());
     }
 
@@ -1068,7 +1156,7 @@ async fn start_wake(
     // here. An interval wake over a silent group must not burn an LLM
     // call. The counter/timer reset already happened in step 3.
     if forced.is_none() && new_messages.is_empty() {
-        debug!(chat_id = %chat_id, "wake over a silent group; no participation decision needed");
+        log_wake_line(chat_id, trigger, 0, "silent", None, "nothing", None);
         return Ok(());
     }
 
@@ -1094,6 +1182,7 @@ async fn start_wake(
             snapshot,
             forced,
             tail_id,
+            trigger,
         )
         .await;
         // A failed send means the actor is shutting down; the result is
@@ -1108,7 +1197,9 @@ async fn start_wake(
 /// spawned task over owned data; touches NO actor state (specs.md
 /// Section 6.1, rule 2). `injection_position` is the tail raw-log row
 /// id computed at wake start; the completion handler uses it as the
-/// Rule C2 position of the injections.
+/// Rule C2 position of the injections. `trigger` is the telemetry
+/// spelling of what started this wake; it passes through to the report
+/// for the curated wake log line.
 #[allow(clippy::too_many_arguments)]
 async fn run_wake_calls(
     chat_id: &str,
@@ -1119,6 +1210,7 @@ async fn run_wake_calls(
     mut snapshot: Vec<ContextMessage>,
     forced: Option<GateMessage>,
     injection_position: i64,
+    trigger: &'static str,
 ) -> Result<WakeReport, CoreError> {
     // Step 2 (Sections 9.1-9.5): recall before the gate. The rendered
     // injection texts enter the gate input (Section 9.6: the recall
@@ -1147,6 +1239,8 @@ async fn run_wake_calls(
         Some(forcing) => GateDecision {
             participate: true,
             target_row_id: Some(forcing.row_id),
+            // A forced wake never consulted the gate: no reason string.
+            reason: None,
         },
         None => {
             gate.decide(&GateInput {
@@ -1156,6 +1250,21 @@ async fn run_wake_calls(
             })
             .await?
         }
+    };
+    // The telemetry of the curated wake log line: the forced path
+    // reports the bypass; an unforced wake reports the decision and
+    // carries the gate's own reason string.
+    let (gate_outcome, gate_reason) = if forced_flag {
+        ("bypassed_forced", None)
+    } else {
+        (
+            if decision.participate {
+                "participate"
+            } else {
+                "silent"
+            },
+            decision.reason.clone(),
+        )
     };
     // Target resolution. An id outside the presented set is treated as
     // no-participation (the gate named a message the wake never saw).
@@ -1192,6 +1301,9 @@ async fn run_wake_calls(
         reply_text,
         injections,
         injection_position,
+        trigger,
+        gate: gate_outcome,
+        gate_reason,
     })
 }
 
@@ -1256,6 +1368,15 @@ async fn handle_wake_report(
     let (Some(target), Some(text)) = (report.target, report.reply_text) else {
         // The gate said no: nothing is sent. Only `wakes_total` (and
         // possibly `injection_wakes_total` above) was counted.
+        log_wake_line(
+            chat_id,
+            report.trigger,
+            report.injections.len(),
+            report.gate,
+            report.gate_reason.as_deref(),
+            "nothing",
+            None,
+        );
         return Ok(());
     };
     // The recency re-check (Section 6.2): when too many newer human
@@ -1269,11 +1390,22 @@ async fn handle_wake_report(
     })
     .await?;
     if newer > config.reply_staleness_threshold {
-        info!(
+        // The detail fields of the discard stay at debug; the curated
+        // line below is the one info line of this wake.
+        debug!(
             chat_id = %chat_id,
             newer,
             threshold = config.reply_staleness_threshold,
             "wake reply discarded: the conversation moved on"
+        );
+        log_wake_line(
+            chat_id,
+            report.trigger,
+            report.injections.len(),
+            report.gate,
+            report.gate_reason.as_deref(),
+            "discarded_stale",
+            None,
         );
         return Ok(());
     }
@@ -1340,6 +1472,16 @@ async fn handle_wake_report(
     // rule 4.
     bump_counter(store, chat_id, "participations_total").await;
     persist_session(store, chat_id, session).await?;
+    // The curated line of this wake: the reply went out.
+    log_wake_line(
+        chat_id,
+        report.trigger,
+        report.injections.len(),
+        report.gate,
+        report.gate_reason.as_deref(),
+        "reply_sent",
+        Some(&target.platform_msg_id),
+    );
     Ok(())
 }
 
@@ -2318,6 +2460,9 @@ mod tests {
                 Ok(GateDecision {
                     participate,
                     target_row_id,
+                    // The scripted double never consulted the gate
+                    // model: no reason string.
+                    reason: None,
                 })
             })
         }
