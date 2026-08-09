@@ -125,19 +125,20 @@ impl KnowledgeExtractor for RigExtractor {
         Box<dyn std::future::Future<Output = Result<KnowledgeGraph, AgentError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let text = self
-                .client
-                .complete(
+            // The shared structured flow of the endpoint layer: one
+            // completion with the schema (the resolved mode decides
+            // how it reaches the wire) plus the one-shot repair retry
+            // on a schema validation failure.
+            self.client
+                .complete_structured::<KnowledgeGraph>(
                     // The preamble becomes the system message.
                     Some(EXTRACTION_PREAMBLE.to_string()),
                     vec![Message::user(render_extraction_prompt(input))],
-                    // The output schema maps to native structured output.
-                    Some(schemars::schema_for!(KnowledgeGraph)),
+                    schemars::schema_for!(KnowledgeGraph),
                     self.max_tokens,
+                    "invalid graph JSON",
                 )
-                .await?;
-            serde_json::from_str::<KnowledgeGraph>(&text)
-                .map_err(|error| AgentError::Extraction(format!("invalid graph JSON: {error}")))
+                .await
         })
     }
 }

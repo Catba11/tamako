@@ -177,6 +177,7 @@ pub trait RelevanceGate: Send + Sync {
 /// The system preamble of the relevance-gate call (Section 9.2).
 pub const RECALL_PREAMBLE: &str = "\
 You select memories for a group pet. The pet is a member of a group chat. Before the pet speaks, it recalls memories of the group.
+Output shape (field names exactly as written): {\"selected\":[<1-based integers>],\"reason\":\"...\"}
 
 Rules:
 1. Read the new group messages. Read the candidate memories.
@@ -227,8 +228,17 @@ pub struct RecallSelection {
     /// The 1-based numbers of the candidate memories to inject,
     /// in descending relevance. Empty when nothing is worth
     /// injecting (the normal case).
+    ///
+    /// The `indices`/`numbers` aliases tolerate field-name drift of
+    /// endpoints that ignore the output schema and free-generate.
+    /// Aliases affect deserialization only: serialization and the
+    /// schemars schema keep the canonical name.
+    #[serde(alias = "indices", alias = "numbers")]
     pub selected: Vec<u32>,
     /// One short reason.
+    ///
+    /// The `rationale` alias tolerates endpoint field-name drift.
+    #[serde(alias = "rationale")]
     pub reason: String,
 }
 
@@ -294,23 +304,21 @@ impl RelevanceGate for RigRelevanceGate {
         Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let text = self
+            // The shared structured flow of the endpoint layer
+            // (schema per the resolved mode, one-shot repair retry).
+            let selection = self
                 .client
-                .complete(
+                .complete_structured::<RecallSelection>(
                     // The preamble becomes the system message.
                     Some(RECALL_PREAMBLE.to_string()),
                     vec![Message::user(render_recall_prompt(input))],
-                    // The output schema maps to native structured output.
-                    Some(schemars::schema_for!(RecallSelection)),
+                    schemars::schema_for!(RecallSelection),
                     self.max_tokens,
+                    "invalid recall gate JSON",
                 )
-                .await?;
-            let selection = serde_json::from_str::<RecallSelection>(&text)
                 // A malformed output is an AgentError; the caller maps
                 // ANY gate failure to "inject nothing" (Section 9.2).
-                .map_err(|error| {
-                    AgentError::Extraction(format!("invalid recall gate JSON: {error}"))
-                })?;
+                .await?;
             Ok(zero_based_indices(&selection))
         })
     }
@@ -775,6 +783,10 @@ mod tests {
         assert!(RECALL_PREAMBLE.contains("select nothing"));
         assert!(RECALL_PREAMBLE.contains("the normal case"));
         assert!(RECALL_PREAMBLE.contains("the JSON object of the required schema"));
+        // The preamble states the exact output field names (a minimal
+        // skeleton): field names must not rely on schema enforcement.
+        assert!(RECALL_PREAMBLE.contains("\"selected\""));
+        assert!(RECALL_PREAMBLE.contains("\"reason\""));
     }
 
     #[test]
@@ -790,6 +802,42 @@ mod tests {
         let schema_json = serde_json::to_string(&schema).expect("schema to json");
         assert!(schema_json.contains("selected"));
         assert!(schema_json.contains("reason"));
+    }
+
+    #[test]
+    fn field_name_aliases_deserialize_into_the_canonical_struct() {
+        // Endpoints that ignore the output schema free-generate; the
+        // aliases tolerate the observed field-name drift
+        // (deserialization only).
+        let selection: RecallSelection =
+            serde_json::from_str(r#"{"indices":[2,1],"rationale":"r"}"#).expect("aliases");
+        assert_eq!(
+            selection,
+            RecallSelection {
+                selected: vec![2, 1],
+                reason: "r".to_string(),
+            }
+        );
+        let selection: RecallSelection =
+            serde_json::from_str(r#"{"numbers":[],"reason":"r"}"#).expect("numbers alias");
+        assert!(selection.selected.is_empty());
+    }
+
+    #[test]
+    fn serialization_keeps_the_canonical_field_names() {
+        // Aliases affect deserialization only: the serialized JSON
+        // keeps the canonical names, so downstream readers never see
+        // the drift spellings.
+        let selection = RecallSelection {
+            selected: vec![1],
+            reason: "r".to_string(),
+        };
+        let value = serde_json::to_value(&selection).expect("to value");
+        assert!(value.get("selected").is_some());
+        assert!(value.get("reason").is_some());
+        assert!(value.get("indices").is_none());
+        assert!(value.get("numbers").is_none());
+        assert!(value.get("rationale").is_none());
     }
 
     #[test]
@@ -844,6 +892,7 @@ mod tests {
             api: crate::endpoint::LlmApi::AnthropicCompatible,
             base_url: None,
             model: "claude-haiku-4-5".to_string(),
+            structured_output: crate::endpoint::StructuredOutputMode::Schema,
         };
         let result = RigRelevanceGate::from_endpoint(&endpoint);
         if let Some(key) = saved_key {

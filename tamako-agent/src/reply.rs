@@ -398,6 +398,7 @@ mod tests {
             api: crate::endpoint::LlmApi::AnthropicCompatible,
             base_url: None,
             model: "claude-sonnet-4-5".to_string(),
+            structured_output: crate::endpoint::StructuredOutputMode::Schema,
         };
         let result = RigReplyGenerator::from_endpoint(&endpoint);
         if let Some(key) = saved_key {

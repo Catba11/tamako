@@ -78,6 +78,20 @@ pub struct TriggerConfig {
     /// step 4). `None` (the default) means the agent crate's built-in
     /// main model.
     pub reply_model: Option<String>,
+    /// How the structured calls enforce their output shape on the wire:
+    /// `schema` (the default), `json_object`, or `prompt_only`. `None`
+    /// means the agent layer resolves the default. Deviation: specs.md
+    /// Section 13 has no such key; reported for spec backfill.
+    pub structured_output: Option<String>,
+    /// The digest-purpose override of `structured_output`. Refer to
+    /// `structured_output` (reported for spec backfill).
+    pub digest_structured_output: Option<String>,
+    /// The gate-purpose override of `structured_output`. Refer to
+    /// `structured_output` (reported for spec backfill).
+    pub gate_structured_output: Option<String>,
+    /// The reply-purpose override of `structured_output`. Refer to
+    /// `structured_output` (reported for spec backfill).
+    pub reply_structured_output: Option<String>,
     /// specs.md Section 6.2 recency re-check: when more than this many
     /// newer human messages arrived after the target message, the
     /// generated reply is DISCARDED, not regenerated. Default 20.
@@ -124,6 +138,10 @@ impl Default for TriggerConfig {
             reply_llm_base_url: None,
             gate_model: None,
             reply_model: None,
+            structured_output: None,
+            digest_structured_output: None,
+            gate_structured_output: None,
+            reply_structured_output: None,
             reply_staleness_threshold: 20,
             recall_injection_cap: 5,
             warmup_quota_min: 1,
@@ -177,6 +195,18 @@ pub struct TriggerConfigToml {
     pub gate_model: Option<String>,
     /// The reply model override. Refer to `TriggerConfig::reply_model`.
     pub reply_model: Option<String>,
+    /// The structured-output mode. Refer to
+    /// `TriggerConfig::structured_output`.
+    pub structured_output: Option<String>,
+    /// The digest-purpose structured-output mode. Refer to
+    /// `TriggerConfig::digest_structured_output`.
+    pub digest_structured_output: Option<String>,
+    /// The gate-purpose structured-output mode. Refer to
+    /// `TriggerConfig::gate_structured_output`.
+    pub gate_structured_output: Option<String>,
+    /// The reply-purpose structured-output mode. Refer to
+    /// `TriggerConfig::reply_structured_output`.
+    pub reply_structured_output: Option<String>,
     /// The recency re-check threshold. Refer to
     /// `TriggerConfig::reply_staleness_threshold`.
     pub reply_staleness_threshold: Option<u32>,
@@ -257,6 +287,18 @@ impl TriggerConfigToml {
         }
         if let Some(value) = &self.reply_model {
             base.reply_model = Some(value.clone());
+        }
+        if let Some(value) = &self.structured_output {
+            base.structured_output = Some(value.clone());
+        }
+        if let Some(value) = &self.digest_structured_output {
+            base.digest_structured_output = Some(value.clone());
+        }
+        if let Some(value) = &self.gate_structured_output {
+            base.gate_structured_output = Some(value.clone());
+        }
+        if let Some(value) = &self.reply_structured_output {
+            base.reply_structured_output = Some(value.clone());
         }
         if let Some(value) = self.reply_staleness_threshold {
             base.reply_staleness_threshold = value;
@@ -376,6 +418,13 @@ wake_floor_secs = 60
         assert_eq!(config.gate_model, None);
         assert_eq!(config.reply_model, None);
         assert_eq!(config.reply_staleness_threshold, 20);
+        // The structured-output mode keys (reported for spec backfill):
+        // every Option is None by default; the agent layer resolves
+        // the default mode.
+        assert_eq!(config.structured_output, None);
+        assert_eq!(config.digest_structured_output, None);
+        assert_eq!(config.gate_structured_output, None);
+        assert_eq!(config.reply_structured_output, None);
         // The M5 key: the injection cap defaults to 5 (Section 9.2
         // conservative default; deviation reported for spec backfill).
         assert_eq!(config.recall_injection_cap, 5);
@@ -460,6 +509,54 @@ reply_staleness_threshold = 3
         assert_eq!(overridden.reply_staleness_threshold, 3);
         // Keys that the override does not set keep the global values.
         assert_eq!(overridden.gate_model.as_deref(), Some("cheap-model"));
+    }
+
+    #[test]
+    fn toml_override_sets_structured_output_modes() {
+        // The structured-output keys follow the same per-key overlay
+        // pattern as every other key (AGENT.md Section 6.3: overridable
+        // per group).
+        let text = r#"
+[global]
+structured_output = "json_object"
+digest_structured_output = "prompt_only"
+
+[groups."-100777"]
+gate_structured_output = "prompt_only"
+reply_structured_output = "json_object"
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        let global = &config.global;
+        assert_eq!(global.structured_output.as_deref(), Some("json_object"));
+        assert_eq!(
+            global.digest_structured_output.as_deref(),
+            Some("prompt_only")
+        );
+        assert_eq!(global.gate_structured_output, None);
+        assert_eq!(global.reply_structured_output, None);
+        // A group override applies the keys the same way; unset keys
+        // keep the global values.
+        let overridden = config.for_group("-100777");
+        assert_eq!(
+            overridden.gate_structured_output.as_deref(),
+            Some("prompt_only")
+        );
+        assert_eq!(
+            overridden.reply_structured_output.as_deref(),
+            Some("json_object")
+        );
+        assert_eq!(overridden.structured_output.as_deref(), Some("json_object"));
+        assert_eq!(
+            overridden.digest_structured_output.as_deref(),
+            Some("prompt_only")
+        );
+        // A group without an override receives the global values.
+        let plain = config.for_group("-100999");
+        assert_eq!(plain.gate_structured_output, None);
+        // Keys that the TOML does not set keep the default (None).
+        let empty = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(empty.global.structured_output, None);
+        assert_eq!(empty.global.digest_structured_output, None);
     }
 
     #[test]

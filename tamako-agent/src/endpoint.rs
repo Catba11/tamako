@@ -33,6 +33,34 @@
 //!   `response_format: { type: "json_schema", ... }`. LIMIT: rig hardcodes
 //!   `strict: true`. An openai-compatible endpoint that does not support
 //!   strict JSON schema may reject the request.
+//! - CAN: OpenAI JSON-object mode. On the chat-completions path,
+//!   `CompletionRequestBuilder::additional_params(serde_json::Value)` is
+//!   merged and `#[serde(flatten)]`ed into the request body, so
+//!   `response_format: { type: "json_object" }` is expressible without a
+//!   schema. The `json_object` structured-output mode uses exactly this.
+//! - CANNOT: Anthropic JSON-object mode. The Anthropic Messages API has
+//!   no json_object response format. On the anthropic-compatible family
+//!   the `json_object` mode cannot be expressed; it degrades to
+//!   prompt-only behavior (no `response_format` at all). The preambles
+//!   state the exact output shape, so the degradation stays usable.
+//!
+//! ## Structured-output modes and the repair retry
+//!
+//! Live extraction against an openai-compatible endpoint that ignores or
+//! mishandles `json_schema` fails intermittently ("missing field").
+//! Two mitigation layers live here:
+//!
+//! 1. [`StructuredOutputMode`]: a per-purpose config of how the schema
+//!    reaches the endpoint — `schema` (rig `output_schema`, the
+//!    default), `json_object` (OpenAI-only `response_format` via
+//!    `additional_params`; degrades to prompt-only on Anthropic), and
+//!    `prompt_only` (no wire-level enforcement at all).
+//! 2. The repair retry of [`EndpointClient::complete_structured`]: when
+//!    the response parses as JSON but fails the typed parse (schema
+//!    validation), ONE repair completion runs on the same endpoint with
+//!    the broken JSON, the validation error, and the schema. A failed
+//!    repair returns the ORIGINAL error, so the caller's backoff and
+//!    dead-letter discipline applies unchanged.
 //! - CHOICE: the default `openai::Client` speaks the Responses API
 //!   (`POST {base}/responses`), which is first-party only in practice. For
 //!   openai-compatible endpoints (vLLM, OpenRouter, self-hosted) this
@@ -72,6 +100,20 @@ pub const GATE_MODEL_ENV_VAR: &str = "TAMAKO_GATE_MODEL";
 
 /// Environment override of the reply model (specs.md Section 13).
 pub const REPLY_MODEL_ENV_VAR: &str = "TAMAKO_REPLY_MODEL";
+
+/// Global environment override of the structured-output mode
+/// (`schema` | `json_object` | `prompt_only`). The per-purpose env vars
+/// take precedence; refer to [`StructuredOutputMode`].
+pub const STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_STRUCTURED_OUTPUT";
+
+/// Environment override of the digest structured-output mode.
+pub const DIGEST_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_DIGEST_STRUCTURED_OUTPUT";
+
+/// Environment override of the gate structured-output mode.
+pub const GATE_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_GATE_STRUCTURED_OUTPUT";
+
+/// Environment override of the reply structured-output mode.
+pub const REPLY_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_REPLY_STRUCTURED_OUTPUT";
 
 /// API key env var of the anthropic-compatible family (specs.md
 /// Section 13: API keys come from the environment only).
@@ -143,6 +185,62 @@ impl std::fmt::Display for LlmApi {
     }
 }
 
+/// How a structured call enforces its output shape on the wire (module
+/// docs). Endpoints that ignore or mishandle `json_schema` need a
+/// weaker mode; the repair retry of `complete_structured` covers the
+/// remaining failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StructuredOutputMode {
+    /// rig `output_schema`: Anthropic native structured output, OpenAI
+    /// `json_schema` response format (rig hardcodes `strict: true`).
+    /// The default.
+    #[default]
+    Schema,
+    /// OpenAI only: `response_format: { type: "json_object" }` via
+    /// `additional_params`. No schema on the wire. On the Anthropic
+    /// family this mode cannot be expressed and degrades to
+    /// prompt-only behavior (module docs).
+    JsonObject,
+    /// No wire-level enforcement: the preamble alone carries the
+    /// output shape.
+    PromptOnly,
+}
+
+impl StructuredOutputMode {
+    /// The config string of the mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StructuredOutputMode::Schema => "schema",
+            StructuredOutputMode::JsonObject => "json_object",
+            StructuredOutputMode::PromptOnly => "prompt_only",
+        }
+    }
+}
+
+/// Parses a mode string. Accepts exactly `schema`, `json_object`, and
+/// `prompt_only`. An unknown mode is a configuration error, never a
+/// silent default (the same discipline as `LlmApi`).
+impl std::str::FromStr for StructuredOutputMode {
+    type Err = AgentError;
+
+    fn from_str(value: &str) -> Result<Self, AgentError> {
+        match value {
+            "schema" => Ok(StructuredOutputMode::Schema),
+            "json_object" => Ok(StructuredOutputMode::JsonObject),
+            "prompt_only" => Ok(StructuredOutputMode::PromptOnly),
+            other => Err(AgentError::ProviderConfig(format!(
+                "unknown structured_output mode {other:?}: expected \"schema\", \"json_object\", or \"prompt_only\""
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for StructuredOutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The LLM purposes of the bot (specs.md Section 13). Each purpose may
 /// override `llm_api` and `llm_base_url` individually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +280,16 @@ impl LlmPurpose {
             LlmPurpose::Reply => DEFAULT_REPLY_MODEL,
         }
     }
+
+    /// The env var that overrides the structured-output mode of the
+    /// purpose.
+    fn structured_output_env_var(&self) -> &'static str {
+        match self {
+            LlmPurpose::Digest => DIGEST_STRUCTURED_OUTPUT_ENV_VAR,
+            LlmPurpose::Gate => GATE_STRUCTURED_OUTPUT_ENV_VAR,
+            LlmPurpose::Reply => REPLY_STRUCTURED_OUTPUT_ENV_VAR,
+        }
+    }
 }
 
 /// The resolved endpoint of one purpose.
@@ -193,6 +301,9 @@ pub struct EndpointConfig {
     pub base_url: Option<String>,
     /// The model name.
     pub model: String,
+    /// The structured-output mode of the purpose
+    /// ([`StructuredOutputMode`], module docs). Default `schema`.
+    pub structured_output: StructuredOutputMode,
 }
 
 /// Plain config-file values for endpoint resolution (specs.md
@@ -223,6 +334,16 @@ pub struct LlmConfigValues {
     pub reply_llm_api: Option<String>,
     /// Reply-specific base URL (`reply_llm_base_url`).
     pub reply_llm_base_url: Option<String>,
+    /// Global structured-output mode (`structured_output`).
+    pub structured_output: Option<String>,
+    /// Digest-specific structured-output mode
+    /// (`digest_structured_output`).
+    pub digest_structured_output: Option<String>,
+    /// Gate-specific structured-output mode (`gate_structured_output`).
+    pub gate_structured_output: Option<String>,
+    /// Reply-specific structured-output mode
+    /// (`reply_structured_output`).
+    pub reply_structured_output: Option<String>,
 }
 
 impl LlmConfigValues {
@@ -252,6 +373,16 @@ impl LlmConfigValues {
             LlmPurpose::Digest => self.digest_model.as_deref(),
             LlmPurpose::Gate => self.gate_model.as_deref(),
             LlmPurpose::Reply => self.reply_model.as_deref(),
+        };
+        value.filter(|value| !value.is_empty())
+    }
+
+    /// The purpose-specific structured-output mode override, when set.
+    fn purpose_structured_output(&self, purpose: LlmPurpose) -> Option<&str> {
+        let value = match purpose {
+            LlmPurpose::Digest => self.digest_structured_output.as_deref(),
+            LlmPurpose::Gate => self.gate_structured_output.as_deref(),
+            LlmPurpose::Reply => self.reply_structured_output.as_deref(),
         };
         value.filter(|value| !value.is_empty())
     }
@@ -286,6 +417,13 @@ impl LlmEndpoints {
     ///   family).
     /// - Model: purpose env (`TAMAKO_DIGEST_MODEL` etc.) → purpose
     ///   config (`digest_model` etc.) → the purpose default.
+    /// - Structured-output mode: purpose env
+    ///   (`TAMAKO_DIGEST_STRUCTURED_OUTPUT` etc.) → global env
+    ///   `TAMAKO_STRUCTURED_OUTPUT` → purpose config
+    ///   (`digest_structured_output` etc.) → global config
+    ///   `structured_output` → default `schema`. An unparsable string
+    ///   (env or config) is `AgentError::ProviderConfig`, never a
+    ///   silent default.
     ///
     /// Empty strings count as unset, in env and config alike.
     pub fn resolve(values: &LlmConfigValues) -> Result<Self, AgentError> {
@@ -325,10 +463,29 @@ impl LlmEndpoints {
         let model = env_value(purpose.model_env_var())
             .or_else(|| values.purpose_model(purpose).map(str::to_string))
             .unwrap_or_else(|| purpose.default_model().to_string());
+        let mode_string = env_value(purpose.structured_output_env_var())
+            .or_else(|| env_value(STRUCTURED_OUTPUT_ENV_VAR))
+            .or_else(|| {
+                values
+                    .purpose_structured_output(purpose)
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                values
+                    .structured_output
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            });
+        let structured_output = match mode_string {
+            Some(value) => value.parse::<StructuredOutputMode>()?,
+            None => StructuredOutputMode::Schema,
+        };
         Ok(EndpointConfig {
             api,
             base_url,
             model,
+            structured_output,
         })
     }
 }
@@ -344,6 +501,9 @@ enum EndpointModel {
 /// per-family rig model types behind one async `complete` call.
 pub struct EndpointClient {
     model: EndpointModel,
+    /// The resolved structured-output mode of the endpoint (module
+    /// docs). `complete` interprets its `output_schema` per this mode.
+    structured_output: StructuredOutputMode,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -357,6 +517,7 @@ impl std::fmt::Debug for EndpointClient {
         };
         f.debug_struct("EndpointClient")
             .field("family", &family)
+            .field("structured_output", &self.structured_output)
             .finish_non_exhaustive()
     }
 }
@@ -390,6 +551,7 @@ impl EndpointClient {
                     .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
                 Ok(EndpointClient {
                     model: EndpointModel::Anthropic(client.completion_model(&endpoint.model)),
+                    structured_output: endpoint.structured_output,
                 })
             }
             LlmApi::OpenAiCompatible => {
@@ -405,6 +567,7 @@ impl EndpointClient {
                     .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
                 Ok(EndpointClient {
                     model: EndpointModel::OpenAi(client.completion_model(&endpoint.model)),
+                    structured_output: endpoint.structured_output,
                 })
             }
         }
@@ -415,8 +578,13 @@ impl EndpointClient {
     /// Prompt convention: the last message is the prompt; the preceding
     /// messages go to the chat history. An empty `messages` sends one
     /// empty user message as the prompt. `preamble` becomes the system
-    /// message. `output_schema` applies only when `Some`. `max_tokens`
-    /// is always set (Anthropic requires it).
+    /// message. `output_schema` is interpreted per the resolved
+    /// structured-output mode (module docs): `Schema` passes it to rig;
+    /// `JsonObject` drops it and adds
+    /// `response_format: { type: "json_object" }` on the OpenAI family
+    /// only (Anthropic degrades to prompt-only); `PromptOnly` drops it
+    /// unconditionally. `max_tokens` is always set (Anthropic requires
+    /// it).
     ///
     /// Errors: provider errors and a response without text content are
     /// `AgentError::Extraction`.
@@ -427,25 +595,93 @@ impl EndpointClient {
         output_schema: Option<schemars::Schema>,
         max_tokens: u64,
     ) -> Result<String, AgentError> {
+        // The mode decides whether the schema reaches the wire and
+        // whether the OpenAI json_object response_format applies.
+        let (output_schema, json_object) = match self.structured_output {
+            StructuredOutputMode::Schema => (output_schema, false),
+            StructuredOutputMode::JsonObject => {
+                (None, matches!(self.model, EndpointModel::OpenAi(_)))
+            }
+            StructuredOutputMode::PromptOnly => (None, false),
+        };
         match &self.model {
             EndpointModel::Anthropic(model) => {
-                complete_with(model, preamble, messages, output_schema, max_tokens).await
+                complete_with(model, preamble, messages, output_schema, max_tokens, false).await
             }
             EndpointModel::OpenAi(model) => {
-                complete_with(model, preamble, messages, output_schema, max_tokens).await
+                complete_with(
+                    model,
+                    preamble,
+                    messages,
+                    output_schema,
+                    max_tokens,
+                    json_object,
+                )
+                .await
             }
         }
+    }
+
+    /// One structured completion with the repair retry of the module
+    /// docs: the shared flow of extraction, gate, and recall.
+    ///
+    /// The first call passes `schema` to `complete` (the resolved mode
+    /// decides how it reaches the wire) and parses the text into `T`.
+    /// A parse failure becomes the ORIGINAL error
+    /// `AgentError::Extraction("{error_label}: {error}")`. When the raw
+    /// text parses as a `serde_json::Value` — it IS JSON but failed
+    /// schema validation — ONE repair completion runs on the same
+    /// endpoint: the broken JSON, the validation error, and the schema,
+    /// with [`REPAIR_PREAMBLE`]. Non-JSON text returns the original
+    /// error immediately (no repair).
+    ///
+    /// A repaired text that parses as `T` is returned (with a warn
+    /// log). A failed repair call OR an unparsable repaired text
+    /// returns the ORIGINAL error, so the caller's backoff and
+    /// dead-letter discipline applies unchanged.
+    pub async fn complete_structured<T>(
+        &self,
+        preamble: Option<String>,
+        messages: Vec<Message>,
+        schema: schemars::Schema,
+        max_tokens: u64,
+        error_label: &str,
+    ) -> Result<T, AgentError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        complete_structured_with(
+            |call| async move {
+                self.complete(
+                    call.preamble,
+                    call.messages,
+                    Some(call.schema),
+                    call.max_tokens,
+                )
+                .await
+            },
+            preamble,
+            messages,
+            schema,
+            max_tokens,
+            error_label,
+        )
+        .await
     }
 }
 
 /// The shared completion flow of both families. The request shape is
-/// identical; only the rig model type differs.
+/// identical; only the rig model type differs. `json_object` adds the
+/// OpenAI `json_object` response format via `additional_params`
+/// (expressible on the chat-completions path only; the caller sets it
+/// for the OpenAI family only).
 async fn complete_with<M>(
     model: &M,
     preamble: Option<String>,
     messages: Vec<Message>,
     output_schema: Option<schemars::Schema>,
     max_tokens: u64,
+    json_object: bool,
 ) -> Result<String, AgentError>
 where
     M: rig::completion::CompletionModel,
@@ -467,6 +703,13 @@ where
         // response_format (rig hardcodes strict: true; see module docs).
         request = request.output_schema(schema);
     }
+    if json_object {
+        // OpenAI chat completions only: additional_params is
+        // serde-flattened into the request body (module docs).
+        request = request.additional_params(serde_json::json!({
+            "response_format": { "type": "json_object" }
+        }));
+    }
     // Always set max_tokens: Anthropic requires it.
     let response = request
         .max_tokens(max_tokens)
@@ -481,6 +724,108 @@ where
             _ => None,
         })
         .ok_or_else(|| AgentError::Extraction("no text content in the response".to_string()))
+}
+
+/// The system preamble of the repair completion (module docs). The
+/// repair fixes structure and field names only; every value stays.
+pub const REPAIR_PREAMBLE: &str = "\
+You repair JSON. Fix the JSON to match the schema. Change nothing else: keep every value, only repair the structure and field names. Output only the repaired JSON.";
+
+/// Renders the user message of the repair completion: the broken JSON,
+/// the validation error, and the target schema as JSON.
+fn render_repair_prompt(
+    broken_json: &str,
+    validation_error: &str,
+    schema: &schemars::Schema,
+) -> String {
+    let schema_json =
+        serde_json::to_string_pretty(schema).unwrap_or_else(|_| format!("{schema:?}"));
+    format!(
+        "The following JSON fails validation:\n\n{broken_json}\n\nValidation error:\n{validation_error}\n\nTarget schema:\n{schema_json}\n\nFix the JSON to match the schema. Change nothing else. Output only the repaired JSON."
+    )
+}
+
+/// The arguments of one completion call of the structured flow (the
+/// first attempt or the repair). Carried through the completion
+/// closure of `complete_structured_with` so tests can capture and
+/// script the calls without a network.
+#[derive(Debug)]
+pub(crate) struct CompletionCall {
+    /// The system preamble.
+    pub(crate) preamble: Option<String>,
+    /// The chat messages; the last is the prompt.
+    pub(crate) messages: Vec<Message>,
+    /// The output schema. How it reaches the wire is the mode's
+    /// decision inside `EndpointClient::complete`.
+    pub(crate) schema: schemars::Schema,
+    /// The max-tokens bound.
+    pub(crate) max_tokens: u64,
+}
+
+/// The two-call flow of `EndpointClient::complete_structured`,
+/// generic over the completion closure so the flow is unit-testable
+/// without a network. `EndpointClient::complete_structured` delegates
+/// with a closure over `EndpointClient::complete`; tests script the
+/// closure. Refer to `complete_structured` for the retry semantics.
+async fn complete_structured_with<T, F, Fut>(
+    complete: F,
+    preamble: Option<String>,
+    messages: Vec<Message>,
+    schema: schemars::Schema,
+    max_tokens: u64,
+    error_label: &str,
+) -> Result<T, AgentError>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(CompletionCall) -> Fut,
+    Fut: std::future::Future<Output = Result<String, AgentError>>,
+{
+    let first = complete(CompletionCall {
+        preamble,
+        messages,
+        schema: schema.clone(),
+        max_tokens,
+    })
+    .await?;
+    let validation_error = match serde_json::from_str::<T>(&first) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    // The ORIGINAL error. A failed repair returns this, never the
+    // repair's own error: the caller's backoff and dead-letter
+    // discipline applies unchanged.
+    let original = AgentError::Extraction(format!("{error_label}: {validation_error}"));
+    // Repair trigger: the text IS JSON but failed the typed parse
+    // (schema validation). Non-JSON text is a different failure class;
+    // no repair attempt.
+    if serde_json::from_str::<serde_json::Value>(&first).is_err() {
+        return Err(original);
+    }
+    let repaired = complete(CompletionCall {
+        preamble: Some(REPAIR_PREAMBLE.to_string()),
+        messages: vec![Message::user(render_repair_prompt(
+            &first,
+            &validation_error.to_string(),
+            &schema,
+        ))],
+        schema,
+        max_tokens,
+    })
+    .await;
+    match repaired {
+        Ok(text) => match serde_json::from_str::<T>(&text) {
+            Ok(value) => {
+                tracing::warn!(
+                    error_label,
+                    "structured output needed a repair completion; the endpoint does not follow the schema reliably"
+                );
+                Ok(value)
+            }
+            Err(_) => Err(original),
+        },
+        // The repair call itself failed: the original error stands.
+        Err(_) => Err(original),
+    }
 }
 
 #[cfg(test)]
@@ -503,6 +848,10 @@ mod tests {
         DIGEST_MODEL_ENV_VAR,
         GATE_MODEL_ENV_VAR,
         REPLY_MODEL_ENV_VAR,
+        STRUCTURED_OUTPUT_ENV_VAR,
+        DIGEST_STRUCTURED_OUTPUT_ENV_VAR,
+        GATE_STRUCTURED_OUTPUT_ENV_VAR,
+        REPLY_STRUCTURED_OUTPUT_ENV_VAR,
         ANTHROPIC_API_KEY_ENV_VAR,
         OPENAI_API_KEY_ENV_VAR,
     ];
@@ -590,6 +939,7 @@ mod tests {
                 api: LlmApi::AnthropicCompatible,
                 base_url: None,
                 model: "claude-haiku-4-5".to_string(),
+                structured_output: StructuredOutputMode::Schema,
             }
         );
         assert_eq!(
@@ -598,6 +948,7 @@ mod tests {
                 api: LlmApi::AnthropicCompatible,
                 base_url: None,
                 model: "claude-haiku-4-5".to_string(),
+                structured_output: StructuredOutputMode::Schema,
             }
         );
         assert_eq!(
@@ -606,6 +957,7 @@ mod tests {
                 api: LlmApi::AnthropicCompatible,
                 base_url: None,
                 model: "claude-sonnet-4-5".to_string(),
+                structured_output: StructuredOutputMode::Schema,
             }
         );
     }
@@ -766,6 +1118,7 @@ mod tests {
                 api,
                 base_url: None,
                 model: "any-model".to_string(),
+                structured_output: StructuredOutputMode::Schema,
             };
             match EndpointClient::build(&endpoint) {
                 Err(AgentError::ProviderConfig(_)) => {}
@@ -784,11 +1137,13 @@ mod tests {
             api: LlmApi::AnthropicCompatible,
             base_url: Some("http://localhost:9999".to_string()),
             model: "claude-haiku-4-5".to_string(),
+            structured_output: StructuredOutputMode::Schema,
         };
         let openai_endpoint = EndpointConfig {
             api: LlmApi::OpenAiCompatible,
             base_url: Some("http://localhost:9998/v1".to_string()),
             model: "local-model".to_string(),
+            structured_output: StructuredOutputMode::JsonObject,
         };
         EndpointClient::build(&anthropic_endpoint).expect("anthropic client");
         EndpointClient::build(&openai_endpoint).expect("openai client");
@@ -802,10 +1157,330 @@ mod tests {
             api: LlmApi::AnthropicCompatible,
             base_url: None,
             model: "claude-haiku-4-5".to_string(),
+            structured_output: StructuredOutputMode::Schema,
         };
         match EndpointClient::build(&endpoint) {
             Err(AgentError::ProviderConfig(_)) => {}
             other => panic!("expected ProviderConfig, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mode_parse_accepts_the_three_spec_strings() {
+        use std::str::FromStr as _;
+        assert_eq!(
+            StructuredOutputMode::from_str("schema").unwrap(),
+            StructuredOutputMode::Schema
+        );
+        assert_eq!(
+            StructuredOutputMode::from_str("json_object").unwrap(),
+            StructuredOutputMode::JsonObject
+        );
+        assert_eq!(
+            StructuredOutputMode::from_str("prompt_only").unwrap(),
+            StructuredOutputMode::PromptOnly
+        );
+        assert_eq!(StructuredOutputMode::Schema.as_str(), "schema");
+        assert_eq!(StructuredOutputMode::JsonObject.as_str(), "json_object");
+        assert_eq!(StructuredOutputMode::PromptOnly.as_str(), "prompt_only");
+        assert_eq!(StructuredOutputMode::JsonObject.to_string(), "json_object");
+        assert_eq!(
+            StructuredOutputMode::default(),
+            StructuredOutputMode::Schema
+        );
+    }
+
+    #[test]
+    fn mode_parse_rejects_unknown_strings() {
+        use std::str::FromStr as _;
+        for bad in ["json", "strict", "", "SCHEMA", "json-object", "none"] {
+            match StructuredOutputMode::from_str(bad) {
+                Err(AgentError::ProviderConfig(_)) => {}
+                other => panic!("expected ProviderConfig for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn structured_output_resolution_follows_the_precedence_chain() {
+        let (_lock, env) = EnvGuard::cleared();
+        // Default: schema.
+        let endpoints = LlmEndpoints::resolve(&LlmConfigValues::default()).unwrap();
+        assert_eq!(
+            endpoints.digest.structured_output,
+            StructuredOutputMode::Schema
+        );
+        // Global config.
+        let values = LlmConfigValues {
+            structured_output: Some("prompt_only".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(
+            endpoints.gate.structured_output,
+            StructuredOutputMode::PromptOnly
+        );
+        // Purpose config wins over global config.
+        let values = LlmConfigValues {
+            structured_output: Some("prompt_only".to_string()),
+            digest_structured_output: Some("json_object".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(
+            endpoints.digest.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+        assert_eq!(
+            endpoints.gate.structured_output,
+            StructuredOutputMode::PromptOnly
+        );
+        // Global env wins over purpose config.
+        env.set(STRUCTURED_OUTPUT_ENV_VAR, "schema");
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(
+            endpoints.digest.structured_output,
+            StructuredOutputMode::Schema
+        );
+        // Purpose env wins over global env.
+        env.set(DIGEST_STRUCTURED_OUTPUT_ENV_VAR, "json_object");
+        env.set(GATE_STRUCTURED_OUTPUT_ENV_VAR, "prompt_only");
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(
+            endpoints.digest.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+        assert_eq!(
+            endpoints.gate.structured_output,
+            StructuredOutputMode::PromptOnly
+        );
+        // The reply purpose env applies to the reply endpoint only.
+        env.set(REPLY_STRUCTURED_OUTPUT_ENV_VAR, "json_object");
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(
+            endpoints.reply.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+    }
+
+    #[test]
+    fn empty_structured_output_values_count_as_unset() {
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(DIGEST_STRUCTURED_OUTPUT_ENV_VAR, "");
+        env.set(STRUCTURED_OUTPUT_ENV_VAR, "");
+        let values = LlmConfigValues {
+            structured_output: Some("json_object".to_string()),
+            digest_structured_output: Some(String::new()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        // The empty purpose env and purpose config fall through to the
+        // global config.
+        assert_eq!(
+            endpoints.digest.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+    }
+
+    #[test]
+    fn an_unknown_structured_output_string_is_a_provider_config_error() {
+        let (_lock, env) = EnvGuard::cleared();
+        // From the global config.
+        let values = LlmConfigValues {
+            structured_output: Some("yaml".to_string()),
+            ..LlmConfigValues::default()
+        };
+        match LlmEndpoints::resolve(&values) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        // From a purpose config.
+        let values = LlmConfigValues {
+            gate_structured_output: Some("bogus".to_string()),
+            ..LlmConfigValues::default()
+        };
+        match LlmEndpoints::resolve(&values) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        // From the global env.
+        env.set(STRUCTURED_OUTPUT_ENV_VAR, "bogus");
+        match LlmEndpoints::resolve(&LlmConfigValues::default()) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        // From a purpose env (wins over every other source).
+        env.set(STRUCTURED_OUTPUT_ENV_VAR, "schema");
+        env.set(REPLY_STRUCTURED_OUTPUT_ENV_VAR, "bogus");
+        match LlmEndpoints::resolve(&LlmConfigValues::default()) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_client_stores_and_reports_the_resolved_mode() {
+        // Client construction performs no I/O; no network call here.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some("http://localhost:9998/v1".to_string()),
+            model: "local-model".to_string(),
+            structured_output: StructuredOutputMode::JsonObject,
+        };
+        let client = EndpointClient::build(&endpoint).expect("openai client");
+        let debug = format!("{client:?}");
+        // Family and mode print with their derived Debug names.
+        assert!(debug.contains("OpenAiCompatible"));
+        assert!(debug.contains("JsonObject"));
+    }
+
+    // --- The repair retry flow (scripted completion closure, no
+    // network) ---
+
+    /// The parse target of the repair-flow tests.
+    #[derive(Debug, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+    struct RepairTarget {
+        value: u32,
+    }
+
+    /// The text of the last (prompt) message of a call.
+    fn prompt_text(call: &CompletionCall) -> String {
+        let Some(Message::User { content }) = call.messages.last() else {
+            return String::new();
+        };
+        content
+            .iter()
+            .find_map(|content| match content {
+                rig::completion::message::UserContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// One recorded call: the preamble, the prompt text, and the schema
+    /// as JSON (for equality assertions).
+    type RecordedCall = (Option<String>, String, serde_json::Value);
+
+    /// A scripted completion closure: pops the next response per call
+    /// and records every call. `RefCell` suffices: `#[tokio::test]` is
+    /// single-threaded by default.
+    struct ScriptedFlow {
+        calls: std::cell::RefCell<Vec<RecordedCall>>,
+        responses: std::cell::RefCell<std::collections::VecDeque<Result<String, AgentError>>>,
+    }
+
+    impl ScriptedFlow {
+        fn new(responses: Vec<Result<String, AgentError>>) -> Self {
+            ScriptedFlow {
+                calls: std::cell::RefCell::new(Vec::new()),
+                responses: std::cell::RefCell::new(responses.into()),
+            }
+        }
+
+        async fn run(&self, label: &str) -> Result<RepairTarget, AgentError> {
+            let schema = schemars::schema_for!(RepairTarget);
+            complete_structured_with(
+                |call| {
+                    self.calls.borrow_mut().push((
+                        call.preamble.clone(),
+                        prompt_text(&call),
+                        serde_json::to_value(&call.schema).expect("schema to json"),
+                    ));
+                    let next = self
+                        .responses
+                        .borrow_mut()
+                        .pop_front()
+                        .expect("a scripted response per call");
+                    async move { next }
+                },
+                Some("test preamble".to_string()),
+                vec![Message::user("test prompt".to_string())],
+                schema,
+                1024,
+                label,
+            )
+            .await
+        }
+
+        fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_succeeds_after_a_schema_validation_failure() {
+        let flow = ScriptedFlow::new(vec![
+            // Valid JSON, invalid shape: the repair trigger.
+            Ok(r#"{"valu":7}"#.to_string()),
+            Ok(r#"{"value":7}"#.to_string()),
+        ]);
+        let result = flow.run("invalid test JSON").await.expect("repaired");
+        assert_eq!(result, RepairTarget { value: 7 });
+        let calls = flow.calls();
+        assert_eq!(calls.len(), 2);
+        // The repair call carries the repair preamble and a prompt with
+        // the broken JSON, the validation error, and the schema.
+        assert_eq!(calls[1].0.as_deref(), Some(REPAIR_PREAMBLE));
+        assert!(calls[1].1.contains(r#"{"valu":7}"#));
+        assert!(calls[1].1.contains("missing field"));
+        assert!(calls[1].1.contains(r#""value""#));
+        // Both calls carry the same schema; the mode decides on the
+        // wire inside EndpointClient::complete.
+        assert_eq!(calls[0].2, calls[1].2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_repair_returns_the_original_error() {
+        let flow = ScriptedFlow::new(vec![
+            Ok(r#"{"valu":7}"#.to_string()),
+            Ok(r#"{"still":"broken"}"#.to_string()),
+        ]);
+        match flow.run("invalid test JSON").await {
+            Err(AgentError::Extraction(message)) => {
+                assert!(message.starts_with("invalid test JSON: missing field"));
+            }
+            other => panic!("expected the original Extraction error, got {other:?}"),
+        }
+        assert_eq!(flow.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_valid_first_response_needs_no_repair() {
+        let flow = ScriptedFlow::new(vec![Ok(r#"{"value":42}"#.to_string())]);
+        let result = flow.run("invalid test JSON").await.expect("first try");
+        assert_eq!(result, RepairTarget { value: 42 });
+        assert_eq!(flow.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_json_text_returns_the_original_error_without_a_repair() {
+        let flow = ScriptedFlow::new(vec![Ok("I cannot help with that.".to_string())]);
+        match flow.run("invalid test JSON").await {
+            Err(AgentError::Extraction(message)) => {
+                assert!(message.starts_with("invalid test JSON:"));
+            }
+            other => panic!("expected the original Extraction error, got {other:?}"),
+        }
+        // Non-JSON text is a different failure class: no repair call.
+        assert_eq!(flow.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_repair_call_returns_the_original_error() {
+        let flow = ScriptedFlow::new(vec![
+            Ok(r#"{"valu":7}"#.to_string()),
+            Err(AgentError::Extraction("the provider is down".to_string())),
+        ]);
+        match flow.run("invalid test JSON").await {
+            Err(AgentError::Extraction(message)) => {
+                // The ORIGINAL parse error, never the repair call's own
+                // error: the caller's backoff discipline applies.
+                assert!(message.starts_with("invalid test JSON: missing field"));
+            }
+            other => panic!("expected the original Extraction error, got {other:?}"),
+        }
+        assert_eq!(flow.calls().len(), 2);
     }
 }

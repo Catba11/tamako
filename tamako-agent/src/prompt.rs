@@ -10,6 +10,7 @@ use crate::extract::ExtractionInput;
 /// The system preamble of the extraction call (Section 7.3).
 pub const EXTRACTION_PREAMBLE: &str = "\
 You extract a knowledge graph from ONE group-chat batch.
+Output shape (field names exactly as written): {\"nodes\":[{\"name\":\"...\",\"node_type\":\"Person\"|\"Concept\",\"description\":\"...\"}],\"edges\":[{\"source\":\"...\",\"target\":\"...\",\"relationship_name\":\"...\",\"description\":\"...\"}]}
 
 Rules:
 1. Nodes have exactly one of two types: \"Person\" (a group member) or \"Concept\" (an open-domain concept). Do not create nodes of any other type.
@@ -141,5 +142,12 @@ mod tests {
         assert!(EXTRACTION_PREAMBLE.contains("no knowledge outside"));
         assert!(EXTRACTION_PREAMBLE.contains("mention/reply map"));
         assert!(EXTRACTION_PREAMBLE.contains("ONE group-chat batch"));
+        // The preamble states the exact output field names (a minimal
+        // skeleton): field names must not rely on schema enforcement.
+        assert!(EXTRACTION_PREAMBLE.contains("\"node_type\""));
+        assert!(EXTRACTION_PREAMBLE.contains("\"relationship_name\""));
+        assert!(EXTRACTION_PREAMBLE.contains("\"nodes\""));
+        assert!(EXTRACTION_PREAMBLE.contains("\"edges\""));
+        assert!(EXTRACTION_PREAMBLE.contains("\"description\""));
     }
 }

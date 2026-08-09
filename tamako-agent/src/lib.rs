@@ -116,6 +116,7 @@ pub mod validate;
 
 pub use endpoint::{
     EndpointClient, EndpointConfig, LlmApi, LlmConfigValues, LlmEndpoints, LlmPurpose,
+    StructuredOutputMode,
 };
 pub use extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,

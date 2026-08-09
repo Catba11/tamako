@@ -41,12 +41,25 @@ pub const GATE_DEFAULT_MAX_TOKENS: u64 = 2048;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct GateOutput {
     /// True when the pet participates in this wake.
+    ///
+    /// The `should_participate` alias tolerates field-name drift of
+    /// endpoints that ignore the output schema and free-generate.
+    /// Aliases affect deserialization only: serialization and the
+    /// schemars schema keep the canonical name.
+    #[serde(alias = "should_participate")]
     pub participate: bool,
     /// The raw-log row id of the ONE message the reply targets. Must be
     /// the id of one of the presented new messages. Null when
     /// participate is false.
+    ///
+    /// The `target_message_id`/`target_id` aliases tolerate endpoint
+    /// field-name drift.
+    #[serde(alias = "target_message_id", alias = "target_id")]
     pub target_msg_id: Option<i64>,
     /// One short reason for the decision.
+    ///
+    /// The `rationale` alias tolerates endpoint field-name drift.
+    #[serde(alias = "rationale")]
     pub reason: String,
 }
 
@@ -54,6 +67,7 @@ pub struct GateOutput {
 /// P6; Section 12).
 pub const GATE_PREAMBLE: &str = "\
 You decide whether a group pet speaks. The pet is a member of a group chat. Attention is scarce: the pet speaks rarely, and it can stay silent.
+Output shape (field names exactly as written): {\"participate\":true|false,\"target_msg_id\":<integer or null>,\"reason\":\"...\"}
 
 Rules:
 1. Read the new group messages. Decide whether the pet participates in this wake.
@@ -172,22 +186,22 @@ impl ParticipationGate for RigGate {
         Box<dyn std::future::Future<Output = Result<GateDecision, CoreError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let text = self
+            // The shared structured flow of the endpoint layer
+            // (schema per the resolved mode, one-shot repair retry).
+            let output = self
                 .client
-                .complete(
+                .complete_structured::<GateOutput>(
                     // The preamble becomes the system message.
                     Some(GATE_PREAMBLE.to_string()),
                     vec![Message::user(render_gate_prompt(input))],
-                    // The output schema maps to native structured output.
-                    Some(schemars::schema_for!(GateOutput)),
+                    schemars::schema_for!(GateOutput),
                     self.max_tokens,
+                    "invalid gate JSON",
                 )
                 .await
                 // A gate failure skips this wake; the next wake is the
                 // natural retry (CoreError::Wake docs).
                 .map_err(|error| CoreError::Wake(error.to_string()))?;
-            let output = serde_json::from_str::<GateOutput>(&text)
-                .map_err(|error| CoreError::Wake(format!("invalid gate JSON: {error}")))?;
             Ok(gate_decision_from_output(output, &input.new_messages))
         })
     }
@@ -347,6 +361,49 @@ mod tests {
     }
 
     #[test]
+    fn field_name_aliases_deserialize_into_the_canonical_struct() {
+        // Endpoints that ignore the output schema free-generate; the
+        // aliases tolerate the observed field-name drift
+        // (deserialization only).
+        let output: GateOutput = serde_json::from_str(
+            r#"{"should_participate":false,"target_id":null,"rationale":"r"}"#,
+        )
+        .expect("aliases");
+        assert_eq!(
+            output,
+            GateOutput {
+                participate: false,
+                target_msg_id: None,
+                reason: "r".to_string(),
+            }
+        );
+        let output: GateOutput =
+            serde_json::from_str(r#"{"participate":true,"target_message_id":42,"reason":"r"}"#)
+                .expect("target_message_id alias");
+        assert_eq!(output.target_msg_id, Some(42));
+    }
+
+    #[test]
+    fn serialization_keeps_the_canonical_field_names() {
+        // Aliases affect deserialization only: the serialized JSON
+        // keeps the canonical names, so downstream readers never see
+        // the drift spellings.
+        let output = GateOutput {
+            participate: true,
+            target_msg_id: Some(42),
+            reason: "r".to_string(),
+        };
+        let value = serde_json::to_value(&output).expect("to value");
+        assert!(value.get("participate").is_some());
+        assert!(value.get("target_msg_id").is_some());
+        assert!(value.get("reason").is_some());
+        assert!(value.get("should_participate").is_none());
+        assert!(value.get("target_message_id").is_none());
+        assert!(value.get("target_id").is_none());
+        assert!(value.get("rationale").is_none());
+    }
+
+    #[test]
     fn the_preamble_states_the_scarce_attention_rules() {
         // Principles P4 and P6; Section 12's 50 percent bound.
         assert!(GATE_PREAMBLE.contains("speaks rarely"));
@@ -354,6 +411,11 @@ mod tests {
         assert!(GATE_PREAMBLE.contains("50 percent"));
         assert!(GATE_PREAMBLE.contains("the most recent message"));
         assert!(GATE_PREAMBLE.contains("the JSON object of the required schema"));
+        // The preamble states the exact output field names (a minimal
+        // skeleton): field names must not rely on schema enforcement.
+        assert!(GATE_PREAMBLE.contains("\"participate\":true|false"));
+        assert!(GATE_PREAMBLE.contains("\"target_msg_id\""));
+        assert!(GATE_PREAMBLE.contains("\"reason\""));
     }
 
     #[test]
@@ -477,6 +539,7 @@ mod tests {
             api: crate::endpoint::LlmApi::AnthropicCompatible,
             base_url: None,
             model: "claude-haiku-4-5".to_string(),
+            structured_output: crate::endpoint::StructuredOutputMode::Schema,
         };
         let result = RigGate::from_endpoint(&endpoint);
         if let Some(key) = saved_key {

@@ -277,6 +277,10 @@ fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
         gate_llm_base_url: config.gate_llm_base_url.clone(),
         reply_llm_api: config.reply_llm_api.clone(),
         reply_llm_base_url: config.reply_llm_base_url.clone(),
+        structured_output: config.structured_output.clone(),
+        digest_structured_output: config.digest_structured_output.clone(),
+        gate_structured_output: config.gate_structured_output.clone(),
+        reply_structured_output: config.reply_structured_output.clone(),
     }
 }
 
