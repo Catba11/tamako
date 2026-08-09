@@ -481,6 +481,37 @@ test-group soak (`docs/soak-runbook.md`).
     text also returns the original error. The classification of the
     call site is unchanged, so the existing exponential backoff and the
     dead-letter path of specs.md Section 10.3 apply exactly as before.
+53. **Curated one-line-per-wake/digest logging, plus `-v`.** At INFO the
+    actor emits exactly one `wake` line per wake event and one `digest`
+    line per completed digest (target `tamako_core::actor`), with a
+    fixed field vocabulary. `wake`: `chat_id`, `trigger`
+    (`message_count`|`interval`|`forced`), `injections`, `gate`
+    (`participate`|`silent`|`bypassed_forced`|`muted`|
+    `in_flight_skipped`), `reason` (ABSENT when the gate has none),
+    `action` (`reply_sent`|`discarded_stale`|`nothing`), `reply_to`
+    (ABSENT unless `reply_sent`). `digest`: `chat_id`, `batch_id`,
+    `range` rendered `(old,new]`, `outcome` (`written` with
+    `nodes`/`edges`, or `skeleton`). A failed wake emits one ERROR
+    `wake procedure failed; skipping this wake`; a dead-lettered digest
+    keeps the pipeline's ERROR line (specs.md Section 10.3) as its one
+    line (the actor's variant drops to debug). Retry WARNs
+    (`digest attempt failed; retry scheduled`) are interpreted as
+    attempt-level signals, not digest-outcome lines — they do not count
+    against the one-line guarantee. The old `(stub)` INFO lines are
+    gone: demoted to DEBUG, reworded `wake services disabled; wake
+    trigger ignored` (the path means no LLM key configured). `-v` /
+    `--verbose` (accepted in every mode) sets the filter to
+    `tamako=debug` when `RUST_LOG` is unset; `RUST_LOG` ALWAYS wins;
+    default stays `info`. Telemetry threading, no behavior change:
+    `GateDecision.reason` is now `Option<String>` carried into the wake
+    line; `WakeScheduler::should_fire` delegates to the new
+    `fire_reason` introspection (`FireReason` enum) so firing is
+    bit-identical. The capture test lives in its own test binary
+    (`tamako/tests/curated_log_replay.rs`) because tracing's
+    process-global callsite interest cache defeats scoped subscribers
+    in a shared test binary. No spec backfill needed: the feature adds
+    no configuration keys (the flag and the log contract are operator
+    surface, not spec configuration).
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 

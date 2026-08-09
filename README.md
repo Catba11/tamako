@@ -134,6 +134,25 @@ Recommended `structured_output` for Opencode Go: `schema`, the default — endpo
 - The bot remembers: every wake runs a shallow recall over the group graph (exact alias matches and the people of the new messages; no fuzzy scans). A conservative relevance gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one "I remember: ..." assistant message — visible to the participation gate and the reply model, and present even when the bot stays silent. Injected memories are deduplicated per digest chunk and removed at digest time.
 - Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
 
+### 6. Watching the pet
+
+At the default `info` level the bot emits exactly one line per wake and one line per completed digest — the one-line guarantee. Nothing else is needed to follow the pet's behavior:
+
+```text
+INFO tamako_core::actor: wake chat_id=-1001234567890 trigger="message_count" injections=0 gate="participate" reason="a direct question" action="reply_sent" reply_to="w3"
+INFO tamako_core::actor: wake chat_id=-1001234567890 trigger="forced" injections=0 gate="bypassed_forced" action="reply_sent" reply_to="100004"
+INFO tamako_core::actor: digest chat_id=-1001234567890 batch_id=e1ba1491-bf91-5853-b0f1-58b24ba26c98 range=(0,101] outcome="written" nodes=19 edges=30
+```
+
+The `wake` fields: `trigger` (`message_count`|`interval`|`forced`), `injections` (recall-memory count, 0 allowed), `gate` (`participate`|`silent`|`bypassed_forced`|`muted`|`in_flight_skipped`), `reason` (the gate's own reason — present only when it gives one), `action` (`reply_sent`|`discarded_stale`|`nothing`), `reply_to` (the target's platform message id — present only on `reply_sent`). A failed wake instead emits one ERROR line `wake procedure failed; skipping this wake`. The `digest` fields: `batch_id`, `range` (the `(old,new]` msg-id range), `outcome` (`written` with `nodes`/`edges` counts, or `skeleton`); a dead-lettered batch keeps the pipeline's ERROR line `digest batch dead-lettered after all retries` as its one line. Note: during a fast catch-up replay thousands of `in_flight_skipped` wake lines can appear (one per suppressed fire while an LLM wake runs); at live tempo they are rare.
+
+Add `-v` (or `--verbose`, accepted in every mode) to lift every Tamako crate to debug level while dependencies stay quiet — useful when one of the lines above needs its backstory. `RUST_LOG` always wins over the flag; use it as the escape hatch for anything finer:
+
+```sh
+RUST_LOG=tamako_core=debug cargo run --release -- --live --config tamako.toml --data-root ./data
+# or: RUST_LOG=tamako=trace,reqwest=warn ...
+```
+
 ## Operator commands
 
 The status modes inspect the group stores read-only. They are safe while the bot runs (the store is a WAL-mode SQLite database), and they never need a persona file, a Telegram token, or an LLM key.

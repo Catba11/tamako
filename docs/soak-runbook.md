@@ -56,13 +56,39 @@ Expected startup lines:
 
 ### 3.1 In the logs
 
+The bot curates its INFO output: exactly one `wake` line per wake event
+and one `digest` line per completed digest, both on target
+`tamako_core::actor`. A healthy group shows a calm rhythm: one wake line
+per floor-bounded wake (`wake_floor`, 5 min default), one digest line
+per batch. The line formats:
+
+```text
+INFO tamako_core::actor: wake chat_id=-1001234567890 trigger="message_count" injections=0 gate="participate" reason="a direct question" action="reply_sent" reply_to="w3"
+INFO tamako_core::actor: digest chat_id=-1001234567890 batch_id=e1ba1491-bf91-5853-b0f1-58b24ba26c98 range=(0,101] outcome="written" nodes=19 edges=30
+```
+
+- `wake` fields: `chat_id`; `trigger` (`message_count`|`interval`|
+  `forced`); `injections` (recall-memory count, 0 allowed); `gate`
+  (`participate`|`silent`|`bypassed_forced`|`muted`|`in_flight_skipped`);
+  `reason` — the gate's own reason string, ABSENT when it has none;
+  `action` (`reply_sent`|`discarded_stale`|`nothing`); `reply_to` — the
+  target's platform message id, ABSENT unless `action="reply_sent"`.
+- `digest` fields: `chat_id`; `batch_id`; `range` — the rendered
+  `(old,new]` msg-id range; `outcome` — `written` with `nodes`/`edges`
+  counts, or `skeleton` (no counts).
+
 | Signal | Healthy | Action when not healthy |
 |---|---|---|
-| Wake rate | Wakes follow the floor (`wake_floor`, 5 min default). | A wake storm below the floor is a bug; capture the log. |
-| Digest batches | One line per batch outcome. | A batch that retries then dead-letters: see 3.2. |
-| Digest failures | Rare ERROR lines. | Frequent failures: check the endpoint and the model name. |
-| Dead letters | ERROR `digest batch dead-lettered after all retries` with `chat_id`, `batch_id`, `attempts`, `error` (specs.md Section 10.3). | Rare is fine. A rising count needs attention. The skipped range stays in the raw log. |
+| Wake rate | One `wake` line per floor-bounded wake (`wake_floor`, 5 min default). | A wake storm below the floor is a bug; capture the log. |
+| In-flight skips | `gate="in_flight_skipped" action="nothing"` occasionally, while an LLM wake runs. | Repeated skips with no `reply_sent` completion: LLM calls are stuck; check the endpoint. |
+| Wake failures | None; a failed wake emits one ERROR `wake procedure failed; skipping this wake`. | Repeated wake ERRORs: check the endpoint and the model names. |
+| Digest batches | One `digest` line per batch, `outcome="written"` (or `skeleton` on an empty extraction). | A batch that retries then dead-letters: see 3.2. |
+| Digest retries | WARN `digest attempt failed; retry scheduled` is rare. This is an attempt-level signal, not the digest outcome. | Retry WARNs repeating for one `batch_id`: endpoint trouble; check latency and rate limits. |
+| Dead letters | ERROR `digest batch dead-lettered after all retries` with `chat_id`, `batch_id`, `attempts`, `error` (specs.md Section 10.3). This line REPLACES the INFO `digest` line for the batch. | Rare is fine. A rising count needs attention. The skipped range stays in the raw log. |
 | Outbound failures | WARN with the chat id, tolerated (specs.md Section 4.2). | Repeated permission failures: check the bot's rights in the group. |
+
+For more detail, `-v` lifts every Tamako crate to debug level;
+`RUST_LOG` always wins over the flag (README, "Watching the pet").
 
 ### 3.2 With `--status` (the Section 12 metrics)
 
