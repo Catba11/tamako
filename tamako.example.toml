@@ -38,10 +38,14 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # reply_llm_api      = "anthropic-compatible"
 # reply_llm_base_url = "https://opencode.ai/zen/go/v1/messages"
 
-# Structured-output mode per endpoint: schema | json_object | prompt_only
-# (Available once the openai-compatible robustness fix lands; default
-# "schema". Run `cargo run -p tamako-agent --example probe_endpoint`
-# to learn what your endpoint honors.)
+# Structured-output mode per endpoint: "schema" | "json_object" | "prompt_only"
+# (default "schema"). Per-purpose overrides: digest_structured_output /
+# gate_structured_output / reply_structured_output; env wins as always.
+# "json_object" applies on the OpenAI family only; on Anthropic it
+# degrades to prompt-only (the Messages API has no json_object format).
+# Opencode Go chat/completions models honor "schema" strictly (verified
+# 2026-08-08). Run `cargo run -p tamako-agent --example probe_endpoint`
+# to learn what your endpoint honors.
 # structured_output = "schema"
 
 # ------------------------------------------------------------ Triggers ----

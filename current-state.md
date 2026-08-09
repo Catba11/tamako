@@ -152,7 +152,7 @@ test-group soak (`docs/soak-runbook.md`).
 | `tamako-persona` | `persona.toml` loading, `PreambleRenderer` trait, `PetPreambleRenderer` with the Section 9.4 injection guardrail, example persona at the repo root. | 7 |
 | `tamako-adapter-mock` | JSON replay fixture format, `MockAdapter` (event replay, action recording), 14-event demo fixture. | 6 |
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide 0.17). Pure `normalize` module (bot identity from get_me, display-name fallback chain, message/service/reaction/count normalization; synthetic `chat:{id}` for anonymous actors) plus the live `TeloxideAdapter` (polling task + bounded mpsc channel of 100, `next_group_event() -> GroupEvent { chat_id, event }` for multi-group routing per Rule P5, `PlatformAdapter` impl as the Rule A5 substitutability proof). Capability model (specs.md Section 4.2): `bot_chat_status` classifies the per-group membership (`BotChatStatus`: `Administrator` — owner counts as administrator — `Member`, `RestrictedOrOther`, `Unknown`; query failures map to `Unknown`). Outbound: `SendText` (optional reply via ReplyParameters), `React` (setMessageReaction); `SendMedia` → `AdapterError::Unsupported` (Phase 3). Outbound permission failures (missing rights or access) are tolerated: logged with the chat id, never fatal. Live Telegram smoke test ignored by default (`TAMAKO_LIVE_TELEGRAM=1` + `TELOXIDE_TOKEN`). | 50 (+1 ignored) |
-| `tamako-agent` | All LLM concerns (the only rig consumer). `KnowledgeGraph` extraction types (serde + schemars 1.x), `KnowledgeExtractor` trait with the live `RigExtractor` (rig-core 0.41 completion + `output_schema`, Anthropic native structured output, default model `claude-haiku-4-5`) and the scripted `ScriptedExtractor`, conservative emoji/greeting skeleton detector (Section 7.2 rule 5), plain-Rust relationship-name validation (Section 6.3), entity resolution steps 1/2/4 with the Alias-node fallback (Section 7.4), `AgentDigestPipeline` with exponential backoff and dead-letter (Section 10.3). M4: the `endpoint` module (specs.md Section 13 endpoint portability: `LlmConfigValues` → `LlmEndpoints::resolve` with env-wins precedence and per-purpose overrides, `EndpointClient` over the two API families — Anthropic Messages and OpenAI chat completions — with base-URL and model overrides; a missing family API key is `AgentError::ProviderConfig`), the participation gate `RigGate` (structured output, post-validated in plain Rust; Section 9.6) with its scripted double, and the reply generator `RigReplyGenerator` (the M2 context→rig conversion seam; Section 9 step 4) with its scripted double. M5: the `recall` module — `ShallowRecall` (deterministic candidate extraction: sender/reply-target Person entries per Section 8.1 step 1, exact alias matches per step 2, the pure candidate-term tokenizer with documented Phase 1 limits; Section 9.3 dedup against `injected_memories`; zero candidates never call the cheap model), the conservative relevance gate `RigRelevanceGate` (Section 9.2, structured output, post-validated in plain Rust, hard cap) with its scripted double, and the Section 9.4 render of exactly one "I remember: ..." injection. Live-API smoke tests ignored by default (`TAMAKO_LIVE_TEST=1`). | 103 (+3 ignored) |
+| `tamako-agent` | All LLM concerns (the only rig consumer). `KnowledgeGraph` extraction types (serde + schemars 1.x, conservative field-name aliases, decision 48), `KnowledgeExtractor` trait with the live `RigExtractor` (rig-core 0.41 completion + `output_schema`, Anthropic native structured output, default model `claude-haiku-4-5`) and the scripted `ScriptedExtractor`, conservative emoji/greeting skeleton detector (Section 7.2 rule 5), plain-Rust relationship-name validation (Section 6.3), entity resolution steps 1/2/4 with the Alias-node fallback (Section 7.4), `AgentDigestPipeline` with exponential backoff and dead-letter (Section 10.3). M4: the `endpoint` module (specs.md Section 13 endpoint portability: `LlmConfigValues` → `LlmEndpoints::resolve` with env-wins precedence and per-purpose overrides, `EndpointClient` over the two API families — Anthropic Messages and OpenAI chat completions — with base-URL and model overrides; a missing family API key is `AgentError::ProviderConfig`; robustness fix, decisions 48/50/52: per-purpose `structured_output` modes `schema`/`json_object`/`prompt_only` with default `schema` — `json_object` via rig `additional_params` on the OpenAI family only, Anthropic degrades to prompt-only — and ONE shared repair retry for every structured call: preamble field-name skeletons, exact JSON, one repair completion on a schema-invalid-but-JSON response, then the original error class), the participation gate `RigGate` (structured output, post-validated in plain Rust; Section 9.6) with its scripted double, and the reply generator `RigReplyGenerator` (the M2 context→rig conversion seam; Section 9 step 4) with its scripted double. M5: the `recall` module — `ShallowRecall` (deterministic candidate extraction: sender/reply-target Person entries per Section 8.1 step 1, exact alias matches per step 2, the pure candidate-term tokenizer with documented Phase 1 limits; Section 9.3 dedup against `injected_memories`; zero candidates never call the cheap model), the conservative relevance gate `RigRelevanceGate` (Section 9.2, structured output, post-validated in plain Rust, hard cap) with its scripted double, and the Section 9.4 render of exactly one "I remember: ..." injection. Live-API smoke tests ignored by default (`TAMAKO_LIVE_TEST=1`). | 103 (+3 ignored) |
 
 ## 3. Key decisions and deviations so far
 
@@ -421,6 +421,66 @@ test-group soak (`docs/soak-runbook.md`).
     (Section 6.1 rule 3; ADR-0001 addendum 2026-08-08; regression test
     `tamako-memory/tests/lbug_concurrent_access.rs`). An upstream
     report to LadybugDB is recommended, not filed.
+48. **Live-extraction robustness fix: four layers, because the endpoint
+    schema enforcement cannot be the only carrier of the field
+    names.** `prompt_only` mode — and any endpoint that silently
+    ignores `response_format` — leaves the model free to drift, and
+    even a strict endpoint enforces names only when the schema reaches
+    the wire. Four layers landed together: (1) the extraction, gate,
+    and recall preambles now state the exact JSON field names with a
+    skeleton; (2) conservative serde aliases on the `KnowledgeGraph`
+    types tolerate field-name drift (`node_type` accepts `type`/`kind`,
+    and likewise); (3) one shared repair retry in `endpoint.rs` — a
+    response that parses as JSON but fails schema validation triggers
+    ONE repair completion (broken JSON + validation error + schema,
+    "fix the JSON to match the schema, change nothing else"); (4) the
+    per-purpose `structured_output` mode config of decision 51.
+49. **Opencode Go chat/completions models honor `json_schema` strict —
+    recommended mode `schema`.** Live probe and verification
+    2026-08-08 against `https://opencode.ai/zen/go/v1`: mimo-v2.5 /
+    mimo-v2.5-pro accept and honor `response_format: {type:
+    "json_schema", strict: true}` — a trivial schema and the real
+    nested `KnowledgeGraph` schema ($defs + enum), 5/5 runs each,
+    byte-exact canonical field names, `reasoning_tokens: 0`. The
+    `json_object` mode verified identical. With NO `response_format`
+    mimo-v2.5 burns ~85–300 reasoning tokens per call, may wrap the
+    output in markdown fences, and ran 5× slower on the trivial probe
+    (5.7 s vs 1.1 s); `prompt_only` is strictly worse on this endpoint.
+    End to end: five consecutive clean replay digests with mimo-v2.5
+    extraction (101-message batches, ~18–19 s wall each, boundary
+    advanced, zero dead letters, no repair-path activity), gate+reply
+    ~3.5 s combined, prompt caching active, no rate limits and no empty
+    responses across ~20 live calls. Residual drift is non-schema:
+    occasional UPPERCASE relationship names and the reserved `is_a` —
+    caught by the existing plain-Rust post-validation, not a parse
+    failure.
+50. **`json_object` mode reaches the wire through rig's
+    `additional_params` on the OpenAI family only.** rig-core 0.41 has
+    no first-class json_object switch; the mode adds `response_format:
+    {type: "json_object"}` as an additional parameter on the
+    chat-completions path. The Anthropic Messages API has no json_object
+    format, so on anthropic-compatible endpoints `json_object` degrades
+    to prompt-only (no output schema, no response format).
+    `prompt_only` drops the schema unconditionally on both families.
+    Documented in the `endpoint` module docs.
+51. **Deviation: new configuration keys `structured_output`,
+    `digest_structured_output`, `gate_structured_output`,
+    `reply_structured_output`** (values `schema`|`json_object`|
+    `prompt_only`, default `schema`, per-group overridable like every
+    trigger key, in `TriggerConfig`/`TriggerConfigToml`) plus the env
+    vars `TAMAKO_STRUCTURED_OUTPUT` (global fallback) and
+    `TAMAKO_DIGEST_STRUCTURED_OUTPUT`, `TAMAKO_GATE_STRUCTURED_OUTPUT`,
+    `TAMAKO_REPLY_STRUCTURED_OUTPUT` (env wins). An unparsable value is
+    a hard startup error (`AgentError::ProviderConfig`). specs.md
+    Section 13 has no such keys; reported for spec backfill.
+52. **Repair-retry behavior contract: one repair, then the original
+    error class.** Only a response that IS JSON but fails schema
+    validation triggers the single repair completion (decision 48
+    layer 3); non-JSON text returns the original parse error
+    immediately, and a failed repair call or an unparsable repaired
+    text also returns the original error. The classification of the
+    call site is unchanged, so the existing exponential backoff and the
+    dead-letter path of specs.md Section 10.3 apply exactly as before.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 

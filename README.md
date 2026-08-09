@@ -98,8 +98,30 @@ Environment variables:
 | `TAMAKO_REPLY_MODEL` | Reply-generation model override. Default `claude-sonnet-4-5`. |
 | `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
 | `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
+| `TAMAKO_STRUCTURED_OUTPUT` | Structured-output mode, global fallback: `schema` (default), `json_object`, `prompt_only`. |
+| `TAMAKO_DIGEST_STRUCTURED_OUTPUT` | Structured-output mode override of the digest (extraction) purpose. |
+| `TAMAKO_GATE_STRUCTURED_OUTPUT` | Structured-output mode override of the gate purpose. |
+| `TAMAKO_REPLY_STRUCTURED_OUTPUT` | Structured-output mode override of the reply purpose. |
 
-Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_` and `reply_`). API keys come from the environment only, never from the config file.
+Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_` and `reply_`). The same pattern applies to the structured-output mode: `structured_output` globally and `digest_structured_output` / `gate_structured_output` / `reply_structured_output` per purpose (values `schema`, `json_object`, `prompt_only`; default `schema`; an unknown value is a hard startup error). API keys come from the environment only, never from the config file.
+
+### Recipe: Opencode Go
+
+Opencode Go serves both API families, split by model family. Chat/completions models (Grok, GLM, Kimi, DeepSeek, MiMo, Hy3) take base `https://opencode.ai/zen/go/v1`; MiniMax/Qwen models speak the Anthropic Messages format at `https://opencode.ai/zen/go/v1/messages` with `llm_api = "anthropic-compatible"`. The mimo recipe (`tamako.example.toml` is a pre-filled variant with commentary):
+
+```toml
+[global]
+llm_api = "openai-compatible"
+llm_base_url = "https://opencode.ai/zen/go/v1"
+digest_model = "mimo-v2.5"        # extraction
+gate_model = "mimo-v2.5"          # participation gate + recall gate
+reply_model = "mimo-v2.5-pro"     # reply generation
+# structured_output = "schema"    # the default; recommended here
+```
+
+with `OPENAI_API_KEY` in the environment.
+
+Recommended `structured_output` for Opencode Go: `schema`, the default — endpoint-verified 2026-08-08. The chat/completions models accept and honor `response_format: {type: "json_schema", strict: true}` byte-exactly, both for a trivial probe schema and for the full nested `KnowledgeGraph` schema, and the structured modes suppress reasoning tokens entirely. Free generation on mimo-v2.5 instead burns ~85-300 reasoning tokens per call, may wrap the output in markdown fences, and cost 5x latency on the probe (5.7 s vs 1.1 s). Pick `json_object` when an OpenAI-family endpoint rejects schema mode (sound on Opencode Go; on anthropic-compatible endpoints it degrades to prompt-only — the Messages API has no json_object format). Pick `prompt_only` only as the last resort for endpoints that reject both. `cargo run -p tamako-agent --example probe_endpoint` probes an endpoint before you commit to a mode.
 
 ### 5. Expected behavior right now
 
