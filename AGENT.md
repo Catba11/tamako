@@ -20,7 +20,7 @@ Rules in these documents have identifiers (example: R3, P5, C2). Reference these
 
 ## 3. Current phase and scope guard
 
-The repository is in **Phase 1** (a living pet). Refer to `dev-roadmap.md` Section 3.
+The repository is **code-complete for Phase 1**; the two-week test-group soak runs on live groups. Refer to `dev-roadmap.md` Section 3 and to `current-state.md` for the exact state.
 
 - rig.rs and teloxide are permitted. They entered in Phase 1.
 - Do not add vector search or embeddings. They enter in Phase 2.
@@ -36,7 +36,7 @@ The workspace is a Cargo workspace at the repository root. Crates:
 | `tamako` | Binary. Wiring, configuration loading, CLI. |
 | `tamako-core` | Normalized events and actions, the per-group actor, trigger logic, session state, the digest pipeline contract. |
 | `tamako-store` | `store.db`: SQLite access, migrations, raw message log, state table. |
-| `tamako-memory` | Graph backend trait and its implementation (or stub). |
+| `tamako-memory` | The `MemoryBackend` trait and the real `LbugBackend` implementation (lbug 0.18), plus deterministic identifiers. |
 | `tamako-persona` | Global persona configuration and preamble rendering. |
 | `tamako-adapter-mock` | Mock platform adapter and the replay fixture for tests. |
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide). Pure normalization plus polling intake and outbound actions. |
@@ -82,5 +82,5 @@ A task is done when all four commands pass.
 ## 7. Definition of done
 
 1. The four commands of Section 5 pass.
-2. New behavior has tests. The Phase 0 exit criterion is in `dev-roadmap.md` Section 2: a scripted mock adapter replays a recorded chat log; the actor persists the raw log and the session state; a restart rebuilds the identical state.
+2. New behavior has tests. The current phase scope and exit criteria live in `dev-roadmap.md` and `current-state.md`; do not build deferred items (Section 3).
 3. Deviations from the governing documents are reported in the pull request description or the task result, not hidden in code.

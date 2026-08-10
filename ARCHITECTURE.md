@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 39 (20 integration + 19 unit) |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 77 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 46 |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 83 |
 | `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 23 |
-| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 17 (+1 concurrent-access regression test) |
-| `tamako-persona` | The global persona configuration and the preamble rendering layer. | 7 |
+| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
+| `tamako-persona` | The global persona configuration and the preamble rendering layer. | 14 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 103 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 121 (+3 ignored live tests) |
 
-Total: 323 tests (+4 ignored live tests). Build, test,
+Total: 361 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
