@@ -43,9 +43,12 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # gate_structured_output / reply_structured_output; env wins as always.
 # "json_object" applies on the OpenAI family only; on Anthropic it
 # degrades to prompt-only (the Messages API has no json_object format).
-# Opencode Go chat/completions models honor "schema" strictly (verified
-# 2026-08-08). Run `cargo run -p tamako-agent --example probe_endpoint`
-# to learn what your endpoint honors.
+# Structured-output support is PER MODEL on Opencode Go: the mimo
+# chat/completions models honor "schema" strictly (verified 2026-08-08);
+# DeepSeek models reject json_schema with "bad response format" and need
+# "prompt_only" (verified 2026-08-10). Run
+# `cargo run -p tamako-agent --example probe_endpoint` against the exact
+# model of each purpose; do not extrapolate across models.
 # structured_output = "schema"
 
 # ------------------------------------------------------------ Triggers ----

@@ -541,8 +541,21 @@ test-group soak (`docs/soak-runbook.md`).
     the WIP commit. Consequence: on main the gate preamble is the
     pre-rebalance scarce-attention text and specs.md Section 12 keeps
     the "below 50 percent" target; the 30-to-60 band and its spec
-    alignment exist only on `catball-self-use`. The branch divergence
-    is deliberate, not drift.
+   alignment exist only on `catball-self-use`. The branch divergence
+   is deliberate, not drift.
+56. **DeepSeek models on Opencode Go reject `json_schema`;
+   structured-output support is a per-MODEL capability.** Operator
+   verification 2026-08-10 in the live deployment: `deepseek-v4-flash`
+   on `https://opencode.ai/zen/go/v1` answers a
+   `response_format: {type: "json_schema"}` request with a
+   `bad response format` error, so `prompt_only` is REQUIRED for it.
+   Decision 49's "schema honored, `prompt_only` strictly worse" verdict
+   covers the mimo models only; neither verdict generalizes across
+   models on one endpoint. The soak deployment runs all three purposes
+   on `deepseek-v4-flash` with `structured_output = "prompt_only"`, so
+   the four robustness layers of decision 48 carry the field-name
+   integrity. Probe the exact model of each purpose with
+   `probe_endpoint`; do not extrapolate across models.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
