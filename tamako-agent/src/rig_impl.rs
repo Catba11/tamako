@@ -23,7 +23,7 @@ pub use crate::endpoint::DIGEST_MODEL_ENV_VAR;
 pub const DEFAULT_EXTRACTION_MODEL: &str = crate::endpoint::DEFAULT_DIGEST_MODEL;
 
 /// The default max tokens of the extraction response.
-pub const DEFAULT_MAX_TOKENS: u64 = 8192;
+pub const DEFAULT_MAX_TOKENS: u64 = 262144;
 
 /// Extractor configuration. Provider: the endpoint layer (specs.md
 /// Section 13), Anthropic family by default.
@@ -31,7 +31,7 @@ pub const DEFAULT_MAX_TOKENS: u64 = 8192;
 pub struct ExtractorConfig {
     /// The extraction model. Default: claude-haiku-4-5 (cheap tier).
     pub model: String,
-    /// Max tokens of the extraction response. Default 8192.
+    /// Max tokens of the extraction response. Default 262144.
     pub max_tokens: u64,
 }
 
@@ -152,7 +152,7 @@ mod tests {
     fn the_default_model_is_the_cheap_tier() {
         let config = ExtractorConfig::default();
         assert_eq!(config.model, "claude-haiku-4-5");
-        assert_eq!(config.max_tokens, 8192);
+        assert_eq!(config.max_tokens, 262144);
     }
 
     #[test]

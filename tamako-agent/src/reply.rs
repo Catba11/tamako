@@ -19,8 +19,8 @@ use crate::endpoint::{EndpointClient, EndpointConfig};
 use crate::extract::AgentError;
 
 /// The default max tokens of the reply. A pet reply is short: one chat
-/// message, one or two sentences. 1024 tokens is a generous bound.
-pub const REPLY_DEFAULT_MAX_TOKENS: u64 = 1024;
+/// message, one or two sentences. 131072 tokens is a generous bound.
+pub const REPLY_DEFAULT_MAX_TOKENS: u64 = 131072;
 
 /// Converts core context messages to the rig call shape (the M2 seam;
 /// the ONLY conversion point — tamako-core stays model-agnostic).

@@ -29,8 +29,8 @@ use crate::endpoint::{EndpointClient, EndpointConfig};
 use crate::extract::AgentError;
 
 /// The default max tokens of the gate response. The output is one small
-/// JSON object (three fields); 2048 tokens is a generous bound.
-pub const GATE_DEFAULT_MAX_TOKENS: u64 = 2048;
+/// JSON object (three fields); 262144 tokens is a generous bound.
+pub const GATE_DEFAULT_MAX_TOKENS: u64 = 262144;
 
 /// The structured gate output (Section 9.6). `target_msg_id` is the
 /// raw-log row id of the message the reply should target.

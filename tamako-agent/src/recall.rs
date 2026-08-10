@@ -68,9 +68,9 @@ use crate::endpoint::{EndpointClient, EndpointConfig};
 use crate::extract::AgentError;
 
 /// The default max tokens of the relevance-gate response. The output is
-/// one small JSON object (two fields); 2048 tokens is a generous bound
+/// one small JSON object (two fields); 262144 tokens is a generous bound
 /// (same bound as the participation gate).
-pub const RECALL_DEFAULT_MAX_TOKENS: u64 = 2048;
+pub const RECALL_DEFAULT_MAX_TOKENS: u64 = 262144;
 
 /// The bound of the candidate-term list of one wake. The terms feed the
 /// entry resolution; 20 terms is a documented bound that keeps the
