@@ -13,7 +13,9 @@ use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
 use tamako_core::context::{ContextMessage, ContextRole};
-use tamako_core::wake::{GateMessage, ReplyGenerator, ReplyRequest};
+use tamako_core::wake::{
+    filter_reply_parrot_lines, GateMessage, ReplyFilterOutcome, ReplyGenerator, ReplyRequest,
+};
 
 use crate::endpoint::{EndpointClient, EndpointConfig};
 use crate::extract::AgentError;
@@ -64,22 +66,35 @@ pub fn render_reply_instruction(target: &GateMessage) -> String {
     format!(
         "Reply to THIS message (id {}): {}\n\
          Reply as the group pet persona. Write only the reply text: \
-         one message, no speaker label, no quotes.",
+         one message, no speaker label, no quotes. \
+         Never write \"I remember:\" lines or a memory list: recalled \
+         memories are context, never speech.",
         target.row_id, target.content
     )
 }
 
-/// Trims the model output. An empty or whitespace-only reply is a wake
-/// error: the bot never sends an empty message (Section 9 step 4: log,
-/// skip this wake, no crash). Pure function, no I/O.
-fn trimmed_reply_or_error(text: &str) -> Result<String, CoreError> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+/// Trims the model output and applies the parrot filter
+/// (`tamako_core::wake::filter_reply_parrot_lines`, decision 59 F1):
+/// every line whose trimmed start matches the recall-injection prefix
+/// (ASCII or full-width colon) is removed. The filter runs at the
+/// reply-text validation seam, BEFORE the outbound raw-log row
+/// persists (Rule B1): the log and the group see the same filtered
+/// text, and the raw log never carries hallucinated speech (Rule P1).
+/// The actor applies the same filter to every generator output, so no
+/// reply text can bypass it.
+///
+/// An empty or whitespace-only remainder — including a reply that was
+/// ONLY a parrot block — is the SAME wake error as an empty reply
+/// today (Section 9 step 4: log, skip this wake, no crash). Pure
+/// function, no I/O.
+pub fn trimmed_reply_or_error(text: &str) -> Result<ReplyFilterOutcome, CoreError> {
+    let filtered = filter_reply_parrot_lines(text);
+    if filtered.text.is_empty() {
         Err(CoreError::Wake(
             "the reply model returned an empty reply".to_string(),
         ))
     } else {
-        Ok(trimmed.to_string())
+        Ok(filtered)
     }
 }
 
@@ -144,7 +159,12 @@ impl ReplyGenerator for RigReplyGenerator {
                 // A reply failure skips this wake; the next wake is the
                 // natural retry (CoreError::Wake docs).
                 .map_err(|error| CoreError::Wake(error.to_string()))?;
-            trimmed_reply_or_error(&text)
+            // The parrot filter runs here too, at the reply-text
+            // validation seam of the live generator (decision 59, F1).
+            // The strip is silent at the generator: the WARN needs the
+            // chat id, which only the actor owns — the actor filters
+            // every generator output again and emits the WARN there.
+            Ok(trimmed_reply_or_error(&text)?.text)
         })
     }
 }
@@ -343,6 +363,16 @@ mod tests {
     }
 
     #[test]
+    fn the_reply_instruction_forbids_the_injection_format() {
+        // Decision 59, F2: the tail instruction hardening. The sentence
+        // is part of the ephemeral call-only instruction; the preamble
+        // (Rule C4 cache anchor) is untouched.
+        let instruction = render_reply_instruction(&sample_target());
+        assert!(instruction.contains("Never write \"I remember:\" lines or a memory list"));
+        assert!(instruction.contains("recalled memories are context, never speech"));
+    }
+
+    #[test]
     fn an_empty_or_whitespace_reply_is_a_wake_error() {
         for empty in ["", "   ", "\n\t "] {
             match trimmed_reply_or_error(empty) {
@@ -357,7 +387,71 @@ mod tests {
     #[test]
     fn a_reply_is_trimmed() {
         let reply = trimmed_reply_or_error("  the cafe on main street \n").expect("reply");
-        assert_eq!(reply, "the cafe on main street");
+        assert_eq!(reply.text, "the cafe on main street");
+        assert!(!reply.stripped_parrot);
+    }
+
+    #[test]
+    fn a_leading_parrot_block_is_stripped() {
+        // Decision 59, F1: the model echoed the injection format before
+        // its real speech (the live-soak failure shape).
+        let reply = trimmed_reply_or_error(
+            "I remember: Alice likes tea.\nI remember: Bob runs.\nthe cafe on main street",
+        )
+        .expect("reply");
+        assert_eq!(reply.text, "the cafe on main street");
+        assert!(reply.stripped_parrot);
+    }
+
+    #[test]
+    fn a_mid_text_parrot_line_is_stripped() {
+        let reply =
+            trimmed_reply_or_error("one\nI remember: Alice likes tea.\ntwo").expect("reply");
+        assert_eq!(reply.text, "one\ntwo");
+        assert!(reply.stripped_parrot);
+    }
+
+    #[test]
+    fn the_full_width_colon_variant_is_stripped() {
+        // Chinese-context model output uses the full-width colon.
+        let reply = trimmed_reply_or_error("I remember：小明喜欢吃辣。\n在的").expect("reply");
+        assert_eq!(reply.text, "在的");
+        assert!(reply.stripped_parrot);
+    }
+
+    #[test]
+    fn a_reply_of_only_a_parrot_block_is_the_empty_reply_error() {
+        // Decision 59, F1: nothing remains after the strip, so the wake
+        // follows the EXACT path of an empty reply today — the same
+        // CoreError::Wake, nothing persisted, nothing sent.
+        for only in [
+            "I remember: Alice likes tea.",
+            "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
+        ] {
+            match trimmed_reply_or_error(only) {
+                Err(CoreError::Wake(message)) => {
+                    assert_eq!(message, "the reply model returned an empty reply")
+                }
+                other => panic!("expected Wake error for {only:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn normal_text_passes_byte_identical() {
+        // False-positive control: an innocuous mid-line "I remember"
+        // mention and multiline text survive untouched (line-start
+        // anchored only).
+        for normal in [
+            "I remember when we tried that place",
+            "在的",
+            "one\ntwo\nthree",
+            "hungry? I remember: not a line start",
+        ] {
+            let reply = trimmed_reply_or_error(normal).expect("reply");
+            assert_eq!(reply.text, normal.trim());
+            assert!(!reply.stripped_parrot, "false positive on {normal:?}");
+        }
     }
 
     #[tokio::test]

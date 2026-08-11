@@ -23,9 +23,9 @@
 //!    most `injection_cap` (the Section 9.2 hard cap, default 5 through
 //!    the config key `recall_injection_cap`).
 //! 7. Render (Section 9.4): exactly one `PlannedInjection` of the form
-//!    "I remember: ...". An empty or "I remember nothing" injection is
-//!    FORBIDDEN (Section 9.2): an empty selection yields no
-//!    `PlannedInjection` at all.
+//!    "I remember: ..." ([`INJECTION_TEXT_PREFIX`]). An empty or
+//!    "I remember nothing" injection is FORBIDDEN (Section 9.2): an
+//!    empty selection yields no `PlannedInjection` at all.
 //!
 //! Degradation policy: a graph error of one entry (alias lookup or
 //! neighbor fetch) logs a warning and skips that entry; the wake
@@ -90,6 +90,13 @@ use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
 use tamako_core::wake::{GateMessage, PlannedInjection, RecallOutcome, RecallProvider};
+
+// The injection prefix is defined ONCE in tamako-core (next to
+// `PlannedInjection`, the type that documents the injection text
+// shape): the recall renderer below uses it, and the reply parrot
+// filter of tamako-core matches it, so the injection format and the
+// filter can never drift apart (decision 59).
+pub use tamako_core::wake::INJECTION_TEXT_PREFIX;
 use tamako_memory::identifiers::{alias_id, normalize, person_id};
 use tamako_memory::MemoryBackend;
 use tamako_store::{Store, StoreError};
@@ -823,7 +830,7 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         // Step 7 (Section 9.4): exactly one PlannedInjection. The edge
         // texts are single sentences.
         let content = format!(
-            "I remember: {}",
+            "{INJECTION_TEXT_PREFIX}{}",
             chosen
                 .iter()
                 .map(|candidate| candidate.edge_text.as_str())
