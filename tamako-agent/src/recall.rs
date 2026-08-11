@@ -32,27 +32,58 @@
 //! continues with the remaining entries. Store failures are unexpected
 //! internal failures and propagate as `CoreError`.
 //!
-//! ## The candidate-term tokenizer (Phase 1, documented limits)
+//! ## The candidate-term tokenizer (Phase 1, decision 44)
 //!
 //! The tokenizer is a pure deterministic function. NO LLM term
-//! extraction (Phase 1). Rules: split on whitespace and punctuation
-//! (Unicode alphanumeric runs survive — CJK characters are
-//! alphanumeric), normalize every token with the Section 7.1 rules
-//! (`tamako_memory::identifiers::normalize`: NFKC, lowercase), drop
-//! empty tokens, tokens shorter than 2 chars after normalization, and a
-//! small built-in English stopword list. Dedup keeps the first
-//! occurrence order. At most [`MAX_CANDIDATE_TERMS`] terms per wake.
+//! extraction (Phase 1). Two paths feed one shared dedup namespace
+//! (a term is a term):
+//!
+//! - Alphanumeric tokens: split on non-alphanumerics, normalize every
+//!   token with the Section 7.1 rules
+//!   (`tamako_memory::identifiers::normalize`: NFKC, lowercase), drop
+//!   empty tokens, tokens shorter than 2 chars after normalization,
+//!   and a small built-in English stopword list. Dedup keeps the
+//!   first occurrence order. At most [`MAX_CANDIDATE_TERMS`] terms
+//!   per wake.
+//! - CJK n-grams: every maximal run of CJK characters yields ALL
+//!   contiguous n-grams with n in 2..=5 (chars, not bytes). A maximal
+//!   run is a maximal sequence of characters of the CJK set: CJK
+//!   Unified Ideographs U+4E00..=U+9FFF, Extension A
+//!   U+3400..=U+4DBF, plus Hiragana/Katakana U+3040..=U+30FF. The
+//!   kana block mixes Japanese kana into the CJK runs on purpose:
+//!   Japanese terms surface as n-grams too. A run breaks on any
+//!   character outside the CJK set, so an ASCII letter between two
+//!   CJK characters splits one run into two. There is NO whole-run
+//!   token: the pre-n-gram behavior kept the whole run as one token
+//!   ("你今天吃饭了吗"), which could never match an Alias. A 1-char
+//!   run yields no term (n starts at 2). Every n-gram goes through
+//!   `normalize` (Section 7.1 parity with the write path: a
+//!   compatibility character in a message matches the alias stored
+//!   under the normalized form). At most [`MAX_NGRAM_TERMS`] n-gram
+//!   terms per wake; when the pool exceeds the bound, longer n-grams
+//!   win (5 before 4 before 3 before 2), ties keep the
+//!   first-occurrence order (message order, then position in the
+//!   message).
+//!
+//! Output order: the alphanumeric terms first in first-occurrence
+//! order, then the n-gram terms (deduped, longer first, first
+//! occurrence inside one length). Both budgets are constants, not
+//! configuration keys. Every lookup of a term stays an exact Alias
+//! match (Section 8.1 step 2, Rule R5 — no fuzzy scans).
 //!
 //! Documented limits (accepted recall loss of Phase 1):
 //!
-//! - NO multi-word terms: "San Francisco" becomes two terms.
+//! - NO multi-word alphanumeric terms: "San Francisco" becomes two
+//!   terms. CJK n-grams ARE multi-character terms by design.
 //! - NO synonyms and NO cross-language merging (Section 7.1 CAUTION):
 //!   "tama" and "たま" stay distinct terms.
-//! - Single-character tokens are dropped, CJK characters included. A
+//! - 1-char CJK runs yield no term (the n-gram path starts at 2). A
 //!   one-character CJK name is not a term.
-//! - The stopword list is English only.
+//! - The stopword list is English only. NO CJK stopword list: alias
+//!   lookups only hit on exact matches against a sparse alias table,
+//!   so an unmatched common-word n-gram costs one indexed miss.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::completion::Message;
@@ -72,10 +103,22 @@ use crate::extract::AgentError;
 /// (same bound as the participation gate).
 pub const RECALL_DEFAULT_MAX_TOKENS: u64 = 262144;
 
-/// The bound of the candidate-term list of one wake. The terms feed the
-/// entry resolution; 20 terms is a documented bound that keeps the
-/// recall cheap (Section 9.1).
+/// The bound of the alphanumeric candidate-term list of one wake. The
+/// terms feed the entry resolution; 20 terms is a documented bound
+/// that keeps the recall cheap (Section 9.1).
 pub const MAX_CANDIDATE_TERMS: usize = 20;
+
+/// The bound of the CJK n-gram term pool of one wake (module docs:
+/// the tokenizer). Separate from the [`MAX_CANDIDATE_TERMS`]
+/// alphanumeric budget. Selection rule when the pool exceeds the
+/// bound: longer n-grams first (5 before 4 before 3 before 2), ties
+/// in first-occurrence order (message order, then position in the
+/// message). A constant, NOT a configuration key.
+pub const MAX_NGRAM_TERMS: usize = 40;
+
+/// The largest n of the CJK n-grams, in chars. The smallest n is 2:
+/// a 1-char CJK run yields no term (module docs).
+const MAX_NGRAM_N: usize = 5;
 
 /// The bound of the candidate list presented to the relevance gate
 /// (Section 9.2). A larger candidate set is truncated: the FIRST
@@ -103,44 +146,87 @@ pub struct RecallCandidate {
     pub edge_id: String,
     pub edge_text: String,
     pub valid_at: time::OffsetDateTime,
+    /// The fact key parts of the edge (decision 40). The edge natural
+    /// key carries `valid_at`, so the same fact extracted twice with a
+    /// different `valid_at` yields two distinct edge ids. The
+    /// same-fact collapse of `recall_inner` keys on the triple
+    /// (source_id, relationship_name, target_id) IGNORING `valid_at`
+    /// and keeps the latest edge (dev-roadmap.md Section 3 item 5).
+    pub source_id: String,
+    pub relationship_name: String,
+    pub target_id: String,
 }
 
-/// The candidate terms of one wake: normalized tokens of the new
-/// message texts, deduped in first-occurrence order, at most
-/// [`MAX_CANDIDATE_TERMS`] entries. Refer to the module docs for the
-/// tokenizer rules and the documented Phase 1 limits.
+/// The candidate terms of one wake: the normalized alphanumeric
+/// tokens of the new message texts (deduped in first-occurrence
+/// order, at most [`MAX_CANDIDATE_TERMS`] entries), then the CJK
+/// n-grams of every maximal CJK run (deduped against the same shared
+/// namespace, longer n-grams first, at most [`MAX_NGRAM_TERMS`]
+/// entries). Refer to the module docs for the tokenizer rules and the
+/// documented Phase 1 limits. Pure and deterministic (decision 44):
+/// no LLM term extraction, no I/O, no randomness.
 pub fn candidate_terms(texts: &[&str]) -> Vec<String> {
-    let mut terms = Vec::new();
+    let mut alnum_terms = Vec::new();
+    let mut ngram_terms = Vec::new();
+    let mut ngram_len_counts = [0usize; MAX_NGRAM_N + 1];
     let mut seen = HashSet::new();
     let mut token = String::new();
+    let mut cjk_run: Vec<char> = Vec::new();
     for text in texts {
         for ch in text.chars() {
-            if ch.is_alphanumeric() {
+            if is_cjk_char(ch) {
+                push_term(&mut alnum_terms, &mut seen, &token);
+                token.clear();
+                cjk_run.push(ch);
+            } else if ch.is_alphanumeric() {
+                push_cjk_ngrams(&mut ngram_terms, &mut ngram_len_counts, &mut seen, &cjk_run);
+                cjk_run.clear();
                 token.push(ch);
             } else {
-                push_term(&mut terms, &mut seen, &token);
+                push_term(&mut alnum_terms, &mut seen, &token);
                 token.clear();
+                push_cjk_ngrams(&mut ngram_terms, &mut ngram_len_counts, &mut seen, &cjk_run);
+                cjk_run.clear();
             }
         }
-        push_term(&mut terms, &mut seen, &token);
+        push_term(&mut alnum_terms, &mut seen, &token);
         token.clear();
-        if terms.len() >= MAX_CANDIDATE_TERMS {
-            return terms;
-        }
+        push_cjk_ngrams(&mut ngram_terms, &mut ngram_len_counts, &mut seen, &cjk_run);
+        cjk_run.clear();
     }
-    terms
+    // Output order (module docs): alphanumeric terms first, then the
+    // n-gram terms, longer n-grams first and first-occurrence order
+    // inside one length. The stable sort keeps the collection order
+    // inside one length.
+    ngram_terms.sort_by_key(|term| std::cmp::Reverse(term.chars().count()));
+    ngram_terms.truncate(MAX_NGRAM_TERMS);
+    alnum_terms.extend(ngram_terms);
+    alnum_terms
 }
 
-/// Normalizes one raw token and appends it when it survives the drop
-/// rules (module docs): Section 7.1 normalization, the 2-char minimum,
-/// the stopword list. Dedup keeps the first occurrence.
+/// The CJK set of the tokenizer (module docs): CJK Unified Ideographs
+/// U+4E00..=U+9FFF, Extension A U+3400..=U+4DBF, plus Hiragana and
+/// Katakana U+3040..=U+30FF. The kana block mixes Japanese kana into
+/// the CJK runs on purpose: Japanese terms surface as n-grams too.
+/// Hand-rolled range check — no regex or unicode crate (Phase 1).
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}'
+    )
+}
+
+/// Normalizes one raw alphanumeric token and appends it when it
+/// survives the drop rules (module docs): Section 7.1 normalization,
+/// the 2-char minimum, the stopword list. Dedup keeps the first
+/// occurrence. CJK characters never reach this function: the CJK runs
+/// go through [`push_cjk_ngrams`].
 fn push_term(terms: &mut Vec<String>, seen: &mut HashSet<String>, raw: &str) {
     if raw.is_empty() || terms.len() >= MAX_CANDIDATE_TERMS {
         return;
     }
     let normalized = normalize(raw);
-    // The 2-char minimum counts chars AFTER normalization. Single CJK
-    // characters are dropped too (documented Phase 1 limit).
+    // The 2-char minimum counts chars AFTER normalization.
     if normalized.chars().count() < 2 {
         return;
     }
@@ -149,6 +235,60 @@ fn push_term(terms: &mut Vec<String>, seen: &mut HashSet<String>, raw: &str) {
     }
     if seen.insert(normalized.clone()) {
         terms.push(normalized);
+    }
+}
+
+/// Emits all contiguous n-grams (n in 2..=[`MAX_NGRAM_N`], chars) of
+/// one maximal CJK run, in first-occurrence order (position, then
+/// growing n). A run shorter than 2 chars yields no term (the 1-char
+/// drop of the module docs). There is NO whole-run token: a run
+/// longer than [`MAX_NGRAM_N`] yields n-grams only.
+fn push_cjk_ngrams(
+    terms: &mut Vec<String>,
+    len_counts: &mut [usize; MAX_NGRAM_N + 1],
+    seen: &mut HashSet<String>,
+    run: &[char],
+) {
+    if run.len() < 2 {
+        return;
+    }
+    for start in 0..run.len() - 1 {
+        let max_len = MAX_NGRAM_N.min(run.len() - start);
+        for len in 2..=max_len {
+            push_ngram(terms, len_counts, seen, run, start, len);
+        }
+    }
+}
+
+/// Normalizes one raw n-gram and appends it when it survives the
+/// selection rule of [`MAX_NGRAM_TERMS`]: longer n-grams win, ties
+/// keep the first occurrence. A new n-gram of length `len` loses
+/// against every already-collected n-gram of length `len` or more, so
+/// it can never enter the final list once the bound is full of such
+/// n-grams — stop the collection then. `len_counts[len]` counts the
+/// distinct collected n-grams of each length.
+fn push_ngram(
+    terms: &mut Vec<String>,
+    len_counts: &mut [usize; MAX_NGRAM_N + 1],
+    seen: &mut HashSet<String>,
+    run: &[char],
+    start: usize,
+    len: usize,
+) {
+    if len_counts[len..].iter().sum::<usize>() >= MAX_NGRAM_TERMS {
+        return;
+    }
+    let raw: String = run[start..start + len].iter().collect();
+    // Section 7.1 parity with the write path: normalize every term
+    // (NFKC, lowercase), so a compatibility character in a message
+    // matches the alias stored under the normalized form.
+    let normalized = normalize(&raw);
+    if normalized.chars().count() < 2 {
+        return;
+    }
+    if seen.insert(normalized.clone()) {
+        terms.push(normalized);
+        len_counts[len] += 1;
     }
 }
 
@@ -530,7 +670,9 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         Ok(entry_ids)
     }
 
-    /// The recall flow (module docs, steps 1-7).
+    /// The recall flow (module docs, steps 1-7, plus the same-fact
+    /// collapse of `collapse_same_fact_candidates` between the
+    /// neighbor fetch and the Section 9.3 dedup — decision 40).
     async fn recall_inner(
         &self,
         chat_id: &str,
@@ -551,6 +693,9 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                                 edge_id,
                                 edge_text: edge.edge_text,
                                 valid_at: edge.valid_at,
+                                source_id: edge.source_id,
+                                relationship_name: edge.relationship_name,
+                                target_id: edge.target_id,
                             });
                         }
                     }
@@ -567,6 +712,16 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             }
         }
 
+        // Same-fact collapse (decision 40): the edge natural key
+        // carries valid_at, so one fact extracted twice with a
+        // different valid_at yields TWO candidates whose injection
+        // would burn the cap twice in one wake. Collapse to the
+        // latest rendering BEFORE the Section 9.3 dedup; refer to
+        // `collapse_same_fact_candidates` for the ordering rationale.
+        let fetched_edge_count = candidates.len();
+        let mut candidates = collapse_same_fact_candidates(candidates);
+        let collapsed_count = fetched_edge_count - candidates.len();
+
         // Step 3 (Section 9.3): drop the candidates that already have a
         // row in injected_memories. The table holds exactly the current
         // chunk — the M2 prune removes the old chunks at digest time.
@@ -582,6 +737,15 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         // The fixed cost of Section 9.1 applies to wakes with
         // candidates only.
         if candidates.is_empty() {
+            // Outcome (a) of the gate observability classes (Section
+            // 9.1). DEBUG only; the curated INFO wake line of
+            // decision 53 is untouched.
+            tracing::debug!(
+                chat_id = %chat_id,
+                entry_count = entry_ids.len(),
+                fetched_edge_count = fetched_edge_count,
+                "recall found no candidates; the relevance gate is not called"
+            );
             return Ok(RecallOutcome::default());
         }
 
@@ -594,34 +758,66 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             new_messages: new_messages.to_vec(),
             candidates,
         };
-        let selection = match self.gate.select(&input).await {
-            Ok(selection) => selection,
-            Err(error) => {
+        tracing::debug!(
+            chat_id = %chat_id,
+            candidate_count = input.candidates.len(),
+            collapsed_count = collapsed_count,
+            "recall presents candidates to the relevance gate"
+        );
+        let gate_result = self.gate.select(&input).await;
+
+        // Step 6: post-validation in plain Rust (never trust the model,
+        // same principle as validate.rs): in-range indices only,
+        // deduped, at most injection_cap (the Section 9.2 hard cap). A
+        // failed gate has no selection to validate.
+        let mut chosen: Vec<&RecallCandidate> = Vec::new();
+        if let Ok(selection) = &gate_result {
+            let mut picked = HashSet::new();
+            for &index in selection {
+                if index < input.candidates.len() && picked.insert(index) {
+                    chosen.push(&input.candidates[index]);
+                    if chosen.len() >= self.injection_cap as usize {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // The gate outcome classes (Section 9.2 observability): the
+        // fail-closed mapping makes a gate failure and a true "not
+        // relevant" produce the SAME RecallOutcome; the DEBUG logs
+        // distinguish them (the WARN at the failure site carries the
+        // error class). Decision 53: the curated INFO wake line stays
+        // untouched.
+        match recall_verdict(input.candidates.len(), gate_result.is_err(), chosen.len()) {
+            RecallVerdict::GateFailed => {
+                // Outcome (c): fail-closed (Section 9.2).
+                let error = gate_result.expect_err("the verdict says the gate failed");
                 tracing::warn!(
                     error = %error,
                     "the relevance gate failed; injecting nothing"
                 );
+                tracing::debug!(
+                    chat_id = %chat_id,
+                    candidate_count = input.candidates.len(),
+                    "the relevance gate failed; injecting nothing"
+                );
                 return Ok(RecallOutcome::default());
             }
-        };
-
-        // Step 6: post-validation in plain Rust (never trust the model,
-        // same principle as validate.rs): in-range indices only,
-        // deduped, at most injection_cap (the Section 9.2 hard cap).
-        let mut chosen: Vec<&RecallCandidate> = Vec::new();
-        let mut picked = HashSet::new();
-        for index in selection {
-            if index < input.candidates.len() && picked.insert(index) {
-                chosen.push(&input.candidates[index]);
-                if chosen.len() >= self.injection_cap as usize {
-                    break;
-                }
+            RecallVerdict::GateSelectedNone => {
+                // Outcome (b): an empty or "I remember nothing"
+                // injection is FORBIDDEN (Section 9.2): an empty
+                // selection yields no PlannedInjection at all.
+                tracing::debug!(
+                    chat_id = %chat_id,
+                    candidate_count = input.candidates.len(),
+                    "the relevance gate selected no candidates; injecting nothing"
+                );
+                return Ok(RecallOutcome::default());
             }
-        }
-        // An empty or "I remember nothing" injection is FORBIDDEN
-        // (Section 9.2): an empty selection yields no PlannedInjection.
-        if chosen.is_empty() {
-            return Ok(RecallOutcome::default());
+            // NoCandidates returned before the gate call (Section
+            // 9.1); Injected falls through to the render.
+            RecallVerdict::NoCandidates | RecallVerdict::Injected => {}
         }
 
         // Step 7 (Section 9.4): exactly one PlannedInjection. The edge
@@ -648,6 +844,92 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
 fn push_unique(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: String) {
     if seen.insert(id.clone()) {
         ids.push(id);
+    }
+}
+
+/// Collapses the candidate set by fact key: one fact is the triple
+/// (source_id, relationship_name, target_id), IGNORING `valid_at`
+/// (decision 40: the edge natural key carries `valid_at`, so the same
+/// fact extracted twice with a different `valid_at` is two distinct
+/// edges). The edge with the LATEST `valid_at` survives —
+/// dev-roadmap.md Section 3 item 5: read-side ordering takes the
+/// latest edge per subject and predicate; the collapse makes the
+/// injection path honor it. A tie on `valid_at` keeps the FIRST
+/// occurrence (deterministic), and the survivor keeps the position of
+/// the first occurrence of its fact.
+///
+/// The collapse runs BEFORE the Section 9.3 dedup against
+/// `injected_memories`: an older already-injected edge must not shadow
+/// the newer same-fact edge — after the collapse the survivor is the
+/// latest rendering, and the dedup keys on the survivor. Corollary:
+/// when the LATEST edge of a fact was already injected (a dedup row
+/// exists for its edge id), the fact drops entirely and the older
+/// duplicate does not come back — same fact, already told, correct.
+///
+/// The fetch-time `seen_edge_ids` dedup still runs first (unchanged):
+/// the same edge reached through several entries (sender and
+/// reply-target neighborhoods overlap) never reaches this function
+/// twice.
+fn collapse_same_fact_candidates(candidates: Vec<RecallCandidate>) -> Vec<RecallCandidate> {
+    // Fact key -> position of the first occurrence in `collapsed`.
+    let mut positions: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut collapsed: Vec<RecallCandidate> = Vec::new();
+    for candidate in candidates {
+        let fact_key = (
+            candidate.source_id.clone(),
+            candidate.relationship_name.clone(),
+            candidate.target_id.clone(),
+        );
+        match positions.get(&fact_key) {
+            None => {
+                positions.insert(fact_key, collapsed.len());
+                collapsed.push(candidate);
+            }
+            Some(&position) => {
+                // The latest valid_at wins; a tie keeps the first
+                // occurrence (deterministic).
+                if candidate.valid_at > collapsed[position].valid_at {
+                    collapsed[position] = candidate;
+                }
+            }
+        }
+    }
+    collapsed
+}
+
+/// The outcome classes of one recall call for the DEBUG observability
+/// logs (Sections 9.1 and 9.2). The fail-closed gate maps every
+/// failure to "inject nothing"; without these classes a gate failure
+/// and a true "not relevant" look identical in the logs. DEBUG/WARN
+/// only — the curated INFO wake line of decision 53 is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallVerdict {
+    /// Zero candidates: the relevance gate is NEVER called
+    /// (Section 9.1).
+    NoCandidates,
+    /// The gate call failed: fail-closed, nothing is injected
+    /// (Section 9.2).
+    GateFailed,
+    /// The gate ran, but the post-validated selection is empty.
+    GateSelectedNone,
+    /// At least one candidate survived post-validation: an injection
+    /// is planned.
+    Injected,
+}
+
+/// Classifies the outcome of one recall call from the three counts of
+/// the flow. Pure and total: zero candidates short-circuits before the
+/// gate (Section 9.1), and a gate failure wins over the selection
+/// count (fail-closed, Section 9.2).
+fn recall_verdict(candidate_count: usize, gate_failed: bool, chosen_count: usize) -> RecallVerdict {
+    if candidate_count == 0 {
+        RecallVerdict::NoCandidates
+    } else if gate_failed {
+        RecallVerdict::GateFailed
+    } else if chosen_count == 0 {
+        RecallVerdict::GateSelectedNone
+    } else {
+        RecallVerdict::Injected
     }
 }
 
@@ -716,11 +998,148 @@ mod tests {
 
     #[test]
     fn the_tokenizer_keeps_multi_character_cjk_tokens() {
-        // CJK characters are alphanumeric and survive.
+        // A CJK run now yields all contiguous n-grams (n in 2..=5), not
+        // one whole-run token. A two-char run yields exactly its
+        // bigram; the one-char run "は" yields nothing.
         assert_eq!(candidate_terms(&["玉子 は 寿司"]), vec!["玉子", "寿司"]);
         // A single CJK character is dropped (documented Phase 1 limit:
-        // the 2-char minimum counts chars after normalization).
+        // the n-gram path starts at 2).
         assert_eq!(candidate_terms(&["猫"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_tokenizer_extracts_all_ngrams_of_a_pure_cjk_run() {
+        // A 6-char run yields every contiguous n-gram with n in 2..=5:
+        // 2 five-grams, 3 four-grams, 4 trigrams, 5 bigrams, ordered
+        // longer first, first occurrence inside one length. The whole
+        // run is NOT a term.
+        let terms = candidate_terms(&["今天天气很好"]);
+        assert_eq!(
+            terms,
+            vec![
+                "今天天气很",
+                "天天气很好",
+                "今天天气",
+                "天天气很",
+                "天气很好",
+                "今天天",
+                "天天气",
+                "天气很",
+                "气很好",
+                "今天",
+                "天天",
+                "天气",
+                "气很",
+                "很好",
+            ]
+        );
+        assert!(!terms.contains(&"今天天气很好".to_string()));
+    }
+
+    #[test]
+    fn a_short_cjk_run_yields_its_ngrams_and_no_whole_run_token() {
+        // A 4-char run yields 1 + 2 + 3 = 6 n-grams and nothing else:
+        // the whole run survives only as its 4-gram, never as a
+        // separate whole-run token.
+        let terms = candidate_terms(&["春夏秋冬"]);
+        assert_eq!(
+            terms,
+            vec!["春夏秋冬", "春夏秋", "夏秋冬", "春夏", "夏秋", "秋冬"]
+        );
+    }
+
+    #[test]
+    fn the_tokenizer_combines_ascii_tokens_and_cjk_ngrams() {
+        // The ASCII token takes the alphanumeric path; the two CJK
+        // runs take the n-gram path. Alphanumeric terms come first.
+        let terms = candidate_terms(&["我今天吃了sushi，很好吃"]);
+        assert_eq!(
+            terms,
+            vec![
+                "sushi",
+                "我今天吃了",
+                "我今天吃",
+                "今天吃了",
+                "我今天",
+                "今天吃",
+                "天吃了",
+                "很好吃",
+                "我今",
+                "今天",
+                "天吃",
+                "吃了",
+                "很好",
+                "好吃",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ascii_letter_inside_a_cjk_run_splits_it_into_two_runs() {
+        // "abc" and "def" go through the alphanumeric path; "明天" is
+        // a maximal CJK run of its own and yields its bigram.
+        let terms = candidate_terms(&["abc明天def"]);
+        assert_eq!(terms, vec!["abc", "def", "明天"]);
+    }
+
+    #[test]
+    fn the_tokenizer_extracts_japanese_kana_ngrams() {
+        // The kana block mixes into the CJK runs on purpose: a kana
+        // run yields n-grams like any CJK run.
+        let terms = candidate_terms(&["たまご"]);
+        assert_eq!(terms, vec!["たまご", "たま", "まご"]);
+    }
+
+    #[test]
+    fn the_tokenizer_normalizes_compatibility_characters_in_cjk_runs() {
+        // Section 7.1 parity: U+30FF KATAKANA DIGRAPH KOTO folds to
+        // コト under NFKC, so the bigram of the run normalizes to the
+        // form an alias is stored under.
+        let terms = candidate_terms(&["読ヿ"]);
+        assert_eq!(terms, vec![normalize("読コト")]);
+        assert_eq!(terms, vec!["読コト"]);
+    }
+
+    #[test]
+    fn the_tokenizer_dedups_ngrams_across_messages_and_token_paths() {
+        // The same n-gram of two messages appears once (one shared
+        // dedup namespace).
+        let terms = candidate_terms(&["他住在北京", "北京很热闹"]);
+        assert_eq!(terms.iter().filter(|term| *term == "北京").count(), 1);
+        // Cross-path dedup: the halfwidth katakana token ｽｼ
+        // normalizes (NFKC) to スシ on the alphanumeric path, so the
+        // bigram of the later full-width run スシ is a duplicate.
+        let terms = candidate_terms(&["ｽｼ、スシ"]);
+        assert_eq!(terms, vec!["スシ"]);
+    }
+
+    #[test]
+    fn the_tokenizer_caps_ngrams_at_forty_longer_first() {
+        // A 13-char run of distinct characters yields 9 + 10 + 11 + 12
+        // = 42 distinct n-grams: two more than MAX_NGRAM_TERMS. The
+        // longer n-grams win; the last two bigrams (盈昃, 昃辰) drop.
+        let terms = candidate_terms(&["天地玄黄宇宙洪荒日月盈昃辰"]);
+        assert_eq!(terms.len(), MAX_NGRAM_TERMS);
+        // All 5-grams first, in first-occurrence order ...
+        assert_eq!(terms[0], "天地玄黄宇");
+        assert_eq!(terms[8], "日月盈昃辰");
+        // ... then the 4-grams and the 3-grams ...
+        assert_eq!(
+            terms.iter().position(|term| term.chars().count() == 2),
+            Some(30)
+        );
+        // ... and every 5-gram appears before any 2-gram.
+        let first_bigram = terms
+            .iter()
+            .position(|term| term.chars().count() == 2)
+            .unwrap();
+        assert!(terms[..first_bigram]
+            .iter()
+            .all(|term| term.chars().count() > 2));
+        // The surviving bigrams keep the first-occurrence order.
+        assert_eq!(terms[MAX_NGRAM_TERMS - 1], "月盈");
+        assert!(!terms.contains(&"盈昃".to_string()));
+        assert!(!terms.contains(&"昃辰".to_string()));
     }
 
     #[test]
@@ -755,11 +1174,17 @@ mod tests {
                     edge_id: "edge-1".to_string(),
                     edge_text: "Alice likes espresso.".to_string(),
                     valid_at: NOW,
+                    source_id: "person-alice".to_string(),
+                    relationship_name: "likes".to_string(),
+                    target_id: "concept-espresso".to_string(),
                 },
                 RecallCandidate {
                     edge_id: "edge-2".to_string(),
                     edge_text: "Bob plays go.".to_string(),
                     valid_at: datetime!(2025-12-31 23:00 UTC),
+                    source_id: "person-bob".to_string(),
+                    relationship_name: "plays".to_string(),
+                    target_id: "concept-go".to_string(),
                 },
             ],
         }
@@ -1312,5 +1737,186 @@ mod tests {
             outcome.injections[0].content,
             format!("I remember: {kept_edge_text}")
         );
+    }
+
+    // --- Same-fact collapse (decision 40: the natural key carries
+    // valid_at, so one fact extracted twice is two edges) and the
+    // gate-outcome classification (Sections 9.1/9.2 observability) ---
+
+    fn candidate(
+        source_id: &str,
+        relationship_name: &str,
+        target_id: &str,
+        valid_at: OffsetDateTime,
+        text: &str,
+    ) -> RecallCandidate {
+        RecallCandidate {
+            edge_id: format!("{source_id}|{relationship_name}|{target_id}|{valid_at:?}"),
+            edge_text: text.to_string(),
+            valid_at,
+            source_id: source_id.to_string(),
+            relationship_name: relationship_name.to_string(),
+            target_id: target_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_same_fact_collapse_keeps_the_latest_edge_at_the_first_position() {
+        // The survivor keeps the position of the FIRST occurrence of
+        // its fact; the other fact is untouched.
+        let other = candidate("p1", "related_to", "c-other", NOW, "Alice plays go.");
+        let older = candidate(
+            "p1",
+            "related_to",
+            "c1",
+            datetime!(2026-08-01 10:00 UTC),
+            "Alice likes espresso.",
+        );
+        let newer = candidate(
+            "p1",
+            "related_to",
+            "c1",
+            datetime!(2026-08-06 10:00 UTC),
+            "Alice loves espresso.",
+        );
+        let collapsed = collapse_same_fact_candidates(vec![other.clone(), older, newer.clone()]);
+        assert_eq!(collapsed, vec![other, newer]);
+    }
+
+    #[test]
+    fn the_same_fact_collapse_keeps_the_first_occurrence_on_a_valid_at_tie() {
+        // A tie on valid_at is deterministic: the first occurrence
+        // wins.
+        let first = candidate("p1", "related_to", "c1", NOW, "the first rendering");
+        let second = candidate("p1", "related_to", "c1", NOW, "the second rendering");
+        let collapsed = collapse_same_fact_candidates(vec![first.clone(), second]);
+        assert_eq!(collapsed, vec![first]);
+    }
+
+    #[test]
+    fn the_recall_verdict_distinguishes_the_three_gate_outcomes() {
+        // (a) Zero candidates: the gate is never called (Section 9.1).
+        // The candidate count short-circuits every other input.
+        assert_eq!(recall_verdict(0, false, 0), RecallVerdict::NoCandidates);
+        assert_eq!(recall_verdict(0, true, 0), RecallVerdict::NoCandidates);
+        // (b) Candidates presented, the post-validated selection is
+        // empty: the gate selected nothing relevant.
+        assert_eq!(recall_verdict(3, false, 0), RecallVerdict::GateSelectedNone);
+        // (c) The gate call failed: fail-closed (Section 9.2). The
+        // failure class wins over the selection count.
+        assert_eq!(recall_verdict(3, true, 0), RecallVerdict::GateFailed);
+        // The normal injection path.
+        assert_eq!(recall_verdict(3, false, 2), RecallVerdict::Injected);
+    }
+
+    /// Seeds one person whose one fact was extracted TWICE: same
+    /// source, relationship, and target, different valid_at and a
+    /// different text rendering (decision 40: the natural key carries
+    /// valid_at, so the two renderings are two distinct edges).
+    /// Returns (older, newer) as the recall read path sees them.
+    async fn seed_duplicated_fact(
+        memory: &LbugBackend,
+    ) -> (tamako_memory::NeighborEdge, tamako_memory::NeighborEdge) {
+        let person = person_node("u42", "Alice");
+        let concept = concept_node("espresso");
+        let older = MemoryEdge {
+            valid_at: datetime!(2026-08-01 10:00 UTC),
+            edge_text: "Alice likes espresso.".to_string(),
+            ..fact_edge(&person.id, &concept.id, "related_to", "")
+        };
+        let newer = MemoryEdge {
+            valid_at: datetime!(2026-08-06 10:00 UTC),
+            edge_text: "Alice loves espresso.".to_string(),
+            // created_at descending (Section 8.2): the newer edge
+            // comes first in the neighbor fetch.
+            created_at: NOW + time::Duration::seconds(1),
+            ..fact_edge(&person.id, &concept.id, "related_to", "")
+        };
+        seed(memory, vec![person, concept], vec![older, newer]).await;
+
+        let mut edges = memory
+            .neighbors(CHAT, &person_id("u42"))
+            .await
+            .expect("neighbors");
+        assert_eq!(edges.len(), 2);
+        // Identify by valid_at, not by fetch order.
+        let newer_position = edges
+            .iter()
+            .position(|edge| edge.valid_at == datetime!(2026-08-06 10:00 UTC))
+            .expect("the newer edge");
+        let newer = edges.remove(newer_position);
+        let older = edges.remove(0);
+        (older, newer)
+    }
+
+    #[tokio::test]
+    async fn the_same_fact_collapse_presents_only_the_latest_edge() {
+        // Two renderings of one fact must not burn the injection cap
+        // twice in one wake: the gate sees the LATEST rendering only
+        // (dev-roadmap.md Section 3 item 5).
+        let (_dir, store, memory) = backend().await;
+        seed_duplicated_fact(&memory).await;
+
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![0]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5);
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        let candidates = &recall.gate.inputs()[0].candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].edge_text, "Alice loves espresso.");
+        assert_eq!(
+            outcome.injections[0].content,
+            "I remember: Alice loves espresso."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_injected_older_edge_does_not_shadow_the_newer_same_fact_edge() {
+        // The collapse runs BEFORE the Section 9.3 dedup: the dedup
+        // row of the OLDER edge must not hide the newer rendering of
+        // the same fact.
+        let (_dir, store, memory) = backend().await;
+        let (older, _newer) = seed_duplicated_fact(&memory).await;
+        store
+            .insert_injected_memory(CHAT, &older.edge_id(), 10, "m1-m10", "earlier injection")
+            .expect("insert the dedup row");
+
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![0]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5);
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        assert_eq!(
+            presented_texts(&recall.gate),
+            vec!["Alice loves espresso.".to_string()]
+        );
+        assert_eq!(
+            outcome.injections[0].content,
+            "I remember: Alice loves espresso."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_injected_latest_edge_drops_the_fact_entirely() {
+        // The converse: the survivor of the collapse is the latest
+        // rendering, and a dedup row for ITS edge id drops the whole
+        // fact. The older duplicate does not come back — same fact,
+        // already told, correct.
+        let (_dir, store, memory) = backend().await;
+        let (_older, newer) = seed_duplicated_fact(&memory).await;
+        store
+            .insert_injected_memory(CHAT, &newer.edge_id(), 10, "m1-m10", "earlier injection")
+            .expect("insert the dedup row");
+
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![0]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5);
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        assert_eq!(outcome, RecallOutcome::default());
+        // No candidate survived: the gate was never called
+        // (Section 9.1).
+        assert_eq!(recall.gate.call_count(), 0);
     }
 }
