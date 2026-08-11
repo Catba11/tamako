@@ -44,7 +44,7 @@ use tamako_core::context::{ContextItem, ContextItemKind, ContextRole, RangeTag};
 use tamako_core::digest::DigestPipeline;
 use tamako_core::event::{InboundEvent, NormalizedMessage, OutboundAction};
 use tamako_core::wake::{GateDecision, ParticipationGate, ReplyGenerator, WakeServices};
-use tamako_memory::identifiers::{concept_id, person_id};
+use tamako_memory::identifiers::{alias_id, concept_id, person_id};
 use tamako_memory::{LbugBackend, MemoryBackend, MemoryBatch, MemoryEdge, MemoryNode, NodeType};
 use tamako_store::{InjectedMemoryRow, Store};
 use time::OffsetDateTime;
@@ -190,6 +190,65 @@ async fn seed_person_facts(
         batch_id: "seed".to_string(),
         nodes,
         edges,
+    };
+    fixture
+        .memory
+        .upsert_batch(CHAT_ID, &batch)
+        .await
+        .expect("the seed upsert");
+}
+
+/// An Alias node of the graph (the `alias_node_seeded` style of
+/// recall.rs). `alias_id` normalizes the surface form internally
+/// (Section 7.1 of the database spec).
+fn alias_node(surface_form: &str) -> MemoryNode {
+    MemoryNode {
+        id: alias_id(surface_form),
+        name: surface_form.to_string(),
+        node_type: NodeType::Alias,
+        created_at: t0(),
+        updated_at: t0(),
+        properties: None,
+    }
+}
+
+/// Seeds the Section 7.4 step 2 write-path shape directly against the
+/// graph (the seeding style of recall.rs `seed_person_alias`): one
+/// Person node, one Alias node for the surface form, the `known_as`
+/// edge person -> alias, plus one fact edge person -> Concept. The
+/// fact edge is the NEWER edge, so it comes first in the neighbor
+/// fetch (created_at descending, Section 8.2 of the database spec).
+async fn seed_person_with_alias_and_fact(
+    fixture: &Fixture,
+    user_id: &str,
+    name: &str,
+    surface: &str,
+    fact: (&str, &str),
+) {
+    let person = person_node(user_id, name);
+    let alias = alias_node(surface);
+    let known_as = MemoryEdge {
+        source_id: person.id.clone(),
+        target_id: alias.id.clone(),
+        relationship_name: "known_as".to_string(),
+        valid_at: t0(),
+        invalid_at: None,
+        edge_text: format!("{surface} is a surface form of {name}."),
+        created_at: t0(),
+        updated_at: t0(),
+        properties: None,
+    };
+    let concept = concept_node(fact.0);
+    let fact = fact_edge(
+        &person.id,
+        &concept.id,
+        fact.1,
+        t0() + time::Duration::seconds(1),
+    );
+    let batch = MemoryBatch {
+        batch_id: "seed".to_string(),
+        nodes: vec![person, alias, concept],
+        edges: vec![known_as, fact],
     };
     fixture
         .memory
@@ -991,6 +1050,158 @@ async fn the_digest_prunes_injection_rows_at_the_boundary() {
     assert_eq!(
         doubles.relevance.inputs()[1].candidates[0].edge_id,
         tea_edge_id
+    );
+
+    handle.shutdown().await.expect("the actor reports no error");
+    shutdown_pump(pump).await;
+}
+
+/// Scenario 6: a Chinese wake message whose CJK n-gram exactly matches
+/// a stored Alias flows end to end (decision 58 on top of the
+/// tokenizer of decision 44; specs.md Sections 9.1-9.4). The wake text
+/// "明哥今天来吗" is one maximal CJK run; its bigram "明哥" matches
+/// the stored Alias. The pre-n-gram tokenizer produced only the
+/// whole-run token "明哥今天来吗", which matches nothing — this test
+/// is the end-to-end proof that the n-gram path finds the alias.
+///
+/// The sender "u9" is UNSEEDED: the sender Person entry resolves to an
+/// unknown node with zero neighbors, so the ONLY path to the candidate
+/// is the alias n-gram (Section 8.1 steps 1 and 2 of the database
+/// spec). The alias has exactly one target, so the entry is the Person
+/// node 小明 and BOTH of its edges are candidates (one hop, Section
+/// 8.2): the fact edge first (the newer edge), then the known_as edge.
+///
+/// Rows: m1=1, m2=2, m3=3; the wake fires at m3, so the Rule C2
+/// injection position is the tail row 3. The gate participates and
+/// targets row 3; the reply sends.
+#[tokio::test]
+async fn a_chinese_ngram_matching_an_alias_flows_end_to_end() {
+    let fixture = make_fixture().await;
+    seed_person_with_alias_and_fact(&fixture, "u7", "小明", "明哥", ("辣味", "小明喜欢吃辣。"))
+        .await;
+    // The natural key of the fact edge, through the same read path as
+    // the other scenarios (Section 8.2 of the database spec).
+    let fact_edge_id = fixture
+        .memory
+        .neighbors(CHAT_ID, &person_id("u7"))
+        .await
+        .expect("the neighbor fetch")
+        .into_iter()
+        .find(|edge| edge.relationship_name == "related_to")
+        .expect("the fact edge")
+        .edge_id();
+
+    let doubles = WakeDoubles {
+        // Index 0 is the fact edge: it is the newer edge of the target
+        // node, so it leads the presented set (verified by the
+        // candidate assertions below).
+        relevance: Arc::new(ScriptedRelevanceGate::with_selections(vec![vec![0]])),
+        gate: Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
+            participate: true,
+            target_row_id: Some(3),
+            reason: None,
+        }])),
+        reply: Arc::new(ScriptedReplyGenerator::with_replies(vec!["r1".to_string()])),
+    };
+    let config = wake_config();
+    let pump = outbound_pump();
+    let handle = spawn_with_wake(
+        &fixture,
+        config,
+        t0(),
+        &doubles,
+        None,
+        Some(pump.tx.clone()),
+    );
+
+    // Three Chinese texts from the unseeded sender. Only m2 carries the
+    // alias, as a substring of a longer CJK run: the n-gram set of the
+    // run "明哥今天来吗" contains the bigram "明哥". The texts are
+    // short enough that the n-gram pool stays below MAX_NGRAM_TERMS, so
+    // no term is truncated.
+    let texts = ["天气不错", "明哥今天来吗", "一起吃饭吧"];
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u9", "阿杰", texts[index]),
+        )
+        .await;
+    }
+    // The send rides AFTER the injection application in the wake
+    // completion handler, so the recorded action is the barrier for
+    // both (Section 9: injections are applied first).
+    wait_for_actions(&pump.sink, 1).await;
+    wait_for_counter(&fixture.store, "injection_wakes_total", "1").await;
+
+    // (a) Sections 9.1/9.2: the relevance gate was called EXACTLY once.
+    // The presented set is exactly the two edges of the alias target
+    // (verified order): the fact edge first, then the known_as edge.
+    // The candidate source is the seeded person "u7", reached ONLY
+    // through the alias n-gram — the sender "u9" is unseeded.
+    let relevance_inputs = doubles.relevance.inputs();
+    assert_eq!(relevance_inputs.len(), 1);
+    assert!(
+        relevance_inputs[0]
+            .new_messages
+            .iter()
+            .all(|message| message.sender_id == "u9"),
+        "every wake message comes from the unseeded sender"
+    );
+    let candidates = &relevance_inputs[0].candidates;
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].edge_id, fact_edge_id);
+    assert_eq!(candidates[0].edge_text, "小明喜欢吃辣。");
+    assert_eq!(candidates[0].source_id, person_id("u7"));
+    assert_eq!(candidates[0].relationship_name, "related_to");
+    assert_eq!(candidates[1].edge_text, "明哥 is a surface form of 小明.");
+    assert_eq!(candidates[1].relationship_name, "known_as");
+
+    // (b) Rule C2 / Section 9.4: exactly one RecallInjection assistant
+    // item, content "I remember: 小明喜欢吃辣。", at the tail row 3.
+    let context = handle
+        .context_snapshot()
+        .await
+        .expect("the context snapshot");
+    let injections = recall_injections(&context);
+    assert_eq!(injections.len(), 1);
+    let injection = injections[0];
+    assert_eq!(injection.role, ContextRole::Assistant);
+    assert_eq!(injection.content, "I remember: 小明喜欢吃辣。");
+    assert_eq!(injection.range_tag, Some(RangeTag::single(3)));
+
+    // (c) Section 9.3 / specs.md Section 5.2: exactly one
+    // injected_memories row, keyed on the natural key of the fact edge.
+    let rows = injected_rows(&fixture.store).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].edge_id, fact_edge_id);
+    assert_eq!(rows[0].injection_position, 3);
+    assert_eq!(rows[0].range_tag, "3-3");
+    assert_eq!(rows[0].content, "I remember: 小明喜欢吃辣。");
+
+    // (d) Section 9.6: the injection rides the gate input and the
+    // reply-model snapshot.
+    let gate_inputs = doubles.gate.inputs();
+    assert_eq!(gate_inputs.len(), 1);
+    assert_eq!(
+        gate_inputs[0].injections,
+        vec!["I remember: 小明喜欢吃辣。".to_string()]
+    );
+    let requests = doubles.reply.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].messages.iter().any(|message| {
+            message.role == ContextRole::Assistant
+                && message.content == "I remember: 小明喜欢吃辣。"
+        }),
+        "the reply-model snapshot carries the injection"
+    );
+
+    // (e) Section 12: the injection-rate metric.
+    assert_eq!(
+        counter(&fixture.store, "injection_wakes_total")
+            .await
+            .as_deref(),
+        Some("1")
     );
 
     handle.shutdown().await.expect("the actor reports no error");
