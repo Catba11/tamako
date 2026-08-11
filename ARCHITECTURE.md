@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 47 |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 83 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 48 |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 89 |
 | `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 23 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 14 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 139 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 145 (+3 ignored live tests) |
 
-Total: 380 tests (+4 ignored live tests). Build, test,
+Total: 393 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -157,6 +157,16 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   `forced_pending` with the intake timestamp of its forcing message
   (Section 6.2, deterministic replay clock) and starts immediately
   after the current wake completes.
+- The reply text of step 4 passes the parrot filter of decision 59 IN
+  the wake task, before the report: every line whose trimmed start
+  matches the recall-injection prefix (`INJECTION_TEXT_PREFIX`, ASCII
+  or full-width colon) is removed — the reply model can imitate the
+  injection format it sees as assistant-role context, and a
+  confabulated "I remember: ..." line must never become bot speech. A
+  strip that leaves text logs one WARN with the chat id; an empty
+  remainder is the empty-reply `CoreError::Wake` (log, skip, no
+  crash). The live reply generator applies the same pure function at
+  its own validation seam (`tamako-agent`, `trimmed_reply_or_error`).
 - The `WakeCompleted` send path: the recency re-check of Section 6.2
   DISCARDS the reply when more than `reply_staleness_threshold` newer
   human messages arrived after the target (discard, not regenerate);
