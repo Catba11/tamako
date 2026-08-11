@@ -790,3 +790,101 @@ async fn stale_reply_is_discarded() {
     wait_for_counter(&fixture.store, "participations_total", "1").await;
     shutdown(harness).await;
 }
+
+/// Scenario F: the parrot filter end to end (decision 59, F1). Two
+/// forced wakes (mentions), two scripted replies:
+///
+/// - reply 1 is ONLY a confabulated parrot block (ASCII and full-width
+///   colon variants): the filter leaves nothing, the wake follows the
+///   exact empty-reply path — nothing persisted, nothing sent, no
+///   participation counted;
+/// - reply 2 is a parrot block followed by real text: the group and
+///   the raw log see the SAME stripped remainder (Rule B1: the log is
+///   the truth).
+///
+/// The second wake's send is the deterministic barrier that the first
+/// wake's failure completed (Section 6.2: a queued forced wake starts
+/// at the earliest inside the previous wake's completion handler),
+/// exactly as in `stale_reply_is_discarded`.
+#[tokio::test]
+async fn parroting_replies_are_filtered_before_log_and_send() {
+    let fixture = make_fixture();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid timestamp");
+    let config = TriggerConfig {
+        wake_msg_count: 3,
+        wake_floor: Duration::ZERO,
+        wake_interval: HUGE_INTERVAL,
+        ..TriggerConfig::default()
+    };
+    // Forced wakes bypass the gate; an exhausted scripted gate fails
+    // the test if one is ever consulted.
+    let gate = Arc::new(ScriptedGate::with_decisions(vec![]));
+    let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
+        "I remember: Alice likes tea.\nI remember：小明喜欢吃辣。".to_string(),
+        "I remember: Alice likes tea.\n在的".to_string(),
+    ]));
+    let harness = spawn_on(&fixture, config, t0, gate, reply);
+    harness
+        .handle
+        .send_event(InboundEvent::Message(message(
+            "f1",
+            t0 + time::Duration::seconds(1),
+            true,
+        )))
+        .await
+        .expect("the actor inbox is open");
+    // The reply model ran for the first wake.
+    let deadline = std::time::Instant::now() + WAKE_TIMEOUT;
+    while harness.reply.requests().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {WAKE_TIMEOUT:?} waiting for the reply generation"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    harness
+        .handle
+        .send_event(InboundEvent::Message(message(
+            "f2",
+            t0 + time::Duration::seconds(2),
+            true,
+        )))
+        .await
+        .expect("the actor inbox is open");
+    // Exactly one send: the stripped remainder of reply 2. Its arrival
+    // proves the parrot-only wake left no trace behind it.
+    let actions = wait_for_actions(&harness.sink, 1).await;
+    let sends = send_texts(&actions);
+    assert_eq!(
+        sends,
+        vec![(
+            CHAT_ID.to_string(),
+            "在的".to_string(),
+            Some("f2".to_string())
+        )],
+        "the parrot block never reaches the group; only the remainder is sent"
+    );
+    // Rule B1: the one outbound raw-log row carries the SAME filtered
+    // text the group saw — the log is the truth.
+    let outbound = rows_of_direction(&fixture.store, Direction::Outbound).await;
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].text, "在的");
+    assert_eq!(outbound[0].reply_to_platform_msg_id.as_deref(), Some("f2"));
+    // Rule C1: the context bot speech is the filtered text too.
+    let context = harness
+        .handle
+        .context_snapshot()
+        .await
+        .expect("the context snapshot succeeds");
+    let bot_speeches: Vec<&str> = context
+        .iter()
+        .filter(|item| item.kind == ContextItemKind::BotSpeech)
+        .map(|item| item.content.as_str())
+        .collect();
+    assert_eq!(bot_speeches, vec!["在的"]);
+    wait_for_counter(&fixture.store, "wakes_total", "2").await;
+    // Only the stripped-remainder send counts as a participation; the
+    // parrot-only wake failed like an empty reply.
+    wait_for_counter(&fixture.store, "participations_total", "1").await;
+    shutdown(harness).await;
+}
