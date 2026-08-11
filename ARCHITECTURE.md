@@ -20,9 +20,9 @@ dependency versions are pinned in `[workspace.dependencies]`.
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 14 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 121 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 125 (+3 ignored live tests) |
 
-Total: 361 tests (+4 ignored live tests). Build, test,
+Total: 365 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -382,7 +382,13 @@ the three model keys) plus the environment into one `EndpointConfig`
 per purpose; env wins at every level (`TAMAKO_LLM_API`,
 `TAMAKO_LLM_BASE_URL`, `TAMAKO_{DIGEST,GATE,REPLY}_MODEL`), and an
 unknown family string is `AgentError::ProviderConfig`, never a silent
-default. `EndpointClient` hides the two rig model types behind one
+default. The global-only `llm_session_id` (env
+`TAMAKO_LLM_SESSION_ID`, default `"tamako"`) resolves into the
+`x-opencode-session` default header of the client — the Opencode Go
+gateway's session-affinity key for the provider prompt cache — sent on
+every request of both families via rig's `ClientBuilder::http_headers`;
+every successful completion logs the rig usage fields (including
+`cached_input_tokens`) at DEBUG. `EndpointClient` hides the two rig model types behind one
 async `complete` call. What rig 0.41 can and cannot do (verified
 against its sources; the module docs carry the full list): custom base
 URLs and free-form model names on every provider through the explicit

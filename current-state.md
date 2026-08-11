@@ -129,7 +129,7 @@ test-group soak (`docs/soak-runbook.md`).
     tail-stats cost is measured and documented (Section 4, gap 7).
     `docs/soak-runbook.md` prepares the Phase 1 exit.
 - Verification: `cargo build --workspace`, `cargo test --workspace`
-  (361 tests, 0 failures, 4 ignored live tests: the live-API smoke
+  (365 tests, 0 failures, 4 ignored live tests: the live-API smoke
   tests of tamako-agent — extraction and wake — and the live Telegram
   smoke test),
   `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -152,7 +152,7 @@ test-group soak (`docs/soak-runbook.md`).
 | `tamako-persona` | `persona.toml` loading, `PreambleRenderer` trait, `PetPreambleRenderer` with the Section 9.4 injection guardrail, example persona at the repo root. | 14 |
 | `tamako-adapter-mock` | JSON replay fixture format, `MockAdapter` (event replay, action recording), 14-event demo fixture. | 6 |
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide 0.17). Pure `normalize` module (bot identity from get_me, display-name fallback chain, message/service/reaction/count normalization; synthetic `chat:{id}` for anonymous actors) plus the live `TeloxideAdapter` (polling task + bounded mpsc channel of 100, `next_group_event() -> GroupEvent { chat_id, event }` for multi-group routing per Rule P5, `PlatformAdapter` impl as the Rule A5 substitutability proof). Capability model (specs.md Section 4.2): `bot_chat_status` classifies the per-group membership (`BotChatStatus`: `Administrator` — owner counts as administrator — `Member`, `RestrictedOrOther`, `Unknown`; query failures map to `Unknown`). Outbound: `SendText` (optional reply via ReplyParameters), `React` (setMessageReaction); `SendMedia` → `AdapterError::Unsupported` (Phase 3). Outbound permission failures (missing rights or access) are tolerated: logged with the chat id, never fatal. Live Telegram smoke test ignored by default (`TAMAKO_LIVE_TELEGRAM=1` + `TELOXIDE_TOKEN`). | 50 (+1 ignored) |
-| `tamako-agent` | All LLM concerns (the only rig consumer). `KnowledgeGraph` extraction types (serde + schemars 1.x, conservative field-name aliases, decision 48), `KnowledgeExtractor` trait with the live `RigExtractor` (rig-core 0.41 completion + `output_schema`, Anthropic native structured output, default model `claude-haiku-4-5`) and the scripted `ScriptedExtractor`, conservative emoji/greeting skeleton detector (Section 7.2 rule 5), plain-Rust relationship-name validation (Section 6.3), entity resolution steps 1/2/4 with the Alias-node fallback (Section 7.4), `AgentDigestPipeline` with exponential backoff and dead-letter (Section 10.3). M4: the `endpoint` module (specs.md Section 13 endpoint portability: `LlmConfigValues` → `LlmEndpoints::resolve` with env-wins precedence and per-purpose overrides, `EndpointClient` over the two API families — Anthropic Messages and OpenAI chat completions — with base-URL and model overrides; a missing family API key is `AgentError::ProviderConfig`; robustness fix, decisions 48/50/52: per-purpose `structured_output` modes `schema`/`json_object`/`prompt_only` with default `schema` — `json_object` via rig `additional_params` on the OpenAI family only, Anthropic degrades to prompt-only — and ONE shared repair retry for every structured call: preamble field-name skeletons, exact JSON, one repair completion on a schema-invalid-but-JSON response, then the original error class), the participation gate `RigGate` (structured output, post-validated in plain Rust; Section 9.6) with its scripted double, and the reply generator `RigReplyGenerator` (the M2 context→rig conversion seam; Section 9 step 4) with its scripted double. M5: the `recall` module — `ShallowRecall` (deterministic candidate extraction: sender/reply-target Person entries per Section 8.1 step 1, exact alias matches per step 2, the pure candidate-term tokenizer with documented Phase 1 limits; Section 9.3 dedup against `injected_memories`; zero candidates never call the cheap model), the conservative relevance gate `RigRelevanceGate` (Section 9.2, structured output, post-validated in plain Rust, hard cap) with its scripted double, and the Section 9.4 render of exactly one "I remember: ..." injection. Live-API smoke tests ignored by default (`TAMAKO_LIVE_TEST=1`). | 121 (+3 ignored) |
+| `tamako-agent` | All LLM concerns (the only rig consumer). `KnowledgeGraph` extraction types (serde + schemars 1.x, conservative field-name aliases, decision 48), `KnowledgeExtractor` trait with the live `RigExtractor` (rig-core 0.41 completion + `output_schema`, Anthropic native structured output, default model `claude-haiku-4-5`) and the scripted `ScriptedExtractor`, conservative emoji/greeting skeleton detector (Section 7.2 rule 5), plain-Rust relationship-name validation (Section 6.3), entity resolution steps 1/2/4 with the Alias-node fallback (Section 7.4), `AgentDigestPipeline` with exponential backoff and dead-letter (Section 10.3). M4: the `endpoint` module (specs.md Section 13 endpoint portability: `LlmConfigValues` → `LlmEndpoints::resolve` with env-wins precedence and per-purpose overrides, `EndpointClient` over the two API families — Anthropic Messages and OpenAI chat completions — with base-URL and model overrides; the global-only `llm_session_id` resolves to the `x-opencode-session` default header on every request of both families through rig's `ClientBuilder::http_headers` (gateway session affinity, decision 57) and every successful completion logs the rig `Usage` fields (incl. `cached_input_tokens`) at DEBUG (decision 53's curated INFO lines untouched); a missing family API key is `AgentError::ProviderConfig`; robustness fix, decisions 48/50/52: per-purpose `structured_output` modes `schema`/`json_object`/`prompt_only` with default `schema` — `json_object` via rig `additional_params` on the OpenAI family only, Anthropic degrades to prompt-only — and ONE shared repair retry for every structured call: preamble field-name skeletons, exact JSON, one repair completion on a schema-invalid-but-JSON response, then the original error class), the participation gate `RigGate` (structured output, post-validated in plain Rust; Section 9.6) with its scripted double, and the reply generator `RigReplyGenerator` (the M2 context→rig conversion seam; Section 9 step 4) with its scripted double. M5: the `recall` module — `ShallowRecall` (deterministic candidate extraction: sender/reply-target Person entries per Section 8.1 step 1, exact alias matches per step 2, the pure candidate-term tokenizer with documented Phase 1 limits; Section 9.3 dedup against `injected_memories`; zero candidates never call the cheap model), the conservative relevance gate `RigRelevanceGate` (Section 9.2, structured output, post-validated in plain Rust, hard cap) with its scripted double, and the Section 9.4 render of exactly one "I remember: ..." injection. Live-API smoke tests ignored by default (`TAMAKO_LIVE_TEST=1`). | 125 (+3 ignored) |
 
 ## 3. Key decisions and deviations so far
 
@@ -551,11 +551,45 @@ test-group soak (`docs/soak-runbook.md`).
    `bad response format` error, so `prompt_only` is REQUIRED for it.
    Decision 49's "schema honored, `prompt_only` strictly worse" verdict
    covers the mimo models only; neither verdict generalizes across
-   models on one endpoint. The soak deployment runs all three purposes
-   on `deepseek-v4-flash` with `structured_output = "prompt_only"`, so
-   the four robustness layers of decision 48 carry the field-name
-   integrity. Probe the exact model of each purpose with
-   `probe_endpoint`; do not extrapolate across models.
+    models on one endpoint. The soak deployment runs all three purposes
+    on `deepseek-v4-flash` with `structured_output = "prompt_only"`, so
+    the four robustness layers of decision 48 carry the field-name
+    integrity. Probe the exact model of each purpose with
+    `probe_endpoint`; do not extrapolate across models.
+57. **Global-only `llm_session_id` config key, sent as the
+    `x-opencode-session` header on every request of both API
+    families.** The Opencode Go gateway honors an undocumented request
+    header `x-opencode-session`: the sticky id drives upstream
+    selection and prompt-cache affinity (the gateway deletes the header
+    before forwarding; body params like `prompt_cache_key` are
+    rejected). Live probe 2026-08-10 against `deepseek-v4-flash`:
+    2304/2309 prompt tokens cached WITH the header vs 0 without.
+    Resolution: env `TAMAKO_LLM_SESSION_ID` wins → global config key
+    `llm_session_id` → default `"tamako"`; empty strings count as
+    unset, so an empty header is never emitted. The header is applied
+    through rig 0.41's `ClientBuilder::http_headers(HeaderMap)` on the
+    anthropic AND the openai builders (the gateway's sticky logic is
+    format-agnostic; `build()` inserts the API-key auth header only
+    when the map does not carry it, so the two never clash); a session
+    id that is not a valid header value is
+    `AgentError::ProviderConfig`. A wire-level test (a local
+    TcpListener answering a minimal OpenAI chat-completion response)
+    proves the header reaches the request head. Per-group session ids
+    were deliberately NOT done: one session id per deployment. The key
+    sits in both `TriggerConfig` and `TriggerConfigToml` like the
+    `structured_output` keys (a group table could set it, harmless) —
+    the agent layer reads the global value only. Alongside it, every
+    successful completion (repair calls included) logs the rig `Usage`
+    fields `input_tokens` / `cached_input_tokens` /
+    `cache_creation_input_tokens` / `output_tokens` at DEBUG, so the
+    cache behavior of the header is observable with `-v`; the curated
+    INFO lines of decision 53 stay untouched. max_tokens audit: the
+    bounds (digest/gate/recall 262144, reply 131072) are already
+    generous against the trigger-bounded inputs — digest leaves >200k
+    tokens of reasoning burn headroom, the gate output is a three-field
+    JSON — so NOTHING changed. The key is REPORTED FOR SPEC BACKFILL
+    (specs.md Section 13 has no LLM keys beyond the endpoint set; the
+    primary spec edit is pending).
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
