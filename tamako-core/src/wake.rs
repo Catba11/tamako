@@ -50,6 +50,79 @@ pub struct PlannedInjection {
     pub content: String,
 }
 
+/// The text prefix of every recall-injection message (Section 9.4):
+/// the rendered injection is `"{INJECTION_TEXT_PREFIX}{edge texts}"`.
+/// This is the SINGLE definition of the prefix. The tamako-agent
+/// recall renderer uses it, and the reply parrot filter
+/// ([`filter_reply_parrot_lines`]) matches it, so the injection
+/// format and the filter can never drift apart (decision 59).
+pub const INJECTION_TEXT_PREFIX: &str = "I remember: ";
+
+/// The outcome of the reply parrot filter
+/// ([`filter_reply_parrot_lines`], decision 59 F1): the text the bot
+/// sends, plus whether the filter stripped one or more lines. The
+/// flag keeps the call site honest: a stripped wake emits the
+/// decision-59 WARN line with the chat id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyFilterOutcome {
+    /// The trimmed reply text with every parrot line removed.
+    pub text: String,
+    /// True when at least one parrot line was removed.
+    pub stripped_parrot: bool,
+}
+
+/// True when the trimmed START of one line is the injection prefix
+/// (decision 59, F1). Matches the ASCII colon of
+/// [`INJECTION_TEXT_PREFIX`] and the full-width colon `：` of
+/// Chinese-context model output. Line-start anchored only: mid-line
+/// text is never matched (false-positive control).
+fn is_parrot_line(line: &str) -> bool {
+    let start = line.trim_start();
+    if start.starts_with(INJECTION_TEXT_PREFIX) {
+        return true;
+    }
+    // The full-width-colon variant: same words, `：` for `:`. Strip
+    // the trailing space AND the ASCII colon of the prefix; the
+    // remainder of the line must then open with the full-width colon.
+    start
+        .strip_prefix(INJECTION_TEXT_PREFIX.trim_end().trim_end_matches(':'))
+        .is_some_and(|rest| rest.starts_with('：'))
+}
+
+/// The outbound parrot filter (decision 59, F1). Removes every line
+/// whose trimmed start matches the recall-injection prefix (ASCII or
+/// full-width colon), then trims the remainder. The reply model can
+/// imitate the injection format (the injections enter its context as
+/// assistant-role messages, Sections 9.3-9.5) and speak a confabulated
+/// "I remember: ..." block; such a line is hallucinated speech, not a
+/// recalled memory, and it must never reach the raw log (Rule P1) or
+/// the group.
+///
+/// The filter runs BEFORE the outbound raw-log row persists (Rule B1):
+/// the log and the group see the same filtered text. It runs on EVERY
+/// reply text by construction: the actor applies it to every
+/// `ReplyGenerator` output, and tamako-agent's live generator applies
+/// the same function at its own validation seam. Always on; no
+/// configuration key. Pure function, no I/O.
+pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
+    let mut stripped_parrot = false;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            if is_parrot_line(line) {
+                stripped_parrot = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    ReplyFilterOutcome {
+        text: kept.join("\n").trim().to_string(),
+        stripped_parrot,
+    }
+}
+
 /// The recall result of one wake (Section 9 step 2). M5 produces
 /// at most one injection per wake; the Vec keeps the seam open.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -203,5 +276,70 @@ mod tests {
         ) {
         }
         assert_object_safe(None, None, None);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_leading_block() {
+        // Decision 59, F1: the model echoed the injection format before
+        // its real speech (the live-soak failure shape).
+        let filtered = filter_reply_parrot_lines(
+            "I remember: Alice likes tea.\nI remember: Bob runs.\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_mid_text_line() {
+        let filtered = filter_reply_parrot_lines("one\nI remember: Alice likes tea.\ntwo");
+        assert_eq!(filtered.text, "one\ntwo");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_the_full_width_colon_variant() {
+        // Chinese-context model output uses the full-width colon.
+        let filtered = filter_reply_parrot_lines("I remember：小明喜欢吃辣。\n在的");
+        assert_eq!(filtered.text, "在的");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn a_reply_of_only_a_parrot_block_filters_to_empty() {
+        // The empty remainder maps to the SAME wake error as an empty
+        // reply at the call sites (decision 59, F1).
+        for only in [
+            "I remember: Alice likes tea.",
+            "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
+        ] {
+            let filtered = filter_reply_parrot_lines(only);
+            assert_eq!(filtered.text, "", "input {only:?}");
+            assert!(filtered.stripped_parrot);
+        }
+    }
+
+    #[test]
+    fn normal_text_passes_the_parrot_filter_byte_identical() {
+        // False-positive control: an innocuous mid-line "I remember"
+        // mention and multiline text survive untouched (line-start
+        // anchored only).
+        for normal in [
+            "I remember when we tried that place",
+            "在的",
+            "one\ntwo\nthree",
+            "hungry? I remember: not a line start",
+        ] {
+            let filtered = filter_reply_parrot_lines(normal);
+            assert_eq!(filtered.text, normal.trim());
+            assert!(!filtered.stripped_parrot, "false positive on {normal:?}");
+        }
+    }
+
+    #[test]
+    fn the_injection_prefix_matches_the_documented_format() {
+        // Section 9.4: the injection renders as "I remember: ...".
+        // The constant guards the renderer and the filter against
+        // drift; this assertion pins the exact bytes.
+        assert_eq!(INJECTION_TEXT_PREFIX, "I remember: ");
     }
 }

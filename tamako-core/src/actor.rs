@@ -82,8 +82,8 @@ use crate::event::{InboundEvent, NormalizedMessage, OutboundAction, ReactionEven
 use crate::session::{round_to_millis, SessionState};
 use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeScheduler};
 use crate::wake::{
-    GateDecision, GateInput, GateMessage, ParticipationGate, PlannedInjection, RecallProvider,
-    ReplyGenerator, ReplyRequest, WakeServices,
+    filter_reply_parrot_lines, GateDecision, GateInput, GateMessage, ParticipationGate,
+    PlannedInjection, RecallProvider, ReplyGenerator, ReplyRequest, WakeServices,
 };
 
 /// Errors of tamako-core.
@@ -1285,14 +1285,32 @@ async fn run_wake_calls(
     // Step 4: the reply generation with the reply model over the context
     // snapshot. Skipped when the decision is no-participation.
     let reply_text = match &target {
-        Some(target) => Some(
-            reply
+        Some(target) => {
+            let raw_text = reply
                 .generate(&ReplyRequest {
                     messages: snapshot,
                     target: target.clone(),
                 })
-                .await?,
-        ),
+                .await?;
+            // Decision 59, F1: the parrot filter guards EVERY reply
+            // text here, so no generator (the live one included, and
+            // every scripted double of tests) can put a confabulated
+            // "I remember: ..." line into the WakeReport. The filtered
+            // text is what the completion handler persists (Rule B1)
+            // and sends: the log and the group see the same text.
+            let filtered = filter_reply_parrot_lines(&raw_text);
+            if filtered.stripped_parrot {
+                tracing::warn!(chat_id = %chat_id, "the parrot filter stripped recall-injection echo lines from the reply");
+            }
+            if filtered.text.is_empty() {
+                // Nothing remains: the SAME wake error as an empty
+                // reply today — nothing persisted, nothing sent.
+                return Err(CoreError::Wake(
+                    "the reply model returned an empty reply".to_string(),
+                ));
+            }
+            Some(filtered.text)
+        }
         None => None,
     };
     Ok(WakeReport {
