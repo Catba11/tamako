@@ -81,3 +81,20 @@ rule 3). The regression test is
 
 An upstream bug report against LadybugDB is recommended. Not filed at
 the time of this addendum.
+
+## Addendum 2026-08-10: Rust 0.18.3 writes storage v43; Python inspection needs ladybug >= 0.19
+
+The Decision pinned `lbug = "0.18"` against Python
+`ladybug>=0.16.0,<=0.18.2` at storage-format v42. A patch release
+moved the storage format: Cargo.lock resolves lbug to **0.18.3**,
+which writes storage-format **v43**. Python ladybug 0.18.2 (the
+newest 0.18.x) still reads v42 only and refuses the file ("Database
+file version: 43, Current build storage version: 42"); Python ladybug
+**0.19.0** reads it cleanly (verified on a /tmp copy of a live group
+graph).
+
+Consequences: the Rust workspace stays on lbug 0.18.3 and the shipped
+binary is unaffected; graph-INSPECTION tooling must use Python ladybug
+>= 0.19. Any future Rust-side lbug upgrade keeps the gap-6 discipline:
+verify storage-version compatibility and re-run
+`tamako-memory/tests/lbug_concurrent_access.rs`.
