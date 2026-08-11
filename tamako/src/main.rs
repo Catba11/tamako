@@ -284,6 +284,7 @@ fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
     LlmConfigValues {
         llm_api: config.llm_api.clone(),
         llm_base_url: config.llm_base_url.clone(),
+        llm_session_id: config.llm_session_id.clone(),
         digest_model: config.digest_model.clone(),
         gate_model: config.gate_model.clone(),
         reply_model: config.reply_model.clone(),

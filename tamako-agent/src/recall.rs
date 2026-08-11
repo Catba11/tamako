@@ -893,6 +893,7 @@ mod tests {
             base_url: None,
             model: "claude-haiku-4-5".to_string(),
             structured_output: crate::endpoint::StructuredOutputMode::Schema,
+            session_id: crate::endpoint::DEFAULT_SESSION_ID.to_string(),
         };
         let result = RigRelevanceGate::from_endpoint(&endpoint);
         if let Some(key) = saved_key {

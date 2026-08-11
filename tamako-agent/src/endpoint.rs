@@ -38,6 +38,13 @@
 //!   merged and `#[serde(flatten)]`ed into the request body, so
 //!   `response_format: { type: "json_object" }` is expressible without a
 //!   schema. The `json_object` structured-output mode uses exactly this.
+//! - CAN: custom default headers on every request of a client.
+//!   `ClientBuilder::http_headers(HeaderMap)` replaces the client's
+//!   default headers; `Client::post`/`get`/`post_sse` merge them into
+//!   every request, and `build()` inserts the API-key auth header only
+//!   when the map does not already carry it. The `x-opencode-session`
+//!   header of the resolved `session_id` uses exactly this (the
+//!   Opencode Go gateway's session-affinity key).
 //! - CANNOT: Anthropic JSON-object mode. The Anthropic Messages API has
 //!   no json_object response format. On the anthropic-compatible family
 //!   the `json_object` mode cannot be expressed; it degrades to
@@ -100,6 +107,15 @@ pub const GATE_MODEL_ENV_VAR: &str = "TAMAKO_GATE_MODEL";
 
 /// Environment override of the reply model (specs.md Section 13).
 pub const REPLY_MODEL_ENV_VAR: &str = "TAMAKO_REPLY_MODEL";
+
+/// Environment override of the session id of the endpoint, sent as the
+/// `x-opencode-session` header (Opencode Go gateway session affinity;
+/// provider prompt-cache affinity). Global-only.
+pub const LLM_SESSION_ID_ENV_VAR: &str = "TAMAKO_LLM_SESSION_ID";
+
+/// The default session id (reported for spec backfill with
+/// `llm_session_id`). One sticky id per deployment.
+pub const DEFAULT_SESSION_ID: &str = "tamako";
 
 /// Global environment override of the structured-output mode
 /// (`schema` | `json_object` | `prompt_only`). The per-purpose env vars
@@ -304,6 +320,11 @@ pub struct EndpointConfig {
     /// The structured-output mode of the purpose
     /// ([`StructuredOutputMode`], module docs). Default `schema`.
     pub structured_output: StructuredOutputMode,
+    /// The resolved session id, sent as the `x-opencode-session`
+    /// header on every request of the client (global-only; the same
+    /// value in all three purposes). Never empty: resolution falls
+    /// back to [`DEFAULT_SESSION_ID`].
+    pub session_id: String,
 }
 
 /// Plain config-file values for endpoint resolution (specs.md
@@ -316,6 +337,9 @@ pub struct LlmConfigValues {
     pub llm_api: Option<String>,
     /// Global base URL (`llm_base_url`).
     pub llm_base_url: Option<String>,
+    /// Global session id (`llm_session_id`; global-only, no
+    /// per-purpose variant).
+    pub llm_session_id: Option<String>,
     /// Digest model (`digest_model`).
     pub digest_model: Option<String>,
     /// Gate model (`gate_model`).
@@ -424,6 +448,9 @@ impl LlmEndpoints {
     ///   `structured_output` → default `schema`. An unparsable string
     ///   (env or config) is `AgentError::ProviderConfig`, never a
     ///   silent default.
+    /// - Session id (global-only, the same value in all three
+    ///   purposes): env `TAMAKO_LLM_SESSION_ID` → global config
+    ///   `llm_session_id` → default [`DEFAULT_SESSION_ID`].
     ///
     /// Empty strings count as unset, in env and config alike.
     pub fn resolve(values: &LlmConfigValues) -> Result<Self, AgentError> {
@@ -486,8 +513,25 @@ impl LlmEndpoints {
             base_url,
             model,
             structured_output,
+            session_id: resolve_session_id(values),
         })
     }
+}
+
+/// Resolves the global session id (module docs): env
+/// `TAMAKO_LLM_SESSION_ID` → global config `llm_session_id` →
+/// [`DEFAULT_SESSION_ID`]. Empty strings count as unset, so the
+/// resolved value is never empty.
+fn resolve_session_id(values: &LlmConfigValues) -> String {
+    env_value(LLM_SESSION_ID_ENV_VAR)
+        .or_else(|| {
+            values
+                .llm_session_id
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string())
 }
 
 /// The rig completion model handle of one family. rig 0.41 has two
@@ -532,6 +576,11 @@ impl EndpointClient {
     /// `llm_base_url` config is honored. rig's `ANTHROPIC_BASE_URL` and
     /// `OPENAI_BASE_URL` env vars therefore do NOT apply; see the module
     /// docs.
+    ///
+    /// The resolved `session_id` becomes the `x-opencode-session`
+    /// default header of the client (module docs): it is sent on every
+    /// request of both API families. A session id that is not a valid
+    /// header value is `AgentError::ProviderConfig`.
     pub fn build(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         let key_var = endpoint.api.api_key_env_var();
         let api_key = env_value(key_var).ok_or_else(|| {
@@ -540,9 +589,25 @@ impl EndpointClient {
                 endpoint.api
             ))
         })?;
+        // The gateway session-affinity header (module docs). The map
+        // replaces the client's default headers; `build()` inserts the
+        // API-key auth header when the map does not carry it, so the
+        // two never clash.
+        let mut headers = rig::http_client::HeaderMap::new();
+        headers.insert(
+            "x-opencode-session",
+            rig::http_client::HeaderValue::from_str(&endpoint.session_id).map_err(|error| {
+                AgentError::ProviderConfig(format!(
+                    "invalid llm_session_id {:?}: {error}",
+                    endpoint.session_id
+                ))
+            })?,
+        );
         match endpoint.api {
             LlmApi::AnthropicCompatible => {
-                let mut builder = anthropic::Client::builder().api_key(api_key);
+                let mut builder = anthropic::Client::builder()
+                    .api_key(api_key)
+                    .http_headers(headers.clone());
                 if let Some(base_url) = &endpoint.base_url {
                     builder = builder.base_url(base_url);
                 }
@@ -558,7 +623,9 @@ impl EndpointClient {
                 // The default openai::Client speaks the Responses API
                 // (first-party only in practice). CompletionsClient is
                 // the openai-compatible path: POST {base}/chat/completions.
-                let mut builder = openai::CompletionsClient::builder().api_key(api_key);
+                let mut builder = openai::CompletionsClient::builder()
+                    .api_key(api_key)
+                    .http_headers(headers);
                 if let Some(base_url) = &endpoint.base_url {
                     builder = builder.base_url(base_url);
                 }
@@ -716,6 +783,16 @@ where
         .send()
         .await
         .map_err(|error| AgentError::Extraction(error.to_string()))?;
+    // Per-call usage at DEBUG (decision 57): the cache fields expose
+    // the provider prompt-cache behavior of the session-affinity
+    // header. The curated INFO lines (decision 53) stay untouched.
+    tracing::debug!(
+        input_tokens = response.usage.input_tokens,
+        cached_input_tokens = response.usage.cached_input_tokens,
+        cache_creation_input_tokens = response.usage.cache_creation_input_tokens,
+        output_tokens = response.usage.output_tokens,
+        "llm completion usage"
+    );
     response
         .choice
         .iter()
@@ -845,6 +922,7 @@ mod tests {
     const ALL_ENV_VARS: &[&str] = &[
         LLM_API_ENV_VAR,
         LLM_BASE_URL_ENV_VAR,
+        LLM_SESSION_ID_ENV_VAR,
         DIGEST_MODEL_ENV_VAR,
         GATE_MODEL_ENV_VAR,
         REPLY_MODEL_ENV_VAR,
@@ -940,6 +1018,7 @@ mod tests {
                 base_url: None,
                 model: "claude-haiku-4-5".to_string(),
                 structured_output: StructuredOutputMode::Schema,
+                session_id: DEFAULT_SESSION_ID.to_string(),
             }
         );
         assert_eq!(
@@ -949,6 +1028,7 @@ mod tests {
                 base_url: None,
                 model: "claude-haiku-4-5".to_string(),
                 structured_output: StructuredOutputMode::Schema,
+                session_id: DEFAULT_SESSION_ID.to_string(),
             }
         );
         assert_eq!(
@@ -958,6 +1038,7 @@ mod tests {
                 base_url: None,
                 model: "claude-sonnet-4-5".to_string(),
                 structured_output: StructuredOutputMode::Schema,
+                session_id: DEFAULT_SESSION_ID.to_string(),
             }
         );
     }
@@ -1119,6 +1200,7 @@ mod tests {
                 base_url: None,
                 model: "any-model".to_string(),
                 structured_output: StructuredOutputMode::Schema,
+                session_id: DEFAULT_SESSION_ID.to_string(),
             };
             match EndpointClient::build(&endpoint) {
                 Err(AgentError::ProviderConfig(_)) => {}
@@ -1138,12 +1220,14 @@ mod tests {
             base_url: Some("http://localhost:9999".to_string()),
             model: "claude-haiku-4-5".to_string(),
             structured_output: StructuredOutputMode::Schema,
+            session_id: "test-session-anthropic".to_string(),
         };
         let openai_endpoint = EndpointConfig {
             api: LlmApi::OpenAiCompatible,
             base_url: Some("http://localhost:9998/v1".to_string()),
             model: "local-model".to_string(),
             structured_output: StructuredOutputMode::JsonObject,
+            session_id: "test-session-openai".to_string(),
         };
         EndpointClient::build(&anthropic_endpoint).expect("anthropic client");
         EndpointClient::build(&openai_endpoint).expect("openai client");
@@ -1158,6 +1242,7 @@ mod tests {
             base_url: None,
             model: "claude-haiku-4-5".to_string(),
             structured_output: StructuredOutputMode::Schema,
+            session_id: DEFAULT_SESSION_ID.to_string(),
         };
         match EndpointClient::build(&endpoint) {
             Err(AgentError::ProviderConfig(_)) => {}
@@ -1328,12 +1413,168 @@ mod tests {
             base_url: Some("http://localhost:9998/v1".to_string()),
             model: "local-model".to_string(),
             structured_output: StructuredOutputMode::JsonObject,
+            session_id: DEFAULT_SESSION_ID.to_string(),
         };
         let client = EndpointClient::build(&endpoint).expect("openai client");
         let debug = format!("{client:?}");
         // Family and mode print with their derived Debug names.
         assert!(debug.contains("OpenAiCompatible"));
         assert!(debug.contains("JsonObject"));
+    }
+
+    // --- The session id (`x-opencode-session` header) ---
+
+    #[test]
+    fn session_id_resolution_follows_the_precedence_chain() {
+        let (_lock, env) = EnvGuard::cleared();
+        // Default: "tamako", the same value in all three purposes
+        // (global-only).
+        let endpoints = LlmEndpoints::resolve(&LlmConfigValues::default()).unwrap();
+        for endpoint in [&endpoints.digest, &endpoints.gate, &endpoints.reply] {
+            assert_eq!(endpoint.session_id, DEFAULT_SESSION_ID);
+        }
+        // Global config wins over the default.
+        let values = LlmConfigValues {
+            llm_session_id: Some("config-session".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(endpoints.digest.session_id, "config-session");
+        // The env wins over the config.
+        env.set(LLM_SESSION_ID_ENV_VAR, "env-session");
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(endpoints.gate.session_id, "env-session");
+    }
+
+    #[test]
+    fn empty_session_id_values_count_as_unset() {
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(LLM_SESSION_ID_ENV_VAR, "");
+        let values = LlmConfigValues {
+            llm_session_id: Some(String::new()),
+            ..LlmConfigValues::default()
+        };
+        // Empty env and empty config fall through to the default, so
+        // the resolved value is never empty (an empty header is never
+        // emitted).
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(endpoints.reply.session_id, DEFAULT_SESSION_ID);
+        // An empty env falls through to the config.
+        let values = LlmConfigValues {
+            llm_session_id: Some("config-session".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(endpoints.digest.session_id, "config-session");
+    }
+
+    #[test]
+    fn an_invalid_session_id_header_value_is_a_provider_config_error() {
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: None,
+            model: "any-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            // A newline is never a valid header value.
+            session_id: "bad\nsession".to_string(),
+        };
+        match EndpointClient::build(&endpoint) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+    }
+
+    /// Wire-level proof: the session id of the endpoint config reaches
+    /// the server as the `x-opencode-session` header. A local
+    /// TcpListener accepts ONE connection, captures the request head,
+    /// and answers a minimal OpenAI chat-completion response; no
+    /// external network.
+    #[tokio::test]
+    async fn the_session_id_header_reaches_the_wire() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
+        let port = listener.local_addr().expect("a local address").port();
+        let (head_tx, head_rx) = std::sync::mpsc::channel::<String>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one connection");
+            // Read the head, then the body per Content-Length, so the
+            // socket closes without unread data.
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let head_end = loop {
+                let read = stream.read(&mut buffer).expect("a readable request");
+                raw.extend_from_slice(&buffer[..read]);
+                if let Some(position) = raw
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                {
+                    break position;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())?
+                })
+                .expect("a content-length header");
+            while raw.len() < head_end + content_length {
+                let read = stream.read(&mut buffer).expect("a readable body");
+                raw.extend_from_slice(&buffer[..read]);
+            }
+            head_tx.send(head).expect("the head reaches the test");
+            let body = concat!(
+                r#"{"id":"x","object":"chat.completion","model":"test-model","#,
+                r#""choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"#,
+                r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("the response is writable");
+        });
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            model: "test-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            session_id: "test-session-xyz".to_string(),
+        };
+        // The API key is read at build time only, so the env guard
+        // drops BEFORE the await (no lock is held across it).
+        let client = {
+            let (_lock, env) = EnvGuard::cleared();
+            env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+            EndpointClient::build(&endpoint).expect("openai client")
+        };
+        let text = client
+            .complete(
+                Some("p".to_string()),
+                vec![Message::user("hi".to_string())],
+                None,
+                64,
+            )
+            .await
+            .expect("the local endpoint completes");
+        assert_eq!(text, "ok");
+        let head = head_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the server captured the request head");
+        assert!(
+            head.lines()
+                .any(|line| { line.eq_ignore_ascii_case("x-opencode-session: test-session-xyz") }),
+            "the request carried x-opencode-session: test-session-xyz, head:\n{head}"
+        );
+        server.join().expect("the server thread joins");
     }
 
     // --- The repair retry flow (scripted completion closure, no

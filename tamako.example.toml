@@ -26,6 +26,13 @@ llm_base_url = "https://opencode.ai/zen/go/v1"
 #   llm_api      = "anthropic-compatible"
 #   llm_base_url = "https://opencode.ai/zen/go/v1/messages"
 
+# Session id, sent as the `x-opencode-session` header on every request:
+# it pins the Opencode Go gateway's session affinity, which drives the
+# provider prompt cache (verified 2026-08-10: 2304/2309 prompt tokens
+# cached with the header vs 0 without). Global-only; the env var
+# TAMAKO_LLM_SESSION_ID wins; the default is "tamako".
+# llm_session_id = "tamako"
+
 # ------------------------------------------------------------- Models ----
 # One model per purpose. Cheap tiers for the high-frequency purposes:
 # Opencode Go limits are dollar-valued (DeepSeek V4 Flash allows ~31k

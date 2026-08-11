@@ -53,6 +53,15 @@ pub struct TriggerConfig {
     pub llm_api: Option<String>,
     /// specs.md Section 13: the base URL of the endpoint.
     pub llm_base_url: Option<String>,
+    /// The session id of the LLM endpoint, sent as the
+    /// `x-opencode-session` header on every request (Opencode Go
+    /// gateway session affinity; provider prompt-cache affinity).
+    /// Global-only (one session id per deployment, no per-purpose or
+    /// per-group variant). `None` (the default): the agent layer
+    /// resolves the default `"tamako"`; the env var
+    /// TAMAKO_LLM_SESSION_ID wins. Deviation: specs.md Section 13 has
+    /// no such key; reported for spec backfill.
+    pub llm_session_id: Option<String>,
     /// specs.md Section 13: a purpose (`digest`, `gate`, `reply`) may
     /// override `llm_api` and `llm_base_url` individually. This permits
     /// mixed deployments. The digest-purpose overrides.
@@ -130,6 +139,7 @@ impl Default for TriggerConfig {
             digest_model: None,
             llm_api: None,
             llm_base_url: None,
+            llm_session_id: None,
             digest_llm_api: None,
             digest_llm_base_url: None,
             gate_llm_api: None,
@@ -173,6 +183,9 @@ pub struct TriggerConfigToml {
     pub llm_api: Option<String>,
     /// The endpoint base URL. Refer to `TriggerConfig::llm_base_url`.
     pub llm_base_url: Option<String>,
+    /// The endpoint session id (global-only). Refer to
+    /// `TriggerConfig::llm_session_id`.
+    pub llm_session_id: Option<String>,
     /// The digest-purpose endpoint family. Refer to
     /// `TriggerConfig::digest_llm_api`.
     pub digest_llm_api: Option<String>,
@@ -263,6 +276,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = &self.llm_base_url {
             base.llm_base_url = Some(value.clone());
+        }
+        if let Some(value) = &self.llm_session_id {
+            base.llm_session_id = Some(value.clone());
         }
         if let Some(value) = &self.digest_llm_api {
             base.digest_llm_api = Some(value.clone());
@@ -409,6 +425,9 @@ wake_floor_secs = 60
         // threshold is 20 (M4 deviation, reported for spec backfill).
         assert_eq!(config.llm_api, None);
         assert_eq!(config.llm_base_url, None);
+        // The session-id key (global-only; reported for spec backfill):
+        // None by default; the agent layer resolves "tamako".
+        assert_eq!(config.llm_session_id, None);
         assert_eq!(config.digest_llm_api, None);
         assert_eq!(config.digest_llm_base_url, None);
         assert_eq!(config.gate_llm_api, None);
@@ -462,6 +481,7 @@ recall_injection_cap = 2
 [global]
 llm_api = "anthropic-compatible"
 llm_base_url = "https://llm.example/v1"
+llm_session_id = "my-deployment"
 digest_llm_api = "openai-compatible"
 digest_llm_base_url = "https://digest.example/v1"
 gate_llm_api = "openai-compatible"
@@ -482,6 +502,8 @@ reply_staleness_threshold = 3
             global.llm_base_url.as_deref(),
             Some("https://llm.example/v1")
         );
+        // The global-only session-id key parses and applies.
+        assert_eq!(global.llm_session_id.as_deref(), Some("my-deployment"));
         assert_eq!(global.digest_llm_api.as_deref(), Some("openai-compatible"));
         assert_eq!(
             global.digest_llm_base_url.as_deref(),
