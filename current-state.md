@@ -697,6 +697,20 @@ test-group soak (`docs/soak-runbook.md`).
     rationale: internal reply machinery, not operator surface).
     Mid-soak migration property: code-only, no schema or configuration
     changes — a restart picks it up.
+60. **Rust lbug 0.18.3 writes storage v43; Python inspection needs
+    ladybug >= 0.19.** Decision 1/ADR-0001 pinned `lbug = "0.18"` for
+    storage-v42 compatibility with Python `ladybug>=0.16.0,<=0.18.2`.
+    A PATCH bump broke the story: Cargo.lock resolves lbug to 0.18.3,
+    which writes storage v43, while Python ladybug 0.18.2 (the newest
+    0.18.x) reads v42 only and refuses the file. Python ladybug 0.19.0
+    reads it cleanly — verified 2026-08-10 against a /tmp copy of the
+    -1001820899717 graph (uv + python 3.12): 668 nodes, 1205 edges.
+    The workspace STAYS on lbug 0.18.3 for the shipped binary (gap 6's
+    upgrade discipline unchanged); only the inspection tooling moves.
+    ADR-0001 gained a 2026-08-10 addendum. The same inspection session
+    confirmed the recall-Fix-A premise from live data: 330 Alias
+    nodes, 127 CJK-bearing — the alias vocabulary is rich; the
+    tokenizer was the bottleneck.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
@@ -728,7 +742,10 @@ Deliberately not done, in priority order:
 6. **lbug 0.19 upgrade check.** RE-DEFERRED (M6): the workspace stays
    on `lbug = "0.18"`. Before any upgrade, verify storage-version
    compatibility and re-run the concurrent-access regression test
-   (ADR-0001 and its 2026-08-08 addendum).
+   (ADR-0001 and its 2026-08-08 addendum). The Python inspection side
+   has already diverged: Rust lbug 0.18.3 writes storage v43, so
+   graph-inspection tooling needs Python ladybug >= 0.19 (decision 60,
+   ADR-0001 2026-08-10 addendum).
 7. **Tail statistics cost one tail scan per digest evaluation.** DONE
    in M6 (measured, not optimized): `tail_stats` costs ~12 µs at the
    trigger-bounded tail (100 rows), ~1 ms at 10k rows, ~11 ms at 100k
