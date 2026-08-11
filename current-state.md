@@ -587,9 +587,7 @@ test-group soak (`docs/soak-runbook.md`).
     bounds (digest/gate/recall 262144, reply 131072) are already
     generous against the trigger-bounded inputs — digest leaves >200k
     tokens of reasoning burn headroom, the gate output is a three-field
-    JSON — so NOTHING changed. The key is REPORTED FOR SPEC BACKFILL
-    (specs.md Section 13 has no LLM keys beyond the endpoint set; the
-    primary spec edit is pending).
+    JSON — so NOTHING changed. The key LANDED in specs.md Section 13.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 

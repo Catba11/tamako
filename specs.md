@@ -276,6 +276,7 @@ LLM access is global configuration, not per-group:
 | `gate_model` | `claude-haiku-4-5` | Participation decision (Section 9.6). Environment override: `TAMAKO_GATE_MODEL`. |
 | `reply_model` | `claude-sonnet-4-5` | Reply generation (Section 9, step 4). Environment override: `TAMAKO_REPLY_MODEL`. |
 | `structured_output` | `schema` | Structured-output mode: `schema` (send the JSON schema), `json_object` (JSON mode without a schema), `prompt_only` (no response_format; for endpoints that reject unknown parameters). Environment override: `TAMAKO_STRUCTURED_OUTPUT`. |
+| `llm_session_id` | `"tamako"` | Session-affinity identifier sent as the `x-opencode-session` request header on every LLM call. Gateways that honor the header (Opencode Go) keep the prompt cache on one upstream. Global only: no per-purpose and no per-group variants. Empty string counts as unset. Environment override: `TAMAKO_LLM_SESSION_ID`. |
 
 A purpose (`digest`, `gate`, `reply`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
 
