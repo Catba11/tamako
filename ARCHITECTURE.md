@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 46 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 47 |
 | `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 83 |
 | `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 23 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 14 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 125 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 139 (+3 ignored live tests) |
 
-Total: 365 tests (+4 ignored live tests). Build, test,
+Total: 380 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -422,20 +422,31 @@ over the shared store and graph. Candidate extraction is deterministic
 (no LLM term extraction, Phase 1): the Person identifiers of the
 senders and of the reply targets (Section 8.1 step 1 — reply targets
 resolve through `Store::find_sender_by_platform_msg_id`), plus exact
-alias matches of the candidate terms (step 2; a pure tokenizer — split
-on non-alphanumerics, Section 7.1 normalization, stopword and
-short-token drops, 20 terms per wake; documented limits: no multi-word
-terms, no synonyms, English-only stopwords). An alias with several
-targets enters through the Alias node itself (the Section 7.4 step 4
+alias matches of the candidate terms (step 2; a pure tokenizer with
+two paths since decision 58 — the alphanumeric path splits on
+non-alphanumerics with stopword and short-token drops, 20 terms per
+wake, and the CJK path splits every maximal CJK run (U+4E00–9FFF,
+Extension-A, kana) into all contiguous n-grams n 2..=5, 40 terms per
+wake, longer n-grams first; Section 7.1 normalization on every term;
+documented limits: no multi-word terms on the alphanumeric path, no
+synonyms, English-only stopwords and no CJK stopword list). An alias
+with several targets enters through the Alias node itself (the Section 7.4 step 4
 ambiguity fallback, mirrored); an unknown term yields no entry
-(step 4, Rule R5). The Section 9.3 dedup drops candidates whose edge
+(step 4, Rule R5). The candidate set first collapses by fact key
+(latest `valid_at` wins per `(source_id, relationship_name,
+target_id)` — the same fact must not burn the cap twice; decision 58,
+dev-roadmap.md Section 3 item 5); THEN the Section 9.3 dedup drops
+candidates whose edge
 id has an `injected_memories` row. Zero candidates never call the
 cheap model (Section 9.1). The relevance gate `RigRelevanceGate`
 (Section 9.2) runs on the cheap `gate` endpoint with structured output
 (`RecallSelection`), post-validated in plain Rust (in-range indices
 only, deduped, hard cap `recall_injection_cap`, default 5 — reported
 for spec backfill); conservative by default, and ANY failure means
-inject nothing — a wake never fails on a recall-gate error. The render
+inject nothing — a wake never fails on a recall-gate error, and DEBUG
+logs distinguish the three gate outcomes (no candidates — the gate is
+not called, selected none, gate failure with a WARN; decision 58)
+while decision 53's curated INFO wake line stays untouched. The render
 is exactly one "I remember: ..." assistant message (Section 9.4); an
 empty injection is forbidden. `ScriptedRelevanceGate` is the test
 double (same pattern as `ScriptedGate`).
