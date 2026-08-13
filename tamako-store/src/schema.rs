@@ -101,6 +101,15 @@ CREATE UNIQUE INDEX reactions_dedup
                   old_emojis, new_emojis, timestamp);
 ",
     ),
+    (
+        4,
+        "\
+-- The XML context rendering (msg 标签) shows the sender's username beside
+-- the display name. Nullable and purely additive: a mid-soak restart
+-- loses nothing, and rows written before this migration read as NULL.
+ALTER TABLE messages ADD COLUMN sender_username TEXT;
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
