@@ -98,6 +98,7 @@ mod tests {
                     "timestamp": "2026-08-01T13:00:00Z",
                     "sender_id": "100001",
                     "sender_display_name": "Alice",
+                    "username": "alice",
                     "text": "first",
                     "reply_to_platform_msg_id": null,
                     "mentions_bot": false,
@@ -135,6 +136,7 @@ mod tests {
             panic!("first event must be a message");
         };
         assert_eq!(m.text, "first");
+        assert_eq!(m.username, Some("alice".to_string()));
 
         let second = adapter.next_event().await.expect("no source error");
         assert!(matches!(second, Some(InboundEvent::Reaction(_))));
