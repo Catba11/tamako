@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 48 |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 111 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v4), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 27 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 49 |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 137 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v5), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the read-only status query. | 32 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
-| `tamako-persona` | The global persona configuration and the preamble rendering layer. | 14 |
+| `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63). | 17 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
 | `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 51 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 147 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker, the Rule C3 summarizer (decision 62). | 162 (+3 ignored live tests) |
 
-Total: 425 tests (+4 ignored live tests). Build, test,
+Total: 475 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -113,8 +113,9 @@ never fatal. `TELOXIDE_API_URL` is honored only by
 
 - One tokio task and one mpsc inbox per group (`ActorCommand`:
   `Inbound`, `Tick`, `Snapshot`, `ContextSnapshot`, `DigestCompleted`,
-  `WakeCompleted`, `Shutdown`). All events enter one FIFO inbox
-  (Section 6.1, rule 1).
+  `SummaryCompleted` (decision 62: the summarization outcome reported
+  by the spawned digest task), `WakeCompleted`, `Shutdown`). All
+  events enter one FIFO inbox (Section 6.1, rule 1).
 - Startup runs inside the spawned task: open the group store, ensure the
   graph schema, load and decode the session state. The handle returns
   immediately; `snapshot()` acts as a FIFO barrier and `shutdown()`
@@ -187,18 +188,29 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   the Section 8.2 digest-timeout fallback of a silent group. Shutdown
   is structural: the ticker lives and dies inside the actor task.
 - On digest completion the actor performs the Rule C3 context removal
-  (M2): every context item with a range tag at or below the PREVIOUS
-  boundary goes (the one-chunk lag of Section 7.1 — the chunk just
-  digested stays as the new overlap buffer), the `injected_memories`
-  dedup set is pruned at the same cutoff (specs.md Section 10.2
-  step 4), and the session boundaries advance
-  (`prev_digest_boundary_msg_id` stays `None` until the SECOND digest
-  completes; `last_digest_boundary_msg_id` advances for EVERY outcome —
-  a dead-lettered batch is skipped and never blocks later batches,
-  specs.md Section 10.3). The session is persisted once after all
-  mutations, then the `PostDigestHook` runs (a seam for observers that
-  need no actor state; `NoopPostDigestHook` is the default), then the
-  digest trigger re-evaluates once.
+  (M2), now with the decision-62 segmented summarization first: every
+  context item with a range tag at or below the PREVIOUS boundary
+  goes (the one-chunk lag of Section 7.1 — the chunk just digested
+  stays as the new overlap buffer), the `injected_memories` dedup set
+  is pruned at the same cutoff (specs.md Section 10.2 step 4), and
+  the session boundaries advance (`prev_digest_boundary_msg_id` stays
+  `None` until the SECOND digest completes;
+  `last_digest_boundary_msg_id` advances for EVERY outcome — a
+  dead-lettered batch is skipped and never blocks later batches,
+  specs.md Section 10.3). Before the removal, the removed chunk
+  `(prev_boundary.unwrap_or(0), b_old]` is LLM-summarized from the
+  raw log (digest flat-label dialect, injections excluded) through
+  the injected `SummaryProvider` (its call rides the same spawned
+  digest task as the pipeline — no FIFO blocking); the summary row
+  persists BEFORE the removal (Rule P1), the re-run of a crashed
+  completion finds the row on the natural range key and skips the LLM
+  call, and the context summary segment is replaced via
+  `upsert_summaries` (keep-two, count-based). A summarization failure
+  defers the removal one cycle (the raw chunk stays; one WARN); a
+  `None` provider keeps the old C3 drop. The session is persisted
+  once after all mutations, then the `PostDigestHook` runs (a seam
+  for observers that need no actor state; `NoopPostDigestHook` is the
+  default), then the digest trigger re-evaluates once.
 - The wake scheduler (`tamako-core::trigger`) is pure logic: fire on the
   first of message count or jittered interval, subject to the floor
   (specs.md Section 8.3). The jittered interval is normalized to whole
@@ -217,17 +229,24 @@ Section 7. The actor owns one `LiveContext` per group and mutates it
 only inside the actor loop (Section 6.1, rule 2).
 
 - **Item model**: an ordered list. Item 0 is always the system preamble
-  from the persona service — the provider cache anchor (Rule C4). Every
+  from the persona service — the provider cache anchor (Rule C4; since
+  decision 63 it embeds the code-owned `CONTEXT_FORMAT_GLOSS`
+  explaining the XML format). Every
   other item carries a message-id range tag (Section 7.1, raw-log row
   ids) and a role (system / user / assistant). Kinds: `HumanMessage`
   (user role), `BotSpeech` (assistant role — Rule B1),
   `RecallInjection` (assistant role; produced by the M5 recall
-  worker through `append_recall_injection`, Rule C2), `ToolOutput`
+  worker through `append_recall_injection`, Rule C2), `Summary`
+  (user role, decision 62: compressed history is reference data, not
+  the bot's own recollection), `ToolOutput`
   (reserved, no producer). Item CONTENT renders as XML (decision 61;
   the item model itself is unchanged): a human message renders
   `<msg from="{display_name}"[ user="{username}"] at="{HH:MM UTC}" id="{row_id}"[ kind="edit"][ reply="bot" | reply="user"[ reply_to_name="{name}" reply_to_id="{row_id}"]][ mention="bot"]>text</msg>`,
-  bot speech renders `<you at="{HH:MM}" id="{row_id}">text</you>`, and
-  a recall injection renders `<memory>escaped edge texts</memory>`.
+  bot speech renders `<you at="{HH:MM}" id="{row_id}">text</you>`, a
+  recall injection renders `<memory>escaped edge texts</memory>`,
+  and a summary renders
+  `<summary range="{first}-{last}">escaped text</summary>` (decision
+  62).
   Every attribute derives from persisted raw-log columns (Rule P1);
   the reply target resolves through `Store::find_reply_target`
   (`platform_msg_id` → the MIN(id) original row, so edits of the
@@ -246,17 +265,24 @@ only inside the actor loop (Section 6.1, rule 2).
   private and the public API permits appends at the tail ONLY. No
   method inserts into, removes from, or mutates the middle of the
   history. The only destructive operations are `remove_at_or_below`
-  (the Rule C3 digest-time removal) and `reload_preamble` (the Rule C4
-  item-0 replacement; a preamble change is a deliberate full
-  invalidation event).
+  (the Rule C3 digest-time removal), `upsert_summaries` (decision 62:
+  a wholesale replace of the summary segment, called ONLY inside the
+  actor-serialized digest-completion window; `Summary` items are
+  exempt from `remove_at_or_below` — keep-two is count-based), and
+  `reload_preamble` (the Rule C4 item-0 replacement; a preamble
+  change is a deliberate full invalidation event).
 - **Restart rebuild (Rule P1)**: `LiveContext::rebuild(preamble, rows,
-  injections)` reconstructs the context from the raw-log rows above the
-  removal cutoff (`prev_digest_boundary_msg_id.unwrap_or(0)`) and the
-  `injected_memories` rows above the same cutoff. Injections land
-  directly after the row at their recorded position (Rule C2). The
-  rebuild is bit-identical to the pre-restart context: one render
-  helper serves both intake and rebuild, and the rendered injection
-  text is persisted (`injected_memories.content`, migration v2).
+  injections, summaries)` reconstructs the context from the raw-log
+  rows above the removal cutoff
+  (`prev_digest_boundary_msg_id.unwrap_or(0)`), the
+  `injected_memories` rows above the same cutoff, and the TWO newest
+  persisted `context_summaries` rows (oldest first, directly after
+  the preamble — decision 62). Injections land directly after the row
+  at their recorded position (Rule C2). The rebuild is bit-identical
+  to the pre-restart context: one render helper serves both intake
+  and rebuild, and the rendered injection text is persisted
+  (`injected_memories.content`, migration v2) as is the summary text
+  (`context_summaries.content`, migration v5).
 - **LLM-facing view**: `messages_for_llm()` returns the ordered items
   as model-agnostic `ContextMessage { role, content }` values, preamble
   first; tamako-agent converts them to rig types in M4. `stats()`
@@ -268,7 +294,7 @@ Rule P5: one directory per group at `{data_root}/{chat_id}/`.
 
 | File | Content |
 |---|---|
-| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth; nullable `sender_username` since migration v4 — decision 61), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `schema_migrations`. |
+| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth; nullable `sender_username` since migration v4 — decision 61), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `context_summaries` (decision 62, migration v5: the removed-chunk summaries with `(first_msg_id, last_msg_id)` as the natural dedup key — the check-before-call replay idempotency of the summarization flow; rotated-out rows stay for forensics), `schema_migrations`. |
 | `memory.lbug` | LadybugDB graph. One `Node` table, one `EDGE` rel table (Section 6.1 of the database specification). |
 
 `tamako-store::Store` is rooted at the data root and takes a `chat_id`
@@ -277,7 +303,8 @@ in every API. Connections open lazily and are cached in a
 Phase 0 tables; v2: `injected_memories.content` for the bit-identical
 context rebuild; v3: the `reactions` table; v4: the additive nullable
 `messages.sender_username` for the decision-61 XML `user` attribute —
-pre-v4 rows read NULL and render without the attribute) applied
+pre-v4 rows read NULL and render without the attribute; v5: the
+additive `context_summaries` table of decision 62) applied
 through a minimal runner; the raw-log insert
 is idempotent (`INSERT OR IGNORE` on `(platform_msg_id, direction,
 event_type, timestamp)`). `chat_id` values with path separators or
@@ -405,10 +432,10 @@ built end to end against the replayed log:
 Provider configuration: the `endpoint` module (M4) implements the
 endpoint portability of specs.md Section 13. `LlmEndpoints::resolve`
 maps the plain `LlmConfigValues` (the config-file keys `llm_api`,
-`llm_base_url`, the per-purpose `digest`/`gate`/`reply` overrides, and
-the three model keys) plus the environment into one `EndpointConfig`
-per purpose; env wins at every level (`TAMAKO_LLM_API`,
-`TAMAKO_LLM_BASE_URL`, `TAMAKO_{DIGEST,GATE,REPLY}_MODEL`), and an
+`llm_base_url`, the per-purpose `digest`/`gate`/`reply`/`summary`
+overrides, and the four model keys) plus the environment into one
+`EndpointConfig` per purpose; env wins at every level (`TAMAKO_LLM_API`,
+`TAMAKO_LLM_BASE_URL`, `TAMAKO_{DIGEST,GATE,REPLY,SUMMARY}_MODEL`), and an
 unknown family string is `AgentError::ProviderConfig`, never a silent
 default. The global-only `llm_session_id` (env
 `TAMAKO_LLM_SESSION_ID`, default `"tamako"`) resolves into the
@@ -479,6 +506,22 @@ is exactly one "I remember: ..." assistant message (Section 9.4); an
 empty injection is forbidden. `ScriptedRelevanceGate` is the test
 double (same pattern as `ScriptedGate`).
 
+The Rule C3 summarizer (decision 62, the `summary` module):
+`RigSummary` implements the tamako-core `SummaryProvider` contract on
+the cheap `summary_model` endpoint through the same
+`EndpointClient::complete_structured` path as every other structured
+call — one-field `SummaryOutput` schema with conservative serde
+aliases, `max_tokens = 262144` (reasoning-burn headroom), the shared
+one-repair-retry machinery (decision 56), and the digest flat-label
+dialect as input (decision 61 divergence: the summarizer does not
+read the XML dialogue dialect). A missing family key degrades to the
+old C3 drop (the binary builds `None` with one startup warning).
+`ScriptedSummary` (tamako-core) is the hermetic double. Decision 63:
+the `GATE_PREAMBLE` and the recall relevance-gate preamble append the
+shared `CONTEXT_FORMAT_GLOSS` (the same constant the persona preamble
+embeds — tamako-agent → tamako-persona, acyclic); the digest
+extraction prompts stay gloss-free (they do not render XML).
+
 ## 9. The binary
 
 `tamako --replay <fixture> [--data-root <dir>] [--config <file>]` loads
@@ -487,15 +530,17 @@ the configuration (Section 13 defaults with per-group overrides from
 fallback chain (`{data_root}/persona.toml`, then the repo-root example,
 then a built-in default — offline demos must not require setup),
 renders the preamble through the `PreambleRenderer` trait (the actor
-stores it as item 0 of the live context, Rule C4), resolves the three
+stores it as item 0 of the live context, Rule C4), resolves the four
 LLM endpoints from the group configuration and the environment (a bad
 `llm_api` family string is a hard startup error), builds the digest
-pipeline and the wake services from them (a missing family API key
-degrades each to one warning and silence; the M5 recall wires
+pipeline, the wake services, and the Rule C3 summarizer from them (a
+missing family API key degrades each to one warning and silence; the
+M5 recall wires
 `ShallowRecall` over the shared store and graph with the relevance
 gate on the cheap `gate` endpoint and `recall_injection_cap` from the
 group configuration — a missing key degrades the recall alone to
-`NoopRecall`), spawns one actor for the
+`NoopRecall`; a missing key for the summary purpose alone degrades the
+summarizer to the old C3 drop, decision 62), spawns one actor for the
 fixture's group, feeds the mock replay, and prints a summary
 (including the digest boundary and the dead-letter count). CLI parsing
 is hand-rolled; no clap.
