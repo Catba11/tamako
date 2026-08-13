@@ -40,6 +40,7 @@ fn message(
         timestamp: OffsetDateTime::from_unix_timestamp(timestamp_secs).expect("valid timestamp"),
         sender_id: sender_id.to_string(),
         sender_display_name: display_name.to_string(),
+        sender_username: None,
         text: text.to_string(),
         reply_to_platform_msg_id: reply_to.map(str::to_string),
         mentions_bot: false,

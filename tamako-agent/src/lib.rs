@@ -128,8 +128,7 @@ pub use pipeline::{AgentDigestPipeline, PipelineConfig};
 pub use prompt::{render_extraction_prompt, EXTRACTION_PREAMBLE};
 pub use recall::{
     candidate_terms, render_recall_prompt, RecallCandidate, RecallSelection, RelevanceGate,
-    RelevanceInput, RigRelevanceGate, ScriptedRelevanceGate, ShallowRecall, INJECTION_TEXT_PREFIX,
-    RECALL_PREAMBLE,
+    RelevanceInput, RigRelevanceGate, ScriptedRelevanceGate, ShallowRecall, RECALL_PREAMBLE,
 };
 pub use reply::{context_messages_to_rig, RigReplyGenerator, ScriptedReplyGenerator};
 pub use resolve::resolve_batch;
