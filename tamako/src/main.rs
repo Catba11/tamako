@@ -301,7 +301,7 @@ fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
     }
 }
 
-/// Resolves the three LLM endpoints of specs.md Section 13 from the
+/// Resolves the four LLM endpoints of specs.md Section 13 from the
 /// group configuration and the environment. A resolve error (an unknown
 /// `llm_api` family string, in the config or in `TAMAKO_LLM_API`) is a
 /// HARD startup error: operator misconfiguration must surface, never
@@ -510,6 +510,7 @@ async fn run_replay(
         // stays a seam for observers that need no actor state.
         post_digest_hook: None,
         wake,
+        summary_provider: None,
         outbound: Some(outbound_tx),
         bot_name: Some(setup.bot_name.clone()),
     });
@@ -988,6 +989,7 @@ async fn run_live(
                                 digest,
                                 post_digest_hook: None,
                                 wake,
+                                summary_provider: None,
                                 outbound: Some(outbound_tx.clone()),
                                 bot_name: Some(setup.bot_name.clone()),
                             }))

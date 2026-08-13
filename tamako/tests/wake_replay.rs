@@ -174,6 +174,7 @@ fn spawn_on(
             gate: Arc::clone(&gate) as Arc<dyn tamako_core::wake::ParticipationGate>,
             reply: Arc::clone(&reply) as Arc<dyn tamako_core::wake::ReplyGenerator>,
         }),
+        summary_provider: None,
         outbound: Some(outbound_tx.clone()),
         bot_name: Some("Tamako".to_string()),
     });

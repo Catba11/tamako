@@ -201,6 +201,7 @@ fn spawn_actor(
         post_digest_hook,
         // The M4 wake wiring enters in a later subtask.
         wake: None,
+        summary_provider: None,
         outbound: None,
         bot_name: None,
     })

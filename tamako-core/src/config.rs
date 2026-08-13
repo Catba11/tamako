@@ -79,6 +79,14 @@ pub struct TriggerConfig {
     /// The reply-purpose override of `llm_base_url`. Refer to
     /// `digest_llm_api`.
     pub reply_llm_base_url: Option<String>,
+    /// The summary-purpose override of `llm_api`. Refer to
+    /// `digest_llm_api`. Reported for spec backfill with the
+    /// `summary_*` keys.
+    pub summary_llm_api: Option<String>,
+    /// The summary-purpose override of `llm_base_url`. Refer to
+    /// `digest_llm_api`. Reported for spec backfill with the
+    /// `summary_*` keys.
+    pub summary_llm_base_url: Option<String>,
     /// specs.md Section 13: the model of the participation gate
     /// (Section 9.6). `None` (the default) means the agent crate's
     /// built-in cheap model.
@@ -87,6 +95,11 @@ pub struct TriggerConfig {
     /// step 4). `None` (the default) means the agent crate's built-in
     /// main model.
     pub reply_model: Option<String>,
+    /// The model of the Rule C3 segmented summarizer (specs.md
+    /// Section 10, keep-two retention). `None` (the default) means the
+    /// agent crate's built-in cheap model. Deviation: specs.md
+    /// Section 13 has no such key; reported for spec backfill.
+    pub summary_model: Option<String>,
     /// How the structured calls enforce their output shape on the wire:
     /// `schema` (the default), `json_object`, or `prompt_only`. `None`
     /// means the agent layer resolves the default. Deviation: specs.md
@@ -101,6 +114,9 @@ pub struct TriggerConfig {
     /// The reply-purpose override of `structured_output`. Refer to
     /// `structured_output` (reported for spec backfill).
     pub reply_structured_output: Option<String>,
+    /// The summary-purpose override of `structured_output`. Refer to
+    /// `structured_output` (reported for spec backfill).
+    pub summary_structured_output: Option<String>,
     /// specs.md Section 6.2 recency re-check: when more than this many
     /// newer human messages arrived after the target message, the
     /// generated reply is DISCARDED, not regenerated. Default 20.
@@ -146,12 +162,16 @@ impl Default for TriggerConfig {
             gate_llm_base_url: None,
             reply_llm_api: None,
             reply_llm_base_url: None,
+            summary_llm_api: None,
+            summary_llm_base_url: None,
             gate_model: None,
             reply_model: None,
+            summary_model: None,
             structured_output: None,
             digest_structured_output: None,
             gate_structured_output: None,
             reply_structured_output: None,
+            summary_structured_output: None,
             reply_staleness_threshold: 20,
             recall_injection_cap: 5,
             warmup_quota_min: 1,
@@ -204,10 +224,19 @@ pub struct TriggerConfigToml {
     /// The reply-purpose base URL. Refer to
     /// `TriggerConfig::reply_llm_base_url`.
     pub reply_llm_base_url: Option<String>,
+    /// The summary-purpose endpoint family (reported for spec
+    /// backfill). Refer to `TriggerConfig::reply_llm_api`.
+    pub summary_llm_api: Option<String>,
+    /// The summary-purpose base URL (reported for spec backfill).
+    /// Refer to `TriggerConfig::reply_llm_base_url`.
+    pub summary_llm_base_url: Option<String>,
     /// The gate model override. Refer to `TriggerConfig::gate_model`.
     pub gate_model: Option<String>,
     /// The reply model override. Refer to `TriggerConfig::reply_model`.
     pub reply_model: Option<String>,
+    /// The summary model override (reported for spec backfill). Refer
+    /// to `TriggerConfig::summary_model`.
+    pub summary_model: Option<String>,
     /// The structured-output mode. Refer to
     /// `TriggerConfig::structured_output`.
     pub structured_output: Option<String>,
@@ -220,6 +249,9 @@ pub struct TriggerConfigToml {
     /// The reply-purpose structured-output mode. Refer to
     /// `TriggerConfig::reply_structured_output`.
     pub reply_structured_output: Option<String>,
+    /// The summary-purpose structured-output mode (reported for spec
+    /// backfill). Refer to `TriggerConfig::summary_structured_output`.
+    pub summary_structured_output: Option<String>,
     /// The recency re-check threshold. Refer to
     /// `TriggerConfig::reply_staleness_threshold`.
     pub reply_staleness_threshold: Option<u32>,
@@ -298,11 +330,20 @@ impl TriggerConfigToml {
         if let Some(value) = &self.reply_llm_base_url {
             base.reply_llm_base_url = Some(value.clone());
         }
+        if let Some(value) = &self.summary_llm_api {
+            base.summary_llm_api = Some(value.clone());
+        }
+        if let Some(value) = &self.summary_llm_base_url {
+            base.summary_llm_base_url = Some(value.clone());
+        }
         if let Some(value) = &self.gate_model {
             base.gate_model = Some(value.clone());
         }
         if let Some(value) = &self.reply_model {
             base.reply_model = Some(value.clone());
+        }
+        if let Some(value) = &self.summary_model {
+            base.summary_model = Some(value.clone());
         }
         if let Some(value) = &self.structured_output {
             base.structured_output = Some(value.clone());
@@ -315,6 +356,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = &self.reply_structured_output {
             base.reply_structured_output = Some(value.clone());
+        }
+        if let Some(value) = &self.summary_structured_output {
+            base.summary_structured_output = Some(value.clone());
         }
         if let Some(value) = self.reply_staleness_threshold {
             base.reply_staleness_threshold = value;
@@ -444,6 +488,13 @@ wake_floor_secs = 60
         assert_eq!(config.digest_structured_output, None);
         assert_eq!(config.gate_structured_output, None);
         assert_eq!(config.reply_structured_output, None);
+        // The summary keys (reported for spec backfill): every Option
+        // is None by default; the agent layer resolves the cheap model
+        // and the default mode.
+        assert_eq!(config.summary_model, None);
+        assert_eq!(config.summary_llm_api, None);
+        assert_eq!(config.summary_llm_base_url, None);
+        assert_eq!(config.summary_structured_output, None);
         // The M5 key: the injection cap defaults to 5 (Section 9.2
         // conservative default; deviation reported for spec backfill).
         assert_eq!(config.recall_injection_cap, 5);
@@ -579,6 +630,60 @@ reply_structured_output = "json_object"
         let empty = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert_eq!(empty.global.structured_output, None);
         assert_eq!(empty.global.digest_structured_output, None);
+    }
+
+    #[test]
+    fn toml_override_sets_the_summary_keys() {
+        // The summary keys (reported for spec backfill) follow the
+        // same per-key overlay pattern as every other key (AGENT.md
+        // Section 6.3: overridable per group).
+        let text = r#"
+[global]
+summary_model = "global-summary-model"
+summary_llm_api = "openai-compatible"
+summary_llm_base_url = "https://summary.example/v1"
+summary_structured_output = "prompt_only"
+
+[groups."-100777"]
+summary_model = "group-summary-model"
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the summary TOML loads");
+        let global = &config.global;
+        assert_eq!(
+            global.summary_model.as_deref(),
+            Some("global-summary-model")
+        );
+        assert_eq!(global.summary_llm_api.as_deref(), Some("openai-compatible"));
+        assert_eq!(
+            global.summary_llm_base_url.as_deref(),
+            Some("https://summary.example/v1")
+        );
+        assert_eq!(
+            global.summary_structured_output.as_deref(),
+            Some("prompt_only")
+        );
+        // A group override applies the keys the same way; unset keys
+        // keep the global values.
+        let overridden = config.for_group("-100777");
+        assert_eq!(
+            overridden.summary_model.as_deref(),
+            Some("group-summary-model")
+        );
+        assert_eq!(
+            overridden.summary_llm_api.as_deref(),
+            Some("openai-compatible")
+        );
+        assert_eq!(
+            overridden.summary_structured_output.as_deref(),
+            Some("prompt_only")
+        );
+        // A group without an override receives the global values.
+        let plain = config.for_group("-100999");
+        assert_eq!(plain.summary_model.as_deref(), Some("global-summary-model"));
+        // Keys that the TOML does not set keep the default (None).
+        let empty = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(empty.global.summary_model, None);
+        assert_eq!(empty.global.summary_structured_output, None);
     }
 
     #[test]

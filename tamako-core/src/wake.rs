@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::actor::CoreError;
-use crate::context::{escape_xml_text, ContextMessage};
+use crate::context::{escape_xml_text, ContextMessage, SUMMARY_TAG_CLOSE, SUMMARY_TAG_OPEN_PREFIX};
 
 /// One message presented to the participation gate (Section 9.6 input).
 /// `content` is the rendered XML item form of
@@ -113,18 +113,35 @@ fn is_parrot_line(line: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('：'))
 }
 
+/// One strip region of the outbound parrot filter: an opener prefix and
+/// the closer that ends the region. The two shapes share the exact same
+/// block semantics (decision 59 F1).
+#[derive(Clone, Copy)]
+struct StripRegion {
+    /// The opener prefix of the region: the open tag minus its trailing
+    /// `>` (`"<memory"` / `"<summary"`). Line-start anchored only.
+    open_line_prefix: &'static str,
+    /// The closer tag; the first line containing it ends the region.
+    closer: &'static str,
+}
+
 /// The outbound parrot filter (decision 59, F1). Removes every line
-/// whose trimmed start matches a recall-injection shape, then trims the
-/// remainder. Two shapes:
+/// whose trimmed start matches a recall-injection or summary shape,
+/// then trims the remainder. Three shapes:
 ///
-/// - OLD: the legacy prefix (ASCII or full-width colon, see
+/// - OLD: the legacy injection prefix (ASCII or full-width colon, see
 ///   [`is_parrot_line`]).
-/// - NEW: a trimmed line starting with `"<memory"` opens a strip
-///   region: that line and every following line up to and including the
-///   first line containing `"</memory>"` are stripped. A single line
-///   carrying both tags strips as one. A trimmed line starting with
-///   `"</memory>"` alone (a bare closer) strips. An unterminated region
-///   strips to the end of the text.
+/// - NEW `<memory>`: a trimmed line starting with `"<memory"` opens a
+///   strip region: that line and every following line up to and
+///   including the first line containing `"</memory>"` are stripped.
+///   A single line carrying both tags strips as one. A trimmed line
+///   starting with `"</memory>"` alone (a bare closer) strips. An
+///   unterminated region strips to the end of the text.
+/// - `<summary>` (segmented summarization): the SAME block semantics
+///   over [`SUMMARY_TAG_OPEN_PREFIX`]/[`SUMMARY_TAG_CLOSE`]. The
+///   summary block is a model-visible format the reply model can
+///   imitate; the extension is cheap and symmetric, so it shares the
+///   region machinery instead of growing a second filter.
 ///
 /// The reply model can imitate the injection format (the injections
 /// enter its context as assistant-role messages, Sections 9.3-9.5) and
@@ -139,34 +156,49 @@ fn is_parrot_line(line: &str) -> bool {
 /// the same function at its own validation seam. Always on; no
 /// configuration key. Pure function, no I/O.
 pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
-    // The opener prefix is the open tag minus its trailing `>`
-    // (`"<memory"`), derived from the constant (decision 59
-    // single-source discipline).
-    let open_line_prefix = INJECTION_TAG_OPEN.trim_end_matches('>');
+    // Single-source discipline (decisions 59/61): the memory opener is
+    // derived from the tag constant; the summary shape uses the
+    // context.rs constants shared with `render_summary_content`.
+    let regions: [StripRegion; 2] = [
+        StripRegion {
+            open_line_prefix: SUMMARY_TAG_OPEN_PREFIX,
+            closer: SUMMARY_TAG_CLOSE,
+        },
+        StripRegion {
+            open_line_prefix: INJECTION_TAG_OPEN.trim_end_matches('>'),
+            closer: INJECTION_TAG_CLOSE,
+        },
+    ];
     let mut stripped_parrot = false;
-    let mut in_memory_block = false;
+    let mut active: Option<StripRegion> = None;
     let mut kept: Vec<&str> = Vec::new();
     for line in text.lines() {
         let start = line.trim_start();
-        if in_memory_block {
-            // Inside a `<memory>` strip region: every line is stripped
-            // up to and including the first line containing the closer.
+        if let Some(region) = active {
+            // Inside a strip region: every line is stripped up to and
+            // including the first line containing the closer.
             stripped_parrot = true;
-            if start.contains(INJECTION_TAG_CLOSE) {
-                in_memory_block = false;
+            if start.contains(region.closer) {
+                active = None;
             }
             continue;
         }
-        if start.starts_with(open_line_prefix) {
+        if let Some(region) = regions
+            .iter()
+            .find(|region| start.starts_with(region.open_line_prefix))
+        {
             // The line opens a strip region (line-start anchored only).
             // A single line carrying the closer too strips as one line.
             stripped_parrot = true;
-            if !start.contains(INJECTION_TAG_CLOSE) {
-                in_memory_block = true;
+            if !start.contains(region.closer) {
+                active = Some(*region);
             }
             continue;
         }
-        if start.starts_with(INJECTION_TAG_CLOSE) {
+        if regions
+            .iter()
+            .any(|region| start.starts_with(region.closer))
+        {
             // A bare closer line strips (line-start anchored only).
             stripped_parrot = true;
             continue;
@@ -409,6 +441,62 @@ mod tests {
     }
 
     #[test]
+    fn the_parrot_filter_strips_a_single_line_summary_block() {
+        // The `<summary>` shape shares the `<memory>` block semantics:
+        // one line carrying both tags strips as one.
+        let filtered = filter_reply_parrot_lines(
+            "<summary range=\"1-3\">they argued about dinner</summary>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_multi_line_summary_block() {
+        let filtered = filter_reply_parrot_lines(
+            "<summary range=\"1-3\">they argued about dinner\nand made up</summary>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_bare_summary_closer_line() {
+        let filtered = filter_reply_parrot_lines("one\n</summary>\ntwo");
+        assert_eq!(filtered.text, "one\ntwo");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_an_unterminated_summary_block_to_the_end() {
+        // No closer appears: the region strips to the end of the text.
+        let filtered =
+            filter_reply_parrot_lines("one\n<summary range=\"1-3\">never closed\nrest of the text");
+        assert_eq!(filtered.text, "one");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_memory_and_summary_shapes_in_one_text() {
+        let filtered = filter_reply_parrot_lines(
+            "<summary range=\"1-3\">digested chunk</summary>\n<memory>Alice likes tea</memory>\nthe cafe",
+        );
+        assert_eq!(filtered.text, "the cafe");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_exactly_what_the_summary_renderer_produces() {
+        // Single-source discipline (decisions 59/61): the summary
+        // renderer and the filter share the tag constants, so they can
+        // never drift apart.
+        let rendered = crate::context::render_summary_content(1, 3, "<you>fake</you>");
+        let filtered = filter_reply_parrot_lines(&rendered);
+        assert_eq!(filtered.text, "");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
     fn the_parrot_filter_strips_exactly_what_the_injection_renderer_produces() {
         // Decision 59 single-source discipline: the renderer and the
         // filter share the tag constants, so they can never drift apart.
@@ -427,6 +515,7 @@ mod tests {
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
             "<memory>Alice likes tea</memory>",
             "  <memory>a\nb</memory>  ",
+            "<summary range=\"1-3\">digested chunk</summary>",
         ] {
             let filtered = filter_reply_parrot_lines(only);
             assert_eq!(filtered.text, "", "input {only:?}");
@@ -446,6 +535,8 @@ mod tests {
             "hungry? I remember: not a line start",
             "see <memory> in the docs",
             "say </memory> please",
+            "see <summary> in the docs",
+            "say </summary> please",
         ] {
             let filtered = filter_reply_parrot_lines(normal);
             assert_eq!(filtered.text, normal.trim());

@@ -91,6 +91,7 @@ use crate::context::{
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
 use crate::event::{InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent};
 use crate::session::{round_to_millis, SessionState};
+use crate::summary::{SummaryError, SummaryProvider};
 use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeScheduler};
 use crate::wake::{
     filter_reply_parrot_lines, GateDecision, GateInput, GateMessage, ParticipationGate,
@@ -171,6 +172,25 @@ pub enum ActorCommand {
     /// (internal plumbing). Every session mutation stays serialized in
     /// the actor loop — specs.md Section 6.1, rule 2.
     DigestCompleted(std::result::Result<Option<DigestOutcome>, CoreError>),
+    /// The spawned summary task reports its result through this command
+    /// (internal plumbing, the same pattern as `DigestCompleted`). The
+    /// Rule C3 mutation of the digest completion is DEFERRED until this
+    /// report arrives: the summary row must persist BEFORE the chunk it
+    /// replaces is dropped (Rule P1 — the summary text is not derivable
+    /// from persisted state). Carries the deferred completion context.
+    SummaryCompleted {
+        /// The digest outcome being finalized (post-digest hook input).
+        outcome: DigestOutcome,
+        /// The removed chunk's range `(first_msg_id, last_msg_id]` —
+        /// the natural dedup key of the summary row. `last_msg_id` is
+        /// the removal cutoff (the old last boundary).
+        first_msg_id: i64,
+        last_msg_id: i64,
+        /// The digest batch's new boundary (deferred boundary update).
+        new_boundary: i64,
+        /// The summary text, or the provider failure.
+        result: std::result::Result<String, SummaryError>,
+    },
     /// The spawned wake task reports its result through this command
     /// (internal plumbing, the same pattern as `DigestCompleted`).
     WakeCompleted(std::result::Result<WakeReport, CoreError>),
@@ -260,6 +280,11 @@ pub struct GroupActorParams<M: MemoryBackend> {
     /// EXACTLY: an unforced fire logs and resets, a forced wake logs
     /// only. `Some` runs the wake procedure of specs.md Section 9.
     pub wake: Option<WakeServices>,
+    /// The Rule C3 chunk summarizer (segmented summarization, keep-two
+    /// retention). `None` keeps the old C3 behavior EXACTLY: the removed
+    /// chunk drops without a summary. The tamako binary wires the live
+    /// implementation (tamako-agent); tests wire a scripted one.
+    pub summary_provider: Option<Arc<dyn SummaryProvider>>,
     /// The outbound action sink (Rule A3). The binary owns the platform
     /// adapter and pumps this channel into `PlatformAdapter::execute`.
     /// `None` drops actions with a debug log. The actor never blocks on
@@ -543,6 +568,7 @@ async fn maybe_launch_digest(
     session: &SessionState,
     digest: Option<&Arc<dyn DigestPipeline>>,
     digest_in_flight: &mut bool,
+    summary_pending: bool,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     now: OffsetDateTime,
 ) -> Result<(), CoreError> {
@@ -550,6 +576,14 @@ async fn maybe_launch_digest(
         return Ok(());
     };
     if *digest_in_flight {
+        return Ok(());
+    }
+    // A pending summary holds the deferred C3 mutation of the last
+    // digest completion: `last_digest_boundary_msg_id` has NOT advanced
+    // yet, so a new digest would redo the same batch range. Suppress
+    // the trigger until the SummaryCompleted report lands (decision
+    // 62). The next evaluation point after it retries naturally.
+    if summary_pending {
         return Ok(());
     }
     let tail_chat_id = chat_id.to_string();
@@ -581,6 +615,74 @@ async fn maybe_launch_digest(
     Ok(())
 }
 
+/// The Rule C3 mutation of a digest completion (decision 16): context
+/// removal at the cutoff, dedup prune, boundary update, session persist,
+/// keep-two summary upsert — ONE serialized step inside the actor loop
+/// (specs.md Section 6.1, rule 2). Runs on the immediate path (no
+/// summarization needed) and on the deferred path after the summary row
+/// persisted (decision 62). The post-digest hook runs AFTER the
+/// mutation; it stays a seam for stateless observers.
+///
+/// The upsert consumes the SAME store query as the startup rebuild
+/// (`list_newest_context_summaries(chat_id, 2)`, oldest first), so the
+/// live placement and the rebuild placement are bit-identical (Rule
+/// P1). Summary items are exempt from `remove_at_or_below`; their
+/// retention is count-based through `upsert_summaries`.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_digest_completion(
+    store: &Arc<Store>,
+    chat_id: &str,
+    session: &mut SessionState,
+    context: &mut LiveContext,
+    cutoff: i64,
+    b_new: i64,
+    outcome: &DigestOutcome,
+    post_digest_hook: &Option<Arc<dyn PostDigestHook>>,
+) -> Result<(), CoreError> {
+    // Rule C3 context removal with the one-chunk lag. Only items at or
+    // below the PREVIOUS chunk's boundary go; the chunk just digested,
+    // (cutoff, b_new], stays as the new overlap buffer (specs.md
+    // Section 7.1). This runs for EVERY outcome variant, matching the
+    // boundary advancement: a dead-lettered batch is skipped (specs.md
+    // Section 10.3) — the skipped range stays in the raw log and its
+    // content lags out of the context mechanically at the next digest.
+    context.remove_at_or_below(cutoff);
+    // Prune the dedup set (specs.md Section 10.2 step 4) at the same
+    // cutoff.
+    let prune_chat_id = chat_id.to_string();
+    let deleted = blocking_store(store, move |store| {
+        store.delete_injected_memories_up_to(&prune_chat_id, cutoff)
+    })
+    .await?;
+    debug!(chat_id = %chat_id, deleted, "injected_memories pruned");
+    // The session boundaries. Read `last_digest_at` BEFORE it is
+    // overwritten below: the FIRST completed digest has no previous
+    // chunk, so prev stays None; from the second digest on, prev is
+    // the boundary that was current before this digest.
+    session.prev_digest_boundary_msg_id = if session.last_digest_at.is_some() {
+        Some(cutoff)
+    } else {
+        None
+    };
+    session.last_digest_boundary_msg_id = b_new;
+    // The wall-clock completion time: the timeout fallback of Section
+    // 8.2 measures real time since the last digest.
+    session.last_digest_at = Some(OffsetDateTime::now_utc());
+    persist_session(store, chat_id, session).await?;
+    // Keep-two summary retention (decision 62): refresh the summary
+    // block from the persisted rows (the two newest, oldest first).
+    let summaries_chat_id = chat_id.to_string();
+    let summaries = blocking_store(store, move |store| {
+        store.list_newest_context_summaries(&summaries_chat_id, 2)
+    })
+    .await?;
+    context.upsert_summaries(&summaries);
+    if let Some(hook) = post_digest_hook {
+        hook.after_digest(chat_id, outcome).await;
+    }
+    Ok(())
+}
+
 /// The actor task. Owns the session state and the live wake scheduler.
 /// specs.md Section 6.1, rule 2: session-state mutations are strictly
 /// serialized inside this loop.
@@ -599,6 +701,7 @@ async fn run_actor<M: MemoryBackend>(
         digest,
         post_digest_hook,
         wake: wake_services,
+        summary_provider,
         outbound,
         bot_name,
         ..
@@ -647,10 +750,25 @@ async fn run_actor<M: MemoryBackend>(
     // A3/B1: replies to the bot are excluded — the synthetic outbound
     // ids never resolve by construction).
     let reply_targets = resolve_reply_targets(&store, &chat_id, &rows).await?;
-    let mut context = LiveContext::rebuild(preamble, &rows, &injections, &reply_targets);
+    // Keep-two summary rebuild (S2a stub for S2b): the startup rebuild
+    // consumes the SAME store query the live digest-completion window
+    // uses (`Store::list_newest_context_summaries(chat_id, 2)`, oldest
+    // first), so live placement and rebuild placement are bit-identical
+    // (Rule P1). S2b owns the digest-completion side of the flow.
+    let summaries_chat_id = chat_id.clone();
+    let summaries = blocking_store(&store, move |store| {
+        store.list_newest_context_summaries(&summaries_chat_id, 2)
+    })
+    .await?;
+    let mut context =
+        LiveContext::rebuild(preamble, &rows, &injections, &reply_targets, &summaries);
 
     // One digest at a time per group (Section 6.1, rule 2).
     let mut digest_in_flight = false;
+    // One chunk summary at a time per group (decision 62): while a
+    // summary task is in flight, the C3 mutation of its digest
+    // completion is deferred and the digest trigger is suppressed.
+    let mut summary_pending = false;
     // One wake at a time per group (Section 6.2: a forced Wake queues
     // behind a running wake; it does not preempt it). The queued entry
     // carries the intake time of the forcing message, so the queued
@@ -692,6 +810,7 @@ async fn run_actor<M: MemoryBackend>(
                     &mut context,
                     digest.as_ref(),
                     &mut digest_in_flight,
+                    summary_pending,
                     wake_services.as_ref(),
                     &mut wake_in_flight,
                     &mut forced_pending,
@@ -760,6 +879,7 @@ async fn run_actor<M: MemoryBackend>(
                     &context,
                     digest.as_ref(),
                     &mut digest_in_flight,
+                    summary_pending,
                     wake_services.as_ref(),
                     &mut wake_in_flight,
                     &inbox_sender,
@@ -861,63 +981,102 @@ async fn run_actor<M: MemoryBackend>(
                                 "digest"
                             ),
                         }
-                        // Rule C3 context removal with the one-chunk
-                        // lag. Only items at or below the PREVIOUS
-                        // boundary go; the chunk just digested,
-                        // (b_old, b_new], stays as the new overlap
-                        // buffer (specs.md Section 7.1). This runs for
-                        // EVERY outcome variant, matching the boundary
-                        // advancement: a dead-lettered batch is skipped
-                        // (specs.md Section 10.3) — the skipped range
-                        // stays in the raw log and its content lags out
-                        // of the context mechanically at the next
-                        // digest.
-                        context.remove_at_or_below(b_old);
-                        // Prune the dedup set (specs.md Section 10.2
-                        // step 4) at the same cutoff.
-                        let prune_chat_id = chat_id.clone();
-                        let deleted = blocking_store(&store, move |store| {
-                            store.delete_injected_memories_up_to(&prune_chat_id, b_old)
-                        })
-                        .await?;
-                        debug!(chat_id = %chat_id, deleted, "injected_memories pruned");
-                        // The session boundaries. Read `last_digest_at`
-                        // BEFORE it is overwritten below: the FIRST
-                        // completed digest has no previous chunk, so
-                        // prev stays None; from the second digest on,
-                        // prev is the boundary that was current before
-                        // this digest.
-                        session.prev_digest_boundary_msg_id = if session.last_digest_at.is_some() {
-                            Some(b_old)
-                        } else {
-                            None
-                        };
-                        session.last_digest_boundary_msg_id = b_new;
-                        // The wall-clock completion time: the timeout
-                        // fallback of Section 8.2 measures real time
-                        // since the last digest.
-                        session.last_digest_at = Some(OffsetDateTime::now_utc());
-                        persist_session(&store, &chat_id, &session).await?;
-                        if let Some(hook) = &post_digest_hook {
-                            // The hook runs AFTER the built-in Rule C3
-                            // removal and the dedup prune. It stays a
-                            // seam for observers that need no actor
-                            // state.
-                            hook.after_digest(&chat_id, &outcome).await;
+                        // Segmented summarization (decision 62, the
+                        // Rule C3 amendment): the chunk being removed,
+                        // (lower, b_old] with lower = the previous
+                        // removal cutoff, is summarized BEFORE the
+                        // removal, and the summary row persists before
+                        // the chunk drops (Rule P1). The FIRST digest
+                        // completion has b_old == 0: nothing is removed
+                        // and nothing is summarized. Without a wired
+                        // summarizer the old C3 behavior applies
+                        // EXACTLY (drop without a summary).
+                        let mut defer_to_summary = false;
+                        if b_old > 0 {
+                            if let Some(provider) = summary_provider.as_ref() {
+                                let lower = session.prev_digest_boundary_msg_id.unwrap_or(0);
+                                // Check-before-call (replay idempotency): a
+                                // handler re-run after a crash finds the
+                                // persisted row and SKIPS the LLM call.
+                                let existing_chat_id = chat_id.clone();
+                                let existing = blocking_store(&store, move |store| {
+                                    store.find_context_summary(&existing_chat_id, lower, b_old)
+                                })
+                                .await?;
+                                if existing.is_none() {
+                                    // The summarizer input is the raw-log
+                                    // range (human + bot rows; injections
+                                    // never enter the raw log — the specs.md
+                                    // Section 10.1/9.5 analog).
+                                    let rows_chat_id = chat_id.clone();
+                                    let rows = blocking_store(&store, move |store| {
+                                        store.list_messages_in_range(&rows_chat_id, lower, b_old)
+                                    })
+                                    .await?;
+                                    // Section 6.1, rule 3 analog: the FIFO
+                                    // never blocks on the LLM call. The C3
+                                    // mutation defers to the SummaryCompleted
+                                    // report; the digest trigger is
+                                    // suppressed while the summary is
+                                    // pending (the batch range derives from
+                                    // the not-yet-advanced last boundary).
+                                    summary_pending = true;
+                                    defer_to_summary = true;
+                                    let provider = Arc::clone(provider);
+                                    let summary_chat_id = chat_id.clone();
+                                    let sender = inbox_sender.clone();
+                                    let report_outcome = outcome.clone();
+                                    tokio::spawn(async move {
+                                        let result = provider
+                                            .summarize(&summary_chat_id, lower, b_old, &rows)
+                                            .await;
+                                        // A failed send means the actor is
+                                        // shutting down. Nothing was
+                                        // persisted; the restart replays the
+                                        // digest completion (the digest
+                                        // itself is idempotent, Section
+                                        // 10.3) and re-summarizes.
+                                        let _ = sender
+                                            .send(ActorCommand::SummaryCompleted {
+                                                outcome: report_outcome,
+                                                first_msg_id: lower,
+                                                last_msg_id: b_old,
+                                                new_boundary: b_new,
+                                                result,
+                                            })
+                                            .await;
+                                    });
+                                }
+                            }
                         }
-                        // Re-evaluate once: the tail can still exceed the
-                        // thresholds (it grew during a long extraction).
-                        maybe_launch_digest(
-                            &store,
-                            &chat_id,
-                            &config,
-                            &session,
-                            digest.as_ref(),
-                            &mut digest_in_flight,
-                            &inbox_sender,
-                            OffsetDateTime::now_utc(),
-                        )
-                        .await?;
+                        if !defer_to_summary {
+                            finalize_digest_completion(
+                                &store,
+                                &chat_id,
+                                &mut session,
+                                &mut context,
+                                b_old,
+                                b_new,
+                                &outcome,
+                                &post_digest_hook,
+                            )
+                            .await?;
+                            // Re-evaluate once: the tail can still
+                            // exceed the thresholds (it grew during a
+                            // long extraction).
+                            maybe_launch_digest(
+                                &store,
+                                &chat_id,
+                                &config,
+                                &session,
+                                digest.as_ref(),
+                                &mut digest_in_flight,
+                                summary_pending,
+                                &inbox_sender,
+                                OffsetDateTime::now_utc(),
+                            )
+                            .await?;
+                        }
                     }
                     // The tail was empty; no state change.
                     Ok(None) => {}
@@ -930,6 +1089,92 @@ async fn run_actor<M: MemoryBackend>(
                         tracing::error!(chat_id = %chat_id, %error, "digest pipeline failed");
                     }
                 }
+            }
+            ActorCommand::SummaryCompleted {
+                outcome,
+                first_msg_id,
+                last_msg_id,
+                new_boundary,
+                result,
+            } => {
+                // The deferred C3 mutation of decision 62 lands here.
+                summary_pending = false;
+                match result {
+                    Ok(text) => {
+                        // Rule P1 order: the summary row persists BEFORE
+                        // the chunk it replaces is dropped. The insert is
+                        // idempotent on the range key (replay safety).
+                        let insert_chat_id = chat_id.clone();
+                        let insert_text = text.clone();
+                        blocking_store(&store, move |store| {
+                            store.insert_context_summary(
+                                &insert_chat_id,
+                                first_msg_id,
+                                last_msg_id,
+                                &insert_text,
+                            )
+                        })
+                        .await?;
+                        debug!(
+                            chat_id = %chat_id,
+                            range = %format!("({first_msg_id},{last_msg_id}]"),
+                            bytes = text.len(),
+                            "context summary stored"
+                        );
+                        finalize_digest_completion(
+                            &store,
+                            &chat_id,
+                            &mut session,
+                            &mut context,
+                            last_msg_id,
+                            new_boundary,
+                            &outcome,
+                            &post_digest_hook,
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        // Failure semantics (decision 62): never drop the
+                        // chunk silently. The removal is DEFERRED one
+                        // digest cycle: `last` advances (the digest
+                        // itself completed), `prev` stays (so the next
+                        // completion retries the same removed range,
+                        // check-before-call makes the retry cheap), and
+                        // the raw chunk stays in the context. The C5
+                        // bound stretches by one cycle on this path; the
+                        // restart rebuild cutoff `prev.unwrap_or(0)`
+                        // stays consistent with the live view.
+                        tracing::warn!(
+                            chat_id = %chat_id,
+                            %error,
+                            range = %format!("({first_msg_id},{last_msg_id}]"),
+                            "context summarization failed; the raw chunk stays one more digest cycle"
+                        );
+                        session.last_digest_boundary_msg_id = new_boundary;
+                        session.last_digest_at = Some(OffsetDateTime::now_utc());
+                        persist_session(&store, &chat_id, &session).await?;
+                        if let Some(hook) = &post_digest_hook {
+                            // The digest completed; only the
+                            // summarization failed. The hook observes
+                            // the digest outcome as usual.
+                            hook.after_digest(&chat_id, &outcome).await;
+                        }
+                    }
+                }
+                // Re-evaluate: the pending gate is open again and the
+                // tail can still exceed the thresholds.
+                maybe_launch_digest(
+                    &store,
+                    &chat_id,
+                    &config,
+                    &session,
+                    digest.as_ref(),
+                    &mut digest_in_flight,
+                    summary_pending,
+                    &inbox_sender,
+                    OffsetDateTime::now_utc(),
+                )
+                .await?;
             }
             ActorCommand::Snapshot(reply) => {
                 // A dropped receiver means the caller went away. That is not
@@ -984,6 +1229,7 @@ async fn handle_message(
     context: &mut LiveContext,
     digest: Option<&Arc<dyn DigestPipeline>>,
     digest_in_flight: &mut bool,
+    summary_pending: bool,
     wake_services: Option<&WakeServices>,
     wake_in_flight: &mut bool,
     forced_pending: &mut Option<(GateMessage, OffsetDateTime)>,
@@ -1055,6 +1301,7 @@ async fn handle_message(
         session,
         digest,
         digest_in_flight,
+        summary_pending,
         inbox_sender,
         now,
     )
@@ -1180,6 +1427,7 @@ async fn handle_tick(
     context: &LiveContext,
     digest: Option<&Arc<dyn DigestPipeline>>,
     digest_in_flight: &mut bool,
+    summary_pending: bool,
     wake_services: Option<&WakeServices>,
     wake_in_flight: &mut bool,
     inbox_sender: &mpsc::Sender<ActorCommand>,
@@ -1192,6 +1440,7 @@ async fn handle_tick(
         session,
         digest,
         digest_in_flight,
+        summary_pending,
         inbox_sender,
         now,
     )
@@ -1713,6 +1962,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::context::{render_bot_content, ContextItemKind, ContextRole, RangeTag};
+    use crate::summary::ScriptedSummary;
 
     /// A memory backend double. All calls succeed; `ensure_schema` records
     /// the chat_id values it receives.
@@ -1951,6 +2201,7 @@ mod tests {
             digest: None,
             post_digest_hook: None,
             wake: None,
+            summary_provider: None,
             outbound: None,
             bot_name: None,
         })
@@ -1973,6 +2224,7 @@ mod tests {
             digest: Some(digest),
             post_digest_hook: None,
             wake: None,
+            summary_provider: None,
             outbound: None,
             bot_name: None,
         })
@@ -2102,6 +2354,7 @@ mod tests {
             digest: None,
             post_digest_hook: None,
             wake: None,
+            summary_provider: None,
             outbound: None,
             bot_name: None,
         });
@@ -2350,11 +2603,14 @@ mod tests {
 
         // The hand-computed rebuild over the same persisted rows. The
         // rows of this test carry no reply targets, so the empty map
-        // matches them.
-        let (rows, injections) = blocking_store_call(&fixture.store, move |store| {
+        // matches them. The summaries query mirrors the startup rebuild
+        // (same store function; the fixture holds no summary rows yet —
+        // S2b lands the digest-completion writer).
+        let (rows, injections, summaries) = blocking_store_call(&fixture.store, move |store| {
             let rows = store.list_messages_after(CHAT_ID, 0)?;
             let injections = store.list_injected_memories(CHAT_ID)?;
-            Ok((rows, injections))
+            let summaries = store.list_newest_context_summaries(CHAT_ID, 2)?;
+            Ok((rows, injections, summaries))
         })
         .await;
         let expected = LiveContext::rebuild(
@@ -2362,6 +2618,7 @@ mod tests {
             &rows,
             &injections,
             &HashMap::new(),
+            &summaries,
         );
         assert_eq!(rebuilt, expected.items());
 
@@ -2535,6 +2792,375 @@ mod tests {
         assert_eq!(session.prev_digest_boundary_msg_id, Some(2));
         assert_eq!(session.last_digest_boundary_msg_id, 4);
         restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- Segmented summarization tests (decision 62) ---
+
+    /// Spawns an actor with the scripted digest pipeline AND a scripted
+    /// summarizer.
+    fn spawn_with_digest_and_summary(
+        fixture: &Fixture,
+        config: TriggerConfig,
+        summary: Arc<dyn SummaryProvider>,
+    ) -> GroupActorHandle {
+        let digest = Arc::new(ScriptedDigest {
+            store: Arc::clone(&fixture.store),
+        });
+        spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config,
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: Some(digest),
+            post_digest_hook: None,
+            wake: None,
+            summary_provider: Some(summary),
+            outbound: None,
+            bot_name: None,
+        })
+    }
+
+    /// Sends one pair of messages (one digest batch of digest_config).
+    async fn send_pair(handle: &GroupActorHandle, first_index: i64) {
+        for index in first_index..first_index + 2 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_second_digest_summarizes_the_removed_chunk_before_its_removal() {
+        // Decision 62: the chunk that Rule C3 removes is summarized
+        // BEFORE the removal; the summary row persists first (Rule P1).
+        // The FIRST digest completion removes nothing and never calls
+        // the summarizer.
+        let fixture = make_fixture();
+        let summary = Arc::new(ScriptedSummary::with_summaries(vec![
+            "Alice planned a hike.".to_string(),
+        ]));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        // Digest 1: the boundary advances 0 -> 2. b_old == 0: no
+        // removal, no summarization.
+        wait_for_boundary(&handle, 2).await;
+        assert!(summary.inputs().is_empty());
+
+        send_pair(&handle, 3).await;
+        // Digest 2: the chunk (0, 2] leaves the context; its summary
+        // enters directly after the preamble.
+        wait_for_boundary(&handle, 4).await;
+
+        // The summarizer saw exactly the raw-log rows of the range.
+        let inputs = summary.inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].first_msg_id, 0);
+        assert_eq!(inputs[0].last_msg_id, 2);
+        let row_ids: Vec<i64> = inputs[0].rows.iter().map(|row| row.id).collect();
+        assert_eq!(row_ids, vec![1, 2]);
+
+        // Persisted BEFORE the removal: the row exists after the
+        // completion, and the raw chunk items are gone from the context.
+        let row = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 0, 2)
+        })
+        .await
+        .expect("the summary row exists");
+        assert_eq!(row.content, "Alice planned a hike.");
+
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].kind, ContextItemKind::Preamble);
+        assert_eq!(items[1].kind, ContextItemKind::Summary);
+        assert_eq!(items[1].role, ContextRole::User);
+        assert_eq!(
+            items[1].content,
+            r#"<summary range="0-2">Alice planned a hike.</summary>"#
+        );
+        assert_eq!(
+            items[1].range_tag,
+            Some(RangeTag {
+                first_msg_id: 0,
+                last_msg_id: 2
+            })
+        );
+        // The previous chunk (2, 4] stays RAW (the one-chunk lag is
+        // unchanged).
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(3)));
+        assert_eq!(items[3].range_tag, Some(RangeTag::single(4)));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_context_keeps_the_two_newest_summaries() {
+        // Decision 62: keep-two retention. Three summarizing digest
+        // completions; the context holds exactly the two newest
+        // summaries (oldest first, after the preamble, before the raw
+        // previous chunk); the store keeps all three (forensics — the
+        // rows are not pruned).
+        let fixture = make_fixture();
+        let summary = Arc::new(ScriptedSummary::with_summaries(vec![
+            "chunk one.".to_string(),
+            "chunk two.".to_string(),
+            "chunk three.".to_string(),
+        ]));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary);
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        send_pair(&handle, 3).await;
+        wait_for_boundary(&handle, 4).await;
+        send_pair(&handle, 5).await;
+        // Digest 3 summarizes (2, 4]; the context holds S(0-2) + S(2-4).
+        wait_for_boundary(&handle, 6).await;
+        send_pair(&handle, 7).await;
+        // Digest 4 summarizes (4, 6]; S(0-2) rotates OUT of the context.
+        wait_for_boundary(&handle, 8).await;
+
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].kind, ContextItemKind::Preamble);
+        assert_eq!(
+            items[1].content,
+            r#"<summary range="2-4">chunk two.</summary>"#
+        );
+        assert_eq!(
+            items[2].content,
+            r#"<summary range="4-6">chunk three.</summary>"#
+        );
+        assert_eq!(items[3].range_tag, Some(RangeTag::single(7)));
+        assert_eq!(items[4].range_tag, Some(RangeTag::single(8)));
+
+        // Forensics: rotated-out rows stay in the table.
+        let rows = blocking_store_call(&fixture.store, move |store| {
+            store.list_newest_context_summaries(CHAT_ID, 10)
+        })
+        .await;
+        assert_eq!(rows.len(), 3);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn an_existing_summary_row_skips_the_llm_call() {
+        // Rule P1 replay idempotency: a handler re-run (crash between
+        // the summary persist and the session persist) finds the row
+        // and NEVER calls the provider again.
+        let fixture = make_fixture();
+        let summary = Arc::new(ScriptedSummary::with_summaries(vec![
+            "must never be used.".to_string()
+        ]));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        // The row exists before the second digest completes (the
+        // crash-recovery twin of the check-before-call path).
+        blocking_store_call(&fixture.store, move |store| {
+            store.insert_context_summary(CHAT_ID, 0, 2, "pre-existing summary")
+        })
+        .await;
+
+        send_pair(&handle, 3).await;
+        wait_for_boundary(&handle, 4).await;
+
+        assert!(summary.inputs().is_empty());
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(
+            items[1].content,
+            r#"<summary range="0-2">pre-existing summary</summary>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_failed_summarization_defers_the_removal_and_retries_next_cycle() {
+        // Decision 62 failure semantics: the chunk is NEVER dropped
+        // silently. The removal defers one digest cycle; `last`
+        // advances, `prev` stays; the next completion retries the
+        // removed range — which then covers the failed chunk AND the
+        // chunk that was the overlap buffer (the uniform
+        // removed-range rule; documented in decision 62).
+        let fixture = make_fixture();
+        let summary = Arc::new(ScriptedSummary::failing_then(
+            1,
+            vec!["recovered summary.".to_string()],
+        ));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        send_pair(&handle, 3).await;
+        // Digest 2 completes, the summary FAILS: last advances to 4,
+        // prev stays None, the raw chunk stays intact.
+        wait_for_boundary(&handle, 4).await;
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.last_digest_boundary_msg_id, 4);
+        assert_eq!(session.prev_digest_boundary_msg_id, None);
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        // Nothing was removed, nothing was summarized.
+        assert_eq!(items.len(), 5);
+        assert!(items
+            .iter()
+            .all(|item| item.kind != ContextItemKind::Summary));
+        let missing = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 0, 4)
+        })
+        .await;
+        assert!(missing.is_none());
+
+        send_pair(&handle, 5).await;
+        // Digest 3 retries: the removed range is (0, 4] (prev stayed
+        // None). The summary succeeds; the chunk leaves.
+        wait_for_boundary(&handle, 6).await;
+        let inputs = summary.inputs();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!((inputs[0].first_msg_id, inputs[0].last_msg_id), (0, 2));
+        assert_eq!((inputs[1].first_msg_id, inputs[1].last_msg_id), (0, 4));
+
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[1].content,
+            r#"<summary range="0-4">recovered summary.</summary>"#
+        );
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(5)));
+        assert_eq!(items[3].range_tag, Some(RangeTag::single(6)));
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.prev_digest_boundary_msg_id, Some(4));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_the_context_with_summaries_bit_identically() {
+        // Rule P1 with summary items: the startup rebuild loads the two
+        // newest persisted summary rows and reproduces the live
+        // placement exactly.
+        let fixture = make_fixture();
+        let summary = Arc::new(ScriptedSummary::with_summaries(vec![
+            "chunk one.".to_string(),
+            "chunk two.".to_string(),
+        ]));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary);
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        send_pair(&handle, 3).await;
+        wait_for_boundary(&handle, 4).await;
+        send_pair(&handle, 5).await;
+        // Digest 3: the context holds S(0-2), S(2-4), and the raw tail.
+        wait_for_boundary(&handle, 6).await;
+        let before = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(before[1].kind, ContextItemKind::Summary);
+        assert_eq!(before[2].kind, ContextItemKind::Summary);
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted_summary = Arc::new(ScriptedSummary::with_summaries(vec![]));
+        let restarted =
+            spawn_with_digest_and_summary(&fixture, digest_config(), restarted_summary.clone());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, before);
+        // The restart made no LLM call.
+        assert!(restarted_summary.inputs().is_empty());
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    /// A summarizer double that blocks until released (the
+    /// pending-gating test).
+    struct GatedSummary {
+        started: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    impl SummaryProvider for GatedSummary {
+        fn summarize<'a>(
+            &'a self,
+            _chat_id: &'a str,
+            _first_msg_id: i64,
+            _last_msg_id: i64,
+            _rows: &'a [MessageRow],
+        ) -> Pin<Box<dyn Future<Output = Result<String, SummaryError>> + Send + 'a>> {
+            Box::pin(async move {
+                // Only the FIRST call blocks; later calls return
+                // immediately (the completion after the release
+                // re-evaluates the digest trigger, whose own
+                // summarization must not block again).
+                if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    self.release.notified().await;
+                }
+                Ok("gated summary.".to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_digest_trigger_does_not_fire_while_a_summary_is_pending() {
+        // Decision 62 gating: while the summary task of one digest
+        // completion is in flight, the digest trigger is suppressed —
+        // the batch range derives from the not-yet-advanced last
+        // boundary, so a new digest would redo the same range.
+        let fixture = make_fixture();
+        let summary = Arc::new(GatedSummary {
+            started: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        send_pair(&handle, 3).await;
+        // Digest 2 completes; its summary call starts and blocks.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !summary.started.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the summary never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // More messages arrive: the digest threshold is exceeded, but
+        // the summary is pending. The boundary must NOT advance (the
+        // deferred mutation holds last at 2) and no new digest spawns.
+        send_pair(&handle, 5).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.last_digest_boundary_msg_id, 2);
+
+        // Release the summary: the deferred mutation lands (last = 4),
+        // then the re-evaluation digests the grown tail (5, 6].
+        summary.release.notify_one();
+        wait_for_boundary(&handle, 4).await;
+        wait_for_boundary(&handle, 6).await;
+        handle.shutdown().await.expect("shutdown succeeds");
     }
 
     // --- Reply-target resolution tests (the amendment-2 rendering) ---
@@ -3158,6 +3784,7 @@ mod tests {
             digest: None,
             post_digest_hook: None,
             wake: Some(services),
+            summary_provider: None,
             outbound: Some(outbound_tx),
             bot_name: None,
         });
