@@ -163,6 +163,7 @@ fn message(id: &str, at: OffsetDateTime) -> NormalizedMessage {
         timestamp: at,
         sender_id: "u1".to_string(),
         sender_display_name: "Alice".to_string(),
+        username: None,
         text: format!("text of {id}"),
         reply_to_platform_msg_id: None,
         mentions_bot: false,
