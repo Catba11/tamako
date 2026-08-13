@@ -744,8 +744,10 @@ test-group soak (`docs/soak-runbook.md`).
     gains an OPTIONAL `username` field (old fixtures keep working and
     exercise the no-username path). Pre-v4 rows read NULL and render
     without the attribute — deterministic, nothing lost on restart.
-    For spec backfill: specs.md Section 5.2 (the new column) and
-    Section 7.2 step 4 (the XML label). **Reply-target resolution
+    LANDED in specs.md: Section 5.2 (the new column), Section 7.2
+    rule C6 plus the new Section 7.3 (the XML rendering and the
+    reply-target resolution), Section 9.4 (the `<memory>` form and
+    the guardrail follow-up). **Reply-target resolution
     (P1-sound).** The reply target renders from the append-only raw
     log, never an in-context index (a target can be pruned below the
     C3 cutoff while the replying item stays): `Store::find_reply_target`
