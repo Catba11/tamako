@@ -8,6 +8,9 @@
 //!
 //! - Display-name fallback chain: "First Last" -> "@username" -> the
 //!   numeric id.
+//! - The `username` field of the normalized message carries
+//!   `User.username` directly. It is `None` when the sender has no
+//!   username, and always `None` for anonymous chat senders.
 //! - Anonymous group admins send as the chat (`from: null`,
 //!   `sender_chat` set). They get the synthetic sender id `chat:{id}` and
 //!   the chat title as the display name. The same synthetic form is used
@@ -86,7 +89,7 @@ pub fn chat_id_string(chat: &Chat) -> String {
 pub fn normalize_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedMessage> {
     let text = msg.text()?;
 
-    let (sender_id, sender_display_name) = resolve_sender(msg);
+    let (sender_id, sender_display_name, username) = resolve_sender(msg);
     let reply = msg.reply_to_message();
 
     Some(NormalizedMessage {
@@ -94,6 +97,7 @@ pub fn normalize_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedM
         timestamp: unix_to_offset(msg.date.timestamp()),
         sender_id,
         sender_display_name,
+        username,
         text: text.to_string(),
         reply_to_platform_msg_id: reply.map(|m| m.id.0.to_string()),
         mentions_bot: mentions_bot(msg, bot),
@@ -186,10 +190,16 @@ pub fn normalize_reaction_count(update: &MessageReactionCountUpdated) -> Reactio
 }
 
 /// Sender resolution for `normalize_message`. See its doc comment for the
-/// anonymous-admin mapping.
-fn resolve_sender(msg: &Message) -> (String, String) {
+/// anonymous-admin mapping. The third tuple member is the sender's
+/// username (`User.username`); `None` for senders without a username and
+/// for anonymous chat senders.
+fn resolve_sender(msg: &Message) -> (String, String, Option<String>) {
     if let Some(user) = &msg.from {
-        return (user.id.0.to_string(), display_name(user));
+        return (
+            user.id.0.to_string(),
+            display_name(user),
+            user.username.clone(),
+        );
     }
     // Sent as a chat (anonymous group admin, or a channel post).
     let chat = msg.sender_chat.as_ref().unwrap_or(&msg.chat);
@@ -198,7 +208,7 @@ fn resolve_sender(msg: &Message) -> (String, String) {
         .map(str::to_string)
         .or_else(|| chat.username().map(|u| format!("@{u}")))
         .unwrap_or_else(|| chat.id.0.to_string());
-    (format!("chat:{}", chat.id.0), name)
+    (format!("chat:{}", chat.id.0), name, None)
 }
 
 /// True when an entity mentions the bot: a `mention` entity whose text is
@@ -359,11 +369,27 @@ mod tests {
         assert_eq!(normalized.platform_msg_id, "1");
         assert_eq!(normalized.sender_id, "42");
         assert_eq!(normalized.sender_display_name, "Alice Smith");
+        assert_eq!(normalized.username, Some("alice".to_string()));
         assert_eq!(normalized.text, "hello");
         assert_eq!(normalized.timestamp, unix_to_offset(DATE));
         assert_eq!(normalized.reply_to_platform_msg_id, None);
         assert!(!normalized.mentions_bot);
         assert!(!normalized.is_reply_to_bot);
+    }
+
+    #[test]
+    fn a_sender_without_a_username_normalizes_to_none_username() {
+        // The display-name fallback chain is untouched (decision 25): a
+        // user without a username still gets a display name. The username
+        // field alone is None.
+        let msg = message(json!({
+            "from": user_json(43, "Bob", None, None),
+            "text": "no username here",
+        }));
+        let normalized = normalize_message(&msg, &bot()).expect("a text message");
+        assert_eq!(normalized.sender_id, "43");
+        assert_eq!(normalized.sender_display_name, "43");
+        assert_eq!(normalized.username, None);
     }
 
     #[test]
@@ -457,6 +483,7 @@ mod tests {
         let msg = message(json!({ "text": "edited text", "edit_date": DATE + 5 }));
         let normalized = normalize_message(&msg, &bot()).expect("a text message");
         assert_eq!(normalized.text, "edited text");
+        assert_eq!(normalized.username, Some("alice".to_string()));
         // The event timestamp stays the send date, not the edit date.
         assert_eq!(normalized.timestamp, unix_to_offset(DATE));
     }
@@ -541,6 +568,8 @@ mod tests {
         let normalized = normalize_message(&msg, &bot()).expect("a text message");
         assert_eq!(normalized.sender_id, format!("chat:{GROUP_ID}"));
         assert_eq!(normalized.sender_display_name, "Test Group");
+        // Anonymous actors carry no user identity, so no username either.
+        assert_eq!(normalized.username, None);
     }
 
     fn reaction_update(actor: serde_json::Value) -> MessageReactionUpdated {

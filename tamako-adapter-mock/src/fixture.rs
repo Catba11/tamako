@@ -4,6 +4,11 @@
 //! data. Justification for JSON: the fixture is test data, and JSON needs
 //! no hand-written parser. serde_json does the work.
 //!
+//! Message and edited-message entries MAY carry an optional `username`
+//! field: the sender's platform username (Rule A1: the normalized
+//! `NormalizedMessage.username`). Entries without the field are valid and
+//! deserialize with `username: None` — the no-username path.
+//!
 //! Rule A5: a second platform adapter must be possible without changes to
 //! the actor. This fixture proves that the normalized contract of
 //! tamako-core is sufficient to drive the system.
@@ -27,6 +32,11 @@ pub struct ReplayFixture {
 /// `{"type": "message", ...fields}`, `{"type": "edited_message", ...}`,
 /// `{"type": "reaction", ...}`, `{"type": "member_join", ...}`,
 /// `{"type": "member_leave", ...}`.
+///
+/// `Message` and `EditedMessage` entries carry the full
+/// [`NormalizedMessage`]. The `username` field inside them is OPTIONAL
+/// (serde `Option`): entries without it deserialize with
+/// `username: None`.
 ///
 /// Rule A2: the adapter exposes these five inbound event kinds. The
 /// variants carry the same normalized structs as [`InboundEvent`].
@@ -143,6 +153,7 @@ mod tests {
             "timestamp": "2026-08-01T13:00:00Z",
             "sender_id": "100001",
             "sender_display_name": "Alice",
+            "username": "alice",
             "text": "hello",
             "reply_to_platform_msg_id": "6",
             "mentions_bot": true,
@@ -158,6 +169,7 @@ mod tests {
         assert_eq!(got.timestamp, message.timestamp);
         assert_eq!(got.sender_id, message.sender_id);
         assert_eq!(got.sender_display_name, message.sender_display_name);
+        assert_eq!(got.username, message.username);
         assert_eq!(got.text, message.text);
         assert_eq!(
             got.reply_to_platform_msg_id,
@@ -207,6 +219,52 @@ mod tests {
 
         let converted = InboundEvent::from(FixtureEvent::EditedMessage(message));
         assert!(matches!(converted, InboundEvent::EditedMessage(_)));
+    }
+
+    /// A message entry JSON with the optional `username` field present.
+    fn message_json_with_username(username: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "platform_msg_id": "1",
+            "timestamp": "2026-08-01T13:00:00Z",
+            "sender_id": "100001",
+            "sender_display_name": "Alice",
+            "username": username,
+            "text": "hello",
+            "reply_to_platform_msg_id": null,
+            "mentions_bot": false,
+            "is_reply_to_bot": false,
+        })
+    }
+
+    #[test]
+    fn a_message_entry_with_username_parses_and_populates_the_field() {
+        let message: NormalizedMessage =
+            serde_json::from_value(message_json_with_username(serde_json::json!("alice")))
+                .expect("message must deserialize");
+        assert_eq!(message.username, Some("alice".to_string()));
+    }
+
+    #[test]
+    fn a_message_entry_without_username_parses_with_none() {
+        // `username` is an optional field of the fixture format: entries
+        // without it must keep working.
+        let message: NormalizedMessage =
+            serde_json::from_value(message_json_with_username(serde_json::Value::Null))
+                .expect("message must deserialize");
+        assert_eq!(message.username, None);
+    }
+
+    #[test]
+    fn a_message_entry_with_a_missing_username_key_parses_with_none() {
+        let json = message_json_with_username(serde_json::json!("alice"));
+        let mut without_key = json;
+        without_key
+            .as_object_mut()
+            .expect("an object")
+            .remove("username");
+        let message: NormalizedMessage =
+            serde_json::from_value(without_key).expect("message must deserialize");
+        assert_eq!(message.username, None);
     }
 
     #[test]
