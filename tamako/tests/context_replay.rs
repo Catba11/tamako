@@ -52,6 +52,7 @@ use tamako_core::config::TriggerConfig;
 use tamako_core::context::{ContextItem, ContextItemKind, ContextRole, LiveContext, RangeTag};
 use tamako_core::digest::{DigestOutcome, PostDigestHook};
 use tamako_core::event::{InboundEvent, NormalizedMessage};
+use tamako_core::summary::{ScriptedSummary, SummaryProvider};
 use tamako_memory::LbugBackend;
 use tamako_store::{EventType, MessageRow, Store, StoreError};
 use time::macros::{datetime, format_description};
@@ -181,6 +182,7 @@ fn spawn_actor(
     config: TriggerConfig,
     extractor: Arc<ScriptedExtractor>,
     post_digest_hook: Option<Arc<dyn PostDigestHook>>,
+    summary_provider: Option<Arc<dyn SummaryProvider>>,
     started_at: OffsetDateTime,
 ) -> GroupActorHandle {
     let digest = Arc::new(AgentDigestPipeline::new(
@@ -201,7 +203,7 @@ fn spawn_actor(
         post_digest_hook,
         // The M4 wake wiring enters in a later subtask.
         wake: None,
-        summary_provider: None,
+        summary_provider,
         outbound: None,
         bot_name: None,
     })
@@ -429,6 +431,7 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
         digest_config(4),
         extractor,
         Some(hook.clone() as Arc<dyn PostDigestHook>),
+        None,
         started_after_fixture(),
     );
 
@@ -469,6 +472,7 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
             trivial_graph(),
             trivial_graph(),
         ])),
+        None,
         None,
         started_after_fixture(),
     );
@@ -570,12 +574,120 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
 }
 
 #[tokio::test]
+async fn summaries_flow_end_to_end_and_survive_a_restart() {
+    // Decision 62 end to end over the real actor, the real store, and
+    // the real pipeline (scripted extractor + scripted summarizer):
+    // the chunk that Rule C3 removes is summarized before the removal,
+    // the context keeps the TWO newest summaries, and the restart
+    // rebuild is bit-identical WITH the summary items (Rule P1).
+    let fixture = make_fixture();
+    let summary = Arc::new(ScriptedSummary::with_summaries(vec![
+        "the first chunk.".to_string(),
+        "the second chunk.".to_string(),
+        "the third chunk.".to_string(),
+    ]));
+    let handle = spawn_actor(
+        &fixture,
+        digest_config(2),
+        Arc::new(ScriptedExtractor::with_graphs(
+            (0..6).map(|_| trivial_graph()).collect(),
+        )),
+        None,
+        Some(summary.clone()),
+        t0(),
+    );
+
+    // Four digests, driven in pairs like the tamako-core actor tests.
+    for pair in 0..4 {
+        let first = pair * 2 + 1;
+        for index in first..first + 2 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    "u1",
+                    "Alice",
+                    &format!("text of m{index}"),
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_boundary(&handle, first + 1, DIGEST_TIMEOUT).await;
+    }
+
+    // The summarizer saw the three removed ranges in order.
+    let ranges: Vec<(i64, i64)> = summary
+        .inputs()
+        .iter()
+        .map(|input| (input.first_msg_id, input.last_msg_id))
+        .collect();
+    assert_eq!(ranges, vec![(0, 2), (2, 4), (4, 6)]);
+
+    // Keep-two: the context holds exactly the two newest summaries,
+    // oldest first, directly after the preamble; the raw previous
+    // chunk (6, 8] stays raw.
+    let items = handle
+        .context_snapshot()
+        .await
+        .expect("the context snapshot succeeds");
+    assert_eq!(items.len(), 5);
+    assert_eq!(items[0].kind, ContextItemKind::Preamble);
+    assert_eq!(items[1].kind, ContextItemKind::Summary);
+    assert_eq!(items[1].role, ContextRole::User);
+    assert_eq!(
+        items[1].content,
+        r#"<summary range="2-4">the second chunk.</summary>"#
+    );
+    assert_eq!(
+        items[2].content,
+        r#"<summary range="4-6">the third chunk.</summary>"#
+    );
+    assert_eq!(items[3].range_tag, Some(RangeTag::single(7)));
+    assert_eq!(items[4].range_tag, Some(RangeTag::single(8)));
+
+    // Forensics: all three rows persist in the store.
+    let stored = blocking_store_call(&fixture.store, move |store| {
+        store.list_newest_context_summaries(CHAT_ID, 10)
+    })
+    .await;
+    assert_eq!(stored.len(), 3);
+
+    // The restart rebuild is bit-identical WITH the summary items, and
+    // the restarted actor makes no new summary call.
+    let before = handle
+        .context_snapshot()
+        .await
+        .expect("the context snapshot succeeds");
+    handle.shutdown().await.expect("the actor reports no error");
+
+    let restarted_summary = Arc::new(ScriptedSummary::with_summaries(vec![]));
+    let restarted = spawn_actor(
+        &fixture,
+        digest_config(2),
+        Arc::new(ScriptedExtractor::with_graphs(vec![])),
+        None,
+        Some(restarted_summary.clone()),
+        t0(),
+    );
+    let rebuilt = restarted
+        .context_snapshot()
+        .await
+        .expect("the context snapshot succeeds");
+    assert_eq!(rebuilt, before);
+    assert!(restarted_summary.inputs().is_empty());
+    restarted
+        .shutdown()
+        .await
+        .expect("the actor reports no error");
+}
+
+#[tokio::test]
 async fn restart_rebuilds_a_bit_identical_context_with_injections() {
     let fixture = make_fixture();
     // Digest 1 only: the tail never reaches three rows again before the
     // restart (m4 and m5 stay below the threshold).
     let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![trivial_graph()]));
-    let handle = spawn_actor(&fixture, digest_config(3), extractor, None, t0());
+    let handle = spawn_actor(&fixture, digest_config(3), extractor, None, None, t0());
 
     for msg in [
         message("m1", 1, "u1", "Alice", "morning all"),
@@ -633,6 +745,7 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
         digest_config(3),
         Arc::new(ScriptedExtractor::with_graphs(vec![trivial_graph()])),
         None,
+        None,
         t0(),
     );
     let session = restarted.snapshot().await.expect("the snapshot succeeds");
@@ -657,6 +770,9 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
         &rows,
         &injections,
         &HashMap::new(),
+        // S2a mechanical fix: the summaries slice is S2b's to wire (this
+        // fixture writes no context summaries).
+        &[],
     );
     let rebuilt = restarted
         .context_snapshot()
@@ -724,6 +840,9 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
         &rows,
         &injections,
         &HashMap::new(),
+        // S2a mechanical fix: the summaries slice is S2b's to wire (this
+        // fixture writes no context summaries).
+        &[],
     );
     let before_shutdown = restarted
         .context_snapshot()
@@ -773,6 +892,7 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
         &fixture,
         digest_config(3),
         Arc::new(ScriptedExtractor::with_graphs(vec![])),
+        None,
         None,
         t0(),
     );
