@@ -47,8 +47,10 @@ use tamako_core::actor::{
 };
 use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::TriggerConfig;
+use tamako_core::context::ContextItemKind;
 use tamako_core::digest::DigestPipeline;
 use tamako_core::event::{InboundEvent, NormalizedMessage, OutboundAction};
+use tamako_core::summary::{ScriptedSummary, SummaryProvider};
 use tamako_core::wake::{GateDecision, ParticipationGate, ReplyGenerator, WakeServices};
 use tamako_memory::identifiers::{alias_id, concept_id, person_id};
 use tamako_memory::{LbugBackend, MemoryBackend, MemoryBatch, MemoryEdge, MemoryNode, NodeType};
@@ -247,6 +249,7 @@ fn spawn_on(
     started_at: OffsetDateTime,
     doubles: &WakeDoubles,
     extractor: Arc<ScriptedExtractor>,
+    summary: Arc<ScriptedSummary>,
     outbound: mpsc::Sender<OutboundAction>,
 ) -> GroupActorHandle {
     // Open the group store BEFORE the actor spawns: a concurrent
@@ -283,7 +286,7 @@ fn spawn_on(
             gate: Arc::clone(&doubles.gate) as Arc<dyn ParticipationGate>,
             reply: Arc::clone(&doubles.reply) as Arc<dyn ReplyGenerator>,
         }),
-        summary_provider: None,
+        summary_provider: Some(summary as Arc<dyn SummaryProvider>),
         outbound: Some(outbound),
         bot_name: Some("Tamako".to_string()),
     })
@@ -497,6 +500,14 @@ async fn stability_loop_digests_wakes_injections_and_restarts() {
     let extractor = Arc::new(ScriptedExtractor::with_graphs(
         (0..12).map(|_| trivial_graph()).collect(),
     ));
+    // The summarizer supply (decision 62): one summary per digest from
+    // the second digest on, plus margin. An exhausted queue would fail
+    // the call and defer the removal, so the margin is free.
+    let summaries = Arc::new(ScriptedSummary::with_summaries(
+        (1..=ITERATIONS + 2)
+            .map(|n| format!("summary of chunk {n}"))
+            .collect(),
+    ));
 
     let pump = outbound_pump();
     let mut handle = spawn_on(
@@ -505,6 +516,7 @@ async fn stability_loop_digests_wakes_injections_and_restarts() {
         started_at,
         &doubles,
         Arc::clone(&extractor),
+        Arc::clone(&summaries),
         pump.tx.clone(),
     );
 
@@ -648,6 +660,7 @@ async fn stability_loop_digests_wakes_injections_and_restarts() {
             started_at,
             &doubles,
             Arc::clone(&extractor),
+            Arc::clone(&summaries),
             pump.tx.clone(),
         );
         let context_after = handle
@@ -663,9 +676,64 @@ async fn stability_loop_digests_wakes_injections_and_restarts() {
             session_after, session_before,
             "iteration {i}: the session survives the restart"
         );
+
+        // Decision 62 invariants across the restart: at most two
+        // summary items, each backed by a persisted context_summaries
+        // row of the same range (the keep-two window is a VIEW of the
+        // table, Rule P1).
+        let summary_ranges: Vec<String> = context_after
+            .iter()
+            .filter(|item| item.kind == ContextItemKind::Summary)
+            .map(|item| item.content.clone())
+            .collect();
+        assert!(
+            summary_ranges.len() <= 2,
+            "iteration {i}: more than two summary items: {summary_ranges:?}"
+        );
+        for content in &summary_ranges {
+            let tag_end = content.find('>').expect("the summary tag closes");
+            let range = content
+                .strip_prefix(r#"<summary range=""#)
+                .and_then(|rest| rest[..tag_end - r#"<summary range=""#.len()].strip_suffix('"'))
+                .expect("the summary item carries a range attribute");
+            let (first, last) = range
+                .split_once('-')
+                .expect("the range attribute is first-last");
+            let first: i64 = first.parse().expect("a numeric range bound");
+            let last: i64 = last.parse().expect("a numeric range bound");
+            let store = Arc::clone(&fixture.store);
+            let row = tokio::task::spawn_blocking(move || {
+                store.find_context_summary(CHAT_ID, first, last)
+            })
+            .await
+            .expect("the blocking task joins")
+            .expect("find_context_summary succeeds");
+            assert!(
+                row.is_some(),
+                "iteration {i}: the summary item ({first}, {last}] has no persisted row"
+            );
+        }
     }
 
     // --- The final state. ---
+    // Decision 62: one summary per digest from the second digest on —
+    // ITERATIONS digests minus the first = ITERATIONS - 1 summary rows,
+    // and the summarizer was never exhausted.
+    {
+        let store = Arc::clone(&fixture.store);
+        let summary_rows =
+            tokio::task::spawn_blocking(move || store.list_newest_context_summaries(CHAT_ID, 1000))
+                .await
+                .expect("the blocking task joins")
+                .expect("list_newest_context_summaries succeeds");
+        assert_eq!(
+            summary_rows.len(),
+            ITERATIONS as usize - 1,
+            "one summary per removed chunk: {summary_rows:?}"
+        );
+        assert_eq!(summaries.inputs().len(), ITERATIONS as usize - 1);
+    }
+
     // specs.md Section 10.3: no dead letters. The scripted extractor
     // never fails, so the table stays empty.
     {
