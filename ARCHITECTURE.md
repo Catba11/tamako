@@ -14,15 +14,15 @@ dependency versions are pinned in `[workspace.dependencies]`.
 | Crate | Role | Tests |
 |---|---|---|
 | `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 48 |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 89 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v3), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 23 |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts. | 111 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v4), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, the read-only status query. | 27 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer. | 14 |
-| `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 6 |
-| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 50 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 145 (+3 ignored live tests) |
+| `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 51 (+1 ignored live test) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker. | 147 (+3 ignored live tests) |
 
-Total: 393 tests (+4 ignored live tests). Build, test,
+Total: 425 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -220,12 +220,28 @@ only inside the actor loop (Section 6.1, rule 2).
   from the persona service — the provider cache anchor (Rule C4). Every
   other item carries a message-id range tag (Section 7.1, raw-log row
   ids) and a role (system / user / assistant). Kinds: `HumanMessage`
-  (user role, speaker label `[{display_name} {HH:MM}] {text}`, HH:MM in
-  UTC — Section 7.2 step 4), `BotSpeech` (assistant role, verbatim
-  text; the label distinguishes group members, not the bot — Rule B1),
-   `RecallInjection` (assistant role; produced by the M5 recall
-   worker through `append_recall_injection`, Rule C2), `ToolOutput`
-   (reserved, no producer).
+  (user role), `BotSpeech` (assistant role — Rule B1),
+  `RecallInjection` (assistant role; produced by the M5 recall
+  worker through `append_recall_injection`, Rule C2), `ToolOutput`
+  (reserved, no producer). Item CONTENT renders as XML (decision 61;
+  the item model itself is unchanged): a human message renders
+  `<msg from="{display_name}"[ user="{username}"] at="{HH:MM UTC}" id="{row_id}"[ kind="edit"][ reply="bot" | reply="user"[ reply_to_name="{name}" reply_to_id="{row_id}"]][ mention="bot"]>text</msg>`,
+  bot speech renders `<you at="{HH:MM}" id="{row_id}">text</you>`, and
+  a recall injection renders `<memory>escaped edge texts</memory>`.
+  Every attribute derives from persisted raw-log columns (Rule P1);
+  the reply target resolves through `Store::find_reply_target`
+  (`platform_msg_id` → the MIN(id) original row, so edits of the
+  target do not move it) at intake, in the wake gate input, and in
+  the restart rebuild through the SAME store function — intake and
+  rebuild renders are bit-identical even when the target sits below
+  the C3 cutoff. A reply to the bot renders `reply="bot"` with no
+  target: outbound rows carry synthetic `bot-out:{nanos}` ids (Rules
+  A3/B1), so the target can never resolve — no fake resolution. Text
+  content escapes `& < >`, attribute values additionally `"`, so a
+  user cannot forge structure through message text. Legacy persisted
+  injections keep their verbatim `I remember: ...` content and age
+  out through C3 within one digest cycle; the decision-59 parrot
+  filter matches both injection shapes.
 - **Append-only by construction (Rules C1, C2)**: the item vector is
   private and the public API permits appends at the tail ONLY. No
   method inserts into, removes from, or mutates the middle of the
@@ -252,15 +268,17 @@ Rule P5: one directory per group at `{data_root}/{chat_id}/`.
 
 | File | Content |
 |---|---|
-| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `schema_migrations`. |
+| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth; nullable `sender_username` since migration v4 — decision 61), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `schema_migrations`. |
 | `memory.lbug` | LadybugDB graph. One `Node` table, one `EDGE` rel table (Section 6.1 of the database specification). |
 
 `tamako-store::Store` is rooted at the data root and takes a `chat_id`
 in every API. Connections open lazily and are cached in a
 `Mutex<HashMap>`. Migrations are an ordered constant array (v1: the
 Phase 0 tables; v2: `injected_memories.content` for the bit-identical
-context rebuild; v3: the `reactions` table) applied through a minimal
-runner; the raw-log insert
+context rebuild; v3: the `reactions` table; v4: the additive nullable
+`messages.sender_username` for the decision-61 XML `user` attribute —
+pre-v4 rows read NULL and render without the attribute) applied
+through a minimal runner; the raw-log insert
 is idempotent (`INSERT OR IGNORE` on `(platform_msg_id, direction,
 event_type, timestamp)`). `chat_id` values with path separators or
 `..` are rejected.
