@@ -110,6 +110,33 @@ CREATE UNIQUE INDEX reactions_dedup
 ALTER TABLE messages ADD COLUMN sender_username TEXT;
 ",
     ),
+    (
+        5,
+        "\
+-- Segmented context summarization: one row per digested chunk. The row
+-- replaces the raw-log range (first_msg_id, last_msg_id] that Rule C3
+-- removed from the live context. An LLM-written summary is not derivable
+-- from persisted state (Rule P1), so its text is persisted at creation
+-- time. The context keeps the TWO newest summaries for the rebuild.
+--
+-- Retention: rotated-out summaries are NOT pruned. They stay in the
+-- table for forensics. The table grows one small row per digest. This
+-- is deliberate.
+CREATE TABLE context_summaries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_msg_id INTEGER NOT NULL,
+    last_msg_id  INTEGER NOT NULL,
+    content      TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+-- The range of the digested chunk is the natural dedup key. Rule P1
+-- replay idempotency: a re-run of a digest-completion handler finds the
+-- existing row and skips the LLM call.
+CREATE UNIQUE INDEX context_summaries_dedup
+    ON context_summaries (first_msg_id, last_msg_id);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.

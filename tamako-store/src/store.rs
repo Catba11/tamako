@@ -146,6 +146,31 @@ pub struct InjectedMemoryRow {
     pub content: String,
 }
 
+/// A row of the `context_summaries` table.
+///
+/// One row summarizes one digested chunk of the raw log: the range
+/// `(first_msg_id, last_msg_id]` that Rule C3 removed from the live
+/// context at digest completion. An LLM-written summary is not derivable
+/// from persisted state (Rule P1), so `content` is persisted at creation
+/// time. The context rebuild keeps the TWO newest summaries.
+///
+/// Retention: rows that rotate out of the keep-two window are NOT
+/// pruned. They stay in the table for forensics. The table grows one
+/// small row per digest. This is deliberate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSummaryRow {
+    pub id: i64,
+    /// Id of the raw-log row just before the summarized chunk. The range
+    /// is exclusive of this boundary: rows with `id > first_msg_id` were
+    /// digested.
+    pub first_msg_id: i64,
+    /// Id of the last raw-log row of the summarized chunk, inclusive.
+    pub last_msg_id: i64,
+    /// The LLM-written summary text. Persisted at creation time because
+    /// it is not derivable from the raw log (Rule P1).
+    pub content: String,
+}
+
 /// A row of the `dead_letter` table. Refer to specs.md Section 10.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLetterRow {
@@ -294,6 +319,29 @@ impl Store {
             ))?;
             let rows = stmt
                 .query_map(rusqlite::params![after_id], message_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// All log rows with `after_msg_id < id <= up_to_msg_id_inclusive`,
+    /// ordered by `id`. The segmented summarizer reads the raw-log range
+    /// of the chunk it replaces with this method.
+    pub fn list_messages_in_range(
+        &self,
+        chat_id: &str,
+        after_msg_id: i64,
+        up_to_msg_id_inclusive: i64,
+    ) -> Result<Vec<MessageRow>> {
+        self.with_conn(chat_id, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id > ?1 AND id <= ?2 ORDER BY id"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![after_msg_id, up_to_msg_id_inclusive],
+                    message_row,
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -611,6 +659,94 @@ impl Store {
         })
     }
 
+    // --- context_summaries (specs.md Section 10; segmented summarization) ---
+    //
+    // One row per digested chunk. The raw-log range (first_msg_id,
+    // last_msg_id] of the chunk is the natural dedup key. Retention
+    // policy: rotated-out summaries are NOT pruned; see ContextSummaryRow.
+
+    /// Finds the summary of the digested range
+    /// `(first_msg_id, last_msg_id]`. Check-before-call support (Rule P1
+    /// replay idempotency): a re-run of a digest-completion handler finds
+    /// the existing row and skips the LLM call.
+    pub fn find_context_summary(
+        &self,
+        chat_id: &str,
+        first_msg_id: i64,
+        last_msg_id: i64,
+    ) -> Result<Option<ContextSummaryRow>> {
+        self.with_conn(chat_id, |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT id, first_msg_id, last_msg_id, content
+                     FROM context_summaries
+                     WHERE first_msg_id = ?1 AND last_msg_id = ?2",
+                    rusqlite::params![first_msg_id, last_msg_id],
+                    context_summary_row,
+                )
+                .optional()?;
+            Ok(row)
+        })
+    }
+
+    /// Records the summary of one digested chunk. Idempotent: INSERT OR
+    /// IGNORE over the natural key (AGENT.md Section 6.2). Returns the
+    /// row id: the new one on insert, the existing one on a replay of
+    /// the same range.
+    pub fn insert_context_summary(
+        &self,
+        chat_id: &str,
+        first_msg_id: i64,
+        last_msg_id: i64,
+        content: &str,
+    ) -> Result<i64> {
+        self.with_conn(chat_id, |conn| {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO context_summaries
+                    (first_msg_id, last_msg_id, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![first_msg_id, last_msg_id, content, schema::now_rfc3339()?,],
+            )?;
+            if inserted == 1 {
+                Ok(conn.last_insert_rowid())
+            } else {
+                // The range already has a summary. Return the existing row
+                // id so the caller is independent of which path won.
+                Ok(conn.query_row(
+                    "SELECT id FROM context_summaries
+                     WHERE first_msg_id = ?1 AND last_msg_id = ?2",
+                    rusqlite::params![first_msg_id, last_msg_id],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+    }
+
+    /// The N newest summary rows by id, returned OLDEST FIRST. The
+    /// keep-two retention source for the context rebuild: the caller
+    /// places the rows after the preamble in this order.
+    pub fn list_newest_context_summaries(
+        &self,
+        chat_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ContextSummaryRow>> {
+        self.with_conn(chat_id, |conn| {
+            // u32 to i64 is lossless.
+            let limit = i64::from(limit);
+            let mut stmt = conn.prepare(
+                "SELECT id, first_msg_id, last_msg_id, content
+                 FROM context_summaries ORDER BY id DESC LIMIT ?1",
+            )?;
+            let mut rows = stmt
+                .query_map(rusqlite::params![limit], context_summary_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // The query returns newest first. Reverse for context
+            // placement: oldest first, newest last.
+            rows.reverse();
+            Ok(rows)
+        })
+    }
+
     /// Opens the group connection when it is not cached, then runs `f`
     /// on it.
     fn with_conn<T>(
@@ -638,8 +774,8 @@ impl Store {
     }
 }
 
-// The column list of the raw-log SELECT queries. `list_messages` and
-// `list_messages_after` share it.
+// The column list of the raw-log SELECT queries. `list_messages`,
+// `list_messages_after`, and `list_messages_in_range` share it.
 const MESSAGE_COLUMNS: &str = "id, platform_msg_id, direction, event_type, timestamp,
         sender_id, sender_display_name, sender_username, text,
         reply_to_platform_msg_id, mentions_bot, is_reply_to_bot";
@@ -754,6 +890,17 @@ fn reaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReactionRow> {
         old_emojis: parse_emojis(&old_emojis)?,
         new_emojis: parse_emojis(&new_emojis)?,
         timestamp: schema::parse_rfc3339(&timestamp)?,
+    })
+}
+
+/// Maps one row of a context_summaries SELECT to a `ContextSummaryRow`.
+/// `find_context_summary` and `list_newest_context_summaries` share it.
+fn context_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextSummaryRow> {
+    Ok(ContextSummaryRow {
+        id: row.get("id")?,
+        first_msg_id: row.get("first_msg_id")?,
+        last_msg_id: row.get("last_msg_id")?,
+        content: row.get("content")?,
     })
 }
 
@@ -1041,7 +1188,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1051,7 +1198,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -1060,6 +1207,99 @@ mod tests {
         })
         .optional()
         .expect("sender_username column must exist");
+
+        // Migration v5 added context_summaries. The SELECT proves the
+        // table exists: a missing table is an error, an empty table yields
+        // Ok(None).
+        conn.query_row("SELECT id FROM context_summaries LIMIT 1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .expect("context_summaries table must exist");
+    }
+
+    #[test]
+    fn migration_v5_upgrades_a_v4_database_in_place() {
+        // A database created by the previous release carries migrations
+        // v1-v4 and live data. Opening it with this build must apply only
+        // v5, keep the data, and be a no-op on reopen.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let group_dir = dir.path().join("c1");
+        std::fs::create_dir_all(&group_dir).expect("create group dir");
+        {
+            let conn = Connection::open(group_dir.join("store.db")).expect("open v4 db");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("create schema_migrations");
+            // Replay the v4-era runner: migrations 1-4 only, each with its
+            // recorded applied_at.
+            for (version, sql) in schema::MIGRATIONS.iter().take(4) {
+                conn.execute_batch(sql).expect("apply v4 migration");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![version, schema::now_rfc3339().expect("timestamp")],
+                )
+                .expect("record v4 migration");
+            }
+            // Data written by the v4-era bot must survive the upgrade.
+            let msg = sample_message();
+            let timestamp = schema::format_rfc3339(msg.timestamp).expect("format");
+            conn.execute(
+                "INSERT INTO messages (
+                    platform_msg_id, direction, event_type, timestamp,
+                    sender_id, sender_display_name, sender_username, text,
+                    reply_to_platform_msg_id, mentions_bot, is_reply_to_bot
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    msg.platform_msg_id,
+                    msg.direction.as_str(),
+                    msg.event_type.as_str(),
+                    timestamp,
+                    msg.sender_id,
+                    msg.sender_display_name,
+                    msg.sender_username,
+                    msg.text,
+                    msg.reply_to_platform_msg_id,
+                    msg.mentions_bot,
+                    msg.is_reply_to_bot,
+                ],
+            )
+            .expect("insert v4 message");
+        }
+
+        // The upgrade open applies v5. A reopen is a no-op.
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("c1").expect("upgrade open");
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen after upgrade");
+
+        // The v4-era message survives the in-place upgrade.
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].platform_msg_id, "m1");
+
+        // The new table is usable right after the upgrade.
+        let summary_id = store
+            .insert_context_summary("c1", 0, rows[0].id, "the first chunk")
+            .expect("insert summary");
+        assert!(summary_id > 0);
+
+        // Migration bookkeeping: exactly one version was added.
+        let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
+        let versions: Vec<u32> = {
+            let mut stmt = conn
+                .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .expect("prepare versions");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query versions")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect versions")
+        };
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -1171,6 +1411,56 @@ mod tests {
             .list_messages_after("c1", ids[2])
             .expect("list empty tail");
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn list_messages_in_range_returns_the_inclusive_range_in_order() {
+        // The segmented summarizer reads the raw-log range (first, last]
+        // of the chunk it replaces. The lower boundary is exclusive, the
+        // upper boundary inclusive.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let mut ids = Vec::new();
+        for index in 1..=4_i64 {
+            let msg = NewMessage {
+                platform_msg_id: format!("m{index}"),
+                timestamp: base.timestamp + time::Duration::seconds(index),
+                text: format!("text {index}"),
+                ..base.clone()
+            };
+            match store.insert_message("c1", &msg).expect("insert") {
+                InsertOutcome::Inserted(id) => ids.push(id),
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+
+        // (0, ids[1]] holds rows 1 and 2.
+        let range = store
+            .list_messages_in_range("c1", 0, ids[1])
+            .expect("range (0, id2]");
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].id, ids[0]);
+        assert_eq!(range[1].id, ids[1]);
+
+        // (ids[0], ids[2]] excludes row 1, includes rows 2 and 3.
+        let middle = store
+            .list_messages_in_range("c1", ids[0], ids[2])
+            .expect("range (id1, id3]");
+        assert_eq!(middle.len(), 2);
+        assert_eq!(middle[0].id, ids[1]);
+        assert_eq!(middle[1].id, ids[2]);
+
+        // An empty range returns an empty vec.
+        let empty = store
+            .list_messages_in_range("c1", ids[1], ids[1])
+            .expect("empty range");
+        assert!(empty.is_empty());
+
+        // Rule P5: one group's data never crosses into another group.
+        let other = store
+            .list_messages_in_range("c2", 0, ids[3])
+            .expect("other group range");
+        assert!(other.is_empty());
     }
 
     #[test]
@@ -1616,5 +1906,112 @@ mod tests {
         assert_eq!(status.state.get("wakes_total"), Some(&"7".to_string()));
         assert_eq!(status.dead_letter_count, 0);
         assert!(status.recent_dead_letters.is_empty());
+    }
+
+    #[test]
+    fn context_summary_insert_find_list_round_trip() {
+        // The digest-completion handler persists the LLM summary of one
+        // digested chunk (Rule P1), and the rebuild reads it back.
+        let (_dir, store) = temp_store();
+        // Check-before-call: a missing range reads as None.
+        assert_eq!(
+            store
+                .find_context_summary("c1", 1, 10)
+                .expect("find missing"),
+            None
+        );
+
+        let id1 = store
+            .insert_context_summary("c1", 1, 10, "Alice and Bob played go")
+            .expect("insert 1");
+        let id2 = store
+            .insert_context_summary("c1", 11, 20, "Carol joined the chat")
+            .expect("insert 2");
+        assert!(id2 > id1);
+
+        let found = store
+            .find_context_summary("c1", 1, 10)
+            .expect("find")
+            .expect("row exists");
+        assert_eq!(
+            found,
+            ContextSummaryRow {
+                id: id1,
+                first_msg_id: 1,
+                last_msg_id: 10,
+                content: "Alice and Bob played go".to_string(),
+            }
+        );
+
+        // The list returns the newest rows by id, oldest first.
+        let newest = store.list_newest_context_summaries("c1", 10).expect("list");
+        assert_eq!(newest.len(), 2);
+        assert_eq!(newest[0].id, id1);
+        assert_eq!(newest[1].id, id2);
+
+        // Rule P5: one group's data never crosses into another group.
+        assert_eq!(
+            store
+                .find_context_summary("c2", 1, 10)
+                .expect("other group find"),
+            None
+        );
+        assert!(store
+            .list_newest_context_summaries("c2", 10)
+            .expect("other group list")
+            .is_empty());
+    }
+
+    #[test]
+    fn insert_context_summary_is_idempotent_on_the_natural_key() {
+        // Rule P1 replay idempotency: a re-run of the digest-completion
+        // handler re-inserts the same range. INSERT OR IGNORE keeps one
+        // row and returns the existing row id.
+        let (_dir, store) = temp_store();
+        let id1 = store
+            .insert_context_summary("c1", 1, 10, "first text")
+            .expect("insert");
+        let id2 = store
+            .insert_context_summary("c1", 1, 10, "second text")
+            .expect("re-insert");
+
+        assert_eq!(id1, id2);
+        let rows = store.list_newest_context_summaries("c1", 10).expect("list");
+        assert_eq!(rows.len(), 1);
+        // The first text wins: the re-insert did not overwrite it.
+        assert_eq!(rows[0].content, "first text");
+    }
+
+    #[test]
+    fn list_newest_context_summaries_returns_the_n_newest_oldest_first() {
+        // The keep-two retention source for the rebuild: the N newest rows
+        // by id, returned oldest first for placement after the preamble.
+        let (_dir, store) = temp_store();
+        let mut ids = Vec::new();
+        for index in 0..5_i64 {
+            let first = index * 10 + 1;
+            let last = first + 9;
+            let id = store
+                .insert_context_summary("c1", first, last, &format!("summary {index}"))
+                .expect("insert");
+            ids.push(id);
+        }
+
+        let keep_two = store
+            .list_newest_context_summaries("c1", 2)
+            .expect("list newest 2");
+        assert_eq!(keep_two.len(), 2);
+        assert_eq!(keep_two[0].id, ids[3]);
+        assert_eq!(keep_two[0].content, "summary 3");
+        assert_eq!(keep_two[1].id, ids[4]);
+        assert_eq!(keep_two[1].content, "summary 4");
+
+        // A limit above the row count returns all rows, oldest first.
+        let all = store
+            .list_newest_context_summaries("c1", 100)
+            .expect("list all");
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].id, ids[0]);
+        assert_eq!(all[4].id, ids[4]);
     }
 }
