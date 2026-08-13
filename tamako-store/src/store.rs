@@ -83,6 +83,9 @@ pub struct NewMessage {
     pub timestamp: OffsetDateTime,
     pub sender_id: String,
     pub sender_display_name: String,
+    /// The sender's username, when the platform provides one. `None` for
+    /// senders without a username and for rows written before migration v4.
+    pub sender_username: Option<String>,
     pub text: String,
     pub reply_to_platform_msg_id: Option<String>,
     pub mentions_bot: bool,
@@ -99,10 +102,23 @@ pub struct MessageRow {
     pub timestamp: OffsetDateTime,
     pub sender_id: String,
     pub sender_display_name: String,
+    /// The sender's username, when the platform provides one. `None` for
+    /// senders without a username and for rows written before migration v4.
+    pub sender_username: Option<String>,
     pub text: String,
     pub reply_to_platform_msg_id: Option<String>,
     pub mentions_bot: bool,
     pub is_reply_to_bot: bool,
+}
+
+/// Resolved reply target of the raw message log. Refer to
+/// `Store::find_reply_target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyTargetRow {
+    /// Row id of the ORIGINAL logged row for the platform message id.
+    pub row_id: i64,
+    /// Display name of the target sender, fixed at intake.
+    pub display_name: String,
 }
 
 /// Result of an idempotent log insert.
@@ -229,9 +245,9 @@ impl Store {
             let n = conn.execute(
                 "INSERT OR IGNORE INTO messages (
                     platform_msg_id, direction, event_type, timestamp,
-                    sender_id, sender_display_name, text,
+                    sender_id, sender_display_name, sender_username, text,
                     reply_to_platform_msg_id, mentions_bot, is_reply_to_bot
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     msg.platform_msg_id,
                     msg.direction.as_str(),
@@ -239,6 +255,7 @@ impl Store {
                     timestamp,
                     msg.sender_id,
                     msg.sender_display_name,
+                    msg.sender_username,
                     msg.text,
                     msg.reply_to_platform_msg_id,
                     msg.mentions_bot,
@@ -314,6 +331,39 @@ impl Store {
                      WHERE platform_msg_id = ?1 ORDER BY id DESC LIMIT 1",
                     rusqlite::params![platform_msg_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })
+    }
+
+    /// Resolves a reply target to the ORIGINAL logged row (Rule P1:
+    /// deterministic from the append-only raw log). Edit rows share
+    /// `platform_msg_id` with their original, so MIN(id) pins the
+    /// original; its display name is fixed at intake. Returns None when
+    /// the target is absent from the log (e.g. it predates the bot
+    /// joining).
+    ///
+    /// No direction filter: in practice only inbound rows carry real
+    /// platform ids. Outbound rows use synthetic `bot-out:{nanos}` ids
+    /// that never collide with real ones.
+    pub fn find_reply_target(
+        &self,
+        chat_id: &str,
+        platform_msg_id: &str,
+    ) -> Result<Option<ReplyTargetRow>> {
+        self.with_conn(chat_id, |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT id, sender_display_name FROM messages
+                     WHERE platform_msg_id = ?1 ORDER BY id ASC LIMIT 1",
+                    rusqlite::params![platform_msg_id],
+                    |row| {
+                        Ok(ReplyTargetRow {
+                            row_id: row.get("id")?,
+                            display_name: row.get("sender_display_name")?,
+                        })
+                    },
                 )
                 .optional()?;
             Ok(row)
@@ -591,7 +641,7 @@ impl Store {
 // The column list of the raw-log SELECT queries. `list_messages` and
 // `list_messages_after` share it.
 const MESSAGE_COLUMNS: &str = "id, platform_msg_id, direction, event_type, timestamp,
-        sender_id, sender_display_name, text,
+        sender_id, sender_display_name, sender_username, text,
         reply_to_platform_msg_id, mentions_bot, is_reply_to_bot";
 
 /// Maps one row of a dead_letter SELECT to a `DeadLetterRow`.
@@ -682,6 +732,7 @@ fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         timestamp: schema::parse_rfc3339(&timestamp)?,
         sender_id: row.get("sender_id")?,
         sender_display_name: row.get("sender_display_name")?,
+        sender_username: row.get("sender_username")?,
         text: row.get("text")?,
         reply_to_platform_msg_id: row.get("reply_to_platform_msg_id")?,
         mentions_bot: row.get("mentions_bot")?,
@@ -766,6 +817,7 @@ mod tests {
             timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
             sender_id: "u1".to_string(),
             sender_display_name: "Alice".to_string(),
+            sender_username: Some("alice".to_string()),
             text: "hello".to_string(),
             reply_to_platform_msg_id: Some("m0".to_string()),
             mentions_bot: true,
@@ -866,6 +918,114 @@ mod tests {
     }
 
     #[test]
+    fn sender_username_round_trips() {
+        // The XML context rendering (msg 标签) shows the username beside
+        // the display name. The value must survive the log round trip.
+        let (_dir, store) = temp_store();
+        let msg = NewMessage {
+            sender_username: Some("alice_w".to_string()),
+            ..sample_message()
+        };
+        assert!(matches!(
+            store.insert_message("c1", &msg).expect("insert"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender_username, Some("alice_w".to_string()));
+    }
+
+    #[test]
+    fn missing_sender_username_reads_back_as_none() {
+        // A sender without a username, and every row written before
+        // migration v4, holds NULL. Migration v4 added the column as
+        // nullable with no default, so both cases read back as None.
+        let (_dir, store) = temp_store();
+        let msg = NewMessage {
+            sender_username: None,
+            ..sample_message()
+        };
+        assert!(matches!(
+            store.insert_message("c1", &msg).expect("insert"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender_username, None);
+    }
+
+    #[test]
+    fn find_reply_target_returns_the_original_row_for_shared_platform_msg_id() {
+        // Rule P1: the append-only raw log decides the reply target.
+        // An edit appends a second row with the same platform_msg_id
+        // (specs.md Section 15). MIN(id) pins the ORIGINAL row; its
+        // display name is fixed at intake, not the edit's.
+        let (_dir, store) = temp_store();
+        let original = NewMessage {
+            platform_msg_id: "m-target".to_string(),
+            sender_display_name: "Alice".to_string(),
+            ..sample_message()
+        };
+        let edit = NewMessage {
+            platform_msg_id: "m-target".to_string(),
+            event_type: EventType::Edit,
+            sender_display_name: "Alice (renamed)".to_string(),
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("valid timestamp"),
+            text: "hello (edited)".to_string(),
+            ..sample_message()
+        };
+
+        let original_id = match store
+            .insert_message("c1", &original)
+            .expect("insert original")
+        {
+            InsertOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        assert!(matches!(
+            store.insert_message("c1", &edit).expect("insert edit"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        assert_eq!(
+            store.find_reply_target("c1", "m-target").expect("lookup"),
+            Some(ReplyTargetRow {
+                row_id: original_id,
+                display_name: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn find_reply_target_returns_none_for_unknown_platform_msg_id() {
+        // A reply to a message the bot never logged (e.g. it predates the
+        // bot joining the group) has no target.
+        let (_dir, store) = temp_store();
+        assert!(matches!(
+            store
+                .insert_message("c1", &sample_message())
+                .expect("insert"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        assert_eq!(
+            store
+                .find_reply_target("c1", "m-missing")
+                .expect("missing lookup"),
+            None
+        );
+        // Rule P5: one group's data never crosses into another group.
+        assert_eq!(
+            store
+                .find_reply_target("c2", "m1")
+                .expect("other group lookup"),
+            None
+        );
+    }
+
+    #[test]
     fn migrations_run_on_first_open_and_are_idempotent_on_reopen() {
         let (dir, store) = temp_store();
         store.open_group("c1").expect("first open");
@@ -881,7 +1041,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -891,7 +1051,15 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
+
+        // Migration v4 added sender_username. The SELECT proves the column
+        // exists: a missing column is an error, an empty log yields Ok(None).
+        conn.query_row("SELECT sender_username FROM messages LIMIT 1", [], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()
+        .expect("sender_username column must exist");
     }
 
     #[test]
@@ -918,6 +1086,7 @@ mod tests {
         assert_eq!(row.timestamp, msg.timestamp);
         assert_eq!(row.sender_id, msg.sender_id);
         assert_eq!(row.sender_display_name, msg.sender_display_name);
+        assert_eq!(row.sender_username, msg.sender_username);
         assert_eq!(row.text, msg.text);
         assert_eq!(row.reply_to_platform_msg_id, msg.reply_to_platform_msg_id);
         assert_eq!(row.mentions_bot, msg.mentions_bot);

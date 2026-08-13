@@ -11,5 +11,5 @@ mod store;
 pub use error::{Result, StoreError};
 pub use store::{
     read_group_status, DeadLetterRow, Direction, EventType, GroupStatus, InjectedMemoryRow,
-    InsertOutcome, MessageRow, NewMessage, NewReaction, ReactionRow, Store,
+    InsertOutcome, MessageRow, NewMessage, NewReaction, ReactionRow, ReplyTargetRow, Store,
 };
