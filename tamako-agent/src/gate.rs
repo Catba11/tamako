@@ -79,14 +79,14 @@ Rules:
 
 /// Renders the user prompt of the gate call (Section 9.6): one line per
 /// new message as `{row_id} {content}` (the content already carries the
-/// speaker label of Section 7.2 step 4), then the injected memories of
-/// the recall step. M4 has no recall, so the section renders `(none)`;
+/// XML `<msg>` shape of Section 7.2 step 4), then the injected memories
+/// of the recall step. M4 has no recall, so the section renders `(none)`;
 /// the section exists on purpose: the recall result is part of the gate
 /// input (Section 9.6).
 pub fn render_gate_prompt(input: &GateInput) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "New messages (id and speaker-labeled content):");
+    let _ = writeln!(out, "New messages (id and XML-tagged content):");
     for message in &input.new_messages {
         let _ = writeln!(out, "{} {}", message.row_id, message.content);
     }
@@ -314,8 +314,14 @@ mod tests {
     fn sample_input() -> GateInput {
         GateInput {
             new_messages: vec![
-                gate_message(41, "[Alice 13:01] has anyone tried the new cafe?"),
-                gate_message(42, "[Bob 13:02] the espresso is great"),
+                gate_message(
+                    41,
+                    r#"<msg from="Alice" at="13:01" id="41">has anyone tried the new cafe?</msg>"#,
+                ),
+                gate_message(
+                    42,
+                    r#"<msg from="Bob" at="13:02" id="42">the espresso is great</msg>"#,
+                ),
             ],
             injections: vec![],
             forced: false,
@@ -323,12 +329,18 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_renders_row_ids_and_speaker_labels() {
+    fn the_prompt_renders_row_ids_and_xml_tagged_content() {
         let prompt = render_gate_prompt(&sample_input());
-        // One line per new message: `{row_id} {content}`; the content
-        // carries the speaker label of Section 7.2 step 4.
-        assert!(prompt.contains("41 [Alice 13:01] has anyone tried the new cafe?"));
-        assert!(prompt.contains("42 [Bob 13:02] the espresso is great"));
+        // The header names the new XML shape; one line per new message
+        // as `{row_id} {content}` with the XML <msg> content of
+        // Section 7.2 step 4.
+        assert!(prompt.starts_with("New messages (id and XML-tagged content):\n"));
+        assert!(prompt.contains(
+            r#"41 <msg from="Alice" at="13:01" id="41">has anyone tried the new cafe?</msg>"#
+        ));
+        assert!(
+            prompt.contains(r#"42 <msg from="Bob" at="13:02" id="42">the espresso is great</msg>"#)
+        );
     }
 
     #[test]
@@ -343,9 +355,9 @@ mod tests {
     #[test]
     fn non_empty_injections_render_as_a_list() {
         let mut input = sample_input();
-        input.injections = vec!["I remember: Alice likes espresso.".to_string()];
+        input.injections = vec!["<memory>Alice likes espresso.</memory>".to_string()];
         let prompt = render_gate_prompt(&input);
-        assert!(prompt.contains("- I remember: Alice likes espresso."));
+        assert!(prompt.contains("- <memory>Alice likes espresso.</memory>"));
         assert!(!prompt.contains("(none)"));
     }
 

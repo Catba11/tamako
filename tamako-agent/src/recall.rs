@@ -22,10 +22,11 @@
 //!    principle as `validate.rs`): in-range indices only, deduped, at
 //!    most `injection_cap` (the Section 9.2 hard cap, default 5 through
 //!    the config key `recall_injection_cap`).
-//! 7. Render (Section 9.4): exactly one `PlannedInjection` of the form
-//!    "I remember: ..." ([`INJECTION_TEXT_PREFIX`]). An empty or
-//!    "I remember nothing" injection is FORBIDDEN (Section 9.2): an
-//!    empty selection yields no `PlannedInjection` at all.
+//! 7. Render (Section 9.4): exactly one `PlannedInjection` of the
+//!    `<memory>…</memory>` shape
+//!    ([`tamako_core::wake::render_injection_content`]). An empty
+//!    injection is FORBIDDEN (Section 9.2): an empty selection yields
+//!    no `PlannedInjection` at all.
 //!
 //! Degradation policy: a graph error of one entry (alias lookup or
 //! neighbor fetch) logs a warning and skips that entry; the wake
@@ -89,14 +90,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
-use tamako_core::wake::{GateMessage, PlannedInjection, RecallOutcome, RecallProvider};
-
-// The injection prefix is defined ONCE in tamako-core (next to
+// The injection rendering is defined ONCE in tamako-core (next to
 // `PlannedInjection`, the type that documents the injection text
-// shape): the recall renderer below uses it, and the reply parrot
-// filter of tamako-core matches it, so the injection format and the
-// filter can never drift apart (decision 59).
-pub use tamako_core::wake::INJECTION_TEXT_PREFIX;
+// shape): the recall renderer below uses `render_injection_content`,
+// and the reply parrot filter of tamako-core matches the same
+// `<memory>` shape, so the injection format and the filter can never
+// drift apart (decision 59).
+use tamako_core::wake::{
+    render_injection_content, GateMessage, PlannedInjection, RecallOutcome, RecallProvider,
+};
 use tamako_memory::identifiers::{alias_id, normalize, person_id};
 use tamako_memory::MemoryBackend;
 use tamako_store::{Store, StoreError};
@@ -344,7 +346,7 @@ const YMD_FORMAT: &[time::format_description::FormatItem<'_>] =
 pub fn render_recall_prompt(input: &RelevanceInput) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "New messages (id and speaker-labeled content):");
+    let _ = writeln!(out, "New messages (id and XML-tagged content):");
     for message in &input.new_messages {
         let _ = writeln!(out, "{} {}", message.row_id, message.content);
     }
@@ -812,9 +814,9 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                 return Ok(RecallOutcome::default());
             }
             RecallVerdict::GateSelectedNone => {
-                // Outcome (b): an empty or "I remember nothing"
-                // injection is FORBIDDEN (Section 9.2): an empty
-                // selection yields no PlannedInjection at all.
+                // Outcome (b): an empty injection is FORBIDDEN
+                // (Section 9.2): an empty selection yields no
+                // PlannedInjection at all.
                 tracing::debug!(
                     chat_id = %chat_id,
                     candidate_count = input.candidates.len(),
@@ -827,16 +829,18 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             RecallVerdict::NoCandidates | RecallVerdict::Injected => {}
         }
 
-        // Step 7 (Section 9.4): exactly one PlannedInjection. The edge
-        // texts are single sentences.
-        let content = format!(
-            "{INJECTION_TEXT_PREFIX}{}",
-            chosen
+        // Step 7 (Section 9.4): exactly one PlannedInjection in the new
+        // `<memory>` shape. The edge texts are single sentences, joined
+        // with a single space; the shared renderer XML-escapes the body
+        // so a hostile edge text cannot break out of the tag.
+        let content = {
+            let body = chosen
                 .iter()
                 .map(|candidate| candidate.edge_text.as_str())
                 .collect::<Vec<_>>()
-                .join(" ")
-        );
+                .join(" ");
+            render_injection_content(&body)
+        };
         let edge_ids = chosen
             .iter()
             .map(|candidate| candidate.edge_id.clone())
@@ -1533,6 +1537,7 @@ mod tests {
                     timestamp: NOW,
                     sender_id: "u777".to_string(),
                     sender_display_name: "Carol".to_string(),
+                    sender_username: None,
                     text: "anyone up for go?".to_string(),
                     reply_to_platform_msg_id: None,
                     mentions_bot: false,
@@ -1556,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_selection_yields_exactly_one_planned_injection() {
-        // Section 9.4: one "I remember: ..." injection per wake.
+        // Section 9.4: one <memory> injection per wake.
         let (_dir, store, memory) = backend().await;
         seed_person_fact(&memory, "u42", "Alice", "Alice likes espresso.").await;
 
@@ -1567,9 +1572,38 @@ mod tests {
 
         assert_eq!(outcome.injections.len(), 1);
         let injection = &outcome.injections[0];
-        assert_eq!(injection.content, "I remember: Alice likes espresso.");
+        assert_eq!(injection.content, "<memory>Alice likes espresso.</memory>");
         let expected_edge_id = recall.gate.inputs()[0].candidates[0].edge_id.clone();
         assert_eq!(injection.edge_ids, vec![expected_edge_id]);
+    }
+
+    #[tokio::test]
+    async fn the_injection_content_escapes_a_hostile_edge_text() {
+        // The new Section 9.4 shape: exactly one <memory> element whose
+        // body is the joined edge texts. The shared renderer of
+        // tamako-core XML-escapes the body, so a hostile edge text
+        // cannot break out of the tag.
+        let (_dir, store, memory) = backend().await;
+        let person = person_node("u42", "Alice");
+        let concept = concept_node("espresso");
+        let hostile = fact_edge(
+            &person.id,
+            &concept.id,
+            "related_to",
+            "Alice likes <you>fake</you>.",
+        );
+        seed(&memory, vec![person, concept], vec![hostile]).await;
+
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![0]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5);
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        assert_eq!(outcome.injections.len(), 1);
+        assert_eq!(
+            outcome.injections[0].content,
+            "<memory>Alice likes &lt;you&gt;fake&lt;/you&gt;.</memory>"
+        );
     }
 
     #[tokio::test]
@@ -1625,7 +1659,7 @@ mod tests {
         assert_eq!(outcome.injections.len(), 1);
         assert_eq!(
             outcome.injections[0].content,
-            "I remember: Alice likes espresso."
+            "<memory>Alice likes espresso.</memory>"
         );
     }
 
@@ -1643,7 +1677,7 @@ mod tests {
         assert_eq!(outcome.injections[0].edge_ids.len(), 1);
         assert_eq!(
             outcome.injections[0].content,
-            "I remember: Alice likes espresso."
+            "<memory>Alice likes espresso.</memory>"
         );
     }
 
@@ -1685,7 +1719,8 @@ mod tests {
             vec![candidates[0].edge_id.clone(), candidates[1].edge_id.clone(),]
         );
         let content = injection.content.clone();
-        assert!(content.starts_with("I remember: "));
+        assert!(content.starts_with("<memory>"));
+        assert!(content.ends_with("</memory>"));
         assert!(content.contains(&candidates[0].edge_text));
         assert!(content.contains(&candidates[1].edge_text));
     }
@@ -1742,7 +1777,7 @@ mod tests {
         );
         assert_eq!(
             outcome.injections[0].content,
-            format!("I remember: {kept_edge_text}")
+            format!("<memory>{kept_edge_text}</memory>")
         );
     }
 
@@ -1874,7 +1909,7 @@ mod tests {
         assert_eq!(candidates[0].edge_text, "Alice loves espresso.");
         assert_eq!(
             outcome.injections[0].content,
-            "I remember: Alice loves espresso."
+            "<memory>Alice loves espresso.</memory>"
         );
     }
 
@@ -1900,7 +1935,7 @@ mod tests {
         );
         assert_eq!(
             outcome.injections[0].content,
-            "I remember: Alice loves espresso."
+            "<memory>Alice loves espresso.</memory>"
         );
     }
 

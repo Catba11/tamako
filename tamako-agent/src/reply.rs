@@ -67,7 +67,7 @@ pub fn render_reply_instruction(target: &GateMessage) -> String {
         "Reply to THIS message (id {}): {}\n\
          Reply as the group pet persona. Write only the reply text: \
          one message, no speaker label, no quotes. \
-         Never write \"I remember:\" lines or a memory list: recalled \
+         Never write \"I remember:\" lines, <memory> blocks, or a memory list: recalled \
          memories are context, never speech.",
         target.row_id, target.content
     )
@@ -262,9 +262,10 @@ mod tests {
         GateMessage {
             row_id: 42,
             platform_msg_id: "m42".to_string(),
-            content: "[Bob 13:02] what should we eat?".to_string(),
-            // The M5 recall fields; the reply path reads `content` and
-            // `platform_msg_id` only, so plausible stand-ins suffice.
+            // The XML <msg> shape of Section 7.2 step 4; the reply path
+            // reads `content` and `platform_msg_id` only, so the M5
+            // recall fields carry plausible stand-ins.
+            content: r#"<msg from="Bob" at="13:02" id="42">what should we eat?</msg>"#.to_string(),
             sender_id: "u2".to_string(),
             reply_to_platform_msg_id: None,
             text: "what should we eat?".to_string(),
@@ -357,7 +358,9 @@ mod tests {
     fn the_reply_instruction_names_the_target_verbatim() {
         let instruction = render_reply_instruction(&sample_target());
         assert!(instruction.contains("id 42"));
-        assert!(instruction.contains("[Bob 13:02] what should we eat?"));
+        assert!(
+            instruction.contains(r#"<msg from="Bob" at="13:02" id="42">what should we eat?</msg>"#)
+        );
         assert!(instruction.contains("no speaker label"));
         assert!(instruction.contains("no quotes"));
     }
@@ -368,8 +371,27 @@ mod tests {
         // is part of the ephemeral call-only instruction; the preamble
         // (Rule C4 cache anchor) is untouched.
         let instruction = render_reply_instruction(&sample_target());
-        assert!(instruction.contains("Never write \"I remember:\" lines or a memory list"));
+        assert!(instruction
+            .contains("Never write \"I remember:\" lines, <memory> blocks, or a memory list"));
         assert!(instruction.contains("recalled memories are context, never speech"));
+    }
+
+    #[test]
+    fn the_reply_instruction_states_the_f2_sentence_and_the_xml_target_verbatim() {
+        // The full ephemeral instruction, byte-exact: the new F2
+        // sentence plus the XML-shaped target embed (the target content
+        // arrives rendered from the actor; the instruction embeds it
+        // verbatim).
+        let expected = concat!(
+            "Reply to THIS message (id 42): ",
+            r#"<msg from="Bob" at="13:02" id="42">what should we eat?</msg>"#,
+            "\n",
+            "Reply as the group pet persona. Write only the reply text: ",
+            "one message, no speaker label, no quotes. ",
+            "Never write \"I remember:\" lines, <memory> blocks, or a memory list: ",
+            "recalled memories are context, never speech.",
+        );
+        assert_eq!(render_reply_instruction(&sample_target()), expected);
     }
 
     #[test]
