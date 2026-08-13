@@ -251,6 +251,7 @@ fn spawn_with_wake(
             gate,
             reply,
         }),
+        summary_provider: None,
         outbound: Some(outbound_tx),
         bot_name: None,
     });
@@ -275,6 +276,7 @@ fn spawn_with_digest(
         digest: Some(digest),
         post_digest_hook: None,
         wake: None,
+        summary_provider: None,
         outbound: None,
         bot_name: None,
     })

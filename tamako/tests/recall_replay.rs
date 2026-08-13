@@ -330,6 +330,7 @@ fn spawn_with_wake(
             gate: Arc::clone(&doubles.gate) as Arc<dyn ParticipationGate>,
             reply: Arc::clone(&doubles.reply) as Arc<dyn ReplyGenerator>,
         }),
+        summary_provider: None,
         outbound,
         bot_name: Some("Tamako".to_string()),
     })
@@ -824,6 +825,7 @@ async fn a_restart_rebuilds_the_injection_bit_identically() {
         digest: None,
         post_digest_hook: None,
         wake: None,
+        summary_provider: None,
         outbound: None,
         bot_name: None,
     });

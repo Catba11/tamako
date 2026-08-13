@@ -8,7 +8,10 @@
 //! `context` is the live context of specs.md Section 7 (rules C1-C5).
 //! Phase 1 M4 adds the wake-procedure contracts (`wake`, specs.md
 //! Section 9): the recall seam, the participation gate, and the reply
-//! generator; the implementations live in tamako-agent.
+//! generator; the implementations live in tamako-agent. Segmented
+//! summarization adds the summary provider contract (`summary`, specs.md
+//! Section 10 keep-two retention); the live implementation lives in
+//! tamako-agent.
 //!
 //! This crate is model-agnostic: no rig or LLM dependency. tamako-agent
 //! converts `context::ContextMessage` to rig completion messages in M4.
@@ -20,5 +23,6 @@ pub mod context;
 pub mod digest;
 pub mod event;
 pub mod session;
+pub mod summary;
 pub mod trigger;
 pub mod wake;
