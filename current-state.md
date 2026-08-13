@@ -892,9 +892,9 @@ test-group soak (`docs/soak-runbook.md`).
     family: `summary_model` (default `claude-haiku-4-5`, the cheap
     tier), `summary_llm_api` / `summary_llm_base_url` /
     `summary_structured_output`, env overrides `TAMAKO_SUMMARY_*` —
-    ALL for spec backfill (specs.md Section 13 key set + Section
-    10.2). The binary wires the summarizer from the resolved summary
-    endpoint like the other purposes; the LLM call rides the same
+    LANDED in specs.md Sections 5.2, 7.1, 7.2 (C3/C5), 7.3, 9.4,
+    10.2 step 4, and 13. The binary wires the summarizer from the
+    resolved summary endpoint like the other purposes; the LLM call rides the same
     spawned digest task as the pipeline (no new inbox plumbing, no
     FIFO blocking — the Section 6.1 rule 3 analog holds).
     **Parrot discipline (decisions 59/61).** The summary shape is a

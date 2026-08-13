@@ -1137,13 +1137,16 @@ async fn run_actor<M: MemoryBackend>(
                         // Failure semantics (decision 62): never drop the
                         // chunk silently. The removal is DEFERRED one
                         // digest cycle: `last` advances (the digest
-                        // itself completed), `prev` stays (so the next
-                        // completion retries the same removed range,
-                        // check-before-call makes the retry cheap), and
-                        // the raw chunk stays in the context. The C5
-                        // bound stretches by one cycle on this path; the
-                        // restart rebuild cutoff `prev.unwrap_or(0)`
-                        // stays consistent with the live view.
+                        // itself completed), `prev` stays, so the next
+                        // completion retries over the WIDENED range
+                        // `(prev, new_last]` (the deferred chunk plus
+                        // the newly digested one; the natural-key
+                        // check-before-call still makes an exact-match
+                        // replay cheap), and the raw chunk stays in the
+                        // context. The C5 bound stretches by one cycle
+                        // on this path; the restart rebuild cutoff
+                        // `prev.unwrap_or(0)` stays consistent with the
+                        // live view.
                         tracing::warn!(
                             chat_id = %chat_id,
                             %error,

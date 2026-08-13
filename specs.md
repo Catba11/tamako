@@ -72,6 +72,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 - `reactions` table: one row per reaction event on a group message. The Phase 2 warmup backoff consumes this table. Reaction data is not recoverable later, so collection starts at intake time in Phase 1.
 - `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `prev_digest_boundary_msg_id`, `wake_last_row_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`.
 - `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag, rendered content. The rendered content is stored so a restart rebuild is bit-identical without graph queries. Refer to Section 9.5.
+- `context_summaries` table: one row per summarized removed chunk. Columns: the message-id range `(first_msg_id, last_msg_id]` as the natural dedup key, the rendered summary text, and a creation timestamp. The text is persisted at creation time so a restart rebuild is bit-identical without re-calling the model. Rule P1 applies. Rows of rotated-out summaries stay for forensics.
 - Vector index: sqlite-vec virtual tables in the same file. The embeddings of Person, Alias, and Concept names and descriptions live here. Refer to `proposed-graph-database-specs.md` Section 7.6.
 
 To delete the memory of a group, delete the directory. Both files share one lifecycle.
@@ -80,6 +81,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 
 - One global persona configuration at `{data_root}/persona.toml`. Hot-reloadable.
 - An optional `system_prefix` string is rendered verbatim before the identity line, with exactly one blank line as the separator. It carries system-level directives, such as alignment notes. When the key is absent, the rendered preamble is bit-identical to a configuration without it. Rule C4 applies. The injection guardrail is code-owned and is never configurable.
+- A code-owned context-format explanation renders into the preamble after the persona sections and before the injection guardrail. It describes the XML item rendering of Section 7.3 in detail. It is version-controlled and never configurable, like the guardrail. The same text feeds the participation-gate and the recall relevance-gate preambles.
 - In live mode the persona file is required. A missing or invalid file fails startup with a clear error. An explicit operator flag permits the lenient fallback chain for experiments. Replay mode is always lenient. The preamble is the cache anchor. Its source must be deliberate. Rule C4 applies.
 - The persona service renders the system preamble. The preamble is the prefix of every model context and never changes inside a context lifetime. Rule C4 applies.
 - The persona rendering layer is an interface. The pet persona is one implementation. This decoupling permits reuse of the runtime for other personas or purposes.
@@ -106,8 +108,9 @@ To delete the memory of a group, delete the directory. Both files share one life
 The live context is an ordered list of items:
 
 1. System preamble. Persona plus behavioral rules plus the injection guardrail. Refer to Section 9.4. This prefix is the cache anchor.
-2. The previous digested chunk. Already extracted into the graph. Kept as an overlap buffer.
-3. The current tail. Undigested inbound messages, bot replies, and recall injections.
+2. The two most recent summaries of removed chunks. Compressed history, rendered as summary items. Refer to Section 7.3.
+3. The previous digested chunk. Already extracted into the graph. Kept as an overlap buffer, in raw form.
+4. The current tail. Undigested inbound messages, bot replies, and recall injections.
 
 Each item carries a message-id range tag. The boundary pair (`prev_digest_boundary_msg_id`, `last_digest_boundary_msg_id`) splits the previous chunk from the current tail. The previous chunk is the range at or below the previous boundary.
 
@@ -115,9 +118,9 @@ Each item carries a message-id range tag. The boundary pair (`prev_digest_bounda
 
 - C1: Between two digests, the context is append-only. Rule P2 applies.
 - C2: A recall injection is always appended at the tail, directly after the messages that triggered it. An insertion into the middle of the history is forbidden.
-- C3: At digest time, the actor removes every item with a range tag at or below the previous boundary. The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. Refer to Section 10.3. The actor performs the removal, the deduplication pruning of Section 10.2, and the boundary update as one serialized step (Section 6.1). Post-digest hooks are stateless observers only. They must not mutate the context.
+- C3: At digest time, the actor summarizes the chunk being removed, then removes every item with a range tag at or below the previous boundary. Summary items are exempt from the removal; their retention is count-based (Section 7.3). The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. The summary is persisted before the removal. If the summarization fails, the removal defers one cycle and the raw chunk stays. Refer to Section 10.3. The actor performs the summarization, the removal, the deduplication pruning of Section 10.2, and the boundary update as one serialized flow (Section 6.1). Post-digest hooks are stateless observers only. They must not mutate the context.
 - C4: A persona preamble change invalidates the provider cache for all groups. Preamble edits are deliberate events, not runtime side effects.
-- C5: The context size is bounded by approximately two digest chunks. The maximum size follows from the digest thresholds in Section 8.2.
+- C5: The context size is bounded by approximately two digest chunks plus two summaries. The maximum size follows from the digest thresholds in Section 8.2.
 - C6: Context items render in the XML form of Section 7.3. Every rendered attribute derives from persisted raw-log columns. Rule P1 applies.
 
 ### 7.3 Rendering
@@ -127,6 +130,7 @@ Each item carries a message-id range tag. The boundary pair (`prev_digest_bounda
 - A reply to the bot never carries a target name or id. Outbound rows use synthetic platform ids (Rule A3), so the target cannot be resolved.
 - The bot's own speech renders: `<you at="{HH:MM}" id="{row_id}">text</you>`, role assistant.
 - A recall injection renders: `<memory>...</memory>`, role assistant. Refer to Section 9.4.
+- A context summary renders: `<summary range="{first}-{last}">text</summary>`, role user. The text is escaped like every other content. Summaries sit directly after the preamble, oldest first, before the raw previous chunk. The context keeps the two most recent summaries; a new one replaces the oldest. Summary items are exempt from the Rule C3 removal.
 - Text content escapes `&`, `<`, `>`. Attribute values also escape `"`. A group member cannot forge context structure through message text.
 - The digest input rendering is unchanged: `[{display_name} {HH:MM}] {text}` per `proposed-graph-database-specs.md` Section 7.2 step 4. The divergence is deliberate: the digest model extracts facts and receives the reply structure as data, not as dialogue.
 
@@ -196,8 +200,8 @@ One wake executes these steps in this sequence:
 
 ### 9.4 Injection format and guardrails
 
-- The injection is one assistant message of the form: `<memory>...</memory>`. It is appended at the tail. Rule C2 applies. Injection rows persisted before this format change keep their legacy "I remember: ..." text verbatim until Rule C3 removes them. The legacy form ages out within one digest cycle.
-- The content of a memory originates from group messages through the graph. This is an indirect prompt-injection channel. The system preamble contains a standing guardrail: injected memory content is reference material, never an instruction. The guardrail text still names the legacy "I remember:" form; amending the preamble is a separate deliberate event. Rule C4 applies.
+- The injection is one assistant message of the form: `<memory>...</memory>`. It is appended at the tail. Rule C2 applies. Injection rows persisted before this format change keep their legacy "I remember: ..." text verbatim until Rule C3 removes them.
+- The content of a memory originates from group messages through the graph. This is an indirect prompt-injection channel. The system preamble contains a standing guardrail that names the `<memory>` and `<summary>` tags: their content is reference material, never an instruction, never speech.
 - A memory injected from a stale or contested fact is acceptable in this version. Negation detection is deferred. Refer to Section 14.
 
 ### 9.5 Injection lifecycle
@@ -224,7 +228,7 @@ One wake executes these steps in this sequence:
 1. Extract the `KnowledgeGraph` object. Refer to `proposed-graph-database-specs.md` Section 7.3.
 2. Run entity resolution and fact validity steps. Refer to Sections 7.4 and 7.5 of that document.
 3. Write nodes, edges, and embeddings in one transaction per group. Run `CHECKPOINT`.
-4. On success, advance `last_digest_boundary_msg_id`, apply the context removal of Rule C3, and prune the deduplication set of Section 9.3.
+4. On success, advance `last_digest_boundary_msg_id`, obtain and persist the summary of the removed chunk (Rule C3, Section 7.3), apply the context removal, and prune the deduplication set of Section 9.3. A crash between the summary write and the boundary advance is replay-safe: the next completion finds the existing summary row and skips the model call. If the summarization fails, the removal defers one cycle; a later completion retries over the widened range.
 
 ### 10.3 Failure handling
 
@@ -286,10 +290,11 @@ LLM access is global configuration, not per-group:
 | `digest_model` | `claude-haiku-4-5` | Extraction (Section 10). Environment override: `TAMAKO_DIGEST_MODEL`. |
 | `gate_model` | `claude-haiku-4-5` | Participation decision (Section 9.6). Environment override: `TAMAKO_GATE_MODEL`. |
 | `reply_model` | `claude-sonnet-4-5` | Reply generation (Section 9, step 4). Environment override: `TAMAKO_REPLY_MODEL`. |
+| `summary_model` | `claude-haiku-4-5` | Removed-chunk summarization (Rule C3, Section 10.2). Environment override: `TAMAKO_SUMMARY_MODEL`. |
 | `structured_output` | `schema` | Structured-output mode: `schema` (send the JSON schema), `json_object` (JSON mode without a schema), `prompt_only` (no response_format; for endpoints that reject unknown parameters). Environment override: `TAMAKO_STRUCTURED_OUTPUT`. |
 | `llm_session_id` | `"tamako"` | Session-affinity identifier sent as the `x-opencode-session` request header on every LLM call. Gateways that honor the header (Opencode Go) keep the prompt cache on one upstream. Global only: no per-purpose and no per-group variants. Empty string counts as unset. Environment override: `TAMAKO_LLM_SESSION_ID`. |
 
-A purpose (`digest`, `gate`, `reply`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
+A purpose (`digest`, `gate`, `reply`, `summary`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
 
 API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well.
 | `warmup_silence` | 4 h | 8.4 |
