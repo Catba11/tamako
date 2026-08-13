@@ -101,6 +101,7 @@ use tamako_core::wake::{
 };
 use tamako_memory::identifiers::{alias_id, normalize, person_id};
 use tamako_memory::MemoryBackend;
+use tamako_persona::CONTEXT_FORMAT_GLOSS;
 use tamako_store::{Store, StoreError};
 use time::macros::format_description;
 
@@ -335,6 +336,18 @@ Rules:
 4. Give the 1-based numbers of the selected memories in descending relevance. Select at most 5 memories.
 5. Output only the JSON object of the required schema. Give one short reason. No commentary.";
 
+/// The full system preamble of the relevance-gate call:
+/// [`RECALL_PREAMBLE`] plus the shared context-format gloss of
+/// tamako-persona (decision 61, the deliberate preamble event). The
+/// gloss is the SINGLE source in tamako-persona: the persona preamble
+/// and the participation-gate preamble embed the same constant. The
+/// relevance gate consumes the same XML-shaped
+/// `GateMessage.content` lines as the participation gate, so it must
+/// read the same explanation.
+pub fn recall_system_preamble() -> String {
+    format!("{RECALL_PREAMBLE}\n\n{CONTEXT_FORMAT_GLOSS}")
+}
+
 /// The date format of the candidate list: YYYY-MM-DD, UTC.
 const YMD_FORMAT: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]");
@@ -458,8 +471,9 @@ impl RelevanceGate for RigRelevanceGate {
             let selection = self
                 .client
                 .complete_structured::<RecallSelection>(
-                    // The preamble becomes the system message.
-                    Some(RECALL_PREAMBLE.to_string()),
+                    // The preamble plus the shared format gloss becomes
+                    // the system message.
+                    Some(recall_system_preamble()),
                     vec![Message::user(render_recall_prompt(input))],
                     schemars::schema_for!(RecallSelection),
                     self.max_tokens,
@@ -1223,6 +1237,22 @@ mod tests {
         // skeleton): field names must not rely on schema enforcement.
         assert!(RECALL_PREAMBLE.contains("\"selected\""));
         assert!(RECALL_PREAMBLE.contains("\"reason\""));
+    }
+
+    #[test]
+    fn the_recall_system_preamble_appends_the_shared_format_gloss() {
+        // Decision 61: the recall gate system message includes the
+        // SAME XML format explanation as the persona preamble and the
+        // participation-gate preamble (single source in
+        // tamako-persona). The conservative rules stay first; the
+        // gloss appends as a clearly separated section.
+        let preamble = recall_system_preamble();
+        assert!(preamble.starts_with(RECALL_PREAMBLE));
+        assert!(preamble.ends_with(&format!("\n\n{CONTEXT_FORMAT_GLOSS}")));
+        assert!(preamble.contains(CONTEXT_FORMAT_GLOSS));
+        // The conservative rules are unchanged and still present.
+        assert!(preamble.contains("materially reduce the quality"));
+        assert!(preamble.contains("the normal case"));
     }
 
     #[test]

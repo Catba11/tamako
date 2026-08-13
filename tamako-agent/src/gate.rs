@@ -24,6 +24,7 @@ use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
 use tamako_core::wake::{GateDecision, GateInput, GateMessage, ParticipationGate};
+use tamako_persona::CONTEXT_FORMAT_GLOSS;
 
 use crate::endpoint::{EndpointClient, EndpointConfig};
 use crate::extract::AgentError;
@@ -76,6 +77,17 @@ Rules:
 4. On participation, select the ONE message the reply targets: the most recent message that motivates the participation. Give its message id.
 5. On silence, set participate to false and target_msg_id to null.
 6. Output only the JSON object of the required schema. Give one short reason. No commentary.";
+
+/// The full system preamble of the gate call: [`GATE_PREAMBLE`] plus
+/// the shared context-format gloss of tamako-persona (decision 61, the
+/// deliberate preamble event). The gloss is the SINGLE source in
+/// tamako-persona: the persona preamble and the recall preamble embed
+/// the same constant, so the format explanations can never drift
+/// apart. The gate consumes the XML-shaped `GateMessage.content`
+/// lines, so it must read the same explanation.
+pub fn gate_system_preamble() -> String {
+    format!("{GATE_PREAMBLE}\n\n{CONTEXT_FORMAT_GLOSS}")
+}
 
 /// Renders the user prompt of the gate call (Section 9.6): one line per
 /// new message as `{row_id} {content}` (the content already carries the
@@ -196,8 +208,9 @@ impl ParticipationGate for RigGate {
             let output = self
                 .client
                 .complete_structured::<GateOutput>(
-                    // The preamble becomes the system message.
-                    Some(GATE_PREAMBLE.to_string()),
+                    // The preamble plus the shared format gloss becomes
+                    // the system message.
+                    Some(gate_system_preamble()),
                     vec![Message::user(render_gate_prompt(input))],
                     schemars::schema_for!(GateOutput),
                     self.max_tokens,
@@ -436,6 +449,21 @@ mod tests {
         assert!(GATE_PREAMBLE.contains("\"participate\":true|false"));
         assert!(GATE_PREAMBLE.contains("\"target_msg_id\""));
         assert!(GATE_PREAMBLE.contains("\"reason\""));
+    }
+
+    #[test]
+    fn the_gate_system_preamble_appends_the_shared_format_gloss() {
+        // Decision 61: the gate system message includes the SAME XML
+        // format explanation as the persona preamble (single source in
+        // tamako-persona). The scarce-attention text stays first; the
+        // gloss appends as a clearly separated section.
+        let preamble = gate_system_preamble();
+        assert!(preamble.starts_with(GATE_PREAMBLE));
+        assert!(preamble.ends_with(&format!("\n\n{CONTEXT_FORMAT_GLOSS}")));
+        assert!(preamble.contains(CONTEXT_FORMAT_GLOSS));
+        // The scarce-attention rules are unchanged and still present.
+        assert!(preamble.contains("speaks rarely"));
+        assert!(preamble.contains("50 percent"));
     }
 
     #[test]
