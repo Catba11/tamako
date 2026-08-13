@@ -14,16 +14,60 @@
 //! This crate is model-agnostic. `ContextMessage` is the LLM-facing view;
 //! tamako-agent converts it to rig completion messages in M4.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
-use tamako_store::{Direction, InjectedMemoryRow, MessageRow};
+use tamako_store::{Direction, EventType, InjectedMemoryRow, MessageRow, ReplyTargetRow};
 
-/// The UTC HH:MM format of the speaker label (specs.md Section 7.2 step 4).
+/// The UTC HH:MM format of the timestamp attributes (specs.md
+/// Section 7.2 step 4).
 const HHMM_FORMAT: &[time::format_description::FormatItem<'_>] =
     format_description!("[hour]:[minute]");
+
+/// The UTC HH:MM of one message row, with the "??:??" fallback on a
+/// format failure (the pattern of tamako-agent/src/pipeline.rs).
+fn hhmm_of(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .to_offset(UtcOffset::UTC)
+        .format(HHMM_FORMAT)
+        .unwrap_or_else(|_| "??:??".to_string())
+}
+
+/// Escapes text content for a text node: `&` first, then `<` and `>`.
+/// Shared by the item renderers of this module and by
+/// `wake::render_injection_content` (decision 59 single-source
+/// discipline).
+pub(crate) fn escape_xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Escapes an attribute value: the text set plus `"` → `&quot;`.
+pub(crate) fn escape_xml_attr(text: &str) -> String {
+    escape_xml_text(text).replace('"', "&quot;")
+}
+
+/// How one human message renders its reply attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyRender {
+    /// Not a reply.
+    None,
+    /// A reply addressed to the bot (Rules A3/B1). Renders
+    /// `reply="bot"` with NO target name/id: outbound rows carry
+    /// synthetic `bot-out:{nanos}` ids, so the real platform id of the
+    /// bot's message can never resolve to a stored row. Do not fake a
+    /// resolution.
+    ToBot,
+    /// `reply_to_platform_msg_id` was set. `target` is `Some` when the
+    /// raw log resolves it (`Store::find_reply_target`), `None` when
+    /// the target is absent from the log (e.g. predates the bot) —
+    /// both deterministic. `None` renders `reply="user"` without the
+    /// target attributes.
+    ToUser { target: Option<ReplyTargetRow> },
+}
 
 /// Role of an item for model input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,33 +174,47 @@ impl LiveContext {
     }
 
     /// Appends one human message at the tail (Rule C1). Role User, kind
-    /// HumanMessage. The content carries the speaker label of specs.md
-    /// Section 7.2 step 4: `[{display_name} {HH:MM}] {text}`, HH:MM in UTC.
+    /// HumanMessage. The content is the XML item rendering of
+    /// [`render_human_content`].
+    #[allow(clippy::too_many_arguments)]
     pub fn append_human_message(
         &mut self,
         msg_id: i64,
         display_name: &str,
+        username: Option<&str>,
         timestamp: OffsetDateTime,
+        is_edit: bool,
+        mentions_bot: bool,
+        reply: ReplyRender,
         text: &str,
     ) {
         self.items.push(ContextItem {
             kind: ContextItemKind::HumanMessage,
             role: ContextRole::User,
-            content: render_human_content(display_name, timestamp, text),
+            content: render_human_content(
+                msg_id,
+                display_name,
+                username,
+                timestamp,
+                is_edit,
+                mentions_bot,
+                reply,
+                text,
+            ),
             range_tag: Some(RangeTag::single(msg_id)),
         });
     }
 
     /// Appends one message of the bot at the tail (Rule C1). Rule B1: the
     /// bot's own speech is part of the raw log. The model sees its own
-    /// speech as plain assistant text; the speaker label distinguishes
+    /// speech as plain assistant text; the `<you>` element distinguishes
     /// group members, not the bot. This is the M4 append API for the
     /// bot's own sent messages.
-    pub fn append_bot_speech(&mut self, msg_id: i64, text: &str) {
+    pub fn append_bot_speech(&mut self, msg_id: i64, timestamp: OffsetDateTime, text: &str) {
         self.items.push(ContextItem {
             kind: ContextItemKind::BotSpeech,
             role: ContextRole::Assistant,
-            content: text.to_string(),
+            content: render_bot_content(msg_id, timestamp, text),
             range_tag: Some(RangeTag::single(msg_id)),
         });
     }
@@ -226,16 +284,23 @@ impl LiveContext {
     /// id above the removal cutoff, ordered by id; `injections` are the
     /// dedup rows with injection_position above the cutoff, ordered by id.
     ///
-    /// Both event types Message and Edit render identically: an edit is
-    /// just a new log row (specs.md Section 15, open item 4). Injections
-    /// land directly after the row whose id equals `injection_position`
-    /// (Rule C2), content verbatim from the persisted row. Leftover
-    /// injections (position matches no row id, e.g. a position beyond the
-    /// current tail) are appended at the tail in injection-row order.
+    /// Bit-identity contract (Rule P1): the caller builds `reply_targets`
+    /// with the same store function used at intake
+    /// (`Store::find_reply_target` over the same `chat_id`), so rebuild
+    /// renders every row exactly like the incremental append did.
+    ///
+    /// Edit rows render `kind="edit"` from `row.event_type` (this
+    /// amends the earlier "edits render identically" behavior
+    /// deliberately). Injections land directly after the row whose id
+    /// equals `injection_position` (Rule C2), content verbatim from the
+    /// persisted row. Leftover injections (position matches no row id,
+    /// e.g. a position beyond the current tail) are appended at the tail
+    /// in injection-row order.
     pub fn rebuild(
         preamble: String,
         rows: &[MessageRow],
         injections: &[InjectedMemoryRow],
+        reply_targets: &HashMap<String, ReplyTargetRow>,
     ) -> Self {
         // BTreeMap: placement is deterministic (positions in id order,
         // injections at one position in injection-row order).
@@ -250,13 +315,34 @@ impl LiveContext {
         let mut context = Self::new(preamble);
         for row in rows {
             match row.direction {
-                Direction::Inbound => context.append_human_message(
-                    row.id,
-                    &row.sender_display_name,
-                    row.timestamp,
-                    &row.text,
-                ),
-                Direction::Outbound => context.append_bot_speech(row.id, &row.text),
+                Direction::Inbound => {
+                    // Rules A3/B1: a reply to the bot renders `reply="bot"`
+                    // with no target name/id — outbound rows carry
+                    // synthetic `bot-out:{nanos}` ids, so the real
+                    // platform id of the bot's message can never resolve
+                    // to a stored row. Do not fake a resolution.
+                    let reply = if row.is_reply_to_bot {
+                        ReplyRender::ToBot
+                    } else {
+                        match &row.reply_to_platform_msg_id {
+                            Some(pid) => ReplyRender::ToUser {
+                                target: reply_targets.get(pid).cloned(),
+                            },
+                            None => ReplyRender::None,
+                        }
+                    };
+                    context.append_human_message(
+                        row.id,
+                        &row.sender_display_name,
+                        row.sender_username.as_deref(),
+                        row.timestamp,
+                        row.event_type == EventType::Edit,
+                        row.mentions_bot,
+                        reply,
+                        &row.text,
+                    );
+                }
+                Direction::Outbound => context.append_bot_speech(row.id, row.timestamp, &row.text),
             }
             if let Some(here) = injections_by_position.remove(&row.id) {
                 for injection in here {
@@ -281,18 +367,90 @@ impl LiveContext {
     }
 }
 
-/// Renders the speaker label of specs.md Section 7.2 step 4. This one
-/// helper serves `append_human_message`, `rebuild`, and the M4 gate
-/// input (`wake::GateMessage::content`): one render helper keeps the
-/// gate input consistent with the live context, and makes the rebuild
-/// bit-identical. On a format failure the HH:MM part falls back to
-/// "??:??" (the pattern of tamako-agent/src/pipeline.rs).
-pub fn render_human_content(display_name: &str, timestamp: OffsetDateTime, text: &str) -> String {
-    let hhmm = timestamp
-        .to_offset(UtcOffset::UTC)
-        .format(HHMM_FORMAT)
-        .unwrap_or_else(|_| "??:??".to_string());
-    format!("[{display_name} {hhmm}] {text}")
+/// Renders one human message as the XML item of specs.md Section 7.2
+/// step 4 (the approved XML context rendering). This one helper serves
+/// `append_human_message`, `rebuild`, and the M4 gate input
+/// (`wake::GateMessage::content`): one render helper keeps the gate
+/// input consistent with the live context, and makes the rebuild
+/// bit-identical.
+///
+/// Output grammar (attribute order fixed; `at` = UTC `[hour]:[minute]`
+/// with the "??:??" fallback; attribute values attr-escaped; text
+/// text-escaped):
+///
+/// ```text
+/// <msg from="{display_name}"[ user="{username}"] at="{HH:MM}" id="{msg_id}"
+///      [ kind="edit"][ reply="bot"][ reply="user"[ reply_to_name="{name}"
+///      reply_to_id="{row_id}"]][ mention="bot"]>{text}</msg>
+/// ```
+///
+/// Flag precedence when several apply: `kind`, then `reply`, then
+/// `mention` (a message can be both a reply and a mention — both
+/// render).
+#[allow(clippy::too_many_arguments)]
+pub fn render_human_content(
+    msg_id: i64,
+    display_name: &str,
+    username: Option<&str>,
+    timestamp: OffsetDateTime,
+    is_edit: bool,
+    mentions_bot: bool,
+    reply: ReplyRender,
+    text: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("<msg from=\"");
+    out.push_str(&escape_xml_attr(display_name));
+    out.push('"');
+    if let Some(username) = username {
+        out.push_str(" user=\"");
+        out.push_str(&escape_xml_attr(username));
+        out.push('"');
+    }
+    out.push_str(" at=\"");
+    out.push_str(&hhmm_of(timestamp));
+    out.push('"');
+    out.push_str(" id=\"");
+    out.push_str(&msg_id.to_string());
+    out.push('"');
+    if is_edit {
+        out.push_str(" kind=\"edit\"");
+    }
+    match &reply {
+        ReplyRender::None => {}
+        ReplyRender::ToBot => out.push_str(" reply=\"bot\""),
+        ReplyRender::ToUser {
+            target: Some(target),
+        } => {
+            out.push_str(" reply=\"user\"");
+            out.push_str(" reply_to_name=\"");
+            out.push_str(&escape_xml_attr(&target.display_name));
+            out.push('"');
+            out.push_str(" reply_to_id=\"");
+            out.push_str(&target.row_id.to_string());
+            out.push('"');
+        }
+        ReplyRender::ToUser { target: None } => out.push_str(" reply=\"user\""),
+    }
+    if mentions_bot {
+        out.push_str(" mention=\"bot\"");
+    }
+    out.push('>');
+    out.push_str(&escape_xml_text(text));
+    out.push_str("</msg>");
+    out
+}
+
+/// Renders one message of the bot: the `<you>` element of the approved
+/// XML context rendering. The model sees its own speech as plain
+/// assistant text; `<you>` marks the bot's rows (Rule B1: the bot's own
+/// speech is part of the raw log).
+pub fn render_bot_content(msg_id: i64, timestamp: OffsetDateTime, text: &str) -> String {
+    format!(
+        "<you at=\"{}\" id=\"{msg_id}\">{}</you>",
+        hhmm_of(timestamp),
+        escape_xml_text(text)
+    )
 }
 
 #[cfg(test)]
@@ -305,8 +463,22 @@ mod tests {
         datetime!(2026-08-07 13:07 UTC)
     }
 
+    fn at_utc(hour: u8, minute: u8) -> OffsetDateTime {
+        let date =
+            time::Date::from_calendar_date(2026, time::Month::August, 7).expect("a valid date");
+        let time = time::Time::from_hms(hour, minute, 0).expect("a valid time");
+        date.with_time(time).assume_utc()
+    }
+
     fn tag_of(item: &ContextItem) -> RangeTag {
         item.range_tag.clone().expect("a range tag")
+    }
+
+    fn target(row_id: i64, name: &str) -> ReplyTargetRow {
+        ReplyTargetRow {
+            row_id,
+            display_name: name.to_string(),
+        }
     }
 
     #[test]
@@ -323,21 +495,33 @@ mod tests {
     #[test]
     fn appends_land_at_the_tail_in_order() {
         let mut context = LiveContext::new("P".to_string());
-        context.append_human_message(1, "Alice", at_1307(), "hello");
-        context.append_bot_speech(2, "hi there");
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "hello",
+        );
+        context.append_bot_speech(2, at_1307(), "hi there");
         context.append_recall_injection(2, "I remember: Alice likes tea.".to_string());
 
         assert_eq!(context.items().len(), 4);
         let human = &context.items()[1];
         assert_eq!(human.kind, ContextItemKind::HumanMessage);
         assert_eq!(human.role, ContextRole::User);
-        assert_eq!(human.content, "[Alice 13:07] hello");
+        assert_eq!(
+            human.content,
+            r#"<msg from="Alice" at="13:07" id="1">hello</msg>"#
+        );
         assert_eq!(tag_of(human), RangeTag::single(1));
 
         let speech = &context.items()[2];
         assert_eq!(speech.kind, ContextItemKind::BotSpeech);
         assert_eq!(speech.role, ContextRole::Assistant);
-        assert_eq!(speech.content, "hi there");
+        assert_eq!(speech.content, r#"<you at="13:07" id="2">hi there</you>"#);
         assert_eq!(tag_of(speech), RangeTag::single(2));
 
         let injection = &context.items()[3];
@@ -351,7 +535,16 @@ mod tests {
     fn lag_one_semantics_across_two_digests() {
         let mut context = LiveContext::new("P".to_string());
         for msg_id in 1..=3 {
-            context.append_human_message(msg_id, "Alice", at_1307(), "chunk one");
+            context.append_human_message(
+                msg_id,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                "chunk one",
+            );
         }
         // Digest 1: boundary advances 0 -> 3. The actor removes at or
         // below the PREVIOUS boundary (0). Nothing is removed.
@@ -359,7 +552,16 @@ mod tests {
         assert_eq!(context.items().len(), 4);
 
         for msg_id in 4..=6 {
-            context.append_human_message(msg_id, "Alice", at_1307(), "chunk two");
+            context.append_human_message(
+                msg_id,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                "chunk two",
+            );
         }
         // Digest 2: boundary advances 3 -> 6. Removal at or below the
         // previous boundary (3) drops chunk one; chunk two stays as the
@@ -382,8 +584,17 @@ mod tests {
     #[test]
     fn removal_at_or_below_covers_every_kind() {
         let mut context = LiveContext::new("P".to_string());
-        context.append_human_message(1, "Alice", at_1307(), "hi");
-        context.append_bot_speech(2, "hello");
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "hi",
+        );
+        context.append_bot_speech(2, at_1307(), "hello");
         context.append_recall_injection(2, "memory at 2".to_string());
         context.append_recall_injection(3, "memory at 3".to_string());
 
@@ -400,8 +611,26 @@ mod tests {
     #[test]
     fn removal_boundary_is_exact() {
         let mut context = LiveContext::new("P".to_string());
-        context.append_human_message(5, "Alice", at_1307(), "at five");
-        context.append_human_message(6, "Alice", at_1307(), "at six");
+        context.append_human_message(
+            5,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "at five",
+        );
+        context.append_human_message(
+            6,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "at six",
+        );
 
         context.remove_at_or_below(5);
 
@@ -413,8 +642,17 @@ mod tests {
     #[test]
     fn reload_preamble_replaces_item_zero_only() {
         let mut context = LiveContext::new("old preamble".to_string());
-        context.append_human_message(1, "Alice", at_1307(), "hello");
-        context.append_bot_speech(2, "hi");
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "hello",
+        );
+        context.append_bot_speech(2, at_1307(), "hi");
         let tail_before: Vec<ContextItem> = context.items()[1..].to_vec();
 
         context.reload_preamble("new preamble".to_string());
@@ -430,6 +668,7 @@ mod tests {
         direction: Direction,
         event_type: EventType,
         name: &str,
+        username: Option<&str>,
         text: &str,
     ) -> MessageRow {
         MessageRow {
@@ -440,6 +679,7 @@ mod tests {
             timestamp: at_1307(),
             sender_id: format!("u{id}"),
             sender_display_name: name.to_string(),
+            sender_username: username.map(str::to_string),
             text: text.to_string(),
             reply_to_platform_msg_id: None,
             mentions_bot: false,
@@ -460,13 +700,28 @@ mod tests {
     #[test]
     fn rebuild_places_items_and_injections_in_order() {
         let rows = vec![
-            row(1, Direction::Inbound, EventType::Message, "Alice", "one"),
-            row(2, Direction::Outbound, EventType::Message, "Tamako", "two"),
+            row(
+                1,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                Some("alice_tg"),
+                "one",
+            ),
+            row(
+                2,
+                Direction::Outbound,
+                EventType::Message,
+                "Tamako",
+                None,
+                "two",
+            ),
             row(
                 3,
                 Direction::Inbound,
                 EventType::Edit,
                 "Alice",
+                Some("alice_tg"),
                 "three (edited)",
             ),
         ];
@@ -477,7 +732,7 @@ mod tests {
             injection(13, 99, "memory beyond the tail"),
         ];
 
-        let context = LiveContext::rebuild("P".to_string(), &rows, &injections);
+        let context = LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new());
 
         let rendered: Vec<(ContextItemKind, String)> = context
             .items()
@@ -490,11 +745,15 @@ mod tests {
                 (ContextItemKind::Preamble, "P".to_string()),
                 (
                     ContextItemKind::HumanMessage,
-                    "[Alice 13:07] one".to_string()
+                    r#"<msg from="Alice" user="alice_tg" at="13:07" id="1">one</msg>"#
+                        .to_string()
                 ),
                 // Injection order at one position is stable (row order).
                 (ContextItemKind::RecallInjection, "memory at 1".to_string()),
-                (ContextItemKind::BotSpeech, "two".to_string()),
+                (
+                    ContextItemKind::BotSpeech,
+                    r#"<you at="13:07" id="2">two</you>"#.to_string()
+                ),
                 (
                     ContextItemKind::RecallInjection,
                     "memory A at 2".to_string()
@@ -503,10 +762,11 @@ mod tests {
                     ContextItemKind::RecallInjection,
                     "memory B at 2".to_string()
                 ),
-                // An edit row renders identically to a message row.
+                // An edit row renders kind="edit".
                 (
                     ContextItemKind::HumanMessage,
-                    "[Alice 13:07] three (edited)".to_string()
+                    r#"<msg from="Alice" user="alice_tg" at="13:07" id="3" kind="edit">three (edited)</msg>"#
+                        .to_string()
                 ),
                 // A position beyond the tail lands at the tail.
                 (
@@ -539,33 +799,327 @@ mod tests {
     fn rebuild_equals_the_incremental_build() {
         // The bit-identical property, in-process form: the same data
         // appended incrementally and rebuilt from persisted rows produce
-        // equal contexts.
-        let mut live = LiveContext::new("P".to_string());
-        live.append_human_message(1, "Alice", at_1307(), "one");
-        live.append_recall_injection(1, "memory at 1".to_string());
-        live.append_bot_speech(2, "two");
-        live.append_recall_injection(2, "memory at 2".to_string());
-        live.append_human_message(3, "Alice", at_1307(), "three");
+        // equal contexts. The caller builds `reply_targets` with the same
+        // store function used at intake (Rule P1), so rebuild ==
+        // incremental. The rows carry a username, a resolved reply
+        // target, and an edit row.
+        let reply_targets = HashMap::from([("p1".to_string(), target(1, "Alice"))]);
 
+        let mut live = LiveContext::new("P".to_string());
+        live.append_human_message(
+            1,
+            "Alice",
+            Some("alice_tg"),
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "one",
+        );
+        live.append_recall_injection(1, "memory at 1".to_string());
+        live.append_bot_speech(2, at_1307(), "two");
+        live.append_recall_injection(2, "memory at 2".to_string());
+        live.append_human_message(
+            3,
+            "Bob",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::ToUser {
+                target: Some(target(1, "Alice")),
+            },
+            "reply to one",
+        );
+        live.append_human_message(
+            4,
+            "Alice",
+            Some("alice_tg"),
+            at_1307(),
+            true,
+            false,
+            ReplyRender::None,
+            "edited",
+        );
+
+        let mut reply_row = row(
+            3,
+            Direction::Inbound,
+            EventType::Message,
+            "Bob",
+            None,
+            "reply to one",
+        );
+        reply_row.reply_to_platform_msg_id = Some("p1".to_string());
         let rows = vec![
-            row(1, Direction::Inbound, EventType::Message, "Alice", "one"),
-            row(2, Direction::Outbound, EventType::Message, "Tamako", "two"),
-            row(3, Direction::Inbound, EventType::Message, "Alice", "three"),
+            row(
+                1,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                Some("alice_tg"),
+                "one",
+            ),
+            row(
+                2,
+                Direction::Outbound,
+                EventType::Message,
+                "Tamako",
+                None,
+                "two",
+            ),
+            reply_row,
+            row(
+                4,
+                Direction::Inbound,
+                EventType::Edit,
+                "Alice",
+                Some("alice_tg"),
+                "edited",
+            ),
         ];
         let injections = vec![
             injection(10, 1, "memory at 1"),
             injection(11, 2, "memory at 2"),
         ];
-        let rebuilt = LiveContext::rebuild("P".to_string(), &rows, &injections);
+        let rebuilt = LiveContext::rebuild("P".to_string(), &rows, &injections, &reply_targets);
 
         assert_eq!(rebuilt, live);
     }
 
     #[test]
+    fn rebuild_resolves_reply_targets_username_and_edit_kind() {
+        // The rebuild renders the resolved reply target, the username,
+        // and the edit kind from the persisted rows.
+        let mut reply_row = row(
+            2,
+            Direction::Inbound,
+            EventType::Message,
+            "Bob",
+            Some("bob_tg"),
+            "hotpot?",
+        );
+        reply_row.reply_to_platform_msg_id = Some("p1".to_string());
+        let rows = vec![
+            row(
+                1,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                None,
+                "any plans?",
+            ),
+            reply_row,
+            row(
+                3,
+                Direction::Inbound,
+                EventType::Edit,
+                "Carol",
+                None,
+                "edited text",
+            ),
+        ];
+        let reply_targets = HashMap::from([("p1".to_string(), target(1, "Alice"))]);
+
+        let context = LiveContext::rebuild("P".to_string(), &rows, &[], &reply_targets);
+
+        assert_eq!(
+            context.items()[1].content,
+            r#"<msg from="Alice" at="13:07" id="1">any plans?</msg>"#
+        );
+        assert_eq!(
+            context.items()[2].content,
+            r#"<msg from="Bob" user="bob_tg" at="13:07" id="2" reply="user" reply_to_name="Alice" reply_to_id="1">hotpot?</msg>"#
+        );
+        assert_eq!(
+            context.items()[3].content,
+            r#"<msg from="Carol" at="13:07" id="3" kind="edit">edited text</msg>"#
+        );
+    }
+
+    #[test]
+    fn rebuild_renders_unresolved_and_bot_replies_deterministically() {
+        // An unresolved user reply renders `reply="user"` with no target
+        // attributes; a reply to the bot renders `reply="bot"` with no
+        // target attributes (Rules A3/B1: the synthetic outbound id can
+        // never resolve). Both deterministic.
+        let mut unresolved = row(
+            1,
+            Direction::Inbound,
+            EventType::Message,
+            "Dave",
+            None,
+            "old stuff",
+        );
+        unresolved.reply_to_platform_msg_id = Some("p-missing".to_string());
+        let mut to_bot = row(
+            2,
+            Direction::Inbound,
+            EventType::Message,
+            "Carol",
+            None,
+            "you pick!",
+        );
+        to_bot.is_reply_to_bot = true;
+        let rows = vec![unresolved, to_bot];
+
+        let context = LiveContext::rebuild("P".to_string(), &rows, &[], &HashMap::new());
+
+        assert_eq!(
+            context.items()[1].content,
+            r#"<msg from="Dave" at="13:07" id="1" reply="user">old stuff</msg>"#
+        );
+        assert_eq!(
+            context.items()[2].content,
+            r#"<msg from="Carol" at="13:07" id="2" reply="bot">you pick!</msg>"#
+        );
+    }
+
+    #[test]
+    fn render_human_content_matches_the_contract_examples_byte_exactly() {
+        // The approved XML grammar, byte-exact. Attribute order fixed.
+        assert_eq!(
+            render_human_content(
+                41,
+                "Alice",
+                None,
+                at_utc(13, 5),
+                false,
+                false,
+                ReplyRender::None,
+                "any plans for dinner?",
+            ),
+            r#"<msg from="Alice" at="13:05" id="41">any plans for dinner?</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                42,
+                "Bob",
+                Some("bob_tg"),
+                at_utc(13, 6),
+                false,
+                false,
+                ReplyRender::ToUser {
+                    target: Some(target(41, "Alice")),
+                },
+                "hotpot?",
+            ),
+            r#"<msg from="Bob" user="bob_tg" at="13:06" id="42" reply="user" reply_to_name="Alice" reply_to_id="41">hotpot?</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                43,
+                "Carol",
+                None,
+                at_utc(13, 7),
+                false,
+                false,
+                ReplyRender::ToBot,
+                "you pick!",
+            ),
+            r#"<msg from="Carol" at="13:07" id="43" reply="bot">you pick!</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                44,
+                "Dave",
+                None,
+                at_utc(13, 8),
+                false,
+                false,
+                ReplyRender::ToUser { target: None },
+                "old stuff",
+            ),
+            r#"<msg from="Dave" at="13:08" id="44" reply="user">old stuff</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                45,
+                "Dave",
+                None,
+                at_utc(13, 8),
+                false,
+                true,
+                ReplyRender::None,
+                "@tamako hi",
+            ),
+            r#"<msg from="Dave" at="13:08" id="45" mention="bot">@tamako hi</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                46,
+                "Alice",
+                None,
+                at_utc(13, 9),
+                true,
+                false,
+                ReplyRender::None,
+                "dinner at 7 (edited)",
+            ),
+            r#"<msg from="Alice" at="13:09" id="46" kind="edit">dinner at 7 (edited)</msg>"#
+        );
+        // Escaping: the display name is attr-escaped, the text is
+        // text-escaped.
+        assert_eq!(
+            render_human_content(
+                47,
+                r#"Ann "Annie" & Co"#,
+                None,
+                at_utc(13, 10),
+                false,
+                false,
+                ReplyRender::None,
+                r#"a < b & "c""#,
+            ),
+            r#"<msg from="Ann &quot;Annie&quot; &amp; Co" at="13:10" id="47">a &lt; b &amp; "c"</msg>"#
+        );
+    }
+
+    #[test]
+    fn render_human_content_flag_precedence_is_kind_then_reply_then_mention() {
+        // A message can be an edit, a reply, and a mention at once: all
+        // three attributes render, in that fixed order.
+        assert_eq!(
+            render_human_content(
+                48,
+                "Eve",
+                None,
+                at_utc(13, 11),
+                true,
+                true,
+                ReplyRender::ToBot,
+                "edited reply mention",
+            ),
+            r#"<msg from="Eve" at="13:11" id="48" kind="edit" reply="bot" mention="bot">edited reply mention</msg>"#
+        );
+    }
+
+    #[test]
+    fn render_bot_content_wraps_in_the_you_element_with_escaping() {
+        assert_eq!(
+            render_bot_content(49, at_utc(13, 12), r#"hi & <bye>"#),
+            r#"<you at="13:12" id="49">hi &amp; &lt;bye&gt;</you>"#
+        );
+        assert_eq!(
+            render_bot_content(50, at_utc(9, 5), "plain"),
+            r#"<you at="09:05" id="50">plain</you>"#
+        );
+    }
+
+    #[test]
     fn messages_for_llm_maps_roles_and_order() {
         let mut context = LiveContext::new("P".to_string());
-        context.append_human_message(1, "Alice", at_1307(), "hello");
-        context.append_bot_speech(2, "hi");
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "hello",
+        );
+        context.append_bot_speech(2, at_1307(), "hi");
 
         let messages = context.messages_for_llm();
         assert_eq!(
@@ -577,11 +1131,11 @@ mod tests {
                 },
                 ContextMessage {
                     role: ContextRole::User,
-                    content: "[Alice 13:07] hello".to_string(),
+                    content: r#"<msg from="Alice" at="13:07" id="1">hello</msg>"#.to_string(),
                 },
                 ContextMessage {
                     role: ContextRole::Assistant,
-                    content: "hi".to_string(),
+                    content: r#"<you at="13:07" id="2">hi</you>"#.to_string(),
                 },
             ]
         );
@@ -590,15 +1144,25 @@ mod tests {
     #[test]
     fn stats_counts_items_and_sums_content_bytes() {
         let mut context = LiveContext::new("abc".to_string());
-        context.append_human_message(1, "Alice", at_1307(), "hello");
-        context.append_bot_speech(2, "hi");
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "hello",
+        );
+        context.append_bot_speech(2, at_1307(), "hi");
 
         let stats = context.stats();
         assert_eq!(stats.item_count, 3);
         let expected_bytes: usize = context.items().iter().map(|item| item.content.len()).sum();
-        // "abc" (3) + "[Alice 13:07] hello" (19) + "hi" (2) = 24.
-        assert_eq!(expected_bytes, 24);
-        assert_eq!(stats.estimated_bytes, 24);
+        // "abc" (3) + `<msg from="Alice" at="13:07" id="1">hello</msg>`
+        // (47) + `<you at="13:07" id="2">hi</you>` (31) = 81.
+        assert_eq!(expected_bytes, 81);
+        assert_eq!(stats.estimated_bytes, 81);
     }
 
     #[test]

@@ -11,6 +11,10 @@ pub struct NormalizedMessage {
     pub timestamp: OffsetDateTime,
     pub sender_id: String,
     pub sender_display_name: String,
+    /// The sender's username, when the platform provides one (Rule A1:
+    /// the adapters fill it — Telegram `User.username`). `None` when the
+    /// sender has no username.
+    pub username: Option<String>,
     pub text: String,
     pub reply_to_platform_msg_id: Option<String>,
     pub mentions_bot: bool,
@@ -103,6 +107,7 @@ mod tests {
                 .expect("a valid unix timestamp"),
             sender_id: "u1".to_string(),
             sender_display_name: "Alice".to_string(),
+            username: None,
             text: "hello".to_string(),
             reply_to_platform_msg_id: None,
             mentions_bot: false,
