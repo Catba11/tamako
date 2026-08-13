@@ -274,6 +274,7 @@ mod tests {
             timestamp: now(),
             sender_id: "u1".to_string(),
             sender_display_name: "Alice".to_string(),
+            sender_username: None,
             text: text.to_string(),
             reply_to_platform_msg_id: None,
             mentions_bot: false,

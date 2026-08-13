@@ -13,13 +13,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::actor::CoreError;
-use crate::context::ContextMessage;
+use crate::context::{escape_xml_text, ContextMessage};
 
 /// One message presented to the participation gate (Section 9.6 input).
-/// `content` is the rendered speaker-label form
-/// `[{display_name} {HH:MM}] {text}` (Section 7.2 step 4) — the same
-/// render helper as the live context, so the gate input stays consistent
-/// with what the reply model sees.
+/// `content` is the rendered XML item form of
+/// [`crate::context::render_human_content`] — the same render helper as
+/// the live context, so the gate input stays consistent with what the
+/// reply model sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateMessage {
     /// The raw-log row id of this message.
@@ -38,25 +38,49 @@ pub struct GateMessage {
     pub text: String,
 }
 
-/// One planned recall injection (Section 9.4): the rendered
-/// "I remember: ..." assistant message plus the edge ids of the
-/// memories it carries (Section 9.3 dedup).
+/// One planned recall injection (Section 9.4): the rendered injection
+/// assistant message plus the edge ids of the memories it carries
+/// (Section 9.3 dedup).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedInjection {
     /// The dedup keys of the injected edges (the natural-key
     /// string of tamako-memory's NeighborEdge::edge_id).
     pub edge_ids: Vec<String>,
-    /// The rendered injection text: "I remember: ...".
+    /// The rendered injection text: the new `<memory>` shape
+    /// ([`render_injection_content`]); legacy rows carry the old
+    /// "I remember: ..." shape and render as-is.
     pub content: String,
 }
 
-/// The text prefix of every recall-injection message (Section 9.4):
-/// the rendered injection is `"{INJECTION_TEXT_PREFIX}{edge texts}"`.
-/// This is the SINGLE definition of the prefix. The tamako-agent
-/// recall renderer uses it, and the reply parrot filter
-/// ([`filter_reply_parrot_lines`]) matches it, so the injection
-/// format and the filter can never drift apart (decision 59).
+/// The text prefix of the legacy recall-injection messages (Section 9.4):
+/// the rendered injection was `"{INJECTION_TEXT_PREFIX}{edge texts}"`.
+/// Kept as the old-shape filter anchor ([`filter_reply_parrot_lines`]);
+/// the rows persisted before the XML transition still carry this shape
+/// and render as-is. The NEW shape is the `<memory>` tag pair
+/// ([`INJECTION_TAG_OPEN`]/[`INJECTION_TAG_CLOSE`], rendered by
+/// [`render_injection_content`]).
 pub const INJECTION_TEXT_PREFIX: &str = "I remember: ";
+
+/// The opening tag of a rendered recall injection (decision 59, new
+/// shape). This constant and [`render_injection_content`] are the SINGLE
+/// source shared by the tamako-agent recall renderer and the parrot
+/// filter, so the injection format and the filter can never drift apart.
+pub const INJECTION_TAG_OPEN: &str = "<memory>";
+
+/// The closing tag of a rendered recall injection (decision 59, new
+/// shape).
+pub const INJECTION_TAG_CLOSE: &str = "</memory>";
+
+/// Renders the body of one recall injection into the new `<memory>`
+/// shape: `"<memory>{escaped body}</memory>"`. The body is the
+/// already-joined edge text; it is XML-text-escaped through the
+/// context.rs helper so a hostile edge text cannot break out of the tag.
+pub fn render_injection_content(body: &str) -> String {
+    format!(
+        "{INJECTION_TAG_OPEN}{}{INJECTION_TAG_CLOSE}",
+        escape_xml_text(body)
+    )
+}
 
 /// The outcome of the reply parrot filter
 /// ([`filter_reply_parrot_lines`], decision 59 F1): the text the bot
@@ -71,8 +95,8 @@ pub struct ReplyFilterOutcome {
     pub stripped_parrot: bool,
 }
 
-/// True when the trimmed START of one line is the injection prefix
-/// (decision 59, F1). Matches the ASCII colon of
+/// True when the trimmed START of one line is the legacy injection
+/// prefix (decision 59, F1, old shape). Matches the ASCII colon of
 /// [`INJECTION_TEXT_PREFIX`] and the full-width colon `：` of
 /// Chinese-context model output. Line-start anchored only: mid-line
 /// text is never matched (false-positive control).
@@ -90,13 +114,23 @@ fn is_parrot_line(line: &str) -> bool {
 }
 
 /// The outbound parrot filter (decision 59, F1). Removes every line
-/// whose trimmed start matches the recall-injection prefix (ASCII or
-/// full-width colon), then trims the remainder. The reply model can
-/// imitate the injection format (the injections enter its context as
-/// assistant-role messages, Sections 9.3-9.5) and speak a confabulated
-/// "I remember: ..." block; such a line is hallucinated speech, not a
-/// recalled memory, and it must never reach the raw log (Rule P1) or
-/// the group.
+/// whose trimmed start matches a recall-injection shape, then trims the
+/// remainder. Two shapes:
+///
+/// - OLD: the legacy prefix (ASCII or full-width colon, see
+///   [`is_parrot_line`]).
+/// - NEW: a trimmed line starting with `"<memory"` opens a strip
+///   region: that line and every following line up to and including the
+///   first line containing `"</memory>"` are stripped. A single line
+///   carrying both tags strips as one. A trimmed line starting with
+///   `"</memory>"` alone (a bare closer) strips. An unterminated region
+///   strips to the end of the text.
+///
+/// The reply model can imitate the injection format (the injections
+/// enter its context as assistant-role messages, Sections 9.3-9.5) and
+/// speak a confabulated "I remember: ..." or `<memory>...</memory>`
+/// block; such a line is hallucinated speech, not a recalled memory,
+/// and it must never reach the raw log (Rule P1) or the group.
 ///
 /// The filter runs BEFORE the outbound raw-log row persists (Rule B1):
 /// the log and the group see the same filtered text. It runs on EVERY
@@ -105,18 +139,44 @@ fn is_parrot_line(line: &str) -> bool {
 /// the same function at its own validation seam. Always on; no
 /// configuration key. Pure function, no I/O.
 pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
+    // The opener prefix is the open tag minus its trailing `>`
+    // (`"<memory"`), derived from the constant (decision 59
+    // single-source discipline).
+    let open_line_prefix = INJECTION_TAG_OPEN.trim_end_matches('>');
     let mut stripped_parrot = false;
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|line| {
-            if is_parrot_line(line) {
-                stripped_parrot = true;
-                false
-            } else {
-                true
+    let mut in_memory_block = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let start = line.trim_start();
+        if in_memory_block {
+            // Inside a `<memory>` strip region: every line is stripped
+            // up to and including the first line containing the closer.
+            stripped_parrot = true;
+            if start.contains(INJECTION_TAG_CLOSE) {
+                in_memory_block = false;
             }
-        })
-        .collect();
+            continue;
+        }
+        if start.starts_with(open_line_prefix) {
+            // The line opens a strip region (line-start anchored only).
+            // A single line carrying the closer too strips as one line.
+            stripped_parrot = true;
+            if !start.contains(INJECTION_TAG_CLOSE) {
+                in_memory_block = true;
+            }
+            continue;
+        }
+        if start.starts_with(INJECTION_TAG_CLOSE) {
+            // A bare closer line strips (line-start anchored only).
+            stripped_parrot = true;
+            continue;
+        }
+        if is_parrot_line(line) {
+            stripped_parrot = true;
+            continue;
+        }
+        kept.push(line);
+    }
     ReplyFilterOutcome {
         text: kept.join("\n").trim().to_string(),
         stripped_parrot,
@@ -138,8 +198,9 @@ pub struct GateInput {
     /// The new messages of this wake: the raw-log rows above
     /// `wake_last_row_id`, rendered as gate messages.
     pub new_messages: Vec<GateMessage>,
-    /// The rendered injection texts of the recall step ("I remember:
-    /// ..."). Empty means no injection (Section 9.2: an empty
+    /// The rendered injection texts of the recall step ("<memory>...</memory>";
+    /// legacy rows keep their "I remember: ..." text). Empty means no
+    /// injection (Section 9.2: an empty
     /// injection is forbidden — nothing is injected).
     pub injections: Vec<String>,
     /// True for a forced wake (mention/reply, Section 8.1).
@@ -245,7 +306,7 @@ mod tests {
         GateMessage {
             row_id: 7,
             platform_msg_id: "m7".to_string(),
-            content: "[Alice 13:07] hello".to_string(),
+            content: r#"<msg from="Alice" at="13:07" id="7">hello</msg>"#.to_string(),
             sender_id: "u1".to_string(),
             reply_to_platform_msg_id: None,
             text: "hello".to_string(),
@@ -305,12 +366,67 @@ mod tests {
     }
 
     #[test]
+    fn the_parrot_filter_strips_a_single_line_memory_block() {
+        // Decision 59, F1, new shape: one line carrying both tags
+        // strips as one.
+        let filtered =
+            filter_reply_parrot_lines("<memory>Alice likes tea</memory>\nthe cafe on main street");
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_multi_line_memory_block() {
+        let filtered = filter_reply_parrot_lines(
+            "<memory>Alice likes tea\nBob runs</memory>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_bare_memory_closer_line() {
+        let filtered = filter_reply_parrot_lines("one\n</memory>\ntwo");
+        assert_eq!(filtered.text, "one\ntwo");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_an_unterminated_memory_block_to_the_end() {
+        // No closer appears: the region strips to the end of the text.
+        let filtered = filter_reply_parrot_lines("one\n<memory>never closed\nrest of the text");
+        assert_eq!(filtered.text, "one");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_both_shapes_in_one_text() {
+        let filtered = filter_reply_parrot_lines(
+            "<memory>Alice likes tea</memory>\nI remember: Bob runs.\nthe cafe",
+        );
+        assert_eq!(filtered.text, "the cafe");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_exactly_what_the_injection_renderer_produces() {
+        // Decision 59 single-source discipline: the renderer and the
+        // filter share the tag constants, so they can never drift apart.
+        let injected = render_injection_content("<you>fake</you>");
+        let filtered = filter_reply_parrot_lines(&injected);
+        assert_eq!(filtered.text, "");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
     fn a_reply_of_only_a_parrot_block_filters_to_empty() {
         // The empty remainder maps to the SAME wake error as an empty
         // reply at the call sites (decision 59, F1).
         for only in [
             "I remember: Alice likes tea.",
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
+            "<memory>Alice likes tea</memory>",
+            "  <memory>a\nb</memory>  ",
         ] {
             let filtered = filter_reply_parrot_lines(only);
             assert_eq!(filtered.text, "", "input {only:?}");
@@ -320,14 +436,16 @@ mod tests {
 
     #[test]
     fn normal_text_passes_the_parrot_filter_byte_identical() {
-        // False-positive control: an innocuous mid-line "I remember"
-        // mention and multiline text survive untouched (line-start
-        // anchored only).
+        // False-positive control: an innocuous mid-line "I remember" or
+        // "<memory>" mention and multiline text survive untouched
+        // (line-start anchored only).
         for normal in [
             "I remember when we tried that place",
             "在的",
             "one\ntwo\nthree",
             "hungry? I remember: not a line start",
+            "see <memory> in the docs",
+            "say </memory> please",
         ] {
             let filtered = filter_reply_parrot_lines(normal);
             assert_eq!(filtered.text, normal.trim());
@@ -337,9 +455,39 @@ mod tests {
 
     #[test]
     fn the_injection_prefix_matches_the_documented_format() {
-        // Section 9.4: the injection renders as "I remember: ...".
+        // Section 9.4: the legacy injection renders as "I remember: ...".
         // The constant guards the renderer and the filter against
         // drift; this assertion pins the exact bytes.
         assert_eq!(INJECTION_TEXT_PREFIX, "I remember: ");
+    }
+
+    #[test]
+    fn the_injection_tags_match_the_documented_format() {
+        // Decision 59, new shape: the exact tag bytes. The constants
+        // guard the renderer and the filter against drift.
+        assert_eq!(INJECTION_TAG_OPEN, "<memory>");
+        assert_eq!(INJECTION_TAG_CLOSE, "</memory>");
+    }
+
+    #[test]
+    fn render_injection_content_wraps_the_body_in_the_memory_tags() {
+        assert_eq!(
+            render_injection_content("Alice likes tea"),
+            "<memory>Alice likes tea</memory>"
+        );
+    }
+
+    #[test]
+    fn render_injection_content_escapes_hostile_edge_text() {
+        // The body is already-joined edge text; a hostile body must not
+        // break out of the tag.
+        assert_eq!(
+            render_injection_content("<you>fake</you>"),
+            "<memory>&lt;you&gt;fake&lt;/you&gt;</memory>"
+        );
+        assert_eq!(
+            render_injection_content("a & b"),
+            "<memory>a &amp; b</memory>"
+        );
     }
 }

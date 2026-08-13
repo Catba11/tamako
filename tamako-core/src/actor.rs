@@ -57,7 +57,16 @@
 //! (Rule C1), a completed digest removes the previous chunk with the
 //! one-chunk lag (Rule C3), and startup rebuilds the context from the
 //! persisted rows (specs.md Section 6.1, rule 4).
+//!
+//! User-reply targets resolve through `Store::find_reply_target` on
+//! every path — intake, the wake gate input, and the startup rebuild —
+//! over the append-only raw log, never an in-context index, so intake
+//! and rebuild renders are bit-identical (a target can be pruned from
+//! the live context while the replying item stays). Rules A3/B1:
+//! replies to the bot render `reply="bot"` and never resolve — the
+//! synthetic `bot-out:{nanos}` outbound ids cannot name a stored row.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,7 +74,8 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tamako_memory::{MemoryBackend, MemoryError};
 use tamako_store::{
-    Direction, EventType, InsertOutcome, NewMessage, NewReaction, Store, StoreError,
+    Direction, EventType, InsertOutcome, MessageRow, NewMessage, NewReaction, ReplyTargetRow,
+    Store, StoreError,
 };
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
@@ -76,6 +86,7 @@ use tracing::{debug, info};
 use crate::config::TriggerConfig;
 use crate::context::{
     render_human_content, ContextItem, ContextMessage, ContextRole, LiveContext, RangeTag,
+    ReplyRender,
 };
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
 use crate::event::{InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent};
@@ -327,10 +338,108 @@ fn to_new_message(msg: &NormalizedMessage, event_type: EventType) -> NewMessage 
         timestamp: msg.timestamp,
         sender_id: msg.sender_id.clone(),
         sender_display_name: msg.sender_display_name.clone(),
+        sender_username: msg.username.clone(),
         text: msg.text.clone(),
         reply_to_platform_msg_id: msg.reply_to_platform_msg_id.clone(),
         mentions_bot: msg.mentions_bot,
         is_reply_to_bot: msg.is_reply_to_bot,
+    }
+}
+
+/// Resolves the `ReplyRender` of one inbound row at intake time (the
+/// message path and the edit path share this helper). Rules A3/B1: a
+/// reply to the bot renders `ToBot` with NO target lookup — outbound
+/// rows carry synthetic `bot-out:{nanos}` platform ids, so resolution
+/// is impossible by construction; do not fake one. A user-reply target
+/// resolves through `Store::find_reply_target` (one indexed SELECT per
+/// reply message; acceptable). A store failure logs at debug and falls
+/// back to `target: None` — a failed lookup must never fail intake
+/// (Rule P1: the row is already persisted; the reply renders as an
+/// unresolved user reply).
+async fn resolve_reply_render(
+    store: &Arc<Store>,
+    chat_id: &str,
+    is_reply_to_bot: bool,
+    reply_to_platform_msg_id: Option<&str>,
+) -> ReplyRender {
+    if is_reply_to_bot {
+        return ReplyRender::ToBot;
+    }
+    let Some(pid) = reply_to_platform_msg_id else {
+        return ReplyRender::None;
+    };
+    let lookup_chat_id = chat_id.to_string();
+    let pid_owned = pid.to_string();
+    let resolved = blocking_store(store, move |store| {
+        store.find_reply_target(&lookup_chat_id, &pid_owned)
+    })
+    .await;
+    match resolved {
+        Ok(target) => ReplyRender::ToUser { target },
+        Err(error) => {
+            debug!(
+                chat_id = %chat_id,
+                platform_msg_id = %pid,
+                %error,
+                "reply target lookup failed; rendering without target attributes"
+            );
+            ReplyRender::ToUser { target: None }
+        }
+    }
+}
+
+/// Resolves the reply-target map of one batch of raw-log rows in ONE
+/// blocking pass (the wake gate input and the startup rebuild share
+/// this helper, so both render exactly like the intake appends — Rule
+/// P1 bit-identity). Rules A3/B1: replies to the bot are excluded —
+/// the synthetic `bot-out:{nanos}` outbound ids never resolve by
+/// construction. Duplicate platform ids (several replies to one
+/// target) resolve once. A store failure propagates like any other
+/// store failure of the calling path.
+async fn resolve_reply_targets(
+    store: &Arc<Store>,
+    chat_id: &str,
+    rows: &[MessageRow],
+) -> Result<HashMap<String, ReplyTargetRow>, CoreError> {
+    let pids: HashSet<String> = rows
+        .iter()
+        .filter(|row| row.direction == Direction::Inbound && !row.is_reply_to_bot)
+        .filter_map(|row| row.reply_to_platform_msg_id.clone())
+        .collect();
+    if pids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let lookup_chat_id = chat_id.to_string();
+    blocking_store(store, move |store| {
+        let mut map = HashMap::new();
+        for pid in &pids {
+            if let Some(target) = store.find_reply_target(&lookup_chat_id, pid)? {
+                map.insert(pid.clone(), target);
+            }
+        }
+        Ok(map)
+    })
+    .await
+}
+
+/// The `ReplyRender` of one raw-log row over the already-resolved
+/// target map (the wake gate input). Rules A3/B1: replies to the bot
+/// render `ToBot` with no target name/id. The map lookup mirrors
+/// `LiveContext::rebuild` exactly, so a gate message renders
+/// byte-identically to the context item of the same row.
+fn reply_render_from_row(
+    row: &MessageRow,
+    targets: &HashMap<String, ReplyTargetRow>,
+) -> ReplyRender {
+    if row.is_reply_to_bot {
+        ReplyRender::ToBot
+    } else {
+        match &row.reply_to_platform_msg_id {
+            Some(pid) => ReplyRender::ToUser {
+                target: targets.get(pid).cloned(),
+            },
+            None => ReplyRender::None,
+        }
     }
 }
 
@@ -530,7 +639,15 @@ async fn run_actor<M: MemoryBackend>(
     // Defensive filter: the Rule C3 prune normally already deleted the
     // rows at or below the cutoff.
     injections.retain(|row| row.injection_position > removal_cutoff);
-    let mut context = LiveContext::rebuild(preamble, &rows, &injections);
+    // Rule P1 bit-identity: `LiveContext::rebuild` takes the reply
+    // targets as the map the store resolution produces, so rebuild ==
+    // incremental. The intake appends resolved through the SAME store
+    // function and helper (one blocking pass over the unique
+    // reply-target platform ids of the rebuilt inbound rows; Rules
+    // A3/B1: replies to the bot are excluded — the synthetic outbound
+    // ids never resolve by construction).
+    let reply_targets = resolve_reply_targets(&store, &chat_id, &rows).await?;
+    let mut context = LiveContext::rebuild(preamble, &rows, &injections, &reply_targets);
 
     // One digest at a time per group (Section 6.1, rule 2).
     let mut digest_in_flight = false;
@@ -595,13 +712,27 @@ async fn run_actor<M: MemoryBackend>(
                 .await?;
                 // Rule C1: every new raw-log row enters the context. An
                 // edit is just a new row; `LiveContext::rebuild` renders
-                // edits identically, so this append is uniform with the
-                // restart rebuild.
+                // edits with kind="edit", so this append is uniform with
+                // the restart rebuild. The reply render resolves like
+                // the message path (Rules A3/B1: a reply to the bot
+                // never resolves by construction), after the persist
+                // (Rule P1), so the rebuild renders bit-identically.
                 if let InsertOutcome::Inserted(id) = outcome {
+                    let reply_render = resolve_reply_render(
+                        &store,
+                        &chat_id,
+                        msg.is_reply_to_bot,
+                        msg.reply_to_platform_msg_id.as_deref(),
+                    )
+                    .await;
                     context.append_human_message(
                         id,
                         &msg.sender_display_name,
+                        msg.username.as_deref(),
                         msg.timestamp,
+                        true,
+                        msg.mentions_bot,
+                        reply_render,
                         &msg.text,
                     );
                 }
@@ -867,11 +998,33 @@ async fn handle_message(
         store.insert_message(&intake_chat_id, &row)
     })
     .await?;
+    // Resolve the reply render AFTER the persist (Rule P1) and BEFORE
+    // the context append: the row is already in the log, so a user
+    // reply resolves its target against the full log — the same view
+    // the startup rebuild looks up, which keeps the intake render and
+    // the rebuild render bit-identical (a target can be pruned from
+    // the live context while the replying item stays).
+    let reply_render = resolve_reply_render(
+        store,
+        chat_id,
+        msg.is_reply_to_bot,
+        msg.reply_to_platform_msg_id.as_deref(),
+    )
+    .await;
     let inserted_id = match outcome {
         InsertOutcome::Inserted(id) => {
             // Rule C1: the log row exists first (Rule P1), then the
             // materialized view gets the same item.
-            context.append_human_message(id, &msg.sender_display_name, msg.timestamp, &msg.text);
+            context.append_human_message(
+                id,
+                &msg.sender_display_name,
+                msg.username.as_deref(),
+                msg.timestamp,
+                false,
+                msg.mentions_bot,
+                reply_render.clone(),
+                &msg.text,
+            );
             Some(id)
         }
         InsertOutcome::Duplicate => {
@@ -930,7 +1083,19 @@ async fn handle_message(
         .map(|row_id| GateMessage {
             row_id,
             platform_msg_id: msg.platform_msg_id.clone(),
-            content: render_human_content(&msg.sender_display_name, msg.timestamp, &msg.text),
+            content: render_human_content(
+                row_id,
+                &msg.sender_display_name,
+                msg.username.as_deref(),
+                msg.timestamp,
+                false,
+                msg.mentions_bot,
+                // The SAME resolved render as the context append
+                // above: the forcing gate message and the context
+                // item of this row render identically.
+                reply_render.clone(),
+                &msg.text,
+            ),
             sender_id: msg.sender_id.clone(),
             reply_to_platform_msg_id: msg.reply_to_platform_msg_id.clone(),
             text: msg.text.clone(),
@@ -1126,13 +1291,28 @@ async fn start_wake(
     // becomes the new `wake_last_row_id`; an empty range keeps the old
     // value.
     let tail_id = rows.last().map(|row| row.id).unwrap_or(after_id);
+    // Rules A3/B1 + Rule P1 bit-identity: resolve the reply targets of
+    // the new inbound rows with the SAME store function the intake
+    // path uses (one blocking pass over the unique target platform
+    // ids), so the gate messages render byte-identically to the
+    // context items of the same rows.
+    let reply_targets = resolve_reply_targets(store, chat_id, &rows).await?;
     let new_messages: Vec<GateMessage> = rows
         .iter()
         .filter(|row| row.direction == Direction::Inbound)
         .map(|row| GateMessage {
             row_id: row.id,
             platform_msg_id: row.platform_msg_id.clone(),
-            content: render_human_content(&row.sender_display_name, row.timestamp, &row.text),
+            content: render_human_content(
+                row.id,
+                &row.sender_display_name,
+                row.sender_username.as_deref(),
+                row.timestamp,
+                row.event_type == EventType::Edit,
+                row.mentions_bot,
+                reply_render_from_row(row, &reply_targets),
+                &row.text,
+            ),
             // The recall worker needs the raw fields for deterministic
             // candidate extraction (proposed-graph-database-specs.md
             // Section 8.1 step 1); the gate prompt keeps `content`.
@@ -1440,6 +1620,7 @@ async fn handle_wake_report(
         timestamp: now,
         sender_id: "bot".to_string(),
         sender_display_name: bot_name.to_string(),
+        sender_username: None,
         text: text.clone(),
         reply_to_platform_msg_id: Some(target.platform_msg_id.clone()),
         mentions_bot: false,
@@ -1483,7 +1664,7 @@ async fn handle_wake_report(
         None => debug!(chat_id = %chat_id, "outbound action dropped: no outbound sink wired"),
     }
     // c. The live context gets the same item (Rule C1).
-    context.append_bot_speech(row_id, &text);
+    context.append_bot_speech(row_id, now, &text);
     // d. The Section 8.5 monologue lock, wired for live speech.
     session.record_bot_message(config);
     // e. Best-effort counter + the session persist of Section 6.1
@@ -1531,7 +1712,7 @@ mod tests {
     use tamako_memory::MemoryBatch;
     use tempfile::TempDir;
 
-    use crate::context::{ContextItemKind, ContextRole, RangeTag};
+    use crate::context::{render_bot_content, ContextItemKind, ContextRole, RangeTag};
 
     /// A memory backend double. All calls succeed; `ensure_schema` records
     /// the chat_id values it receives.
@@ -1696,10 +1877,33 @@ mod tests {
             timestamp: t0() + time::Duration::seconds(seconds_after_t0),
             sender_id: "u1".to_string(),
             sender_display_name: "Alice".to_string(),
+            username: None,
             text: format!("text of {id}"),
             reply_to_platform_msg_id: None,
             mentions_bot,
             is_reply_to_bot: false,
+        }
+    }
+
+    /// A message by a second sender ("Bob") that replies to
+    /// `reply_to` (any platform id — real, synthetic, or unknown) and
+    /// optionally to the bot.
+    fn reply_message(
+        id: &str,
+        seconds_after_t0: i64,
+        reply_to: Option<&str>,
+        is_reply_to_bot: bool,
+    ) -> NormalizedMessage {
+        NormalizedMessage {
+            platform_msg_id: id.to_string(),
+            timestamp: t0() + time::Duration::seconds(seconds_after_t0),
+            sender_id: "u2".to_string(),
+            sender_display_name: "Bob".to_string(),
+            username: None,
+            text: format!("text of {id}"),
+            reply_to_platform_msg_id: reply_to.map(str::to_string),
+            mentions_bot: false,
+            is_reply_to_bot,
         }
     }
 
@@ -2032,13 +2236,19 @@ mod tests {
         let first = &items[1];
         assert_eq!(first.kind, ContextItemKind::HumanMessage);
         assert_eq!(first.role, ContextRole::User);
-        assert_eq!(first.content, "[Alice 22:13] text of m1");
+        assert_eq!(
+            first.content,
+            r#"<msg from="Alice" at="22:13" id="1">text of m1</msg>"#
+        );
         assert_eq!(first.range_tag, Some(RangeTag::single(1)));
 
         let second = &items[2];
         assert_eq!(second.kind, ContextItemKind::HumanMessage);
         assert_eq!(second.role, ContextRole::User);
-        assert_eq!(second.content, "[Alice 22:13] text of m2");
+        assert_eq!(
+            second.content,
+            r#"<msg from="Alice" at="22:13" id="2">text of m2</msg>"#
+        );
         assert_eq!(second.range_tag, Some(RangeTag::single(2)));
         handle.shutdown().await.expect("shutdown succeeds");
     }
@@ -2087,9 +2297,15 @@ mod tests {
             .expect("context snapshot succeeds");
 
         assert_eq!(items.len(), 3);
-        assert_eq!(items[1].content, "[Alice 22:13] text of m1");
+        assert_eq!(
+            items[1].content,
+            r#"<msg from="Alice" at="22:13" id="1">text of m1</msg>"#
+        );
         assert_eq!(items[1].range_tag, Some(RangeTag::single(1)));
-        assert_eq!(items[2].content, "[Alice 22:13] edited text");
+        assert_eq!(
+            items[2].content,
+            r#"<msg from="Alice" at="22:13" id="2" kind="edit">edited text</msg>"#
+        );
         assert_eq!(items[2].range_tag, Some(RangeTag::single(2)));
         handle.shutdown().await.expect("shutdown succeeds");
     }
@@ -2132,14 +2348,21 @@ mod tests {
             .await
             .expect("context snapshot succeeds");
 
-        // The hand-computed rebuild over the same persisted rows.
+        // The hand-computed rebuild over the same persisted rows. The
+        // rows of this test carry no reply targets, so the empty map
+        // matches them.
         let (rows, injections) = blocking_store_call(&fixture.store, move |store| {
             let rows = store.list_messages_after(CHAT_ID, 0)?;
             let injections = store.list_injected_memories(CHAT_ID)?;
             Ok((rows, injections))
         })
         .await;
-        let expected = LiveContext::rebuild(TEST_PREAMBLE.to_string(), &rows, &injections);
+        let expected = LiveContext::rebuild(
+            TEST_PREAMBLE.to_string(),
+            &rows,
+            &injections,
+            &HashMap::new(),
+        );
         assert_eq!(rebuilt, expected.items());
 
         // Rule C2 placement: the injection sits directly after row 2.
@@ -2198,9 +2421,15 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].kind, ContextItemKind::Preamble);
         assert_eq!(items[1].range_tag, Some(RangeTag::single(3)));
-        assert_eq!(items[1].content, "[Alice 22:13] text of m3");
+        assert_eq!(
+            items[1].content,
+            r#"<msg from="Alice" at="22:13" id="3">text of m3</msg>"#
+        );
         assert_eq!(items[2].range_tag, Some(RangeTag::single(4)));
-        assert_eq!(items[2].content, "[Alice 22:13] text of m4");
+        assert_eq!(
+            items[2].content,
+            r#"<msg from="Alice" at="22:13" id="4">text of m4</msg>"#
+        );
         // From the second digest on, prev is the boundary that was
         // current before this digest.
         let session = handle.snapshot().await.expect("snapshot succeeds");
@@ -2305,6 +2534,293 @@ mod tests {
         let session = restarted.snapshot().await.expect("snapshot succeeds");
         assert_eq!(session.prev_digest_boundary_msg_id, Some(2));
         assert_eq!(session.last_digest_boundary_msg_id, 4);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- Reply-target resolution tests (the amendment-2 rendering) ---
+
+    #[tokio::test]
+    async fn reply_to_a_target_pruned_below_the_cutoff_rebuilds_identically() {
+        // The amendment-2 trap, Rule P1 bit-identity: the intake-time
+        // render and the post-restart rebuild render of a reply MUST
+        // produce the same string, resolved through the append-only
+        // raw log — never an in-context index. Here the target X is
+        // pruned from the live context by the Rule C3 removal while
+        // the reply Y stays; the restart rebuild must still render Y
+        // with X's display name and row id.
+        let fixture = make_fixture();
+        let handle = spawn_with_scripted_digest(&fixture, digest_config());
+        // Digest 1: the boundary advances 0 -> 2.
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, false)))
+            .await
+            .expect("send succeeds");
+        wait_for_boundary(&handle, 2).await;
+        // Digest 2: the boundary advances 2 -> 4; the C3 removal at
+        // the previous boundary 2 prunes m1 (the future target) from
+        // the live context.
+        handle
+            .send_event(InboundEvent::Message(message("m3", 3, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m4", 4, false)))
+            .await
+            .expect("send succeeds");
+        wait_for_boundary(&handle, 4).await;
+        // The reply Y to the already-pruned m1 arrives; intake
+        // resolves its target through the raw log, not the context.
+        handle
+            .send_event(InboundEvent::Message(reply_message(
+                "y",
+                5,
+                Some("m1"),
+                false,
+            )))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m6", 6, false)))
+            .await
+            .expect("send succeeds");
+        // Digest 3: the boundary advances 4 -> 6; rows 3-4 leave, Y
+        // (row 5) stays.
+        wait_for_boundary(&handle, 6).await;
+        let before = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[1].range_tag, Some(RangeTag::single(5)));
+        // The live render of Y carries the target's display name and
+        // row id (row 1, "Alice" fixed at intake).
+        assert_eq!(
+            before[1].content,
+            r#"<msg from="Bob" at="22:13" id="5" reply="user" reply_to_name="Alice" reply_to_id="1">text of y</msg>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // Restart. The rebuild cutoff is the previous boundary (4):
+        // the target row 1 is NOT among the rebuilt rows, yet the
+        // full-log lookup still resolves it — bit-identical to the
+        // intake render.
+        let restarted = spawn_with_scripted_digest(&fixture, digest_config());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, before);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_an_edited_message_renders_the_original_row_id_and_display_name() {
+        // `find_reply_target` pins the ORIGINAL logged row (MIN(id))
+        // and the display name fixed at intake: an edit row that
+        // arrives before the reply must not move the reply target
+        // identity.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let mut edited = message("m1", 2, false);
+        edited.sender_display_name = "Alicia".to_string();
+        edited.text = "edited text".to_string();
+        handle
+            .send_event(InboundEvent::EditedMessage(edited))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(reply_message(
+                "y",
+                3,
+                Some("m1"),
+                false,
+            )))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        // The reply renders the ORIGINAL row id (1) and the ORIGINAL
+        // intake display name ("Alice"), not the edit row (2,
+        // "Alicia").
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[3].content,
+            r#"<msg from="Bob" at="22:13" id="3" reply="user" reply_to_name="Alice" reply_to_id="1">text of y</msg>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // Rebuild parity: the restart renders the same reply
+        // attributes.
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, items);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn an_edit_row_that_is_itself_a_reply_renders_reply_attributes() {
+        // The edit path resolves the reply render exactly like the
+        // message path: an edit whose normalized message carries a
+        // reply target renders kind="edit" plus the resolved reply
+        // attributes (flag precedence: kind, then reply).
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let mut edit_reply = message("e1", 2, false);
+        edit_reply.reply_to_platform_msg_id = Some("m1".to_string());
+        edit_reply.text = "edit that replies".to_string();
+        handle
+            .send_event(InboundEvent::EditedMessage(edit_reply))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        assert_eq!(
+            items[2].content,
+            r#"<msg from="Alice" at="22:13" id="2" kind="edit" reply="user" reply_to_name="Alice" reply_to_id="1">edit that replies</msg>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, items);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_the_bot_renders_no_target_attributes() {
+        // Rules A3/B1: outbound rows carry synthetic `bot-out:{nanos}`
+        // ids; a reply to the bot renders `reply="bot"` with NO target
+        // name/id and never attempts a lookup.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(reply_message(
+                "r1",
+                1,
+                Some("bot-out:1700000000000000000"),
+                true,
+            )))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        assert_eq!(
+            items[1].content,
+            r#"<msg from="Bob" at="22:13" id="1" reply="bot">text of r1</msg>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, items);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_an_unknown_platform_id_renders_a_plain_user_reply() {
+        // The target is absent from the log (it predates the bot or
+        // never arrived): the lookup returns None and the reply
+        // renders `reply="user"` with no target attributes.
+        // Deterministic; rebuild-identical.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(reply_message(
+                "r1",
+                1,
+                Some("missing-pid"),
+                false,
+            )))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        assert_eq!(
+            items[1].content,
+            r#"<msg from="Bob" at="22:13" id="1" reply="user">text of r1</msg>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, items);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn username_renders_and_rebuilds_with_and_without_the_attribute() {
+        // The intake append renders `user="..."` only when the
+        // platform provides a username; the rebuild renders the same
+        // from the persisted `sender_username`.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        let mut with_username = message("u1", 1, false);
+        with_username.username = Some("alice_tg".to_string());
+        handle
+            .send_event(InboundEvent::Message(with_username))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("u2", 2, false)))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        assert_eq!(
+            items[1].content,
+            r#"<msg from="Alice" user="alice_tg" at="22:13" id="1">text of u1</msg>"#
+        );
+        assert_eq!(
+            items[2].content,
+            r#"<msg from="Alice" at="22:13" id="2">text of u2</msg>"#
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let rebuilt = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(rebuilt, items);
         restarted.shutdown().await.expect("shutdown succeeds");
     }
 
@@ -2806,7 +3322,12 @@ mod tests {
         let last = items.last().expect("items exist");
         assert_eq!(last.kind, ContextItemKind::BotSpeech);
         assert_eq!(last.role, ContextRole::Assistant);
-        assert_eq!(last.content, "a thoughtful reply");
+        // The `<you>` item of the row (the row timestamp is the same
+        // `now` the append used).
+        assert_eq!(
+            last.content,
+            render_bot_content(bot_row.id, bot_row.timestamp, "a thoughtful reply")
+        );
         assert_eq!(last.range_tag, Some(RangeTag::single(bot_row.id)));
 
         // The wake advanced the tail marker.
@@ -3220,7 +3741,10 @@ mod tests {
         assert_eq!(presented[0].sender_id, "u1");
         assert_eq!(presented[0].text, "text of m1");
         assert_eq!(presented[0].reply_to_platform_msg_id, None);
-        assert_eq!(presented[0].content, "[Alice 22:13] text of m1");
+        assert_eq!(
+            presented[0].content,
+            r#"<msg from="Alice" at="22:13" id="1">text of m1</msg>"#
+        );
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
@@ -3327,6 +3851,112 @@ mod tests {
             None
         );
         assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- Reply-target resolution tests (the amendment-2 rendering) ---
+
+    #[tokio::test]
+    async fn wake_gate_messages_carry_resolved_reply_targets() {
+        // `start_wake` resolves the reply targets of the new inbound
+        // rows in ONE blocking pass (the same store function as
+        // intake), so the gate input renders byte-identically to the
+        // context items — the amendment-2 attention fix reaches the
+        // gate.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("gate reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, false)))
+            .await
+            .expect("send succeeds");
+        handle
+            .send_event(InboundEvent::Message(reply_message(
+                "m3",
+                3,
+                Some("m1"),
+                false,
+            )))
+            .await
+            .expect("send succeeds");
+        wait_for_gate_calls(&gate, 1).await;
+
+        // The third new message presented to the gate renders the
+        // resolved target attributes of m1 (row 1, "Alice").
+        let gate_calls = gate.calls.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(gate_calls.len(), 1);
+        let presented = &gate_calls[0].new_messages;
+        assert_eq!(presented.len(), 3);
+        assert_eq!(presented[2].row_id, 3);
+        assert_eq!(
+            presented[2].content,
+            r#"<msg from="Bob" at="22:13" id="3" reply="user" reply_to_name="Alice" reply_to_id="1">text of m3</msg>"#
+        );
+
+        // The reply goes out targeting the last new message.
+        let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "gate reply");
+        assert_eq!(reply_to, Some("m3".to_string()));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_forcing_reply_mention_renders_the_resolved_target_in_the_gate_message() {
+        // The forcing gate message reuses the SAME resolved
+        // `ReplyRender` as the context append (computed once): the
+        // reply model's target view and the live context item of the
+        // forcing row render identically.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("forced reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(100),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let mut forcing = reply_message("m2", 2, Some("m1"), false);
+        forcing.mentions_bot = true;
+        handle
+            .send_event(InboundEvent::Message(forcing))
+            .await
+            .expect("send succeeds");
+        wait_for_reply_calls(&reply, 1).await;
+
+        // The reply model saw the forcing gate message with the
+        // resolved target AND the mention flag.
+        let requests = reply.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].target.content,
+            r#"<msg from="Bob" at="22:13" id="2" reply="user" reply_to_name="Alice" reply_to_id="1" mention="bot">text of m2</msg>"#
+        );
+        let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "forced reply");
+        assert_eq!(reply_to, Some("m2".to_string()));
+
+        // The context item of the forcing row renders identically.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items[2].content, requests[0].target.content);
         handle.shutdown().await.expect("shutdown succeeds");
     }
 }
