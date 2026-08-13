@@ -62,13 +62,18 @@ pub fn context_messages_to_rig(messages: &[ContextMessage]) -> (Option<String>, 
 /// This instruction is part of the reply CALL input only. It is never
 /// appended to the live context: the live context holds group speech
 /// and bot speech (Section 7.1), not per-call scaffolding.
+///
+/// The F2 tail sentence stays in sync with the outbound parrot filter
+/// of tamako-core (decision 59 F1): the filter strips `I remember:`
+/// lines, `<memory>` blocks, and `<summary>` blocks from the reply
+/// text, and the instruction names the same shapes.
 pub fn render_reply_instruction(target: &GateMessage) -> String {
     format!(
         "Reply to THIS message (id {}): {}\n\
          Reply as the group pet persona. Write only the reply text: \
          one message, no speaker label, no quotes. \
-         Never write \"I remember:\" lines, <memory> blocks, or a memory list: recalled \
-         memories are context, never speech.",
+         Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, or a memory list: \
+         recalled memories are context, never speech.",
         target.row_id, target.content
     )
 }
@@ -372,7 +377,7 @@ mod tests {
         // (Rule C4 cache anchor) is untouched.
         let instruction = render_reply_instruction(&sample_target());
         assert!(instruction
-            .contains("Never write \"I remember:\" lines, <memory> blocks, or a memory list"));
+            .contains("Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, or a memory list"));
         assert!(instruction.contains("recalled memories are context, never speech"));
     }
 
@@ -388,7 +393,7 @@ mod tests {
             "\n",
             "Reply as the group pet persona. Write only the reply text: ",
             "one message, no speaker label, no quotes. ",
-            "Never write \"I remember:\" lines, <memory> blocks, or a memory list: ",
+            "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, or a memory list: ",
             "recalled memories are context, never speech.",
         );
         assert_eq!(render_reply_instruction(&sample_target()), expected);

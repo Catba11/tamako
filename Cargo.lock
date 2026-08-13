@@ -2573,6 +2573,7 @@ dependencies = [
  "tamako-adapter-mock",
  "tamako-core",
  "tamako-memory",
+ "tamako-persona",
  "tamako-store",
  "tempfile",
  "thiserror",

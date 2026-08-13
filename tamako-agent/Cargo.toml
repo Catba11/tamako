@@ -7,6 +7,9 @@ edition = "2021"
 tamako-core.workspace = true
 tamako-store.workspace = true
 tamako-memory.workspace = true
+# The shared context-format gloss of decision 61 (gate and recall
+# preambles). tamako-persona is a leaf crate: acyclic (AGENT.md Section 4).
+tamako-persona.workspace = true
 # LLM client. Structured extraction is a completion request with an
 # output schema (rig-core 0.41 has no Extractor type).
 rig.workspace = true
