@@ -410,6 +410,7 @@ fn message(
         timestamp: at,
         sender_id: sender_id.to_string(),
         sender_display_name: name.to_string(),
+        username: None,
         text: text.to_string(),
         reply_to_platform_msg_id: None,
         mentions_bot: false,

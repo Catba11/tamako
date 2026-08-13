@@ -30,6 +30,7 @@
 //! subsumed here: the queued `Shutdown` drains the inbox, so the join
 //! proves every intake landed.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -110,6 +111,7 @@ fn message(id: &str, seconds: i64, sender_id: &str, name: &str, text: &str) -> N
         timestamp: t0() + time::Duration::seconds(seconds),
         sender_id: sender_id.to_string(),
         sender_display_name: name.to_string(),
+        username: None,
         text: text.to_string(),
         reply_to_platform_msg_id: None,
         mentions_bot: false,
@@ -131,6 +133,7 @@ fn tail_message(
         timestamp: datetime!(2026-08-01 13:16 UTC) + time::Duration::seconds(seconds),
         sender_id: sender_id.to_string(),
         sender_display_name: name.to_string(),
+        username: None,
         text: text.to_string(),
         reply_to_platform_msg_id: None,
         mentions_bot: false,
@@ -267,14 +270,36 @@ async fn store_rows_after(fixture: &Fixture, after_id: i64) -> Vec<MessageRow> {
     .await
 }
 
-/// The speaker label of specs.md Section 7.2 step 4, rendered by the
-/// test from a persisted raw-log row.
-fn expected_label(display_name: &str, timestamp: OffsetDateTime, text: &str) -> String {
-    let hhmm = timestamp
+/// The XML speaker label of specs.md Section 7.2 step 4, rendered by the
+/// test from a persisted raw-log row. The fixture rows carry no username
+/// and no resolvable user-reply targets, so only the edit, bot-reply,
+/// and mention attributes can appear; the texts have no special
+/// characters, so the unescaped form is exact here.
+fn expected_label(row: &MessageRow) -> String {
+    let hhmm = row
+        .timestamp
         .to_offset(UtcOffset::UTC)
         .format(HHMM_FORMAT)
         .expect("the replay timestamps format");
-    format!("[{display_name} {hhmm}] {text}")
+    let kind = if row.event_type == EventType::Edit {
+        " kind=\"edit\""
+    } else {
+        ""
+    };
+    let reply = if row.is_reply_to_bot {
+        " reply=\"bot\""
+    } else {
+        ""
+    };
+    let mention = if row.mentions_bot {
+        " mention=\"bot\""
+    } else {
+        ""
+    };
+    format!(
+        "<msg from=\"{}\" at=\"{}\" id=\"{}\"{}{}{}>{}</msg>",
+        row.sender_display_name, hhmm, row.id, kind, reply, mention, row.text
+    )
 }
 
 /// Asserts the Rule C4 item 0.
@@ -290,10 +315,7 @@ fn assert_preamble(item: &ContextItem) {
 fn assert_human_row_item(item: &ContextItem, row: &MessageRow) {
     assert_eq!(item.kind, ContextItemKind::HumanMessage);
     assert_eq!(item.role, ContextRole::User);
-    assert_eq!(
-        item.content,
-        expected_label(&row.sender_display_name, row.timestamp, &row.text)
-    );
+    assert_eq!(item.content, expected_label(row));
     assert_eq!(item.range_tag, Some(RangeTag::single(row.id)));
 }
 
@@ -629,7 +651,12 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
         2,
         "the injection rows survive: nothing is pruned before a second digest"
     );
-    let expected = LiveContext::rebuild(TEST_PREAMBLE.to_string(), &rows, &injections);
+    let expected = LiveContext::rebuild(
+        TEST_PREAMBLE.to_string(),
+        &rows,
+        &injections,
+        &HashMap::new(),
+    );
     let rebuilt = restarted
         .context_snapshot()
         .await
@@ -691,7 +718,12 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
         Ok((rows, injections))
     })
     .await;
-    let expected = LiveContext::rebuild(TEST_PREAMBLE.to_string(), &rows, &injections);
+    let expected = LiveContext::rebuild(
+        TEST_PREAMBLE.to_string(),
+        &rows,
+        &injections,
+        &HashMap::new(),
+    );
     let before_shutdown = restarted
         .context_snapshot()
         .await

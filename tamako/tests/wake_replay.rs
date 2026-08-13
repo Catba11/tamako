@@ -23,7 +23,7 @@ use tamako_core::actor::{
 };
 use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::TriggerConfig;
-use tamako_core::context::ContextItemKind;
+use tamako_core::context::{render_bot_content, ContextItemKind};
 use tamako_core::event::{InboundEvent, NormalizedMessage, OutboundAction};
 use tamako_core::session::SessionState;
 use tamako_core::wake::{GateDecision, NoopRecall, WakeServices};
@@ -306,6 +306,7 @@ fn message(id: &str, at: OffsetDateTime, mention: bool) -> NormalizedMessage {
         timestamp: at,
         sender_id: "u1".to_string(),
         sender_display_name: "Alice".to_string(),
+        username: None,
         text: format!("text of {id}"),
         reply_to_platform_msg_id: None,
         mentions_bot: mention,
@@ -431,7 +432,11 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
         .filter(|item| item.kind == ContextItemKind::BotSpeech)
         .map(|item| item.content.as_str())
         .collect();
-    assert_eq!(bot_speeches, vec!["r1", "r2", "r3"]);
+    let expected: Vec<String> = outbound
+        .iter()
+        .map(|row| render_bot_content(row.id, row.timestamp, &row.text))
+        .collect();
+    assert_eq!(bot_speeches, expected);
     // The gate ran exactly once (the two forced wakes bypass it,
     // Section 8.1), over the new messages of the threshold wake.
     let inputs = harness.gate.inputs();
@@ -870,7 +875,8 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
     assert_eq!(outbound.len(), 1);
     assert_eq!(outbound[0].text, "在的");
     assert_eq!(outbound[0].reply_to_platform_msg_id.as_deref(), Some("f2"));
-    // Rule C1: the context bot speech is the filtered text too.
+    // Rule C1: the context bot speech is the filtered text too, wrapped
+    // by the Section 7.2 step 4 bot-speech renderer.
     let context = harness
         .handle
         .context_snapshot()
@@ -881,7 +887,9 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
         .filter(|item| item.kind == ContextItemKind::BotSpeech)
         .map(|item| item.content.as_str())
         .collect();
-    assert_eq!(bot_speeches, vec!["在的"]);
+    let expected_speech =
+        render_bot_content(outbound[0].id, outbound[0].timestamp, &outbound[0].text);
+    assert_eq!(bot_speeches, vec![expected_speech.as_str()]);
     wait_for_counter(&fixture.store, "wakes_total", "2").await;
     // Only the stripped-remainder send counts as a participation; the
     // parrot-only wake failed like an empty reply.

@@ -8,7 +8,8 @@
 //!
 //! Coverage:
 //! - Section 9.4 / Rule C2: a wake with a graph hit appends exactly one
-//!   "I remember: ..." RecallInjection assistant item at the tail row
+//!   "I remember: ..." — since the XML context rendering round, a
+//!   "<memory>...</memory>" RecallInjection assistant item at the tail row
 //!   of the wake, writes one `injected_memories` row per edge id, and
 //!   bumps `injection_wakes_total`;
 //! - Section 9.6: the injection rides the gate input (the "Injected
@@ -91,6 +92,7 @@ fn message(id: &str, seconds: i64, sender_id: &str, name: &str, text: &str) -> N
         timestamp: t0() + time::Duration::seconds(seconds),
         sender_id: sender_id.to_string(),
         sender_display_name: name.to_string(),
+        username: None,
         text: text.to_string(),
         reply_to_platform_msg_id: None,
         mentions_bot: false,
@@ -544,7 +546,7 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
     wait_for_counter(&fixture.store, "injection_wakes_total", "1").await;
 
     // (a) Rule C2 / Section 9.4: exactly one RecallInjection assistant
-    // item, content "I remember: Alice likes tea.", at the tail row 3.
+    // item, content "<memory>Alice likes tea.</memory>", at the tail row 3.
     let context = handle
         .context_snapshot()
         .await
@@ -553,7 +555,7 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
     assert_eq!(injections.len(), 1);
     let injection = injections[0];
     assert_eq!(injection.role, ContextRole::Assistant);
-    assert_eq!(injection.content, "I remember: Alice likes tea.");
+    assert_eq!(injection.content, "<memory>Alice likes tea.</memory>");
     assert_eq!(injection.range_tag, Some(RangeTag::single(3)));
 
     // (b) Section 9.3 / specs.md Section 5.2: one injected_memories row
@@ -563,7 +565,7 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
     assert_eq!(rows[0].edge_id, tea_edge_id);
     assert_eq!(rows[0].injection_position, 3);
     assert_eq!(rows[0].range_tag, "3-3");
-    assert_eq!(rows[0].content, "I remember: Alice likes tea.");
+    assert_eq!(rows[0].content, "<memory>Alice likes tea.</memory>");
 
     // (c) Section 9.6: the injection rides the gate input (the
     // "Injected memories" section of the gate prompt).
@@ -571,7 +573,7 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
     assert_eq!(gate_inputs.len(), 1);
     assert_eq!(
         gate_inputs[0].injections,
-        vec!["I remember: Alice likes tea.".to_string()]
+        vec!["<memory>Alice likes tea.</memory>".to_string()]
     );
     assert!(!gate_inputs[0].forced);
     // ... and the reply-model snapshot (Section 9 step 4, Rule C2 tail
@@ -581,7 +583,7 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
     assert!(
         requests[0].messages.iter().any(|message| {
             message.role == ContextRole::Assistant
-                && message.content == "I remember: Alice likes tea."
+                && message.content == "<memory>Alice likes tea.</memory>"
         }),
         "the reply-model snapshot carries the injection"
     );
@@ -839,7 +841,7 @@ async fn a_restart_rebuilds_the_injection_bit_identically() {
     assert_eq!(injections.len(), 1);
     assert_eq!(injections[0].kind, ContextItemKind::RecallInjection);
     assert_eq!(injections[0].role, ContextRole::Assistant);
-    assert_eq!(injections[0].content, "I remember: Alice likes tea.");
+    assert_eq!(injections[0].content, "<memory>Alice likes tea.</memory>");
     assert_eq!(injections[0].range_tag, Some(RangeTag::single(3)));
 
     restarted
@@ -1036,14 +1038,14 @@ async fn the_digest_prunes_injection_rows_at_the_boundary() {
     assert_eq!(rows[0].edge_id, tea_edge_id);
     assert_eq!(rows[0].injection_position, 8);
     assert_eq!(rows[0].range_tag, "8-8");
-    assert_eq!(rows[0].content, "I remember: Zed likes tea.");
+    assert_eq!(rows[0].content, "<memory>Zed likes tea.</memory>");
     let context = handle
         .context_snapshot()
         .await
         .expect("the context snapshot");
     let injections = recall_injections(&context);
     assert_eq!(injections.len(), 1);
-    assert_eq!(injections[0].content, "I remember: Zed likes tea.");
+    assert_eq!(injections[0].content, "<memory>Zed likes tea.</memory>");
     assert_eq!(injections[0].range_tag, Some(RangeTag::single(8)));
     // The relevance gate saw the re-resolved candidate (call 2).
     assert_eq!(doubles.relevance.call_count(), 2);
@@ -1157,7 +1159,7 @@ async fn a_chinese_ngram_matching_an_alias_flows_end_to_end() {
     assert_eq!(candidates[1].relationship_name, "known_as");
 
     // (b) Rule C2 / Section 9.4: exactly one RecallInjection assistant
-    // item, content "I remember: 小明喜欢吃辣。", at the tail row 3.
+    // item, content "<memory>小明喜欢吃辣。</memory>", at the tail row 3.
     let context = handle
         .context_snapshot()
         .await
@@ -1166,7 +1168,7 @@ async fn a_chinese_ngram_matching_an_alias_flows_end_to_end() {
     assert_eq!(injections.len(), 1);
     let injection = injections[0];
     assert_eq!(injection.role, ContextRole::Assistant);
-    assert_eq!(injection.content, "I remember: 小明喜欢吃辣。");
+    assert_eq!(injection.content, "<memory>小明喜欢吃辣。</memory>");
     assert_eq!(injection.range_tag, Some(RangeTag::single(3)));
 
     // (c) Section 9.3 / specs.md Section 5.2: exactly one
@@ -1176,7 +1178,7 @@ async fn a_chinese_ngram_matching_an_alias_flows_end_to_end() {
     assert_eq!(rows[0].edge_id, fact_edge_id);
     assert_eq!(rows[0].injection_position, 3);
     assert_eq!(rows[0].range_tag, "3-3");
-    assert_eq!(rows[0].content, "I remember: 小明喜欢吃辣。");
+    assert_eq!(rows[0].content, "<memory>小明喜欢吃辣。</memory>");
 
     // (d) Section 9.6: the injection rides the gate input and the
     // reply-model snapshot.
@@ -1184,14 +1186,14 @@ async fn a_chinese_ngram_matching_an_alias_flows_end_to_end() {
     assert_eq!(gate_inputs.len(), 1);
     assert_eq!(
         gate_inputs[0].injections,
-        vec!["I remember: 小明喜欢吃辣。".to_string()]
+        vec!["<memory>小明喜欢吃辣。</memory>".to_string()]
     );
     let requests = doubles.reply.requests();
     assert_eq!(requests.len(), 1);
     assert!(
         requests[0].messages.iter().any(|message| {
             message.role == ContextRole::Assistant
-                && message.content == "I remember: 小明喜欢吃辣。"
+                && message.content == "<memory>小明喜欢吃辣。</memory>"
         }),
         "the reply-model snapshot carries the injection"
     );
