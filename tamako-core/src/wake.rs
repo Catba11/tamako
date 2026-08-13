@@ -26,7 +26,7 @@ pub struct GateMessage {
     pub row_id: i64,
     /// The platform-side message id.
     pub platform_msg_id: String,
-    /// The rendered speaker-label content (Section 7.2 step 4).
+    /// The rendered XML item content (specs.md Section 7.3).
     pub content: String,
     /// The sender id of the message (recall entry resolution,
     /// proposed-graph-database-specs.md Section 8.1 step 1).
@@ -34,7 +34,7 @@ pub struct GateMessage {
     /// The platform id of the reply target, when the message is a reply.
     pub reply_to_platform_msg_id: Option<String>,
     /// The raw message text (recall term tokenization). `content`
-    /// stays the rendered speaker-label form of Section 7.2 step 4.
+    /// stays the rendered XML item form of specs.md Section 7.3.
     pub text: String,
 }
 

@@ -22,7 +22,7 @@ use time::{OffsetDateTime, UtcOffset};
 use tamako_store::{Direction, EventType, InjectedMemoryRow, MessageRow, ReplyTargetRow};
 
 /// The UTC HH:MM format of the timestamp attributes (specs.md
-/// Section 7.2 step 4).
+/// Section 7.3).
 const HHMM_FORMAT: &[time::format_description::FormatItem<'_>] =
     format_description!("[hour]:[minute]");
 

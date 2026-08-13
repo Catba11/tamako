@@ -3,8 +3,8 @@
 //! backend, driven through the REAL actor with a scripted extractor.
 //!
 //! Coverage:
-//! - Rule C1 / Section 7.2 step 4: intake appends User items with the
-//!   `[{display_name} {HH:MM}] {text}` speaker label (UTC);
+//! - Rule C1 / Section 7.3: intake appends User items in the XML
+//!   `<msg>` rendering (UTC);
 //! - Rule C4: item 0 is the preamble;
 //! - Rule C3 / Section 7.1: a completed digest removes only the items at
 //!   or below the PREVIOUS boundary (the one-chunk lag);
@@ -75,8 +75,8 @@ const DIGEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// The poll interval of `wait_for_boundary` and `wait_for_first_outcome`.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// The UTC HH:MM format of the speaker label (specs.md Section 7.2
-/// step 4). The test re-renders the label independently of the
+/// The UTC HH:MM format of the timestamp attributes (specs.md
+/// Section 7.3). The test re-renders the label independently of the
 /// implementation renderer.
 const HHMM_FORMAT: &[time::format_description::FormatItem<'_>] =
     format_description!("[hour]:[minute]");
@@ -270,7 +270,7 @@ async fn store_rows_after(fixture: &Fixture, after_id: i64) -> Vec<MessageRow> {
     .await
 }
 
-/// The XML speaker label of specs.md Section 7.2 step 4, rendered by the
+/// The XML speaker label of specs.md Section 7.3, rendered by the
 /// test from a persisted raw-log row. The fixture rows carry no username
 /// and no resolvable user-reply targets, so only the edit, bot-reply,
 /// and mention attributes can appear; the texts have no special
