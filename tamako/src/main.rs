@@ -20,7 +20,7 @@ use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
-    RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, ShallowRecall,
+    RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, RigSummary, ShallowRecall,
 };
 use tamako_core::actor::{
     spawn_group_actor, GroupActorHandle, GroupActorParams, DEFAULT_INBOX_CAPACITY,
@@ -29,6 +29,7 @@ use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::{BotConfig, TriggerConfig};
 use tamako_core::digest::DigestPipeline;
 use tamako_core::event::OutboundAction;
+use tamako_core::summary::SummaryProvider;
 use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
 use tamako_memory::LbugBackend;
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
@@ -288,16 +289,20 @@ fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
         digest_model: config.digest_model.clone(),
         gate_model: config.gate_model.clone(),
         reply_model: config.reply_model.clone(),
+        summary_model: config.summary_model.clone(),
         digest_llm_api: config.digest_llm_api.clone(),
         digest_llm_base_url: config.digest_llm_base_url.clone(),
         gate_llm_api: config.gate_llm_api.clone(),
         gate_llm_base_url: config.gate_llm_base_url.clone(),
         reply_llm_api: config.reply_llm_api.clone(),
         reply_llm_base_url: config.reply_llm_base_url.clone(),
+        summary_llm_api: config.summary_llm_api.clone(),
+        summary_llm_base_url: config.summary_llm_base_url.clone(),
         structured_output: config.structured_output.clone(),
         digest_structured_output: config.digest_structured_output.clone(),
         gate_structured_output: config.gate_structured_output.clone(),
         reply_structured_output: config.reply_structured_output.clone(),
+        summary_structured_output: config.summary_structured_output.clone(),
     }
 }
 
@@ -340,6 +345,28 @@ fn build_digest_pipeline(
             Ok(None)
         }
         Err(error) => Err(error).context("failed to build the digest pipeline"),
+    }
+}
+
+/// Builds the Rule C3 summarizer (specs.md Section 10, keep-two
+/// summary retention) for the resolved summary endpoint. `Ok(None)`
+/// means the summarizer is disabled for this run: the actor keeps the
+/// old-style C3 removal, so the removed chunk drops without a summary.
+/// A missing family API key (`EndpointClient::build` reports it as
+/// `AgentError::ProviderConfig`, either family) degrades to `None`
+/// with a warning; every other build error propagates.
+fn build_summary_provider(endpoint: &EndpointConfig) -> Result<Option<Arc<dyn SummaryProvider>>> {
+    let model = endpoint.model.clone();
+    match RigSummary::from_endpoint(endpoint) {
+        Ok(summary) => {
+            info!(model = %model, "Rule C3 summarizer wired (live segmented summaries)");
+            Ok(Some(Arc::new(summary)))
+        }
+        Err(AgentError::ProviderConfig(error)) => {
+            warn!(%error, "Rule C3 summarizer disabled: no provider configuration; removed chunks drop without a summary");
+            Ok(None)
+        }
+        Err(error) => Err(error).context("failed to build the Rule C3 summarizer"),
     }
 }
 
@@ -496,6 +523,10 @@ async fn run_replay(
         &endpoints,
         group_config.recall_injection_cap,
     )?;
+    // The Rule C3 summarizer (decision 62). A missing family API key
+    // degrades to the old C3 behavior (drop without a summary) with one
+    // startup warning inside `build_summary_provider`.
+    let summary_provider = build_summary_provider(&endpoints.summary)?;
     let handle = spawn_group_actor(GroupActorParams {
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
@@ -510,7 +541,7 @@ async fn run_replay(
         // stays a seam for observers that need no actor state.
         post_digest_hook: None,
         wake,
-        summary_provider: None,
+        summary_provider,
         outbound: Some(outbound_tx),
         bot_name: Some(setup.bot_name.clone()),
     });
@@ -975,6 +1006,16 @@ async fn run_live(
                                     break;
                                 }
                             };
+                            // The Rule C3 summarizer (decision 62), as
+                            // in the replay path.
+                            let summary_provider =
+                                match build_summary_provider(&endpoints.summary) {
+                                    Ok(summary) => summary,
+                                    Err(error) => {
+                                        fatal = Some(error);
+                                        break;
+                                    }
+                                };
                             info!(chat_id = %chat_id, "first event of a configured group; spawning the actor");
                             entry.insert(spawn_group_actor(GroupActorParams {
                                 chat_id: chat_id.clone(),
@@ -989,7 +1030,7 @@ async fn run_live(
                                 digest,
                                 post_digest_hook: None,
                                 wake,
-                                summary_provider: None,
+                                summary_provider,
                                 outbound: Some(outbound_tx.clone()),
                                 bot_name: Some(setup.bot_name.clone()),
                             }))

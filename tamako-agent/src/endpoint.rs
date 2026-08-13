@@ -4,8 +4,9 @@
 //! uses one of two API families: `anthropic-compatible` or
 //! `openai-compatible`. 'Compatible' describes the wire format only, never
 //! the vendor." The base URL and the model names are configuration items.
-//! A purpose (`digest`, `gate`, `reply`) may override `llm_api` and
-//! `llm_base_url` individually; mixed deployments are legal.
+//! A purpose (`digest`, `gate`, `reply`, `summary`) may override
+//! `llm_api` and `llm_base_url` individually; mixed deployments are
+//! legal.
 //!
 //! Resolution inputs are the plain data struct [`LlmConfigValues`]. This
 //! keeps resolution decoupled from tamako-core's TriggerConfig; a later
@@ -108,6 +109,22 @@ pub const GATE_MODEL_ENV_VAR: &str = "TAMAKO_GATE_MODEL";
 /// Environment override of the reply model (specs.md Section 13).
 pub const REPLY_MODEL_ENV_VAR: &str = "TAMAKO_REPLY_MODEL";
 
+/// Environment override of the summary model (specs.md Section 13,
+/// reported for spec backfill with the `summary_*` keys).
+pub const SUMMARY_MODEL_ENV_VAR: &str = "TAMAKO_SUMMARY_MODEL";
+
+/// Environment override of the summary API family (specs.md Section 13,
+/// reported for spec backfill with the `summary_*` keys). The summary
+/// purpose alone has per-purpose api/base URL env vars (the S3
+/// deployment contract); the other purposes keep the global
+/// `TAMAKO_LLM_API` / `TAMAKO_LLM_BASE_URL` overrides only.
+pub const SUMMARY_LLM_API_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_API";
+
+/// Environment override of the summary base URL (specs.md Section 13,
+/// reported for spec backfill with the `summary_*` keys). Refer to
+/// [`SUMMARY_LLM_API_ENV_VAR`].
+pub const SUMMARY_LLM_BASE_URL_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_BASE_URL";
+
 /// Environment override of the session id of the endpoint, sent as the
 /// `x-opencode-session` header (Opencode Go gateway session affinity;
 /// provider prompt-cache affinity). Global-only.
@@ -131,6 +148,9 @@ pub const GATE_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_GATE_STRUCTURED_OUTPUT"
 /// Environment override of the reply structured-output mode.
 pub const REPLY_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_REPLY_STRUCTURED_OUTPUT";
 
+/// Environment override of the summary structured-output mode.
+pub const SUMMARY_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_SUMMARY_STRUCTURED_OUTPUT";
+
 /// API key env var of the anthropic-compatible family (specs.md
 /// Section 13: API keys come from the environment only).
 pub const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
@@ -148,6 +168,12 @@ pub const DEFAULT_GATE_MODEL: &str = anthropic::completion::CLAUDE_HAIKU_4_5;
 /// rig-core 0.41.0 has no `CLAUDE_SONNET_4_5` constant (only
 /// `CLAUDE_SONNET_4_6`), so this is a string literal.
 pub const DEFAULT_REPLY_MODEL: &str = "claude-sonnet-4-5";
+
+/// The default summary model (cheap tier: the segmented summarizer of
+/// the Rule C3 removed chunk, specs.md Section 10). The same cheap
+/// model as the gate. Reported for spec backfill with the
+/// `summary_*` keys.
+pub const DEFAULT_SUMMARY_MODEL: &str = anthropic::completion::CLAUDE_HAIKU_4_5;
 
 /// The API family of an endpoint (specs.md Section 13). The family
 /// selects the wire format only, not the vendor.
@@ -267,6 +293,9 @@ pub enum LlmPurpose {
     Gate,
     /// Reply generation (specs.md Section 9, step 4).
     Reply,
+    /// Segmented context summarization of the Rule C3 removed chunk
+    /// (specs.md Section 10, keep-two retention). Cheap tier.
+    Summary,
 }
 
 impl LlmPurpose {
@@ -276,6 +305,7 @@ impl LlmPurpose {
             LlmPurpose::Digest => "digest",
             LlmPurpose::Gate => "gate",
             LlmPurpose::Reply => "reply",
+            LlmPurpose::Summary => "summary",
         }
     }
 
@@ -285,6 +315,7 @@ impl LlmPurpose {
             LlmPurpose::Digest => DIGEST_MODEL_ENV_VAR,
             LlmPurpose::Gate => GATE_MODEL_ENV_VAR,
             LlmPurpose::Reply => REPLY_MODEL_ENV_VAR,
+            LlmPurpose::Summary => SUMMARY_MODEL_ENV_VAR,
         }
     }
 
@@ -294,6 +325,7 @@ impl LlmPurpose {
             LlmPurpose::Digest => DEFAULT_DIGEST_MODEL,
             LlmPurpose::Gate => DEFAULT_GATE_MODEL,
             LlmPurpose::Reply => DEFAULT_REPLY_MODEL,
+            LlmPurpose::Summary => DEFAULT_SUMMARY_MODEL,
         }
     }
 
@@ -304,6 +336,29 @@ impl LlmPurpose {
             LlmPurpose::Digest => DIGEST_STRUCTURED_OUTPUT_ENV_VAR,
             LlmPurpose::Gate => GATE_STRUCTURED_OUTPUT_ENV_VAR,
             LlmPurpose::Reply => REPLY_STRUCTURED_OUTPUT_ENV_VAR,
+            LlmPurpose::Summary => SUMMARY_STRUCTURED_OUTPUT_ENV_VAR,
+        }
+    }
+
+    /// The env var that overrides the API family of the purpose.
+    /// `None` for digest, gate, and reply: those purposes keep the
+    /// global `TAMAKO_LLM_API` override only (refer to
+    /// [`SUMMARY_LLM_API_ENV_VAR`]).
+    fn llm_api_env_var(&self) -> Option<&'static str> {
+        match self {
+            LlmPurpose::Summary => Some(SUMMARY_LLM_API_ENV_VAR),
+            _ => None,
+        }
+    }
+
+    /// The env var that overrides the base URL of the purpose. `None`
+    /// for digest, gate, and reply: those purposes keep the global
+    /// `TAMAKO_LLM_BASE_URL` override only (refer to
+    /// [`SUMMARY_LLM_BASE_URL_ENV_VAR`]).
+    fn llm_base_url_env_var(&self) -> Option<&'static str> {
+        match self {
+            LlmPurpose::Summary => Some(SUMMARY_LLM_BASE_URL_ENV_VAR),
+            _ => None,
         }
     }
 }
@@ -322,7 +377,7 @@ pub struct EndpointConfig {
     pub structured_output: StructuredOutputMode,
     /// The resolved session id, sent as the `x-opencode-session`
     /// header on every request of the client (global-only; the same
-    /// value in all three purposes). Never empty: resolution falls
+    /// value in every purpose). Never empty: resolution falls
     /// back to [`DEFAULT_SESSION_ID`].
     pub session_id: String,
 }
@@ -346,6 +401,8 @@ pub struct LlmConfigValues {
     pub gate_model: Option<String>,
     /// Reply model (`reply_model`).
     pub reply_model: Option<String>,
+    /// Summary model (`summary_model`, reported for spec backfill).
+    pub summary_model: Option<String>,
     /// Digest-specific API family (`digest_llm_api`).
     pub digest_llm_api: Option<String>,
     /// Digest-specific base URL (`digest_llm_base_url`).
@@ -358,6 +415,12 @@ pub struct LlmConfigValues {
     pub reply_llm_api: Option<String>,
     /// Reply-specific base URL (`reply_llm_base_url`).
     pub reply_llm_base_url: Option<String>,
+    /// Summary-specific API family (`summary_llm_api`, reported for
+    /// spec backfill).
+    pub summary_llm_api: Option<String>,
+    /// Summary-specific base URL (`summary_llm_base_url`, reported for
+    /// spec backfill).
+    pub summary_llm_base_url: Option<String>,
     /// Global structured-output mode (`structured_output`).
     pub structured_output: Option<String>,
     /// Digest-specific structured-output mode
@@ -368,6 +431,9 @@ pub struct LlmConfigValues {
     /// Reply-specific structured-output mode
     /// (`reply_structured_output`).
     pub reply_structured_output: Option<String>,
+    /// Summary-specific structured-output mode
+    /// (`summary_structured_output`, reported for spec backfill).
+    pub summary_structured_output: Option<String>,
 }
 
 impl LlmConfigValues {
@@ -377,6 +443,7 @@ impl LlmConfigValues {
             LlmPurpose::Digest => self.digest_llm_api.as_deref(),
             LlmPurpose::Gate => self.gate_llm_api.as_deref(),
             LlmPurpose::Reply => self.reply_llm_api.as_deref(),
+            LlmPurpose::Summary => self.summary_llm_api.as_deref(),
         };
         value.filter(|value| !value.is_empty())
     }
@@ -387,6 +454,7 @@ impl LlmConfigValues {
             LlmPurpose::Digest => self.digest_llm_base_url.as_deref(),
             LlmPurpose::Gate => self.gate_llm_base_url.as_deref(),
             LlmPurpose::Reply => self.reply_llm_base_url.as_deref(),
+            LlmPurpose::Summary => self.summary_llm_base_url.as_deref(),
         };
         value.filter(|value| !value.is_empty())
     }
@@ -397,6 +465,7 @@ impl LlmConfigValues {
             LlmPurpose::Digest => self.digest_model.as_deref(),
             LlmPurpose::Gate => self.gate_model.as_deref(),
             LlmPurpose::Reply => self.reply_model.as_deref(),
+            LlmPurpose::Summary => self.summary_model.as_deref(),
         };
         value.filter(|value| !value.is_empty())
     }
@@ -407,6 +476,7 @@ impl LlmConfigValues {
             LlmPurpose::Digest => self.digest_structured_output.as_deref(),
             LlmPurpose::Gate => self.gate_structured_output.as_deref(),
             LlmPurpose::Reply => self.reply_structured_output.as_deref(),
+            LlmPurpose::Summary => self.summary_structured_output.as_deref(),
         };
         value.filter(|value| !value.is_empty())
     }
@@ -417,7 +487,7 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// The resolved endpoints of the three purposes.
+/// The resolved endpoints of the four purposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmEndpoints {
     /// The digest extraction endpoint.
@@ -426,19 +496,24 @@ pub struct LlmEndpoints {
     pub gate: EndpointConfig,
     /// The reply generation endpoint.
     pub reply: EndpointConfig,
+    /// The segmented summarizer endpoint (the Rule C3 removed chunk).
+    pub summary: EndpointConfig,
 }
 
 impl LlmEndpoints {
-    /// Resolves the three endpoints from the config values and the
+    /// Resolves the four endpoints from the config values and the
     /// environment (specs.md Section 13). Precedence per purpose:
     ///
     /// - API family: env `TAMAKO_LLM_API` → purpose config
     ///   (`digest_llm_api` etc.) → global config `llm_api` → default
-    ///   `anthropic-compatible`. An unparsable string (env or config) is
+    ///   `anthropic-compatible`. The summary purpose adds one higher
+    ///   step: `TAMAKO_SUMMARY_LLM_API` wins over `TAMAKO_LLM_API`.
+    ///   An unparsable string (env or config) is
     ///   `AgentError::ProviderConfig`, never a silent default.
     /// - Base URL: env `TAMAKO_LLM_BASE_URL` → purpose config → global
     ///   config `llm_base_url` → `None` (the canonical default of the
-    ///   family).
+    ///   family). The summary purpose adds one higher step:
+    ///   `TAMAKO_SUMMARY_LLM_BASE_URL` wins over `TAMAKO_LLM_BASE_URL`.
     /// - Model: purpose env (`TAMAKO_DIGEST_MODEL` etc.) → purpose
     ///   config (`digest_model` etc.) → the purpose default.
     /// - Structured-output mode: purpose env
@@ -448,8 +523,8 @@ impl LlmEndpoints {
     ///   `structured_output` → default `schema`. An unparsable string
     ///   (env or config) is `AgentError::ProviderConfig`, never a
     ///   silent default.
-    /// - Session id (global-only, the same value in all three
-    ///   purposes): env `TAMAKO_LLM_SESSION_ID` → global config
+    /// - Session id (global-only, the same value in every purpose):
+    ///   env `TAMAKO_LLM_SESSION_ID` → global config
     ///   `llm_session_id` → default [`DEFAULT_SESSION_ID`].
     ///
     /// Empty strings count as unset, in env and config alike.
@@ -458,6 +533,7 @@ impl LlmEndpoints {
             digest: Self::resolve_purpose(LlmPurpose::Digest, values)?,
             gate: Self::resolve_purpose(LlmPurpose::Gate, values)?,
             reply: Self::resolve_purpose(LlmPurpose::Reply, values)?,
+            summary: Self::resolve_purpose(LlmPurpose::Summary, values)?,
         })
     }
 
@@ -465,7 +541,10 @@ impl LlmEndpoints {
         purpose: LlmPurpose,
         values: &LlmConfigValues,
     ) -> Result<EndpointConfig, AgentError> {
-        let api_string = env_value(LLM_API_ENV_VAR)
+        let api_string = purpose
+            .llm_api_env_var()
+            .and_then(env_value)
+            .or_else(|| env_value(LLM_API_ENV_VAR))
             .or_else(|| values.purpose_llm_api(purpose).map(str::to_string))
             .or_else(|| {
                 values
@@ -478,7 +557,10 @@ impl LlmEndpoints {
             Some(value) => value.parse::<LlmApi>()?,
             None => LlmApi::AnthropicCompatible,
         };
-        let base_url = env_value(LLM_BASE_URL_ENV_VAR)
+        let base_url = purpose
+            .llm_base_url_env_var()
+            .and_then(env_value)
+            .or_else(|| env_value(LLM_BASE_URL_ENV_VAR))
             .or_else(|| values.purpose_llm_base_url(purpose).map(str::to_string))
             .or_else(|| {
                 values
@@ -690,7 +772,8 @@ impl EndpointClient {
     }
 
     /// One structured completion with the repair retry of the module
-    /// docs: the shared flow of extraction, gate, and recall.
+    /// docs: the shared flow of extraction, gate, recall, and the
+    /// segmented summarizer.
     ///
     /// The first call passes `schema` to `complete` (the resolved mode
     /// decides how it reaches the wire) and parses the text into `T`.
@@ -842,9 +925,11 @@ pub(crate) struct CompletionCall {
 /// The two-call flow of `EndpointClient::complete_structured`,
 /// generic over the completion closure so the flow is unit-testable
 /// without a network. `EndpointClient::complete_structured` delegates
-/// with a closure over `EndpointClient::complete`; tests script the
-/// closure. Refer to `complete_structured` for the retry semantics.
-async fn complete_structured_with<T, F, Fut>(
+/// with a closure over `EndpointClient::complete`; tests (of this
+/// module and of the single-purpose providers such as
+/// `crate::summary`) script the closure. Refer to
+/// `complete_structured` for the retry semantics.
+pub(crate) async fn complete_structured_with<T, F, Fut>(
     complete: F,
     preamble: Option<String>,
     messages: Vec<Message>,
@@ -926,10 +1011,14 @@ mod tests {
         DIGEST_MODEL_ENV_VAR,
         GATE_MODEL_ENV_VAR,
         REPLY_MODEL_ENV_VAR,
+        SUMMARY_MODEL_ENV_VAR,
+        SUMMARY_LLM_API_ENV_VAR,
+        SUMMARY_LLM_BASE_URL_ENV_VAR,
         STRUCTURED_OUTPUT_ENV_VAR,
         DIGEST_STRUCTURED_OUTPUT_ENV_VAR,
         GATE_STRUCTURED_OUTPUT_ENV_VAR,
         REPLY_STRUCTURED_OUTPUT_ENV_VAR,
+        SUMMARY_STRUCTURED_OUTPUT_ENV_VAR,
         ANTHROPIC_API_KEY_ENV_VAR,
         OPENAI_API_KEY_ENV_VAR,
     ];
@@ -1005,6 +1094,7 @@ mod tests {
         assert_eq!(LlmPurpose::Digest.as_str(), "digest");
         assert_eq!(LlmPurpose::Gate.as_str(), "gate");
         assert_eq!(LlmPurpose::Reply.as_str(), "reply");
+        assert_eq!(LlmPurpose::Summary.as_str(), "summary");
     }
 
     #[test]
@@ -1041,6 +1131,18 @@ mod tests {
                 session_id: DEFAULT_SESSION_ID.to_string(),
             }
         );
+        // The summary purpose defaults to the cheap tier (the same
+        // model as the gate).
+        assert_eq!(
+            endpoints.summary,
+            EndpointConfig {
+                api: LlmApi::AnthropicCompatible,
+                base_url: None,
+                model: "claude-haiku-4-5".to_string(),
+                structured_output: StructuredOutputMode::Schema,
+                session_id: DEFAULT_SESSION_ID.to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1052,6 +1154,7 @@ mod tests {
             digest_model: Some("qwen2.5-7b".to_string()),
             gate_model: Some("qwen2.5-3b".to_string()),
             reply_model: Some("qwen2.5-32b".to_string()),
+            summary_model: Some("qwen2.5-1b".to_string()),
             ..LlmConfigValues::default()
         };
         let endpoints = LlmEndpoints::resolve(&values).unwrap();
@@ -1063,6 +1166,12 @@ mod tests {
         assert_eq!(endpoints.digest.model, "qwen2.5-7b");
         assert_eq!(endpoints.gate.model, "qwen2.5-3b");
         assert_eq!(endpoints.reply.model, "qwen2.5-32b");
+        assert_eq!(endpoints.summary.model, "qwen2.5-1b");
+        assert_eq!(endpoints.summary.api, LlmApi::OpenAiCompatible);
+        assert_eq!(
+            endpoints.summary.base_url.as_deref(),
+            Some("http://localhost:8000/v1")
+        );
     }
 
     #[test]
@@ -1111,10 +1220,17 @@ mod tests {
             gate_llm_base_url: Some("http://gate.internal/v1".to_string()),
             reply_llm_api: Some("openai-compatible".to_string()),
             reply_llm_base_url: Some("http://reply.internal/v1".to_string()),
+            summary_llm_api: Some("openai-compatible".to_string()),
+            summary_llm_base_url: Some("http://summary.internal/v1".to_string()),
             ..LlmConfigValues::default()
         };
         let endpoints = LlmEndpoints::resolve(&values).unwrap();
-        for endpoint in [&endpoints.digest, &endpoints.gate, &endpoints.reply] {
+        for endpoint in [
+            &endpoints.digest,
+            &endpoints.gate,
+            &endpoints.reply,
+            &endpoints.summary,
+        ] {
             assert_eq!(endpoint.api, LlmApi::AnthropicCompatible);
             assert_eq!(
                 endpoint.base_url.as_deref(),
@@ -1129,16 +1245,76 @@ mod tests {
         env.set(DIGEST_MODEL_ENV_VAR, "env-digest-model");
         env.set(GATE_MODEL_ENV_VAR, "env-gate-model");
         env.set(REPLY_MODEL_ENV_VAR, "env-reply-model");
+        env.set(SUMMARY_MODEL_ENV_VAR, "env-summary-model");
         let values = LlmConfigValues {
             digest_model: Some("config-digest-model".to_string()),
             gate_model: Some("config-gate-model".to_string()),
             reply_model: Some("config-reply-model".to_string()),
+            summary_model: Some("config-summary-model".to_string()),
             ..LlmConfigValues::default()
         };
         let endpoints = LlmEndpoints::resolve(&values).unwrap();
         assert_eq!(endpoints.digest.model, "env-digest-model");
         assert_eq!(endpoints.gate.model, "env-gate-model");
         assert_eq!(endpoints.reply.model, "env-reply-model");
+        assert_eq!(endpoints.summary.model, "env-summary-model");
+    }
+
+    #[test]
+    fn the_summary_purpose_resolves_its_own_keys() {
+        let (_lock, env) = EnvGuard::cleared();
+        // Per-group config: the summary purpose overrides family, base
+        // URL, and model individually (mixed deployments, specs.md
+        // Section 13; the summary keys are reported for spec backfill).
+        let values = LlmConfigValues {
+            llm_api: Some("anthropic-compatible".to_string()),
+            summary_llm_api: Some("openai-compatible".to_string()),
+            summary_llm_base_url: Some("http://summary.internal/v1".to_string()),
+            summary_model: Some("local-summary-model".to_string()),
+            summary_structured_output: Some("prompt_only".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(endpoints.summary.api, LlmApi::OpenAiCompatible);
+        assert_eq!(
+            endpoints.summary.base_url.as_deref(),
+            Some("http://summary.internal/v1")
+        );
+        assert_eq!(endpoints.summary.model, "local-summary-model");
+        assert_eq!(
+            endpoints.summary.structured_output,
+            StructuredOutputMode::PromptOnly
+        );
+        // The other purposes keep the global family; their models keep
+        // the defaults.
+        assert_eq!(endpoints.gate.api, LlmApi::AnthropicCompatible);
+        assert_eq!(endpoints.gate.model, "claude-haiku-4-5");
+        assert_eq!(
+            endpoints.gate.structured_output,
+            StructuredOutputMode::Schema
+        );
+
+        // The summary purpose env vars win over every config source.
+        env.set(SUMMARY_LLM_API_ENV_VAR, "anthropic-compatible");
+        env.set(
+            SUMMARY_LLM_BASE_URL_ENV_VAR,
+            "https://summary.env.example.com",
+        );
+        env.set(SUMMARY_MODEL_ENV_VAR, "env-summary-model");
+        env.set(SUMMARY_STRUCTURED_OUTPUT_ENV_VAR, "json_object");
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(endpoints.summary.api, LlmApi::AnthropicCompatible);
+        assert_eq!(
+            endpoints.summary.base_url.as_deref(),
+            Some("https://summary.env.example.com")
+        );
+        assert_eq!(endpoints.summary.model, "env-summary-model");
+        assert_eq!(
+            endpoints.summary.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+        // The global env overrides still feed the other purposes.
+        assert_eq!(endpoints.gate.api, LlmApi::AnthropicCompatible);
     }
 
     #[test]
@@ -1183,8 +1359,24 @@ mod tests {
             Err(AgentError::ProviderConfig(_)) => {}
             other => panic!("expected ProviderConfig, got {other:?}"),
         }
+        // From the summary purpose override.
+        let values = LlmConfigValues {
+            summary_llm_api: Some("bogus".to_string()),
+            ..LlmConfigValues::default()
+        };
+        match LlmEndpoints::resolve(&values) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
         // From the environment.
         env.set(LLM_API_ENV_VAR, "bogus");
+        match LlmEndpoints::resolve(&LlmConfigValues::default()) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        // From the summary purpose env (wins over every other source).
+        env.set(LLM_API_ENV_VAR, "anthropic-compatible");
+        env.set(SUMMARY_LLM_API_ENV_VAR, "bogus");
         match LlmEndpoints::resolve(&LlmConfigValues::default()) {
             Err(AgentError::ProviderConfig(_)) => {}
             other => panic!("expected ProviderConfig, got {other:?}"),
@@ -1346,6 +1538,17 @@ mod tests {
             endpoints.reply.structured_output,
             StructuredOutputMode::JsonObject
         );
+        // The summary purpose env applies to the summary endpoint only.
+        env.set(SUMMARY_STRUCTURED_OUTPUT_ENV_VAR, "prompt_only");
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        assert_eq!(
+            endpoints.summary.structured_output,
+            StructuredOutputMode::PromptOnly
+        );
+        assert_eq!(
+            endpoints.reply.structured_output,
+            StructuredOutputMode::JsonObject
+        );
     }
 
     #[test]
@@ -1388,6 +1591,15 @@ mod tests {
             Err(AgentError::ProviderConfig(_)) => {}
             other => panic!("expected ProviderConfig, got {other:?}"),
         }
+        // From the summary purpose config.
+        let values = LlmConfigValues {
+            summary_structured_output: Some("bogus".to_string()),
+            ..LlmConfigValues::default()
+        };
+        match LlmEndpoints::resolve(&values) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
         // From the global env.
         env.set(STRUCTURED_OUTPUT_ENV_VAR, "bogus");
         match LlmEndpoints::resolve(&LlmConfigValues::default()) {
@@ -1397,6 +1609,13 @@ mod tests {
         // From a purpose env (wins over every other source).
         env.set(STRUCTURED_OUTPUT_ENV_VAR, "schema");
         env.set(REPLY_STRUCTURED_OUTPUT_ENV_VAR, "bogus");
+        match LlmEndpoints::resolve(&LlmConfigValues::default()) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        // From the summary purpose env.
+        env.set(REPLY_STRUCTURED_OUTPUT_ENV_VAR, "schema");
+        env.set(SUMMARY_STRUCTURED_OUTPUT_ENV_VAR, "bogus");
         match LlmEndpoints::resolve(&LlmConfigValues::default()) {
             Err(AgentError::ProviderConfig(_)) => {}
             other => panic!("expected ProviderConfig, got {other:?}"),
@@ -1427,10 +1646,15 @@ mod tests {
     #[test]
     fn session_id_resolution_follows_the_precedence_chain() {
         let (_lock, env) = EnvGuard::cleared();
-        // Default: "tamako", the same value in all three purposes
+        // Default: "tamako", the same value in every purpose
         // (global-only).
         let endpoints = LlmEndpoints::resolve(&LlmConfigValues::default()).unwrap();
-        for endpoint in [&endpoints.digest, &endpoints.gate, &endpoints.reply] {
+        for endpoint in [
+            &endpoints.digest,
+            &endpoints.gate,
+            &endpoints.reply,
+            &endpoints.summary,
+        ] {
             assert_eq!(endpoint.session_id, DEFAULT_SESSION_ID);
         }
         // Global config wins over the default.

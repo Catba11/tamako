@@ -3,7 +3,7 @@
 //! Sections 9, 10, and 13 and proposed-graph-database-specs.md
 //! Section 7.
 //!
-//! The LLM concerns are three calls:
+//! The LLM concerns:
 //!
 //! - Extraction (`extract`, `prompt`, `rig_impl`): the digest pipeline
 //!   turns a range of the raw message log into graph writes
@@ -23,6 +23,13 @@
 //!   the main `reply_model` over the live context (specs.md Section 9
 //!   step 4). The live implementation is `RigReplyGenerator`; tests use
 //!   `ScriptedReplyGenerator`.
+//! - The Rule C3 segmented summarizer (`summary`): when a digest
+//!   removes a chunk from the live context, the actor summarizes the
+//!   chunk and keeps the two newest summaries (specs.md Section 10,
+//!   keep-two retention). The live implementation is `RigSummary`
+//!   over the cheap `summary_model` endpoint, with the digest
+//!   flat-label dialect as input (decision 61 divergence: the
+//!   summarizer does not read the XML dialogue dialect).
 //!
 //! Gate and reply failures are `CoreError::Wake`: log, skip this wake,
 //! no crash (the next wake is the natural retry).
@@ -75,16 +82,19 @@
 //! `openai-compatible`. "Compatible" describes the wire format only,
 //! never the vendor. The `endpoint` module implements this: it maps
 //! config values (`LlmConfigValues`) and environment overrides onto one
-//! resolved endpoint per purpose (`digest`, `gate`, `reply`), and builds
-//! rig clients for them.
+//! resolved endpoint per purpose (`digest`, `gate`, `reply`,
+//! `summary`), and builds rig clients for them.
 //!
 //! Config keys: `llm_api`, `llm_base_url`, `digest_model`, `gate_model`,
-//! `reply_model`, plus per-purpose overrides of `llm_api` and
-//! `llm_base_url` (`digest_llm_api` etc. — mixed deployments are legal).
-//! Environment overrides: `TAMAKO_LLM_API`, `TAMAKO_LLM_BASE_URL`,
-//! `TAMAKO_DIGEST_MODEL`, `TAMAKO_GATE_MODEL`, `TAMAKO_REPLY_MODEL`. The
+//! `reply_model`, `summary_model`, plus per-purpose overrides of
+//! `llm_api` and `llm_base_url` (`digest_llm_api` etc. — mixed
+//! deployments are legal). Environment overrides: `TAMAKO_LLM_API`,
+//! `TAMAKO_LLM_BASE_URL`, `TAMAKO_DIGEST_MODEL`, `TAMAKO_GATE_MODEL`,
+//! `TAMAKO_REPLY_MODEL`, `TAMAKO_SUMMARY_MODEL`; the summary purpose
+//! additionally overrides the family and the base URL with
+//! `TAMAKO_SUMMARY_LLM_API` and `TAMAKO_SUMMARY_LLM_BASE_URL`. The
 //! environment wins. The default family is `anthropic-compatible`; the
-//! default models are `claude-haiku-4-5` (digest, gate) and
+//! default models are `claude-haiku-4-5` (digest, gate, summary) and
 //! `claude-sonnet-4-5` (reply).
 //!
 //! API keys come from the environment only, never from a config file:
@@ -112,6 +122,7 @@ pub mod reply;
 pub mod resolve;
 pub mod rig_impl;
 pub mod skeleton;
+pub mod summary;
 pub mod validate;
 
 pub use endpoint::{
@@ -134,6 +145,7 @@ pub use reply::{context_messages_to_rig, RigReplyGenerator, ScriptedReplyGenerat
 pub use resolve::resolve_batch;
 pub use rig_impl::{ExtractorConfig, RigExtractor};
 pub use skeleton::is_skeleton_batch;
+pub use summary::{render_summary_prompt, RigSummary, SummaryOutput, SUMMARY_PREAMBLE};
 pub use validate::{
     is_snake_case_identifier, validate_relationship_name, RelationshipName,
     FALLBACK_RELATIONSHIP_NAME, RESERVED_RELATIONSHIP_NAMES,
