@@ -13,7 +13,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::actor::CoreError;
-use crate::context::{escape_xml_text, ContextMessage, SUMMARY_TAG_CLOSE, SUMMARY_TAG_OPEN_PREFIX};
+use crate::context::{
+    escape_xml_text, ContextMessage, MSG_TAG_CLOSE, MSG_TAG_OPEN_PREFIX, SUMMARY_TAG_CLOSE,
+    SUMMARY_TAG_OPEN_PREFIX, YOU_TAG_CLOSE, YOU_TAG_OPEN_PREFIX,
+};
 
 /// One message presented to the participation gate (Section 9.6 input).
 /// `content` is the rendered XML item form of
@@ -114,20 +117,22 @@ fn is_parrot_line(line: &str) -> bool {
 }
 
 /// One strip region of the outbound parrot filter: an opener prefix and
-/// the closer that ends the region. The two shapes share the exact same
+/// the closer that ends the region. All shapes share the exact same
 /// block semantics (decision 59 F1).
 #[derive(Clone, Copy)]
 struct StripRegion {
     /// The opener prefix of the region: the open tag minus its trailing
-    /// `>` (`"<memory"` / `"<summary"`). Line-start anchored only.
+    /// `>` (`"<memory"` / `"<summary"`), or the open tag plus its
+    /// trailing space (`"<msg "` / `"<you "`, before the attributes).
+    /// Line-start anchored only.
     open_line_prefix: &'static str,
     /// The closer tag; the first line containing it ends the region.
     closer: &'static str,
 }
 
 /// The outbound parrot filter (decision 59, F1). Removes every line
-/// whose trimmed start matches a recall-injection or summary shape,
-/// then trims the remainder. Three shapes:
+/// whose trimmed start matches a recall-injection or context-structure
+/// shape, then trims the remainder. Five shapes:
 ///
 /// - OLD: the legacy injection prefix (ASCII or full-width colon, see
 ///   [`is_parrot_line`]).
@@ -142,12 +147,22 @@ struct StripRegion {
 ///   summary block is a model-visible format the reply model can
 ///   imitate; the extension is cheap and symmetric, so it shares the
 ///   region machinery instead of growing a second filter.
+/// - `<msg>` / `<you>` (the XML context items of
+///   [`crate::context::render_human_content`]/
+///   [`crate::context::render_bot_content`]): the SAME block semantics
+///   over [`MSG_TAG_OPEN_PREFIX`]/[`MSG_TAG_CLOSE`] and
+///   [`YOU_TAG_OPEN_PREFIX`]/[`YOU_TAG_CLOSE`]. The reply model sees
+///   these elements on every wake (they ARE its context) and imitated
+///   them live (the 2026-08-14 soak incident); a confabulated `<msg>`
+///   or `<you>` block must never reach the group.
 ///
 /// The reply model can imitate the injection format (the injections
 /// enter its context as assistant-role messages, Sections 9.3-9.5) and
 /// speak a confabulated "I remember: ..." or `<memory>...</memory>`
 /// block; such a line is hallucinated speech, not a recalled memory,
-/// and it must never reach the raw log (Rule P1) or the group.
+/// and it must never reach the raw log (Rule P1) or the group. The
+/// same holds for the imitated context structure: an echoed `<msg>` or
+/// `<you>` element is not the bot's speech and must not be sent.
 ///
 /// The filter runs BEFORE the outbound raw-log row persists (Rule B1):
 /// the log and the group see the same filtered text. It runs on EVERY
@@ -157,9 +172,9 @@ struct StripRegion {
 /// configuration key. Pure function, no I/O.
 pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
     // Single-source discipline (decisions 59/61): the memory opener is
-    // derived from the tag constant; the summary shape uses the
-    // context.rs constants shared with `render_summary_content`.
-    let regions: [StripRegion; 2] = [
+    // derived from the tag constant; the summary and message shapes use
+    // the context.rs constants shared with the renderers.
+    let regions: [StripRegion; 4] = [
         StripRegion {
             open_line_prefix: SUMMARY_TAG_OPEN_PREFIX,
             closer: SUMMARY_TAG_CLOSE,
@@ -167,6 +182,14 @@ pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
         StripRegion {
             open_line_prefix: INJECTION_TAG_OPEN.trim_end_matches('>'),
             closer: INJECTION_TAG_CLOSE,
+        },
+        StripRegion {
+            open_line_prefix: MSG_TAG_OPEN_PREFIX,
+            closer: MSG_TAG_CLOSE,
+        },
+        StripRegion {
+            open_line_prefix: YOU_TAG_OPEN_PREFIX,
+            closer: YOU_TAG_CLOSE,
         },
     ];
     let mut stripped_parrot = false;
@@ -486,6 +509,119 @@ mod tests {
     }
 
     #[test]
+    fn the_parrot_filter_strips_a_single_line_msg_block() {
+        // The `<msg>` shape shares the `<memory>` block semantics (the
+        // 2026-08-14 soak incident: the reply model imitated the XML
+        // context structure live).
+        let filtered = filter_reply_parrot_lines(
+            "<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_multi_line_msg_block() {
+        let filtered = filter_reply_parrot_lines(
+            "<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello\nthere</msg>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_bare_msg_closer_line() {
+        let filtered = filter_reply_parrot_lines("one\n</msg>\ntwo");
+        assert_eq!(filtered.text, "one\ntwo");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_an_unterminated_msg_block_to_the_end() {
+        // No closer appears: the region strips to the end of the text.
+        let filtered = filter_reply_parrot_lines(
+            "one\n<msg from=\"Alice\" at=\"13:07\" id=\"1\">never closed\nrest of the text",
+        );
+        assert_eq!(filtered.text, "one");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_single_line_you_block() {
+        let filtered = filter_reply_parrot_lines(
+            "<you at=\"13:07\" id=\"2\">hi there</you>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_multi_line_you_block() {
+        let filtered = filter_reply_parrot_lines(
+            "<you at=\"13:07\" id=\"2\">hi\nthere</you>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_bare_you_closer_line() {
+        let filtered = filter_reply_parrot_lines("one\n</you>\ntwo");
+        assert_eq!(filtered.text, "one\ntwo");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_an_unterminated_you_block_to_the_end() {
+        // No closer appears: the region strips to the end of the text.
+        let filtered = filter_reply_parrot_lines(
+            "one\n<you at=\"13:07\" id=\"2\">never closed\nrest of the text",
+        );
+        assert_eq!(filtered.text, "one");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_the_old_and_xml_shapes_in_one_text() {
+        // The injection shapes and the imitated context structure strip
+        // together; only real speech remains.
+        let filtered = filter_reply_parrot_lines(
+            "I remember: Bob runs.\n<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>\n<you at=\"13:08\" id=\"2\">hi</you>\nthe cafe",
+        );
+        assert_eq!(filtered.text, "the cafe");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_exactly_what_the_message_renderers_produce() {
+        // Single-source discipline (decisions 59/61): the `<msg>`/`<you>`
+        // renderers and the filter share the tag constants, so they can
+        // never drift apart.
+        let human = crate::context::render_human_content(
+            1,
+            "Alice",
+            None,
+            time::macros::datetime!(2026-08-07 13:07 UTC),
+            false,
+            false,
+            crate::context::ReplyRender::None,
+            "hello",
+        );
+        let filtered = filter_reply_parrot_lines(&human);
+        assert_eq!(filtered.text, "");
+        assert!(filtered.stripped_parrot);
+
+        let speech = crate::context::render_bot_content(
+            2,
+            time::macros::datetime!(2026-08-07 13:07 UTC),
+            "hi there",
+        );
+        let filtered = filter_reply_parrot_lines(&speech);
+        assert_eq!(filtered.text, "");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
     fn the_parrot_filter_strips_exactly_what_the_summary_renderer_produces() {
         // Single-source discipline (decisions 59/61): the summary
         // renderer and the filter share the tag constants, so they can
@@ -516,6 +652,8 @@ mod tests {
             "<memory>Alice likes tea</memory>",
             "  <memory>a\nb</memory>  ",
             "<summary range=\"1-3\">digested chunk</summary>",
+            "<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>",
+            "  <you at=\"13:07\" id=\"2\">hi\nthere</you>  ",
         ] {
             let filtered = filter_reply_parrot_lines(only);
             assert_eq!(filtered.text, "", "input {only:?}");
@@ -526,7 +664,7 @@ mod tests {
     #[test]
     fn normal_text_passes_the_parrot_filter_byte_identical() {
         // False-positive control: an innocuous mid-line "I remember" or
-        // "<memory>" mention and multiline text survive untouched
+        // tag mention and multiline text survive untouched
         // (line-start anchored only).
         for normal in [
             "I remember when we tried that place",
@@ -537,6 +675,10 @@ mod tests {
             "say </memory> please",
             "see <summary> in the docs",
             "say </summary> please",
+            "see <msg from=\"Alice\"> in the docs",
+            "say </msg> please",
+            "see <you at=\"13:07\"> in the docs",
+            "say </you> please",
         ] {
             let filtered = filter_reply_parrot_lines(normal);
             assert_eq!(filtered.text, normal.trim());

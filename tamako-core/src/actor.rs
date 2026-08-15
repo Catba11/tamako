@@ -1727,12 +1727,13 @@ async fn run_wake_calls(
             // Decision 59, F1: the parrot filter guards EVERY reply
             // text here, so no generator (the live one included, and
             // every scripted double of tests) can put a confabulated
-            // "I remember: ..." line into the WakeReport. The filtered
+            // "I remember: ..." line or an imitated `<msg>`/`<you>`
+            // context element into the WakeReport. The filtered
             // text is what the completion handler persists (Rule B1)
             // and sends: the log and the group see the same text.
             let filtered = filter_reply_parrot_lines(&raw_text);
             if filtered.stripped_parrot {
-                tracing::warn!(chat_id = %chat_id, "the parrot filter stripped recall-injection echo lines from the reply");
+                tracing::warn!(chat_id = %chat_id, "the reply parrots context structure: the parrot filter stripped the imitated lines");
             }
             if filtered.text.is_empty() {
                 // Nothing remains: the SAME wake error as an empty

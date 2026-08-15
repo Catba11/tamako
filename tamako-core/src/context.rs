@@ -438,6 +438,35 @@ impl LiveContext {
     }
 }
 
+/// The opening-tag prefix of a rendered human-message item: `"<msg "`
+/// (with the trailing space before the attributes). This constant and
+/// [`render_human_content`] are the SINGLE source shared by the
+/// renderer and the outbound parrot filter
+/// ([`crate::wake::filter_reply_parrot_lines`]): the `<msg>` element is
+/// a model-visible format the reply model can imitate (the live-soak
+/// `<msg>`/`<you>` parroting incident of 2026-08-14), and a
+/// confabulated `<msg>` block must never reach the group. Sharing the
+/// constant keeps the renderer and the filter from drifting apart
+/// (decisions 59/61 single-source discipline).
+pub const MSG_TAG_OPEN_PREFIX: &str = "<msg ";
+
+/// The closing tag of a rendered human-message item: `"</msg>"`. The
+/// closer of the [`MSG_TAG_OPEN_PREFIX`] strip region in the parrot
+/// filter.
+pub const MSG_TAG_CLOSE: &str = "</msg>";
+
+/// The opening-tag prefix of a rendered bot-speech item: `"<you "`
+/// (with the trailing space before the attributes). Same single-source
+/// discipline as [`MSG_TAG_OPEN_PREFIX`]: shared by
+/// [`render_bot_content`] and the outbound parrot filter
+/// ([`crate::wake::filter_reply_parrot_lines`]).
+pub const YOU_TAG_OPEN_PREFIX: &str = "<you ";
+
+/// The closing tag of a rendered bot-speech item: `"</you>"`. The
+/// closer of the [`YOU_TAG_OPEN_PREFIX`] strip region in the parrot
+/// filter.
+pub const YOU_TAG_CLOSE: &str = "</you>";
+
 /// Renders one human message as the XML item of specs.md Section 7.2
 /// step 4 (the approved XML context rendering). This one helper serves
 /// `append_human_message`, `rebuild`, and the M4 gate input
@@ -470,7 +499,8 @@ pub fn render_human_content(
     text: &str,
 ) -> String {
     let mut out = String::new();
-    out.push_str("<msg from=\"");
+    out.push_str(MSG_TAG_OPEN_PREFIX);
+    out.push_str("from=\"");
     out.push_str(&escape_xml_attr(display_name));
     out.push('"');
     if let Some(username) = username {
@@ -508,7 +538,7 @@ pub fn render_human_content(
     }
     out.push('>');
     out.push_str(&escape_xml_text(text));
-    out.push_str("</msg>");
+    out.push_str(MSG_TAG_CLOSE);
     out
 }
 
@@ -518,7 +548,7 @@ pub fn render_human_content(
 /// speech is part of the raw log).
 pub fn render_bot_content(msg_id: i64, timestamp: OffsetDateTime, text: &str) -> String {
     format!(
-        "<you at=\"{}\" id=\"{msg_id}\">{}</you>",
+        "{YOU_TAG_OPEN_PREFIX}at=\"{}\" id=\"{msg_id}\">{}{YOU_TAG_CLOSE}",
         hhmm_of(timestamp),
         escape_xml_text(text)
     )
@@ -631,6 +661,30 @@ mod tests {
         assert_eq!(injection.role, ContextRole::Assistant);
         assert_eq!(injection.content, "I remember: Alice likes tea.");
         assert_eq!(tag_of(injection), RangeTag::single(2));
+    }
+
+    #[test]
+    fn the_message_renderers_compose_through_the_tag_constants() {
+        // Single-source discipline (decisions 59/61): the renderers and
+        // the parrot filter share the tag constants, so they can never
+        // drift apart. The exact bytes stay pinned by the existing
+        // renderer tests; this one pins the composition.
+        let human = render_human_content(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "hello",
+        );
+        assert!(human.starts_with(MSG_TAG_OPEN_PREFIX));
+        assert!(human.ends_with(MSG_TAG_CLOSE));
+
+        let speech = render_bot_content(2, at_1307(), "hi there");
+        assert!(speech.starts_with(YOU_TAG_OPEN_PREFIX));
+        assert!(speech.ends_with(YOU_TAG_CLOSE));
     }
 
     #[test]
