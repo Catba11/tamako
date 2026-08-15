@@ -87,6 +87,19 @@
 //! endpoints. `TAMAKO_LLM_BASE_URL` is the Tamako-level override. This
 //! keeps the base URL under one configuration scheme (specs.md
 //! Section 13).
+//!
+//! ## Per-attempt timeout (H4b)
+//!
+//! Every completion attempt is bounded by [`ENDPOINT_TIMEOUT`] (a code
+//! constant, deliberately no config key). The bound is PER ATTEMPT:
+//! the first call and the one repair retry of
+//! [`EndpointClient::complete_structured`] each get their own window.
+//! A stalled completion maps to `AgentError::Extraction` with an
+//! `endpoint timeout after` prefix, so every caller's existing failure
+//! semantics apply unchanged (digest backoff/dead-letter, wake skip,
+//! summary deferral).
+
+use std::time::Duration;
 
 use rig::client::CompletionClient;
 use rig::completion::{AssistantContent, Message};
@@ -175,6 +188,23 @@ pub const DEFAULT_REPLY_MODEL: &str = "claude-sonnet-4-5";
 /// `summary_*` keys.
 pub const DEFAULT_SUMMARY_MODEL: &str = anthropic::completion::CLAUDE_HAIKU_4_5;
 
+/// The per-attempt completion timeout (H4b). One bound around every
+/// endpoint completion attempt: the first call AND the one repair
+/// retry of `complete_structured` each get their own window (both go
+/// through `EndpointClient::complete`).
+///
+/// 300 s is generous on purpose. Live digests complete in ~20 s, but
+/// reasoning models burn reasoning tokens before any content, and with
+/// `max_tokens` up to 262144 a slow-but-progressing reasoning response
+/// legitimately runs for minutes. The timeout only guards against a
+/// STALLED completion (no response at all); at 15× the observed live
+/// digest latency it cannot false-positive on a healthy slow endpoint,
+/// while a hung connection is bounded to 5 minutes per attempt.
+///
+/// There is deliberately no config key: the bound is a code constant.
+/// Tests inject a smaller value through `EndpointClient::with_timeout`.
+pub const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The API family of an endpoint (specs.md Section 13). The family
 /// selects the wire format only, not the vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +269,9 @@ pub enum StructuredOutputMode {
     #[default]
     Schema,
     /// OpenAI only: `response_format: { type: "json_object" }` via
-    /// `additional_params`. No schema on the wire. On the Anthropic
+    /// `additional_params`. No schema on the wire. Attached PER CALL,
+    /// only when the call carries a schema (M1: a schema-less
+    /// plain-text call sends no response_format). On the Anthropic
     /// family this mode cannot be expressed and degrades to
     /// prompt-only behavior (module docs).
     JsonObject,
@@ -630,6 +662,10 @@ pub struct EndpointClient {
     /// The resolved structured-output mode of the endpoint (module
     /// docs). `complete` interprets its `output_schema` per this mode.
     structured_output: StructuredOutputMode,
+    /// The per-attempt completion timeout (H4b, [`ENDPOINT_TIMEOUT`]).
+    /// Production clients always use the constant; tests override it
+    /// through `with_timeout`.
+    timeout: Duration,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -644,6 +680,7 @@ impl std::fmt::Debug for EndpointClient {
         f.debug_struct("EndpointClient")
             .field("family", &family)
             .field("structured_output", &self.structured_output)
+            .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
 }
@@ -699,6 +736,7 @@ impl EndpointClient {
                 Ok(EndpointClient {
                     model: EndpointModel::Anthropic(client.completion_model(&endpoint.model)),
                     structured_output: endpoint.structured_output,
+                    timeout: ENDPOINT_TIMEOUT,
                 })
             }
             LlmApi::OpenAiCompatible => {
@@ -717,9 +755,19 @@ impl EndpointClient {
                 Ok(EndpointClient {
                     model: EndpointModel::OpenAi(client.completion_model(&endpoint.model)),
                     structured_output: endpoint.structured_output,
+                    timeout: ENDPOINT_TIMEOUT,
                 })
             }
         }
+    }
+
+    /// Test-only override of the per-attempt timeout (H4b). Production
+    /// clients always use [`ENDPOINT_TIMEOUT`]; there is deliberately
+    /// no config key for it.
+    #[cfg(test)]
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Sends one completion request and returns the first text content.
@@ -729,13 +777,18 @@ impl EndpointClient {
     /// empty user message as the prompt. `preamble` becomes the system
     /// message. `output_schema` is interpreted per the resolved
     /// structured-output mode (module docs): `Schema` passes it to rig;
-    /// `JsonObject` drops it and adds
+    /// `JsonObject` drops it and — only when the call CARRIES a schema
+    /// (M1: a schema-less call, e.g. the plain-text reply path, sends
+    /// NO response_format) — adds
     /// `response_format: { type: "json_object" }` on the OpenAI family
     /// only (Anthropic degrades to prompt-only); `PromptOnly` drops it
     /// unconditionally. `max_tokens` is always set (Anthropic requires
-    /// it).
+    /// it). The attempt is bounded by the per-attempt timeout (H4b,
+    /// [`ENDPOINT_TIMEOUT`]).
     ///
-    /// Errors: provider errors and a response without text content are
+    /// Errors: provider errors, a response without text content, and a
+    /// stalled attempt (no response within the timeout; the message
+    /// starts with `endpoint timeout after`) are
     /// `AgentError::Extraction`.
     pub async fn complete(
         &self,
@@ -746,16 +799,32 @@ impl EndpointClient {
     ) -> Result<String, AgentError> {
         // The mode decides whether the schema reaches the wire and
         // whether the OpenAI json_object response_format applies.
+        // M1: the json_object response_format is PER CALL — only a
+        // call that carries a schema gets it. A schema-less call (the
+        // plain-text reply path) on a json_object endpoint sends NO
+        // response_format; otherwise the endpoint would force JSON
+        // output on a plain-text reply.
         let (output_schema, json_object) = match self.structured_output {
             StructuredOutputMode::Schema => (output_schema, false),
             StructuredOutputMode::JsonObject => {
-                (None, matches!(self.model, EndpointModel::OpenAi(_)))
+                let attach =
+                    output_schema.is_some() && matches!(self.model, EndpointModel::OpenAi(_));
+                (None, attach)
             }
             StructuredOutputMode::PromptOnly => (None, false),
         };
         match &self.model {
             EndpointModel::Anthropic(model) => {
-                complete_with(model, preamble, messages, output_schema, max_tokens, false).await
+                complete_with(
+                    model,
+                    preamble,
+                    messages,
+                    output_schema,
+                    max_tokens,
+                    self.timeout,
+                    false,
+                )
+                .await
             }
             EndpointModel::OpenAi(model) => {
                 complete_with(
@@ -764,6 +833,7 @@ impl EndpointClient {
                     messages,
                     output_schema,
                     max_tokens,
+                    self.timeout,
                     json_object,
                 )
                 .await
@@ -824,13 +894,17 @@ impl EndpointClient {
 /// identical; only the rig model type differs. `json_object` adds the
 /// OpenAI `json_object` response format via `additional_params`
 /// (expressible on the chat-completions path only; the caller sets it
-/// for the OpenAI family only).
+/// for the OpenAI family only). `timeout` bounds the send: a stalled
+/// completion (no response within the window) is an
+/// `AgentError::Extraction` whose message starts with
+/// `endpoint timeout after` (H4b).
 async fn complete_with<M>(
     model: &M,
     preamble: Option<String>,
     messages: Vec<Message>,
     output_schema: Option<schemars::Schema>,
     max_tokens: u64,
+    timeout: Duration,
     json_object: bool,
 ) -> Result<String, AgentError>
 where
@@ -860,11 +934,18 @@ where
             "response_format": { "type": "json_object" }
         }));
     }
-    // Always set max_tokens: Anthropic requires it.
-    let response = request
-        .max_tokens(max_tokens)
-        .send()
+    // Always set max_tokens: Anthropic requires it. The per-attempt
+    // timeout (H4b, ENDPOINT_TIMEOUT) guards against a STALLED
+    // completion only; a slow-but-progressing response is untouched.
+    // The first call and the one repair retry each get their own
+    // window (both go through EndpointClient::complete).
+    let response = tokio::time::timeout(timeout, request.max_tokens(max_tokens).send())
         .await
+        .map_err(|_| {
+            AgentError::Extraction(format!(
+                "endpoint timeout after {timeout:?}: no completion response from the endpoint"
+            ))
+        })?
         .map_err(|error| AgentError::Extraction(error.to_string()))?;
     // Per-call usage at DEBUG (decision 57): the cache fields expose
     // the provider prompt-cache behavior of the session-affinity
@@ -1641,6 +1722,123 @@ mod tests {
         assert!(debug.contains("JsonObject"));
     }
 
+    #[test]
+    fn the_default_timeout_is_the_endpoint_constant() {
+        // Client construction performs no I/O; no network call here.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some("http://localhost:9998/v1".to_string()),
+            model: "local-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            session_id: DEFAULT_SESSION_ID.to_string(),
+        };
+        let client = EndpointClient::build(&endpoint).expect("openai client");
+        // H4b: no config key; production always uses the constant.
+        assert_eq!(client.timeout, ENDPOINT_TIMEOUT);
+    }
+
+    // --- Wire fakes (local TcpListener, no external network) ---
+
+    /// The canned OpenAI chat-completion body of the wire fakes.
+    const CANNED_COMPLETION: &str = concat!(
+        r#"{"id":"x","object":"chat.completion","model":"test-model","#,
+        r#""choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"#,
+        r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+    );
+
+    /// Reads one HTTP request (head + the body per Content-Length) off
+    /// the stream, so the socket closes without unread data (the same
+    /// discipline as the_session_id_header_reaches_the_wire). Returns
+    /// (head, body).
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, String) {
+        use std::io::Read as _;
+        let mut raw = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let head_end = loop {
+            let read = stream.read(&mut buffer).expect("a readable request");
+            raw.extend_from_slice(&buffer[..read]);
+            if let Some(position) = raw
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            {
+                break position;
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .expect("a content-length header");
+        while raw.len() < head_end + content_length {
+            let read = stream.read(&mut buffer).expect("a readable body");
+            raw.extend_from_slice(&buffer[..read]);
+        }
+        let body = String::from_utf8_lossy(&raw[head_end..head_end + content_length]).to_string();
+        (head, body)
+    }
+
+    /// Writes the canned OpenAI chat-completion response. The
+    /// `connection: close` header makes every request its own
+    /// connection (no keep-alive ambiguity in the fake).
+    fn write_canned_response(stream: &mut std::net::TcpStream) {
+        use std::io::Write as _;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            CANNED_COMPLETION.len(),
+            CANNED_COMPLETION
+        )
+        .expect("the response is writable");
+    }
+
+    /// A local HTTP fake: accepts `requests` connections in order,
+    /// captures each request body, and answers the canned OpenAI
+    /// chat-completion response. No external network.
+    fn spawn_capture_server(
+        requests: usize,
+    ) -> (
+        u16,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
+        let port = listener.local_addr().expect("a local address").port();
+        let (body_tx, body_rx) = std::sync::mpsc::channel::<String>();
+        let server = std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("one connection");
+                let (_head, body) = read_request(&mut stream);
+                body_tx.send(body).expect("the body reaches the test");
+                write_canned_response(&mut stream);
+            }
+        });
+        (port, body_rx, server)
+    }
+
+    /// Builds an OpenAI-family client against a local fake (the API key
+    /// is read at build time only, so the env guard drops BEFORE any
+    /// await: no lock is held across it).
+    fn local_openai_client(port: u16, mode: StructuredOutputMode) -> EndpointClient {
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            model: "test-model".to_string(),
+            structured_output: mode,
+            session_id: DEFAULT_SESSION_ID.to_string(),
+        };
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        EndpointClient::build(&endpoint).expect("openai client")
+    }
+
     // --- The session id (`x-opencode-session` header) ---
 
     #[test]
@@ -1797,6 +1995,99 @@ mod tests {
             head.lines()
                 .any(|line| { line.eq_ignore_ascii_case("x-opencode-session: test-session-xyz") }),
             "the request carried x-opencode-session: test-session-xyz, head:\n{head}"
+        );
+        server.join().expect("the server thread joins");
+    }
+
+    // --- H4b: the per-attempt timeout ---
+
+    /// A stalled completion fails with the timeout error class
+    /// (`AgentError::Extraction` with the `endpoint timeout after`
+    /// prefix). The seam is the full `EndpointClient::complete` path
+    /// against a local server that reads the request and then NEVER
+    /// responds until the test releases it — hermetic (localhost only),
+    /// and rig's client needs no special stall hook because the fake
+    /// server IS the stall. The tiny timeout is injected through the
+    /// test-only `with_timeout` override (no config key).
+    #[tokio::test]
+    async fn a_stalled_completion_fails_with_a_timeout_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
+        let port = listener.local_addr().expect("a local address").port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one connection");
+            // Read the full request so the client is not blocked on
+            // write, then hold the connection open without answering.
+            let _ = read_request(&mut stream);
+            // Block until the test releases the server; the client has
+            // long timed out by then. The stream drops unanswered.
+            let _ = release_rx.recv();
+        });
+        let client = local_openai_client(port, StructuredOutputMode::Schema)
+            .with_timeout(Duration::from_millis(100));
+        match client
+            .complete(None, vec![Message::user("hi".to_string())], None, 64)
+            .await
+        {
+            Err(AgentError::Extraction(message)) => {
+                assert!(
+                    message.starts_with("endpoint timeout after"),
+                    "expected the timeout error class, got {message:?}"
+                );
+            }
+            other => panic!("expected a timeout Extraction error, got {other:?}"),
+        }
+        drop(release_tx);
+        server.join().expect("the server thread joins");
+    }
+
+    // --- M1: json_object response_format is per call ---
+
+    /// M1 regression: on a json_object-configured OpenAI endpoint the
+    /// `response_format` parameter is PER CALL. A structured call
+    /// (schema present) carries `response_format: {"type":
+    /// "json_object"}`; a plain-text call (no schema — the reply
+    /// generator path) carries NO response_format. Before the fix the
+    /// mode attached response_format to every call of the client and
+    /// broke plain-text replies on json_object endpoints.
+    #[tokio::test]
+    async fn json_object_response_format_is_attached_only_with_a_schema() {
+        let (port, bodies, server) = spawn_capture_server(2);
+        let client = local_openai_client(port, StructuredOutputMode::JsonObject);
+        // Plain-text call (the reply path): NO response_format.
+        client
+            .complete(None, vec![Message::user("hi".to_string())], None, 64)
+            .await
+            .expect("the plain-text call completes");
+        let plain_body = bodies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the plain-text request body");
+        let plain: serde_json::Value =
+            serde_json::from_str(&plain_body).expect("the plain-text body is JSON");
+        assert!(
+            plain.get("response_format").is_none(),
+            "a schema-less call must not carry response_format: {plain}"
+        );
+        // Structured call (schema present): the json_object
+        // response_format reaches the wire.
+        client
+            .complete(
+                None,
+                vec![Message::user("hi".to_string())],
+                Some(schemars::schema_for!(RepairTarget)),
+                64,
+            )
+            .await
+            .expect("the structured call completes");
+        let structured_body = bodies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the structured request body");
+        let structured: serde_json::Value =
+            serde_json::from_str(&structured_body).expect("the structured body is JSON");
+        assert_eq!(
+            structured.get("response_format"),
+            Some(&serde_json::json!({ "type": "json_object" })),
+            "a schema-carrying call must carry the json_object response_format: {structured}"
         );
         server.join().expect("the server thread joins");
     }
