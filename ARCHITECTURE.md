@@ -13,16 +13,16 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 49 |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 137 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v5), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the read-only status query. | 32 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 50 |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 170 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v6), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the read-only status query. | 38 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
-| `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63). | 17 |
+| `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63). | 18 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
-| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 51 (+1 ignored live test) |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker, the Rule C3 summarizer (decision 62). | 162 (+3 ignored live tests) |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 53 (+1 ignored live test) |
+| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker, the Rule C3 summarizer (decision 62). | 167 (+3 ignored live tests) |
 
-Total: 475 tests (+4 ignored live tests). Build, test,
+Total: 523 tests (+4 ignored live tests). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -119,7 +119,12 @@ never fatal. `TELOXIDE_API_URL` is honored only by
 - Startup runs inside the spawned task: open the group store, ensure the
   graph schema, load and decode the session state. The handle returns
   immediately; `snapshot()` acts as a FIFO barrier and `shutdown()`
-  surfaces startup errors through the join handle.
+  surfaces startup errors through the join handle. Decision 65
+  (K2-latent): a missing/malformed `wake_last_row_id` with prior log
+  rows repairs to the raw-log tail at startup ("start from now", one
+  WARN; P1-safe scheduling state), and the disabled-services path
+  advances the marker where a wake would have started, so an unwired
+  group never re-presents its entire raw log.
 - Message intake order is fixed (Rule P1): first persist the raw-log row
   through `spawn_blocking`, then append the item to the live context
   (Rule C1), then update the in-memory session, then persist the
@@ -128,7 +133,12 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   (specs.md Section 8.1).
 - Edited messages append a new log row with `event_type = 'edit'` and a
   context item like any other new row (uniform with the rebuild, which
-  renders edits identically). An edit never retracts (specs.md
+  renders edits identically) — with the decision-65 identical-text
+  exception: a text-identical edit is not an event (compared byte-exact
+  against the LATEST persisted row for the platform message id via
+  `Store::find_latest_message_by_platform_msg_id`; a match drops with
+  no row, no context item, no wake-counter advance, one DEBUG line;
+  lookup errors fail open). An edit never retracts (specs.md
   Section 15, open item 4).
 - Reaction intake is passive collection (M3): the reaction row persists
   first into the `reactions` table (Rule P1, idempotent under
@@ -140,7 +150,11 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   the digest pipeline as a task that reports back through the inbox
   (`ActorCommand::DigestCompleted`), so extraction and backoff never
   block the FIFO queue (Section 6.1, rule 3). Session mutations stay
-  serialized in the loop.
+  serialized in the loop. Decision 65 (H4a): every spawned task body
+  (digest, summary, wake) is panic-contained — a panic becomes a
+  synthetic failure completion through the inbox, so the
+  `digest_in_flight` / `summary_pending` / `wake_in_flight` flags
+  ALWAYS reset.
 - The wake procedure of specs.md Section 9 is live (M4; the recall
   step is live since M5). Steps 1–5 actor side: (1) the monologue lock suppresses an unforced wake while
   muted (a forced wake is never suppressed, Section 8.1) without
@@ -161,13 +175,24 @@ never fatal. `TELOXIDE_API_URL` is honored only by
 - The reply text of step 4 passes the parrot filter of decision 59 IN
   the wake task, before the report: every line whose trimmed start
   matches the recall-injection prefix (`INJECTION_TEXT_PREFIX`, ASCII
-  or full-width colon) is removed — the reply model can imitate the
-  injection format it sees as assistant-role context, and a
-  confabulated "I remember: ..." line must never become bot speech. A
+  or full-width colon) or opens a `<memory>`/`<summary>`/`<msg>`/`<you>`
+  region (decisions 61/62/64 — the region strips through its closer
+  line) is removed — the reply model can imitate the
+  injection format and the context structure it sees, and a
+  confabulated "I remember: ..." line or `<msg>`/`<you>` block (the
+  2026-08-14 live incident) must never become bot speech. A
   strip that leaves text logs one WARN with the chat id; an empty
   remainder is the empty-reply `CoreError::Wake` (log, skip, no
   crash). The live reply generator applies the same pure function at
   its own validation seam (`tamako-agent`, `trimmed_reply_or_error`).
+- Decision 65 (M2) wake-failure semantics: `WakeCompleted` carries the
+  pre-wake `wake_last_row_id` and the forced-wake entry. On Err the
+  marker rolls back so the failed wake's messages re-present at the
+  next natural trigger (floor-bounded — no retry storm); a failed
+  forced wake requeues ONCE (a newer forcing supersedes the retry per
+  Section 6.2), and a second failure drops it with a distinct ERROR
+  naming the unmet Section 8.1 must-respond obligation (amends
+  decision 33's reset-at-start).
 - The `WakeCompleted` send path: the recency re-check of Section 6.2
   DISCARDS the reply when more than `reply_staleness_threshold` newer
   human messages arrived after the target (discard, not regenerate);
@@ -206,8 +231,14 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   completion finds the row on the natural range key and skips the LLM
   call, and the context summary segment is replaced via
   `upsert_summaries` (keep-two, count-based). A summarization failure
-  defers the removal one cycle (the raw chunk stays; one WARN); a
-  `None` provider keeps the old C3 drop. The session is persisted
+  defers the removal one cycle (the raw chunk stays; one WARN);
+  decision 65 (M3): after 3 consecutive failures the chunk falls back
+  to the sanctioned old-C3 drop with one ERROR and the breaker resets
+  (the next chunk probes again), the summarizer input caps at 2x
+  `digest_max_messages` (an oversized chunk summarizes the newest
+  suffix; the row records the full range), and a best-effort
+  `summaries_failed_total` counter lets `--status` surface a stuck
+  group. A `None` provider keeps the old C3 drop. The session is persisted
   once after all mutations, then the `PostDigestHook` runs (a seam
   for observers that need no actor state; `NoopPostDigestHook` is the
   default), then the digest trigger re-evaluates once.
@@ -278,7 +309,12 @@ only inside the actor loop (Section 6.1, rule 2).
   `injected_memories` rows above the same cutoff, and the TWO newest
   persisted `context_summaries` rows (oldest first, directly after
   the preamble — decision 62). Injections land directly after the row
-  at their recorded position (Rule C2). The rebuild is bit-identical
+  at their recorded position (Rule C2) — with the decision-65 (H2)
+  multi-edge collapse: consecutive rows sharing
+  (injection_position, content) replay as ONE item, matching the live
+  path's one-item-per-PlannedInjection (this changes rebuilt bytes for
+  groups with persisted multi-edge injections — one deliberate
+  invalidation with decision 64). The rebuild is bit-identical
   to the pre-restart context: one render helper serves both intake
   and rebuild, and the rendered injection text is persisted
   (`injected_memories.content`, migration v2) as is the summary text
@@ -294,7 +330,7 @@ Rule P5: one directory per group at `{data_root}/{chat_id}/`.
 
 | File | Content |
 |---|---|
-| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth; nullable `sender_username` since migration v4 — decision 61), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `context_summaries` (decision 62, migration v5: the removed-chunk summaries with `(first_msg_id, last_msg_id)` as the natural dedup key — the check-before-call replay idempotency of the summarization flow; rotated-out rows stay for forensics), `schema_migrations`. |
+| `store.db` | SQLite, WAL mode, `synchronous=NORMAL`. Tables: `messages` (raw log, source of truth; nullable `sender_username` since migration v4 — decision 61), `state` (session KV plus counters), `injected_memories` (dedup set plus the rendered injection `content`, since migration v2), `dead_letter`, `reactions` (reaction rows from intake time, since migration v3 — specs.md Section 5.2), `context_summaries` (decision 62, migration v5: the removed-chunk summaries with `(first_msg_id, last_msg_id)` as the natural dedup key — the check-before-call replay idempotency of the summarization flow; rotated-out rows stay for forensics), `schema_migrations`. The `messages_dedup` unique index is (platform_msg_id, direction, event_type, timestamp, text) since migration v6 (decision 65 H1: same-second different-text edits persist; index-only migration, no data touched). |
 | `memory.lbug` | LadybugDB graph. One `Node` table, one `EDGE` rel table (Section 6.1 of the database specification). |
 
 `tamako-store::Store` is rooted at the data root and takes a `chat_id`
@@ -304,7 +340,8 @@ Phase 0 tables; v2: `injected_memories.content` for the bit-identical
 context rebuild; v3: the `reactions` table; v4: the additive nullable
 `messages.sender_username` for the decision-61 XML `user` attribute —
 pre-v4 rows read NULL and render without the attribute; v5: the
-additive `context_summaries` table of decision 62) applied
+additive `context_summaries` table of decision 62; v6: the index-only
+`messages_dedup` key extension of decision 65) applied
 through a minimal runner; the raw-log insert
 is idempotent (`INSERT OR IGNORE` on `(platform_msg_id, direction,
 event_type, timestamp)`). `chat_id` values with path separators or
@@ -444,7 +481,14 @@ gateway's session-affinity key for the provider prompt cache — sent on
 every request of both families via rig's `ClientBuilder::http_headers`;
 every successful completion logs the rig usage fields (including
 `cached_input_tokens`) at DEBUG. `EndpointClient` hides the two rig model types behind one
-async `complete` call. What rig 0.41 can and cannot do (verified
+async `complete` call. Decision 65: every completion attempt is
+bounded by a 300 s per-attempt timeout (`ENDPOINT_TIMEOUT` — a code
+constant with a cfg(test) override, no config key; elapsed maps to
+`AgentError::Extraction` with a stable prefix so caller failure
+semantics apply unchanged), and json_object mode attaches
+`response_format` only when the call carries an output schema (M1 —
+plain-text reply calls on a json_object endpoint are no longer forced
+into JSON). What rig 0.41 can and cannot do (verified
 against its sources; the module docs carry the full list): custom base
 URLs and free-form model names on every provider through the explicit
 builder (so rig's own `*_BASE_URL` env vars deliberately do NOT apply);
@@ -502,9 +546,16 @@ inject nothing — a wake never fails on a recall-gate error, and DEBUG
 logs distinguish the three gate outcomes (no candidates — the gate is
 not called, selected none, gate failure with a WARN; decision 58)
 while decision 53's curated INFO wake line stays untouched. The render
-is exactly one "I remember: ..." assistant message (Section 9.4); an
-empty injection is forbidden. `ScriptedRelevanceGate` is the test
-double (same pattern as `ScriptedGate`).
+is exactly one `<memory>...</memory>` assistant-role item per
+PlannedInjection (Sections 9.4/9.5, decision 61; legacy persisted rows
+keep the verbatim old form); an empty injection is forbidden.
+Decision 65: the relevance-gate preamble renders the configured
+`recall_injection_cap` per call (`recall_preamble(cap)` — the model
+reads the cap the post-validation enforces), and the recall prompt
+lines carry no duplicated row-id prefix (the `RecallSelection`
+contract validates in-range indices; the GATE prompt keeps the prefix
+— its target contract depends on it). `ScriptedRelevanceGate` is the
+test double (same pattern as `ScriptedGate`).
 
 The Rule C3 summarizer (decision 62, the `summary` module):
 `RigSummary` implements the tamako-core `SummaryProvider` contract on
@@ -558,7 +609,10 @@ mode the pump is an arm of the main `select!`; an `AdapterError` warns
 with the chat id and continues (Section 4.2 tolerance, never fatal).
 Every spawn site passes the wake services, a clone of the outbound
 sender, and the persona name (the sender display name of outbound
-raw-log rows).
+raw-log rows). Decision 65 (H4c): loud fail-fast — a dead polling
+stream, an escaping adapter error, or an actor shutdown failure exits
+NON-ZERO (ExitCode::FAILURE) so a supervisor restarts; replay mode
+and clean ctrl-c stay exit 0.
 
 `tamako --live [--allow-default-persona] [--data-root <dir>] [--config <file>]` (mutually
 exclusive with `--replay`) connects the teloxide adapter: the token
