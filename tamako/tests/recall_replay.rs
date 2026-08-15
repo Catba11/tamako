@@ -852,6 +852,113 @@ async fn a_restart_rebuilds_the_injection_bit_identically() {
         .expect("the actor reports no error");
 }
 
+/// Scenario 4b: the MULTI-EDGE form of the restart bit-identity
+/// (decision 65). One wake injects TWO edges of the same person as one
+/// PlannedInjection: the live context gets ONE RecallInjection item,
+/// while `injected_memories` persists ONE ROW PER EDGE (Section 9.3) —
+/// two consecutive rows with the same position and content. The restart
+/// rebuild must collapse that run back into the one live item (Rule
+/// P1). The absence of this test hid the M5-era violation where the
+/// rebuild appended one item per ROW.
+#[tokio::test]
+async fn a_restart_rebuilds_a_multi_edge_injection_bit_identically() {
+    let fixture = make_fixture().await;
+    // created_at descending: "tea" (newer) is presented first, "go"
+    // second; the scripted gate selects both.
+    seed_person_facts(
+        &fixture,
+        "u1",
+        "Alice",
+        &[("go", "Alice plays go.", 0), ("tea", "Alice likes tea.", 1)],
+    )
+    .await;
+
+    let doubles = WakeDoubles {
+        relevance: Arc::new(ScriptedRelevanceGate::with_selections(vec![vec![0, 1]])),
+        gate: Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
+            participate: false,
+            target_row_id: None,
+            reason: None,
+        }])),
+        reply: Arc::new(ScriptedReplyGenerator::failing(
+            "a gate-no wake never reaches the reply model",
+        )),
+    };
+    let handle = spawn_with_wake(&fixture, wake_config(), t0(), &doubles, None, None);
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u1", "Alice", STOPWORD_TEXT),
+        )
+        .await;
+    }
+    wait_for_counter(&fixture.store, "injection_wakes_total", "1").await;
+    let before = handle
+        .context_snapshot()
+        .await
+        .expect("the context snapshot");
+    // The live view: ONE injection item carrying both edge texts.
+    assert_eq!(recall_injections(&before).len(), 1);
+    handle.shutdown().await.expect("the actor reports no error");
+
+    // The persisted form: TWO rows (one per edge), the same position
+    // and content, consecutive row ids — the exact shape the decision
+    // 65 collapse consumes.
+    let rows = injected_rows(&fixture.store).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].injection_position, 3);
+    assert_eq!(rows[1].injection_position, 3);
+    assert_eq!(rows[0].content, rows[1].content);
+    assert_eq!(
+        rows[0].content,
+        "<memory>Alice likes tea. Alice plays go.</memory>"
+    );
+    assert_ne!(rows[0].edge_id, rows[1].edge_id);
+
+    // The restart: a fresh actor over the same data root.
+    fixture
+        .store
+        .open_group(CHAT_ID)
+        .expect("open_group succeeds");
+    let restarted = spawn_group_actor(GroupActorParams {
+        chat_id: CHAT_ID.to_string(),
+        store: Arc::clone(&fixture.store),
+        memory: Arc::clone(&fixture.memory),
+        config: wake_config(),
+        started_at: t0(),
+        inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        preamble: TEST_PREAMBLE.to_string(),
+        digest: None,
+        post_digest_hook: None,
+        wake: None,
+        summary_provider: None,
+        outbound: None,
+        bot_name: None,
+    });
+    let after = restarted
+        .context_snapshot()
+        .await
+        .expect("the context snapshot");
+    assert_eq!(
+        after, before,
+        "the restart rebuilds the multi-edge injection bit-identically (Rule P1)"
+    );
+    // Explicitly: the two persisted rows collapsed back into ONE item.
+    let injections = recall_injections(&after);
+    assert_eq!(injections.len(), 1);
+    assert_eq!(injections[0].kind, ContextItemKind::RecallInjection);
+    assert_eq!(
+        injections[0].content,
+        "<memory>Alice likes tea. Alice plays go.</memory>"
+    );
+    assert_eq!(injections[0].range_tag, Some(RangeTag::single(3)));
+
+    restarted
+        .shutdown()
+        .await
+        .expect("the actor reports no error");
+}
+
 /// The trivial scripted graph of the digest tests (the pattern of
 /// tamako/tests/context_replay.rs). The extracted person never binds
 /// (no "Alice" message exists here), so the digest writes no neighbor
