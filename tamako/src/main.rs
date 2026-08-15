@@ -399,6 +399,9 @@ fn build_wake_services(
             // over the shared store and graph.
             let recall: Arc<dyn RecallProvider> = match RigRelevanceGate::from_endpoint(
                 &endpoints.gate,
+                // The gate renders the cap into its preamble (decision
+                // 65); ShallowRecall enforces the same cap.
+                recall_injection_cap,
             ) {
                 Ok(relevance_gate) => Arc::new(ShallowRecall::new(
                     Arc::clone(store),
@@ -1046,14 +1049,30 @@ async fn run_live(
                     events_routed += 1;
                 }
                 Ok(None) => {
-                    info!("the telegram update stream ended");
+                    // H4c (decision 65): loud fail-fast. A dead polling
+                    // stream is NOT a clean shutdown — the process is
+                    // supervisor-managed and an exit 0 defeats
+                    // restart-on-failure, so the loop surfaces a fatal
+                    // error and main exits non-zero. Respawn is rejected:
+                    // two pollers of one group risk split-brain dual
+                    // state, so the supervisor restarts the process
+                    // instead.
+                    error!("the telegram update stream ended; exiting non-zero so the supervisor restarts the bot");
+                    fatal = Some(anyhow::anyhow!(
+                        "the telegram update stream ended; the bot receives no events until restarted"
+                    ));
                     break;
                 }
                 Err(error) => {
                     // The adapter already skips transient stream errors
                     // internally. An escaping Err is a fatal channel issue;
-                    // a continue could spin hot, so the loop breaks instead.
-                    warn!(%error, "fatal telegram adapter error; stopping the event loop");
+                    // a continue could spin hot. Fail loud like the
+                    // dead-stream path (H4c): a silent exit 0 would defeat
+                    // the supervisor's restart-on-failure.
+                    error!(%error, "fatal telegram adapter error; stopping the event loop");
+                    fatal = Some(
+                        anyhow::Error::new(error).context("the telegram adapter stream failed")
+                    );
                     break;
                 }
             },
@@ -1102,6 +1121,16 @@ async fn run_live(
 
     if let Some(error) = fatal {
         return Err(error);
+    }
+    // H4c (decision 65): actor task failures surfaced at shutdown are
+    // not a clean exit either — fail loud so the supervisor restarts
+    // the bot. Mid-run actor death is already fatal at the send site
+    // (the inbox closed); a dedicated actor-death watch channel does
+    // not exist and is a documented follow-up.
+    if shutdown_failures > 0 {
+        return Err(anyhow::anyhow!(
+            "{shutdown_failures} group actor(s) reported an error at shutdown"
+        ));
     }
     Ok(())
 }
