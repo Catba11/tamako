@@ -42,7 +42,7 @@ The workspace is a Cargo workspace at the repository root. Crates:
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide). Pure normalization plus polling intake and outbound actions. |
 | `tamako-agent` | All LLM concerns: the extraction call (rig) and the digest pipeline. The only crate that depends on rig. |
 
-Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, and `tamako-memory`. No cycles.
+Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, `tamako-memory`, and `tamako-persona` (the shared context-format gloss). No cycles.
 
 ## 5. Commands
 

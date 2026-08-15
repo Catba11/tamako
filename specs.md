@@ -43,13 +43,14 @@ LLM access is endpoint-portable. Every LLM call uses one of two API families: `a
 - A1: All platform-specific types stay inside the adapter. The actor sees only normalized events.
 - A2: The adapter exposes inbound events: `Message`, `EditedMessage`, `Reaction`, `MemberJoin`, `MemberLeave`.
 - A3: The adapter exposes outbound actions: `SendText`, `SendMedia`, `React`.
-- A4: A normalized message carries: platform message id, timestamp, sender id, sender display name, text, reply-to id, and mention flags.
+- A4: A normalized message carries: platform message id, timestamp, sender id, sender display name, the optional sender username, text, reply-to id, and mention flags.
 - A5: The first adapter is Telegram via teloxide. A Matrix adapter must be possible without changes to the actor, the context, or the memory backend.
 
 ### 4.2 Platform constraints
 
 - The Telegram Bot API does not provide history before the bot joins a group. The bot receives messages only through the update stream. Rule P1 applies: every inbound message is persisted to the raw log at intake time, before any processing.
 - Mention and reply metadata is resolved at intake time and stored with the log row. The digest pipeline uses this stored map. Refer to `proposed-graph-database-specs.md` Section 7.3.
+- An edited message persists its `edit_date` as the row timestamp, not the original send date. Rows written before this rule (the schema v6 cutover) carry the original send date; the mixed semantics are deliberate (Rule P1, append-only). Telegram also delivers `edited_message` updates without a user-visible text change, for example on link-preview generation. Refer to Section 8.1 for the intake rule.
 - Administrator status is OPTIONAL. The bot works as a plain group member when privacy mode is disabled; only reaction collection is absent. Reaction collection requires administrator status: reaction updates (`message_reaction`, `message_reaction_count`) are delivered to administrators only. Requesting these update kinds in `allowed_updates` without administrator status causes no error — the updates never arrive.
 - Privacy mode cannot be queried through the Bot API. The combination non-administrator + privacy mode on (only commands and replies to the bot arrive) is normal platform behavior. The runtime surfaces it as operator guidance in the logs, not as runtime detection.
 - Outbound permission failures are tolerated. Example: `setMessageReaction` without the needed rights. Such a failure is logged with the chat id and is never fatal.
@@ -68,7 +69,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 
 ### 5.2 `store.db` content
 
-- `messages` table: one row per normalized inbound or outbound message. Outbound rows store the bot's own speech. Rule B1 applies. Sender identity columns carry the sender id and the display name; schema v4 adds the nullable `sender_username`. Rows written before v4 read it as NULL.
+- `messages` table: one row per normalized inbound or outbound message. Outbound rows store the bot's own speech. Rule B1 applies. Sender identity columns carry the sender id and the display name; schema v4 adds the nullable `sender_username`. Rows written before v4 read it as NULL. Schema v6 extends the dedup key with the message text, so several edits of one message persist.
 - `reactions` table: one row per reaction event on a group message. The Phase 2 warmup backoff consumes this table. Reaction data is not recoverable later, so collection starts at intake time in Phase 1.
 - `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `prev_digest_boundary_msg_id`, `wake_last_row_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`.
 - `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag, rendered content. The rendered content is stored so a restart rebuild is bit-identical without graph queries. Refer to Section 9.5.
@@ -79,9 +80,9 @@ To delete the memory of a group, delete the directory. Both files share one life
 
 ### 5.3 Persona configuration
 
-- One global persona configuration at `{data_root}/persona.toml`. Hot-reloadable.
+- One global persona configuration at `{data_root}/persona.toml`. Loaded once at startup.
 - An optional `system_prefix` string is rendered verbatim before the identity line, with exactly one blank line as the separator. It carries system-level directives, such as alignment notes. When the key is absent, the rendered preamble is bit-identical to a configuration without it. Rule C4 applies. The injection guardrail is code-owned and is never configurable.
-- A code-owned context-format explanation renders into the preamble after the persona sections and before the injection guardrail. It describes the XML item rendering of Section 7.3 in detail. It is version-controlled and never configurable, like the guardrail. The same text feeds the participation-gate and the recall relevance-gate preambles.
+- A code-owned context-format explanation renders into the preamble after the persona sections and before the injection guardrail. It describes the XML item rendering of Section 7.3 in detail, and it forbids the model to write the `<msg>` or `<you>` structure itself. It is version-controlled and never configurable, like the guardrail. The same text feeds the participation-gate and the recall relevance-gate preambles.
 - In live mode the persona file is required. A missing or invalid file fails startup with a clear error. An explicit operator flag permits the lenient fallback chain for experiments. Replay mode is always lenient. The preamble is the cache anchor. Its source must be deliberate. Rule C4 applies.
 - The persona service renders the system preamble. The preamble is the prefix of every model context and never changes inside a context lifetime. Rule C4 applies.
 - The persona rendering layer is an interface. The pet persona is one implementation. This decoupling permits reuse of the runtime for other personas or purposes.
@@ -100,6 +101,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 - If several triggers are pending, `Digest` runs before `Wake`. Recall sees the freshest graph.
 - A forced `Wake` (mention or reply to the bot) moves to the head of the queue. It does not preempt a running call.
 - Inbound messages during a running `Wake` are logged and appended to the context. They do not interrupt the running call. Before the bot sends a reply, the actor re-checks the recency of the target message. If the number of newer human messages after the target exceeds `reply_staleness_threshold` (20), the reply is discarded, not regenerated. The next wake is the natural retry.
+- If a wake fails, `wake_last_row_id` rolls back to its pre-wake value: the messages are presented again at the next wake. A failed forced wake requeues once. A second failure emits a distinct error, because Section 8.1 obliges the bot to respond.
 
 ## 7. Context lifecycle
 
@@ -142,7 +144,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 
 - Every inbound message: append to the raw log, append to the live context, increment the wake counter. No LLM call.
 - Duplicate deliveries: the raw log insert is idempotent. The wake counter counts each delivery. The counter is a scheduling hint; the log row is the source of truth. Rule P1 applies.
-- An edited message appends a new log row. Extracted facts are not retracted. Refer to Section 15.
+- An edited message appends a new log row with the edit time as its timestamp. An edit whose text is identical to the latest stored row of that message appends nothing: it is not an event (Section 4.2 lists the platform causes). Extracted facts are not retracted. Refer to Section 15.
 - A mention of the bot or a reply to the bot triggers a forced `Wake`. The bot must respond when addressed directly. The `muted` state does not suppress a forced wake. Refer to Section 8.4.
 
 ### 8.2 Digest trigger
@@ -228,7 +230,7 @@ One wake executes these steps in this sequence:
 1. Extract the `KnowledgeGraph` object. Refer to `proposed-graph-database-specs.md` Section 7.3.
 2. Run entity resolution and fact validity steps. Refer to Sections 7.4 and 7.5 of that document.
 3. Write nodes, edges, and embeddings in one transaction per group. Run `CHECKPOINT`.
-4. On success, advance `last_digest_boundary_msg_id`, obtain and persist the summary of the removed chunk (Rule C3, Section 7.3), apply the context removal, and prune the deduplication set of Section 9.3. A crash between the summary write and the boundary advance is replay-safe: the next completion finds the existing summary row and skips the model call. If the summarization fails, the removal defers one cycle; a later completion retries over the widened range.
+4. On every completion (a dead-lettered batch also advances the boundary), advance `last_digest_boundary_msg_id`, obtain and persist the summary of the removed chunk (Rule C3, Section 7.3), apply the context removal, and prune the deduplication set of Section 9.3. A crash between the summary write and the boundary advance is replay-safe: the next completion finds the existing summary row and skips the model call. If the summarization fails, the removal defers one cycle; a later completion retries over the widened range. After 3 consecutive failures the chunk is removed without a summary (one ERROR), and the failure count resets. The summarizer input is capped at 2 × `digest_max_messages`; an oversized chunk summarizes its newest suffix while the summary row records the full range.
 
 ### 10.3 Failure handling
 
@@ -260,6 +262,7 @@ Metrics per group:
 | Dead-letter count | Skipped batches. Requires operator attention. |
 | Fallback attachment rate | Refer to `proposed-graph-database-specs.md` Section 10. Primary entity-resolution quality metric. |
 | Wake rate | Wakes per hour. Watch against the floor configuration. |
+| Summarization failures | `summaries_failed_total`, cumulative. A rising count warns of a stuck summarizer before the circuit breaker of Section 10.2 engages. |
 
 The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the counters, the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
@@ -280,8 +283,12 @@ Global defaults. Every item is overridable per group.
 | `digest_timeout` | 6 h | 8.2 |
 | `digest_max_retries` | 5 total attempts, including the first | 10.3 |
 | `warmup_quota` | 1–3 per day | 8.4 |
+| `warmup_silence` | 4 h | 8.4 |
+| `monologue_limit` | 2 | 8.5 |
+| `reply_staleness_threshold` | 20 newer human messages | 6.2 |
+| `recall_injection_cap` | 5 per wake | 9.2 |
 
-LLM access is global configuration, not per-group:
+LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -292,15 +299,11 @@ LLM access is global configuration, not per-group:
 | `reply_model` | `claude-sonnet-4-5` | Reply generation (Section 9, step 4). Environment override: `TAMAKO_REPLY_MODEL`. |
 | `summary_model` | `claude-haiku-4-5` | Removed-chunk summarization (Rule C3, Section 10.2). Environment override: `TAMAKO_SUMMARY_MODEL`. |
 | `structured_output` | `schema` | Structured-output mode: `schema` (send the JSON schema), `json_object` (JSON mode without a schema), `prompt_only` (no response_format; for endpoints that reject unknown parameters). Environment override: `TAMAKO_STRUCTURED_OUTPUT`. |
-| `llm_session_id` | `"tamako"` | Session-affinity identifier sent as the `x-opencode-session` request header on every LLM call. Gateways that honor the header (Opencode Go) keep the prompt cache on one upstream. Global only: no per-purpose and no per-group variants. Empty string counts as unset. Environment override: `TAMAKO_LLM_SESSION_ID`. |
+| `llm_session_id` | `"tamako"` | Session-affinity identifier sent as the `x-opencode-session` request header on every LLM call. Gateways that honor the header (Opencode Go) keep the prompt cache on one upstream. No per-purpose variant. One session id per deployment is the intent; the per-group resolution means a group table could override it — do not. Empty string counts as unset. Environment override: `TAMAKO_LLM_SESSION_ID`. |
 
 A purpose (`digest`, `gate`, `reply`, `summary`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
 
 API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well.
-| `warmup_silence` | 4 h | 8.4 |
-| `monologue_limit` | 2 | 8.5 |
-| `reply_staleness_threshold` | 20 newer human messages | 6.2 |
-| `recall_injection_cap` | 5 per wake | 9.2 |
 
 ## 14. Deferred items
 

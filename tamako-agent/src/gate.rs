@@ -79,7 +79,7 @@ Rules:
 6. Output only the JSON object of the required schema. Give one short reason. No commentary.";
 
 /// The full system preamble of the gate call: [`GATE_PREAMBLE`] plus
-/// the shared context-format gloss of tamako-persona (decision 61, the
+/// the shared context-format gloss of tamako-persona (decision 63, the
 /// deliberate preamble event). The gloss is the SINGLE source in
 /// tamako-persona: the persona preamble and the recall preamble embed
 /// the same constant, so the format explanations can never drift
