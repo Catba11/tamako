@@ -6,9 +6,24 @@
 //! spawned task and the result returns through the FIFO inbox.
 //!
 //! The wake procedure (specs.md Section 9, steps 1-5) is live since
-//! Phase 1 M4. A wake failure is logged and skipped, never retried
-//! inline and never fatal. The counters `wakes_total` and
-//! `participations_total` (Section 12) are best effort. The steps:
+//! Phase 1 M4. A wake failure is logged and skipped, never fatal. On a
+//! failure `wake_last_row_id` rolls back to its pre-wake value
+//! (decision 65, amending decision 33's reset-at-start — decision-log +
+//! spec-backfill note for Sections 6.2/9): the failed wake's messages
+//! re-present at the next NATURAL trigger, and the reset-at-start
+//! floor/threshold still gates it, so there is no immediate retry
+//! storm. A failed FORCED wake requeues into `forced_pending` ONCE
+//! (bounded, marked entry); a second failure drops it with a distinct
+//! ERROR naming the unmet Section 8.1 must-respond obligation. The
+//! counters `wakes_total` and
+//! `participations_total` (Section 12) are best effort. Decision 65
+//! also fixes the two latent marker bugs: at startup a missing or
+//! malformed `wake_last_row_id` of a group WITH prior log rows is
+//! repaired to the raw-log tail ("start from now" — scheduling state,
+//! P1-safe to recompute), and the disabled-services path (no
+//! gate/reply provider wired) still advances the marker past the
+//! messages a wake would have presented, so the presented range stays
+//! bounded while the services are off. The steps:
 //! 1. The monologue lock (Section 8.5): a muted, unforced wake resets
 //!    and returns. `wake_last_row_id` stays put, so messages of the
 //!    muted period remain "new" for the next real wake.
@@ -122,6 +137,29 @@ pub enum CoreError {
 /// The default inbox capacity when the caller has no preference.
 pub const DEFAULT_INBOX_CAPACITY: usize = 256;
 
+/// The M3 summarization circuit breaker (decision 65): after this many
+/// CONSECUTIVE summarization failures, the failing chunk falls back to
+/// the sanctioned old-C3 drop (the removal proceeds without a summary,
+/// exactly like the None-provider behavior) with one ERROR, and the
+/// breaker resets. Justification of 3: a brief endpoint flap self-heals
+/// within one or two digest cycles (the decision-62 deferral already
+/// retries those), so three consecutive failures across three digest
+/// completions mean the endpoint is durably broken — and wedging the
+/// context growth forever is worse than losing one summary. After a
+/// circuit-break drop the next chunk tries summarization again (a
+/// transient outage self-heals); a permanently broken endpoint pays one
+/// probe summarization every 4th chunk, the accepted probe cadence.
+const SUMMARY_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// The summarizer input cap, in multiples of the digest row threshold
+/// `digest_max_messages` (decision 65). The decision-62 failure
+/// deferral widens the chunk by one digest range per failed cycle;
+/// without a cap the summarizer input grows unboundedly. Two multiples
+/// cover one natural chunk plus one deferred widening; the circuit
+/// breaker bounds the widening anyway, so a chunk past the cap is
+/// always the final attempt before the drop.
+const SUMMARY_INPUT_CAP_DIGEST_MULTIPLE: usize = 2;
+
 /// The result of one wake procedure run, reported back through the
 /// FIFO inbox (specs.md Section 6.1, rule 1).
 #[derive(Debug)]
@@ -153,6 +191,27 @@ pub struct WakeReport {
     /// The gate's own reason string, when the gate ran (telemetry for
     /// the curated wake log line). `None` for a forced wake.
     pub gate_reason: Option<String>,
+}
+
+/// One forced wake (mention/reply, Section 8.1): the queue entry of
+/// `forced_pending` AND the failure context a `WakeCompleted` report
+/// carries back, so the completion handler can apply the decision-65
+/// requeue-once rule. In-memory only; nothing of it persists. `pub`
+/// because the public `ActorCommand::WakeCompleted` names it; the
+/// fields stay crate-internal.
+#[derive(Debug, Clone)]
+pub struct ForcedWakeEntry {
+    /// The forcing message (the mention/reply that Section 8.1 obliges
+    /// the bot to answer).
+    forcing: GateMessage,
+    /// The intake time of the forcing message: the queued wake's `now`,
+    /// so it stays on the deterministic replay clock.
+    forced_at: OffsetDateTime,
+    /// True when this entry is the ONE bounded retry of a failed forced
+    /// wake (decision 65): a second failure does NOT requeue again; the
+    /// entry drops with a distinct ERROR naming the unmet Section 8.1
+    /// must-respond obligation.
+    retried: bool,
 }
 
 /// Commands of the per-group actor inbox. specs.md Section 6.1, rule 1:
@@ -192,8 +251,22 @@ pub enum ActorCommand {
         result: std::result::Result<String, SummaryError>,
     },
     /// The spawned wake task reports its result through this command
-    /// (internal plumbing, the same pattern as `DigestCompleted`).
-    WakeCompleted(std::result::Result<WakeReport, CoreError>),
+    /// (internal plumbing, the same pattern as `DigestCompleted`). The
+    /// report carries the failure context of decision 65 alongside the
+    /// result, so a failed wake can roll `wake_last_row_id` back and a
+    /// failed forced wake can requeue once.
+    WakeCompleted {
+        /// The wake outcome. Boxed: `WakeReport` is by far the largest
+        /// payload of the inbox enum (clippy::large_enum_variant).
+        result: Box<std::result::Result<WakeReport, CoreError>>,
+        /// The `wake_last_row_id` value at wake START. A failed wake
+        /// rolls the marker back to it, so the failed wake's messages
+        /// re-present at the next natural trigger (decision 65).
+        pre_wake_row_id: i64,
+        /// The forced entry of this wake, when forced (Section 8.1).
+        /// Its `retried` mark bounds the requeue-once rule.
+        forced: Option<ForcedWakeEntry>,
+    },
     Shutdown,
 }
 
@@ -353,6 +426,54 @@ where
     Ok(outcome?)
 }
 
+/// Runs one spawned LLM task body to completion, containing a panic
+/// (the H4a supervision rule): a panicking digest/summary/wake task
+/// reports a synthetic FAILURE through the inbox instead of vanishing
+/// silently, so the completion handler ALWAYS runs and the in-flight
+/// flag (`digest_in_flight` / `summary_pending` / `wake_in_flight`)
+/// ALWAYS resets. The panic becomes the same failure class as a
+/// provider error; the returned message carries the `task panicked`
+/// marker, so the logs distinguish a panic from a provider failure.
+///
+/// Mechanism: `futures::FutureExt::catch_unwind` is the textbook
+/// shape, but `futures` is not a dependency of tamako-core (nor of the
+/// workspace) and the std covers the same ground: `poll_fn` +
+/// `std::panic::catch_unwind`, no new dependency. The
+/// `AssertUnwindSafe` is sound here: after a caught panic the inner
+/// future is NEVER polled again — the wrapper resolves with the error
+/// and drops it — which is exactly the contract `futures`' own
+/// `CatchUnwind` relies on.
+async fn contain_task_panic<F, T>(body: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut body = Box::pin(body);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(format!(
+                "task panicked: {}",
+                panic_payload_text(payload.as_ref())
+            ))),
+        }
+    })
+    .await
+}
+
+/// Renders the payload of a caught panic: the `&str` or `String` of a
+/// `panic!` message; anything else (a `panic_any` payload) reports its
+/// kind, since the payload is opaque.
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a non-string panic payload".to_string()
+    }
+}
+
 /// Builds the raw-log row for one normalized inbound message.
 /// Rule A4: the normalized message carries every field the row needs.
 fn to_new_message(msg: &NormalizedMessage, event_type: EventType) -> NewMessage {
@@ -494,6 +615,46 @@ async fn persist_session(
     blocking_store(store, move |store| store.set_state_many(&chat_id, &pairs)).await
 }
 
+/// True when the persisted state has no usable `wake_last_row_id`: the
+/// key is absent or its value is malformed. The key string is session.rs
+/// `KEY_WAKE_LAST_ROW_ID` (private there); the startup repair spells it
+/// out because it must distinguish an absent/malformed key from a
+/// PERSISTED zero, which `SessionState::decode` maps to the same fresh
+/// default.
+fn wake_last_row_id_missing_or_malformed(persisted: &HashMap<String, String>) -> bool {
+    persisted
+        .get("wake_last_row_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_none()
+}
+
+/// The disabled-services marker advance (decision 65, the K2-latent
+/// marker fix): a wake WOULD start here, but no gate/reply provider is
+/// wired. Advance `wake_last_row_id` past the messages the wake would
+/// have presented — the same tail rule as `start_wake` (the last
+/// raw-log row above the marker, any direction) — so the presented
+/// range cannot grow without bound while the services are off and
+/// re-present as one huge batch when they are re-enabled. One tail
+/// scan per suppressed fire: the same scan `start_wake` would have
+/// done. The caller resets the scheduler (when the fire is a trigger
+/// fire) and persists the session.
+async fn advance_wake_marker_without_services(
+    store: &Arc<Store>,
+    chat_id: &str,
+    session: &mut SessionState,
+) -> Result<(), CoreError> {
+    let after_id = session.wake_last_row_id;
+    let gather_chat_id = chat_id.to_string();
+    let rows = blocking_store(store, move |store| {
+        store.list_messages_after(&gather_chat_id, after_id)
+    })
+    .await?;
+    if let Some(tail_id) = rows.last().map(|row| row.id) {
+        session.wake_last_row_id = tail_id;
+    }
+    Ok(())
+}
+
 /// The counter increment of specs.md Section 12. Best effort (the M1
 /// counter style): a failure is logged and swallowed, never propagated —
 /// the wake does not depend on its metrics.
@@ -606,7 +767,14 @@ async fn maybe_launch_digest(
     let chat_id = chat_id.to_string();
     let sender = inbox_sender.clone();
     tokio::spawn(async move {
-        let result = pipeline.run_digest(&chat_id, boundary).await;
+        // H4a panic containment: a panicking pipeline reports a
+        // synthetic failure through the inbox (the same failure class
+        // as an infrastructure error), so the completion handler runs
+        // and `digest_in_flight` ALWAYS resets.
+        let result =
+            contain_task_panic(async move { pipeline.run_digest(&chat_id, boundary).await })
+                .await
+                .unwrap_or_else(|message| Err(CoreError::Digest(message)));
         // A failed send means the actor is shutting down. The result is
         // dropped; the boundary did not advance, so the next run redoes
         // the batch (the MERGEs are idempotent, Section 10.3).
@@ -734,6 +902,33 @@ async fn run_actor<M: MemoryBackend>(
         store.list_messages_after(&rebuild_chat_id, removal_cutoff)
     })
     .await?;
+
+    // Decision 65 (the K2-latent marker fix): `SessionState::decode`
+    // is a total function — a missing or malformed `wake_last_row_id`
+    // key decodes to the fresh default 0. For a group with PRIOR log
+    // rows that silently re-presents the ENTIRE raw log at the next
+    // wake (an unbounded gate prompt; true duplicate responses are
+    // possible). Scheduling state is P1-safe to recompute, so repair
+    // it here: "start from now" — the marker moves to the raw-log
+    // tail. The rebuild rows above are every row above the removal
+    // cutoff of the append-only log, so their last id IS the log
+    // tail; no extra store read is needed. A group with no rows keeps
+    // 0, and a present, well-formed marker (even 0) is kept as
+    // persisted. One WARN line with the chat id: the repair means
+    // persisted scheduling state was lost or never written — an
+    // operator-visible anomaly reported once per restart, not a
+    // routine event (the state repair of a healthy group never logs).
+    if wake_last_row_id_missing_or_malformed(&persisted) {
+        if let Some(tail) = rows.last() {
+            session.wake_last_row_id = tail.id;
+            persist_session(&store, &chat_id, &session).await?;
+            tracing::warn!(
+                chat_id = %chat_id,
+                wake_last_row_id = tail.id,
+                "wake_last_row_id missing or malformed; repaired to the raw-log tail"
+            );
+        }
+    }
     let injections_chat_id = chat_id.clone();
     let mut injections = blocking_store(&store, move |store| {
         store.list_injected_memories(&injections_chat_id)
@@ -769,12 +964,19 @@ async fn run_actor<M: MemoryBackend>(
     // summary task is in flight, the C3 mutation of its digest
     // completion is deferred and the digest trigger is suppressed.
     let mut summary_pending = false;
+    // The M3 summarization circuit breaker (decision 65): CONSECUTIVE
+    // summarization failures. In-memory on purpose (no new session
+    // key): a restart re-probes the endpoint anyway, and the worst
+    // case of a lost count is one extra deferral cycle. Resets on a
+    // success and after a circuit-break drop.
+    let mut summary_failures: u32 = 0;
     // One wake at a time per group (Section 6.2: a forced Wake queues
     // behind a running wake; it does not preempt it). The queued entry
     // carries the intake time of the forcing message, so the queued
-    // wake stays on the deterministic replay clock.
+    // wake stays on the deterministic replay clock, and the
+    // requeue-once mark of decision 65.
     let mut wake_in_flight = false;
-    let mut forced_pending: Option<(GateMessage, OffsetDateTime)> = None;
+    let mut forced_pending: Option<ForcedWakeEntry> = None;
 
     // --- The M4 timer driver (known gap 2) ---
     // `MissedTickBehavior::Delay`: a delayed tick loses at most cadence
@@ -823,6 +1025,51 @@ async fn run_actor<M: MemoryBackend>(
                 // specs.md Section 15, open item 4: an edit is appended as a
                 // new log row with event_type Edit. It is never a
                 // retraction. No other processing in Phase 0.
+                //
+                // Decision 65 (invisible-edit intake filter), the
+                // identical-text exception: an edit whose text is
+                // byte-identical to the LATEST persisted row of the same
+                // platform_msg_id is not an event. The comparison target
+                // is the newest row (highest id), not the original: edit
+                // chains (A→B→A) treat each edit as a delta against the
+                // current state, which is exactly the "did anything
+                // change" question. The filter runs BEFORE the persist
+                // step (Rule P1 order: persist → context append →
+                // session → triggers): a dropped edit produces no log
+                // row, no context item, no session mutation, and no
+                // wake-counter advance. Telegram sends the full text, so
+                // the comparison is byte-exact (no trimming).
+                let lookup_chat_id = chat_id.clone();
+                let lookup_pid = msg.platform_msg_id.clone();
+                let latest = blocking_store(&store, move |store| {
+                    store.find_latest_message_by_platform_msg_id(&lookup_chat_id, &lookup_pid)
+                })
+                .await;
+                match latest {
+                    Ok(Some(row)) if row.text == msg.text => {
+                        debug!(
+                            chat_id = %chat_id,
+                            platform_msg_id = %msg.platform_msg_id,
+                            "text-identical edit dropped (not an event)"
+                        );
+                        continue;
+                    }
+                    // No persisted row: the edit predates the bot's view
+                    // (target unknown); keep the current behavior.
+                    Ok(_) => {}
+                    // Fail open: a lookup failure never loses data — treat
+                    // the edit as a real edit. Not covered by an actor
+                    // test: the harness holds a concrete `Arc<Store>` (no
+                    // trait seam), so a store error is not injectable.
+                    Err(error) => {
+                        tracing::warn!(
+                            chat_id = %chat_id,
+                            platform_msg_id = %msg.platform_msg_id,
+                            %error,
+                            "latest-row lookup failed; treating the edit as a real edit (fail open)"
+                        );
+                    }
+                }
                 let row = to_new_message(&msg, EventType::Edit);
                 let edit_chat_id = chat_id.clone();
                 let outcome = blocking_store(&store, move |store| {
@@ -887,14 +1134,64 @@ async fn run_actor<M: MemoryBackend>(
                 )
                 .await?;
             }
-            ActorCommand::WakeCompleted(result) => {
+            ActorCommand::WakeCompleted {
+                result,
+                pre_wake_row_id,
+                forced,
+            } => {
                 wake_in_flight = false;
-                match result {
+                match *result {
                     Err(error) => {
-                        // Log, skip, no crash, NO inline retry: the next
-                        // wake is the natural retry (specs.md Section 9
-                        // failure handling).
-                        tracing::error!(chat_id = %chat_id, %error, "wake procedure failed; skipping this wake");
+                        // Decision 65 (amending decision 33's
+                        // reset-at-start): roll `wake_last_row_id` back
+                        // to its pre-wake value, so the failed wake's
+                        // messages re-present at the next NATURAL
+                        // trigger. The wake scheduler stays reset (the
+                        // floor/threshold still gates), so there is no
+                        // immediate retry storm. NO inline retry of an
+                        // unforced wake (specs.md Section 9 failure
+                        // handling). A SUCCESSFUL wake keeps the
+                        // reset-at-start advance (nothing changes).
+                        session.wake_last_row_id = pre_wake_row_id;
+                        persist_session(&store, &chat_id, &session).await?;
+                        match forced {
+                            Some(entry) if !entry.retried => {
+                                // The Section 8.1 must-respond
+                                // obligation gets ONE bounded retry:
+                                // the forced wake requeues (marked), so
+                                // a second failure cannot requeue again.
+                                // The requeue honors the Section 6.2
+                                // "newest address wins" rule: a forcing
+                                // queued DURING the failed wake is
+                                // newer, so it supersedes the retry
+                                // (the rollback above means its wake
+                                // re-presents the failed wake's
+                                // messages anyway).
+                                if forced_pending.is_some() {
+                                    tracing::warn!(chat_id = %chat_id, %error, "wake procedure failed; a newer forced wake is already queued — the newest address wins, no requeue");
+                                } else {
+                                    tracing::error!(chat_id = %chat_id, %error, "wake procedure failed; the forced wake requeues once (specs.md Section 8.1)");
+                                    forced_pending = Some(ForcedWakeEntry {
+                                        retried: true,
+                                        ..entry
+                                    });
+                                }
+                            }
+                            Some(entry) => {
+                                // The requeued forced wake failed
+                                // again: drop it with a DISTINCT error
+                                // naming the unmet obligation.
+                                tracing::error!(
+                                    chat_id = %chat_id,
+                                    %error,
+                                    forcing_row_id = entry.forcing.row_id,
+                                    "the requeued forced wake failed again; dropping it — the must-respond obligation of specs.md Section 8.1 is unmet"
+                                );
+                            }
+                            None => {
+                                tracing::error!(chat_id = %chat_id, %error, "wake procedure failed; skipping this wake");
+                            }
+                        }
                     }
                     Ok(report) => {
                         handle_wake_report(
@@ -913,9 +1210,11 @@ async fn run_actor<M: MemoryBackend>(
                 // Section 6.2: a queued forced Wake moves to the head of
                 // the queue; it starts immediately after the current
                 // wake completes. The intake time of the forcing message
-                // is its `now` (deterministic replay).
+                // is its `now` (deterministic replay). A forced wake
+                // requeued by the failure path above starts here too.
                 if let Some(services) = wake_services.as_ref() {
-                    if let Some((forcing, forced_at)) = forced_pending.take() {
+                    if let Some(entry) = forced_pending.take() {
+                        let forced_at = entry.forced_at;
                         start_wake(
                             &store,
                             &chat_id,
@@ -927,7 +1226,7 @@ async fn run_actor<M: MemoryBackend>(
                             services,
                             &mut wake_in_flight,
                             &inbox_sender,
-                            Some(forcing),
+                            Some(entry),
                             forced_at,
                             "forced",
                         )
@@ -1009,10 +1308,44 @@ async fn run_actor<M: MemoryBackend>(
                                     // never enter the raw log — the specs.md
                                     // Section 10.1/9.5 analog).
                                     let rows_chat_id = chat_id.clone();
-                                    let rows = blocking_store(&store, move |store| {
+                                    let mut rows = blocking_store(&store, move |store| {
                                         store.list_messages_in_range(&rows_chat_id, lower, b_old)
                                     })
                                     .await?;
+                                    // Decision 65 input cap: the
+                                    // decision-62 failure deferral
+                                    // widens the chunk by one digest
+                                    // range per failed cycle, so without
+                                    // a cap the summarizer input grows
+                                    // unboundedly. Cap the INPUT at
+                                    // twice the digest row threshold
+                                    // (one natural chunk plus one
+                                    // deferred widening). An oversized
+                                    // chunk summarizes only its NEWEST
+                                    // cap-sized suffix (the oldest
+                                    // context is the least valuable),
+                                    // while the summary row is recorded
+                                    // against the FULL removed range:
+                                    // the row's (first,last) key covers
+                                    // the removal, the content covers
+                                    // the suffix — asymmetric on
+                                    // purpose; partial memory beats
+                                    // none.
+                                    let cap = (SUMMARY_INPUT_CAP_DIGEST_MULTIPLE
+                                        * config.digest_max_messages as usize)
+                                        .max(1);
+                                    let rows = if rows.len() > cap {
+                                        debug!(
+                                            chat_id = %chat_id,
+                                            range = %format!("({lower},{b_old}]"),
+                                            rows = rows.len(),
+                                            cap,
+                                            "the summarizer input exceeds the cap; summarizing the newest suffix only"
+                                        );
+                                        rows.split_off(rows.len() - cap)
+                                    } else {
+                                        rows
+                                    };
                                     // Section 6.1, rule 3 analog: the FIFO
                                     // never blocks on the LLM call. The C3
                                     // mutation defers to the SummaryCompleted
@@ -1027,9 +1360,22 @@ async fn run_actor<M: MemoryBackend>(
                                     let sender = inbox_sender.clone();
                                     let report_outcome = outcome.clone();
                                     tokio::spawn(async move {
-                                        let result = provider
-                                            .summarize(&summary_chat_id, lower, b_old, &rows)
-                                            .await;
+                                        // H4a panic containment (the
+                                        // digest-task pattern): a
+                                        // panicking summarizer reports a
+                                        // synthetic failure, so
+                                        // `summary_pending` ALWAYS
+                                        // resets and the decision-62
+                                        // failure deferral applies.
+                                        let result = contain_task_panic(async move {
+                                            provider
+                                                .summarize(&summary_chat_id, lower, b_old, &rows)
+                                                .await
+                                        })
+                                        .await
+                                        .unwrap_or_else(|message| {
+                                            Err(SummaryError::Provider(message))
+                                        });
                                         // A failed send means the actor is
                                         // shutting down. Nothing was
                                         // persisted; the restart replays the
@@ -1101,6 +1447,9 @@ async fn run_actor<M: MemoryBackend>(
                 summary_pending = false;
                 match result {
                     Ok(text) => {
+                        // A success resets the decision-65 circuit
+                        // breaker's consecutive-failure count.
+                        summary_failures = 0;
                         // Rule P1 order: the summary row persists BEFORE
                         // the chunk it replaces is dropped. The insert is
                         // idempotent on the range key (replay safety).
@@ -1134,33 +1483,77 @@ async fn run_actor<M: MemoryBackend>(
                         .await?;
                     }
                     Err(error) => {
-                        // Failure semantics (decision 62): never drop the
-                        // chunk silently. The removal is DEFERRED one
-                        // digest cycle: `last` advances (the digest
-                        // itself completed), `prev` stays, so the next
-                        // completion retries over the WIDENED range
-                        // `(prev, new_last]` (the deferred chunk plus
-                        // the newly digested one; the natural-key
-                        // check-before-call still makes an exact-match
-                        // replay cheap), and the raw chunk stays in the
-                        // context. The C5 bound stretches by one cycle
-                        // on this path; the restart rebuild cutoff
-                        // `prev.unwrap_or(0)` stays consistent with the
-                        // live view.
-                        tracing::warn!(
-                            chat_id = %chat_id,
-                            %error,
-                            range = %format!("({first_msg_id},{last_msg_id}]"),
-                            "context summarization failed; the raw chunk stays one more digest cycle"
-                        );
-                        session.last_digest_boundary_msg_id = new_boundary;
-                        session.last_digest_at = Some(OffsetDateTime::now_utc());
-                        persist_session(&store, &chat_id, &session).await?;
-                        if let Some(hook) = &post_digest_hook {
-                            // The digest completed; only the
-                            // summarization failed. The hook observes
-                            // the digest outcome as usual.
-                            hook.after_digest(&chat_id, &outcome).await;
+                        // The Section 12-style counter (spec-backfill
+                        // note): EVERY summarization failure counts, so
+                        // `--status` surfaces a stuck group. Best
+                        // effort like the other counters; incremented
+                        // before the circuit-break check.
+                        summary_failures += 1;
+                        bump_counter(&store, &chat_id, "summaries_failed_total").await;
+                        if summary_failures >= SUMMARY_MAX_CONSECUTIVE_FAILURES {
+                            // The M3 circuit breaker (decision 65):
+                            // three consecutive failures across three
+                            // digest completions mean the endpoint is
+                            // durably broken, and wedging the context
+                            // growth forever is worse than losing the
+                            // summary. Fall back to the sanctioned
+                            // old-C3 drop FOR THIS CHUNK (removal
+                            // proceeds without a summary, exactly like
+                            // the None-provider behavior) with one
+                            // ERROR naming the chat and the dropped
+                            // range. The breaker then RESETS: the next
+                            // chunk tries summarization again, so a
+                            // transient outage self-heals and a
+                            // permanently broken endpoint pays one probe
+                            // summarization every 4th chunk.
+                            tracing::error!(
+                                chat_id = %chat_id,
+                                %error,
+                                range = %format!("({first_msg_id},{last_msg_id}]"),
+                                consecutive_failures = summary_failures,
+                                "context summarization failed too many times in a row; dropping the chunk without a summary (the old-C3 fallback)"
+                            );
+                            summary_failures = 0;
+                            finalize_digest_completion(
+                                &store,
+                                &chat_id,
+                                &mut session,
+                                &mut context,
+                                last_msg_id,
+                                new_boundary,
+                                &outcome,
+                                &post_digest_hook,
+                            )
+                            .await?;
+                        } else {
+                            // Failure semantics (decision 62): never drop the
+                            // chunk silently. The removal is DEFERRED one
+                            // digest cycle: `last` advances (the digest
+                            // itself completed), `prev` stays, so the next
+                            // completion retries over the WIDENED range
+                            // `(prev, new_last]` (the deferred chunk plus
+                            // the newly digested one; the natural-key
+                            // check-before-call still makes an exact-match
+                            // replay cheap), and the raw chunk stays in the
+                            // context. The C5 bound stretches by one cycle
+                            // on this path; the restart rebuild cutoff
+                            // `prev.unwrap_or(0)` stays consistent with the
+                            // live view.
+                            tracing::warn!(
+                                chat_id = %chat_id,
+                                %error,
+                                range = %format!("({first_msg_id},{last_msg_id}]"),
+                                "context summarization failed; the raw chunk stays one more digest cycle"
+                            );
+                            session.last_digest_boundary_msg_id = new_boundary;
+                            session.last_digest_at = Some(OffsetDateTime::now_utc());
+                            persist_session(&store, &chat_id, &session).await?;
+                            if let Some(hook) = &post_digest_hook {
+                                // The digest completed; only the
+                                // summarization failed. The hook observes
+                                // the digest outcome as usual.
+                                hook.after_digest(&chat_id, &outcome).await;
+                            }
                         }
                     }
                 }
@@ -1235,7 +1628,7 @@ async fn handle_message(
     summary_pending: bool,
     wake_services: Option<&WakeServices>,
     wake_in_flight: &mut bool,
-    forced_pending: &mut Option<(GateMessage, OffsetDateTime)>,
+    forced_pending: &mut Option<ForcedWakeEntry>,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     msg: NormalizedMessage,
 ) -> Result<(), CoreError> {
@@ -1313,13 +1706,21 @@ async fn handle_message(
         // The wake services are disabled (no LLM key wired): an
         // unforced fire logs and resets, a forced wake logs only. The
         // startup warning already covers the disabled state, so these
-        // lines stay at debug.
+        // lines stay at debug. Decision 65: BOTH branches still
+        // advance `wake_last_row_id` past the messages the suppressed
+        // wake would have presented (the Section 9.6 gather range), so
+        // the range cannot grow without bound while the services are
+        // off. No gate/reply call, no outbound — only the scheduling
+        // marker moves.
         if msg.mentions_bot || msg.is_reply_to_bot {
             // specs.md Section 8.1: the bot must respond when addressed
             // directly. The muted state does not suppress a forced wake.
             debug!(chat_id = %chat_id, "wake services disabled; forced wake ignored");
+            advance_wake_marker_without_services(store, chat_id, session).await?;
+            persist_session(store, chat_id, session).await?;
         } else if wake.should_fire(now, config) {
             debug!(chat_id = %chat_id, "wake services disabled; wake trigger ignored");
+            advance_wake_marker_without_services(store, chat_id, session).await?;
             reset_wake(config, session, wake, rng, now);
             persist_session(store, chat_id, session).await?;
         }
@@ -1358,7 +1759,13 @@ async fn handle_message(
             // replaces the queued one (the newest address wins). The
             // queued wake gets its own curated line at completion.
             debug!(chat_id = %chat_id, "a wake is in flight; the forced wake is queued");
-            *forced_pending = Some((forcing, now));
+            *forced_pending = Some(ForcedWakeEntry {
+                forcing,
+                forced_at: now,
+                // A fresh forcing has its full requeue budget (decision
+                // 65); only a failure-requeued entry is marked.
+                retried: false,
+            });
         } else {
             start_wake(
                 store,
@@ -1371,7 +1778,11 @@ async fn handle_message(
                 services,
                 wake_in_flight,
                 inbox_sender,
-                Some(forcing),
+                Some(ForcedWakeEntry {
+                    forcing,
+                    forced_at: now,
+                    retried: false,
+                }),
                 now,
                 "forced",
             )
@@ -1450,9 +1861,11 @@ async fn handle_tick(
     .await?;
     let Some(services) = wake_services else {
         // The wake services are disabled (no LLM key wired); the
-        // behavior matches the intake path exactly.
+        // behavior matches the intake path exactly, marker advance
+        // included (decision 65).
         if wake.should_fire(now, config) {
             debug!(chat_id = %chat_id, "wake services disabled; wake trigger ignored");
+            advance_wake_marker_without_services(store, chat_id, session).await?;
             reset_wake(config, session, wake, rng, now);
             persist_session(store, chat_id, session).await?;
         }
@@ -1499,7 +1912,9 @@ async fn handle_tick(
 /// run in a spawned task over owned data and report back through the
 /// FIFO inbox as `WakeCompleted`). `trigger` is the telemetry spelling
 /// of what started this wake (`"forced"` or a `FireReason`); it lands
-/// on the curated wake log line.
+/// on the curated wake log line. `forced` carries the full forced entry
+/// (not just the forcing message), so the failure report can apply the
+/// decision-65 requeue-once rule.
 #[allow(clippy::too_many_arguments)]
 async fn start_wake(
     store: &Arc<Store>,
@@ -1512,7 +1927,7 @@ async fn start_wake(
     services: &WakeServices,
     wake_in_flight: &mut bool,
     inbox_sender: &mpsc::Sender<ActorCommand>,
-    forced: Option<GateMessage>,
+    forced: Option<ForcedWakeEntry>,
     now: OffsetDateTime,
     trigger: &'static str,
 ) -> Result<(), CoreError> {
@@ -1578,7 +1993,11 @@ async fn start_wake(
     // collapse into ONE reset at wake START, so messages that arrive
     // during a running wake count toward the next wake instead of being
     // zeroed at completion (Section 6.2). The counter is best effort: a
-    // counter failure logs and never aborts the wake.
+    // counter failure logs and never aborts the wake. Decision 65
+    // amends this on the FAILURE path only: the completion handler
+    // rolls `wake_last_row_id` back to `pre_wake_row_id`, so a failed
+    // wake loses no messages (they re-present at the next natural
+    // trigger). On success the advance below stands unchanged.
     reset_wake(config, session, wake, rng, now);
     session.wake_last_row_id = tail_id;
     bump_counter(store, chat_id, "wakes_total").await;
@@ -1604,22 +2023,42 @@ async fn start_wake(
     let reply = Arc::clone(&services.reply);
     let task_chat_id = chat_id.to_string();
     let sender = inbox_sender.clone();
+    // The decision-65 failure context: the pre-wake marker (the gather
+    // floor of this wake) and the forced entry travel with the report,
+    // so a failure can roll the marker back and requeue a forced wake
+    // once. The wake calls themselves consume only the forcing message.
+    let pre_wake_row_id = after_id;
+    let failure_forced = forced.clone();
+    let run_forced = forced.map(|entry| entry.forcing);
     tokio::spawn(async move {
-        let result = run_wake_calls(
-            &task_chat_id,
-            recall,
-            gate,
-            reply,
-            new_messages,
-            snapshot,
-            forced,
-            tail_id,
-            trigger,
-        )
-        .await;
+        // H4a panic containment (the digest-task pattern): a panicking
+        // recall/gate/reply call reports a synthetic failure, so the
+        // wake-skip handler runs and `wake_in_flight` ALWAYS resets.
+        let result = contain_task_panic(async move {
+            run_wake_calls(
+                &task_chat_id,
+                recall,
+                gate,
+                reply,
+                new_messages,
+                snapshot,
+                run_forced,
+                tail_id,
+                trigger,
+            )
+            .await
+        })
+        .await
+        .unwrap_or_else(|message| Err(CoreError::Wake(message)));
         // A failed send means the actor is shutting down; the result is
         // dropped (same rule as the digest task).
-        let _ = sender.send(ActorCommand::WakeCompleted(result)).await;
+        let _ = sender
+            .send(ActorCommand::WakeCompleted {
+                result: Box::new(result),
+                pre_wake_row_id,
+                forced: failure_forced,
+            })
+            .await;
     });
     Ok(())
 }
@@ -2075,6 +2514,87 @@ mod tests {
         }
     }
 
+    /// A digest pipeline double whose first `panics` calls panic INSIDE
+    /// the returned future (the H4a containment tests: an LLM task
+    /// panics mid-flight, not at call time); later calls delegate to
+    /// the store-backed scripted pipeline. Every call is counted.
+    struct PanicThenDigest {
+        fallback: ScriptedDigest,
+        panics_remaining: Mutex<usize>,
+        calls: Mutex<usize>,
+    }
+
+    impl PanicThenDigest {
+        fn new(store: Arc<Store>, panics: usize) -> Arc<Self> {
+            Arc::new(Self {
+                fallback: ScriptedDigest { store },
+                panics_remaining: Mutex::new(panics),
+                calls: Mutex::new(0),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl DigestPipeline for PanicThenDigest {
+        fn run_digest<'a>(
+            &'a self,
+            chat_id: &'a str,
+            last_digest_boundary_msg_id: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>
+        {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            let panic_now = {
+                let mut remaining = self
+                    .panics_remaining
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if panic_now {
+                return Box::pin(async move { panic!("the digest extractor exploded") });
+            }
+            self.fallback
+                .run_digest(chat_id, last_digest_boundary_msg_id)
+        }
+    }
+
+    /// Spawns an actor with an arbitrary digest pipeline double.
+    fn spawn_with_digest(
+        fixture: &Fixture,
+        config: TriggerConfig,
+        digest: Arc<dyn DigestPipeline>,
+    ) -> GroupActorHandle {
+        spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config,
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: Some(digest),
+            post_digest_hook: None,
+            wake: None,
+            summary_provider: None,
+            outbound: None,
+            bot_name: None,
+        })
+    }
+
     /// The trigger config of the digest tests: the trigger fires every
     /// two messages (specs.md Section 8.2).
     fn digest_config() -> TriggerConfig {
@@ -2101,6 +2621,85 @@ mod tests {
                 "timed out waiting for the digest boundary to reach {min} \
                  (current boundary: {})",
                 session.last_digest_boundary_msg_id
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A `tracing` subscriber that records the rendered fields of every
+    /// event. The failure errors of the spawned LLM tasks surface
+    /// through the actor's WARN/ERROR log lines (their only reporting
+    /// surface), so the H4a tests assert the `task panicked` marker in
+    /// the captured events. tamako-core has no tracing-subscriber
+    /// dependency, so the capture is a minimal hand-rolled subscriber;
+    /// `set_default` is thread-local and the `#[tokio::test]` runtime is
+    /// single-threaded, so the capture sees every actor event.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EventCapture {
+        fn contains(&self, needle: &str) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|event| event.contains(needle))
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct FieldText(String);
+
+            impl tracing::field::Visit for FieldText {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+
+            let mut text = FieldText(String::new());
+            event.record(&mut text);
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(text.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Polls the capture until an event contains `needle` or the
+    /// deadline passes (the `wait_for_boundary` pattern).
+    async fn wait_for_event(capture: &EventCapture, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if capture.contains(needle) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a log event containing {needle:?}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2568,6 +3167,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_identical_edit_drops_without_a_trace() {
+        // Decision 65: an edit whose text equals the LATEST persisted row
+        // is not an event — no log row, no context item, no session
+        // mutation, no wake-counter advance.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        // Byte-exact same text as the persisted original row.
+        let edited = message("m1", 1, false);
+        handle
+            .send_event(InboundEvent::EditedMessage(edited))
+            .await
+            .expect("send succeeds");
+        // A snapshot is a FIFO barrier: both events are processed.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, EventType::Message);
+        // Preamble + the original message; no edit item.
+        assert_eq!(items.len(), 2);
+        // The edit path never advanced the wake counter; the drop must
+        // not change that.
+        assert_eq!(session.wake.msgs_since_wake, 1);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn edit_chain_a_b_a_persists_each_delta_and_a_repeat_drops() {
+        // Decision 65: the comparison target is the LATEST persisted row,
+        // so a chain A→B→A persists each real delta (the second A differs
+        // from the current state B), while a no-op repeat A→A drops.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        // A → B: a real delta, persists.
+        let mut edit_b = message("m1", 1, false);
+        edit_b.text = "text B".to_string();
+        handle
+            .send_event(InboundEvent::EditedMessage(edit_b))
+            .await
+            .expect("send succeeds");
+        // B → A: back to the original text; differs from the latest row
+        // (B), so it persists.
+        let edit_a = message("m1", 1, false);
+        handle
+            .send_event(InboundEvent::EditedMessage(edit_a))
+            .await
+            .expect("send succeeds");
+        // A → A: identical to the latest row, drops.
+        let repeat_a = message("m1", 1, false);
+        handle
+            .send_event(InboundEvent::EditedMessage(repeat_a))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].event_type, EventType::Message);
+        assert_eq!(rows[1].event_type, EventType::Edit);
+        assert_eq!(rows[1].text, "text B");
+        assert_eq!(rows[2].event_type, EventType::Edit);
+        assert_eq!(rows[2].text, "text of m1");
+        // Preamble + original + two edit items; the repeat appended none.
+        assert_eq!(items.len(), 4);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn edit_of_an_unknown_target_persists() {
+        // Decision 65: no persisted row for the platform_msg_id (the edit
+        // predates the bot's view) keeps the current behavior — the edit
+        // is persisted like any other new row.
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        let edited = message("m-unknown", 1, false);
+        handle
+            .send_event(InboundEvent::EditedMessage(edited))
+            .await
+            .expect("send succeeds");
+        handle.snapshot().await.expect("snapshot succeeds");
+
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, EventType::Edit);
+        assert_eq!(rows[0].text, "text of m-unknown");
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+    // Note: the fail-open branch of the decision-65 filter (a store error
+    // on the latest-row lookup) is not covered here — the actor harness
+    // holds a concrete `Arc<Store>` with no trait seam, so a store error
+    // is not injectable. The branch is documented at the intake site.
+
+    #[tokio::test]
     async fn restart_rebuilds_a_bit_identical_context() {
         // Rule P1: the startup rebuild from the persisted rows is
         // bit-identical to the pre-restart context.
@@ -2796,6 +3501,65 @@ mod tests {
         assert_eq!(session.prev_digest_boundary_msg_id, Some(2));
         assert_eq!(session.last_digest_boundary_msg_id, 4);
         restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- H4a panic-containment tests (batch 2, decision 65 package) ---
+
+    #[tokio::test]
+    async fn contain_task_panic_converts_a_panic_into_a_marked_failure() {
+        // The `&str` payload of `panic!`.
+        let outcome: Result<(), String> =
+            contain_task_panic(async { panic!("the model exploded") }).await;
+        assert_eq!(
+            outcome,
+            Err("task panicked: the model exploded".to_string())
+        );
+        // An owned `String` payload renders too.
+        let outcome: Result<(), String> =
+            contain_task_panic(async { panic!("{}", "owned payload".to_string()) }).await;
+        assert_eq!(outcome, Err("task panicked: owned payload".to_string()));
+        // A `panic_any` payload has no message; the marker still
+        // distinguishes the panic from a provider failure.
+        let outcome: Result<(), String> =
+            contain_task_panic(async { std::panic::panic_any(42) }).await;
+        assert_eq!(
+            outcome,
+            Err("task panicked: a non-string panic payload".to_string())
+        );
+        // No panic: the output passes through unchanged.
+        let outcome: Result<u32, String> = contain_task_panic(async { 41 + 1 }).await;
+        assert_eq!(outcome, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_digest_task_reports_a_failure_and_the_trigger_recovers() {
+        // H4a: the spawned digest task panics; the containment reports a
+        // synthetic DigestCompleted(Err) through the inbox, so
+        // `digest_in_flight` resets and a later digest fires again. The
+        // failure semantics are EXACTLY those of an infrastructure
+        // error: the boundary does not advance and the next evaluation
+        // point retries.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let digest = PanicThenDigest::new(Arc::clone(&fixture.store), 1);
+        let handle = spawn_with_digest(&fixture, digest_config(), digest.clone());
+
+        send_pair(&handle, 1).await;
+        // Digest 1 panics. The failure log line proves the completion
+        // handler ran (the flag is already reset at that point: it
+        // resets BEFORE the match on the result).
+        wait_for_event(&capture, "task panicked: the digest extractor exploded").await;
+        // Same semantics as a provider error: no boundary advance.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.last_digest_boundary_msg_id, 0);
+
+        // The trigger recovered: the next evaluation digests the whole
+        // tail above boundary 0.
+        send_pair(&handle, 3).await;
+        wait_for_boundary(&handle, 4).await;
+        assert_eq!(digest.call_count(), 2);
+        handle.shutdown().await.expect("shutdown succeeds");
     }
 
     // --- Segmented summarization tests (decision 62) ---
@@ -3059,6 +3823,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn three_consecutive_summary_failures_drop_the_chunk_and_the_breaker_resets() {
+        // Decision 65, the M3 circuit breaker: on the THIRD consecutive
+        // summarization failure THAT chunk drops without a summary row
+        // (the sanctioned old-C3 fallback) with one ERROR, and the
+        // breaker resets — the next chunk tries summarization again.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let summary = Arc::new(ScriptedSummary::failing_then(
+            3,
+            vec!["recovered summary.".to_string()],
+        ));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        send_pair(&handle, 3).await;
+        // Failure 1 (chunk (0, 2]): the decision-62 deferral.
+        wait_for_boundary(&handle, 4).await;
+        send_pair(&handle, 5).await;
+        // Failure 2 (chunk (0, 4]): deferred again; the context still
+        // keeps every raw row.
+        wait_for_boundary(&handle, 6).await;
+        send_pair(&handle, 7).await;
+        // Failure 3 (chunk (0, 6]): the breaker fires — the removal
+        // proceeds WITHOUT a summary row (prev = 6), one ERROR lands.
+        wait_for_boundary(&handle, 8).await;
+        wait_for_event(&capture, "dropping the chunk without a summary").await;
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.last_digest_boundary_msg_id, 8);
+        assert_eq!(session.prev_digest_boundary_msg_id, Some(6));
+        let dropped = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 0, 6)
+        })
+        .await;
+        assert!(dropped.is_none());
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        // The dropped chunk left the context; the overlap buffer
+        // (6, 8] stays raw.
+        assert_eq!(items.len(), 3);
+        assert!(items
+            .iter()
+            .all(|item| item.kind != ContextItemKind::Summary));
+        // The Section 12-style counter counted all three failures.
+        assert_eq!(
+            counter_value(&fixture.store, "summaries_failed_total").await,
+            Some(3)
+        );
+
+        send_pair(&handle, 9).await;
+        // The breaker reset: digest 5 summarizes the next chunk (6, 8]
+        // again — and succeeds.
+        wait_for_boundary(&handle, 10).await;
+        let inputs = summary.inputs();
+        assert_eq!(inputs.len(), 4);
+        assert_eq!((inputs[3].first_msg_id, inputs[3].last_msg_id), (6, 8));
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[1].content,
+            r#"<summary range="6-8">recovered summary.</summary>"#
+        );
+
+        send_pair(&handle, 11).await;
+        // The success reset the count: ONE new failure (the scripted
+        // queue is exhausted) defers again instead of dropping.
+        wait_for_boundary(&handle, 12).await;
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.last_digest_boundary_msg_id, 12);
+        assert_eq!(session.prev_digest_boundary_msg_id, Some(8));
+        // No drop: the deferred chunk (8, 10] stays raw in the context.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 6);
+        let missing = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 8, 10)
+        })
+        .await;
+        assert!(missing.is_none());
+        assert_eq!(
+            counter_value(&fixture.store, "summaries_failed_total").await,
+            Some(4)
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_chunk_summarizes_only_the_newest_suffix_of_the_full_range() {
+        // Decision 65 input cap (2 × digest_max_messages = 4 rows
+        // here): the deferred-retry widening grows the chunk past the
+        // cap; the summarizer receives only the NEWEST cap-sized
+        // suffix, while the summary row is recorded against the FULL
+        // removed range.
+        let fixture = make_fixture();
+        let summary = Arc::new(ScriptedSummary::failing_then(
+            2,
+            vec!["suffix summary.".to_string()],
+        ));
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        wait_for_boundary(&handle, 2).await;
+        send_pair(&handle, 3).await;
+        // Failure 1 (chunk (0, 2]): deferred.
+        wait_for_boundary(&handle, 4).await;
+        send_pair(&handle, 5).await;
+        // Failure 2 (chunk (0, 4]): four rows — exactly AT the cap, no
+        // truncation.
+        wait_for_boundary(&handle, 6).await;
+        send_pair(&handle, 7).await;
+        // Attempt 3 (chunk (0, 6]): six rows EXCEED the cap; the
+        // provider receives only the newest four (rows 3-6), and the
+        // summary row is recorded against the full range (0, 6].
+        wait_for_boundary(&handle, 8).await;
+
+        let inputs = summary.inputs();
+        assert_eq!(inputs.len(), 3);
+        let untruncated: Vec<i64> = inputs[1].rows.iter().map(|row| row.id).collect();
+        assert_eq!(untruncated, vec![1, 2, 3, 4]);
+        assert_eq!((inputs[2].first_msg_id, inputs[2].last_msg_id), (0, 6));
+        let suffix: Vec<i64> = inputs[2].rows.iter().map(|row| row.id).collect();
+        assert_eq!(suffix, vec![3, 4, 5, 6]);
+
+        let row = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 0, 6)
+        })
+        .await
+        .expect("the summary row exists");
+        assert_eq!(row.content, "suffix summary.");
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[1].content,
+            r#"<summary range="0-6">suffix summary.</summary>"#
+        );
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(7)));
+        assert_eq!(items[3].range_tag, Some(RangeTag::single(8)));
+        // Two failures, no circuit-break drop (N = 3).
+        assert_eq!(
+            counter_value(&fixture.store, "summaries_failed_total").await,
+            Some(2)
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
     async fn restart_rebuilds_the_context_with_summaries_bit_identically() {
         // Rule P1 with summary items: the startup rebuild loads the two
         // newest persisted summary rows and reproduces the live
@@ -3164,6 +4085,133 @@ mod tests {
         summary.release.notify_one();
         wait_for_boundary(&handle, 4).await;
         wait_for_boundary(&handle, 6).await;
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    /// A summarizer double whose first `panics` calls panic INSIDE the
+    /// returned future (the H4a containment tests: an LLM task panics
+    /// mid-flight, not at call time); later calls delegate to the
+    /// scripted summarizer. Every call is counted.
+    struct PanicThenSummary {
+        fallback: ScriptedSummary,
+        panics_remaining: Mutex<usize>,
+        calls: Mutex<usize>,
+    }
+
+    impl PanicThenSummary {
+        fn new(panics: usize, summaries: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                fallback: ScriptedSummary::with_summaries(summaries),
+                panics_remaining: Mutex::new(panics),
+                calls: Mutex::new(0),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl SummaryProvider for PanicThenSummary {
+        fn summarize<'a>(
+            &'a self,
+            chat_id: &'a str,
+            first_msg_id: i64,
+            last_msg_id: i64,
+            rows: &'a [MessageRow],
+        ) -> Pin<Box<dyn Future<Output = Result<String, SummaryError>> + Send + 'a>> {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            let panic_now = {
+                let mut remaining = self
+                    .panics_remaining
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if panic_now {
+                return Box::pin(async move { panic!("the summarizer exploded") });
+            }
+            self.fallback
+                .summarize(chat_id, first_msg_id, last_msg_id, rows)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_summary_task_reports_a_failure_and_defers_the_removal() {
+        // H4a + decision 62: the spawned summary task panics; the
+        // containment reports a synthetic SummaryCompleted(Err), so
+        // `summary_pending` resets and the EXISTING failure semantics
+        // apply unchanged — the removal defers one digest cycle and the
+        // next completion retries the summarization over the WIDENED
+        // range.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let summary = PanicThenSummary::new(1, vec!["chunk one.".to_string()]);
+        let handle = spawn_with_digest_and_summary(&fixture, digest_config(), summary.clone());
+
+        send_pair(&handle, 1).await;
+        // Digest 1: the boundary advances 0 -> 2; b_old == 0 summarizes
+        // nothing.
+        wait_for_boundary(&handle, 2).await;
+        assert_eq!(summary.call_count(), 0);
+
+        send_pair(&handle, 3).await;
+        // Digest 2 completes; the summary task of the (0,2] chunk
+        // PANICS. The failure semantics of decision 62: `last`
+        // advances to 4, the chunk stays one more cycle, and the
+        // digest trigger is free again (summary_pending reset).
+        wait_for_boundary(&handle, 4).await;
+        wait_for_event(&capture, "task panicked: the summarizer exploded").await;
+        assert_eq!(summary.call_count(), 1);
+        // No summary row persisted (a panic fabricates no history).
+        let missing = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 0, 2)
+        })
+        .await;
+        assert!(missing.is_none());
+
+        send_pair(&handle, 5).await;
+        // Digest 3 completes; its deferred summarization retries over
+        // the widened range (0,4] and SUCCEEDS through the fallback.
+        wait_for_boundary(&handle, 6).await;
+        assert_eq!(summary.call_count(), 2);
+        let row = blocking_store_call(&fixture.store, move |store| {
+            store.find_context_summary(CHAT_ID, 0, 4)
+        })
+        .await
+        .expect("the retried summary row exists");
+        assert_eq!(row.content, "chunk one.");
+
+        // The deferred removal landed: the summary item replaced the
+        // raw chunk; the newest chunk (4,6] stays raw (one-chunk lag).
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].kind, ContextItemKind::Preamble);
+        assert_eq!(items[1].kind, ContextItemKind::Summary);
+        assert_eq!(
+            items[1].range_tag,
+            Some(RangeTag {
+                first_msg_id: 0,
+                last_msg_id: 4
+            })
+        );
+        assert_eq!(items[2].range_tag, Some(RangeTag::single(5)));
+        assert_eq!(items[3].range_tag, Some(RangeTag::single(6)));
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
@@ -3632,6 +4680,65 @@ mod tests {
         }
     }
 
+    /// A gate double whose first `panics` `decide` calls panic INSIDE
+    /// the returned future (the H4a containment tests: an LLM task
+    /// panics mid-flight, not at call time); later calls delegate to
+    /// the scripted gate. Every call is counted.
+    struct PanicThenGate {
+        fallback: ScriptedGate,
+        panics_remaining: Mutex<usize>,
+        calls: Mutex<usize>,
+    }
+
+    impl PanicThenGate {
+        fn yes_after(panics: usize, target: GateTarget) -> Arc<Self> {
+            Arc::new(Self {
+                fallback: ScriptedGate {
+                    participate: true,
+                    target,
+                    calls: Mutex::new(Vec::new()),
+                },
+                panics_remaining: Mutex::new(panics),
+                calls: Mutex::new(0),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl ParticipationGate for PanicThenGate {
+        fn decide<'a>(
+            &'a self,
+            input: &'a GateInput,
+        ) -> Pin<Box<dyn Future<Output = Result<GateDecision, CoreError>> + Send + 'a>> {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            let panic_now = {
+                let mut remaining = self
+                    .panics_remaining
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if panic_now {
+                return Box::pin(async move { panic!("the gate model exploded") });
+            }
+            self.fallback.decide(input)
+        }
+    }
+
     /// A scripted reply generator. With `hold` set, the FIRST `generate`
     /// call waits on the notify (the in-flight hold of the queueing
     /// tests). Every call is counted and every request recorded.
@@ -3700,6 +4807,66 @@ mod tests {
                     }
                 }
                 Ok(self.text.clone())
+            })
+        }
+    }
+
+    /// A reply generator double whose first `failures` calls fail with a
+    /// wake error; later calls answer with `text` (the decision-65
+    /// forced-requeue tests: a forced wake BYPASSES the gate, so the
+    /// wake failure must come from the reply model). Every call is
+    /// counted.
+    struct FailThenReply {
+        text: String,
+        failures_remaining: Mutex<usize>,
+        calls: Mutex<usize>,
+    }
+
+    impl FailThenReply {
+        fn new(failures: usize, text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                text: text.to_string(),
+                failures_remaining: Mutex::new(failures),
+                calls: Mutex::new(0),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl ReplyGenerator for FailThenReply {
+        fn generate<'a>(
+            &'a self,
+            _request: &'a ReplyRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            let fail_now = {
+                let mut remaining = self
+                    .failures_remaining
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            let text = self.text.clone();
+            Box::pin(async move {
+                if fail_now {
+                    Err(CoreError::Wake("the reply endpoint is down".to_string()))
+                } else {
+                    Ok(text)
+                }
             })
         }
     }
@@ -3795,6 +4962,40 @@ mod tests {
         (handle, outbound_rx)
     }
 
+    /// Spawns an actor with arbitrary wake doubles: the trait-object
+    /// variant of `spawn_with_wake`, for the doubles that are not a
+    /// `ScriptedGate`/`ScriptedReply` pair (PanicThenGate,
+    /// FailThenReply).
+    fn spawn_with_wake_doubles(
+        fixture: &Fixture,
+        config: TriggerConfig,
+        recall: Arc<dyn RecallProvider>,
+        gate: Arc<dyn ParticipationGate>,
+        reply: Arc<dyn ReplyGenerator>,
+    ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(64);
+        let handle = spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config,
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: None,
+            post_digest_hook: None,
+            wake: Some(WakeServices {
+                recall,
+                gate,
+                reply,
+            }),
+            summary_provider: None,
+            outbound: Some(outbound_tx),
+            bot_name: None,
+        });
+        (handle, outbound_rx)
+    }
+
     /// Reads one counter of the state table (None when the key does not
     /// exist).
     async fn counter_value(store: &Arc<Store>, key: &str) -> Option<i64> {
@@ -3881,6 +5082,38 @@ mod tests {
             tokio::time::timeout(window, outbound.recv()).await.is_err(),
             "an unexpected outbound action arrived"
         );
+    }
+
+    /// Inserts messages directly into the raw log WITHOUT an actor run
+    /// (the marker-repair tests: log rows exist, but no session state
+    /// row was ever written — the old-session/pre-repair shape). The
+    /// group store is opened BEFORE the actor spawns (the
+    /// curated_log_replay.rs WAL-pragma race note).
+    async fn insert_messages_without_session(fixture: &Fixture, messages: &[NormalizedMessage]) {
+        let rows: Vec<NewMessage> = messages
+            .iter()
+            .map(|msg| to_new_message(msg, EventType::Message))
+            .collect();
+        blocking_store_call(&fixture.store, move |store| {
+            store.open_group(CHAT_ID)?;
+            for row in &rows {
+                store.insert_message(CHAT_ID, row)?;
+            }
+            Ok(())
+        })
+        .await;
+    }
+
+    /// Writes one state-table row directly (the malformed-marker repair
+    /// test corrupts the key this way).
+    async fn set_state_directly(fixture: &Fixture, key: &str, value: &str) {
+        let key = key.to_string();
+        let value = value.to_string();
+        blocking_store_call(&fixture.store, move |store| {
+            store.open_group(CHAT_ID)?;
+            store.set_state(CHAT_ID, &key, &value)
+        })
+        .await;
     }
 
     /// Destructures a SendText action; panics on any other variant.
@@ -4007,6 +5240,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_panicking_wake_gate_reports_a_failure_and_the_next_wake_runs() {
+        // H4a: the gate panics inside the spawned wake task; the
+        // containment reports a synthetic WakeCompleted(Err), so the
+        // wake is skipped EXACTLY like a provider failure (log, no
+        // outbound, no participation) and `wake_in_flight` resets.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let gate = PanicThenGate::yes_after(1, GateTarget::Last);
+        let reply = ScriptedReply::new("recovered reply");
+        let (outbound_tx, mut outbound) = mpsc::channel(64);
+        let handle = spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config: wake_config(3),
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: None,
+            post_digest_hook: None,
+            wake: Some(WakeServices {
+                recall: Arc::new(NoopRecall),
+                gate: gate.clone(),
+                reply: reply.clone(),
+            }),
+            summary_provider: None,
+            outbound: Some(outbound_tx),
+            bot_name: None,
+        });
+
+        // Wake 1 fires on the count threshold; its gate call panics.
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        // The failure log line proves the completion handler ran (the
+        // flag is already reset at that point: it resets BEFORE the
+        // match on the result).
+        wait_for_event(&capture, "task panicked: the gate model exploded").await;
+        assert_eq!(gate.call_count(), 1);
+        // The wake-skip semantics of a provider failure: nothing sent,
+        // no participation counted.
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            None
+        );
+
+        // A later wake runs. A mention forces one; had it arrived
+        // while wake 1 was still in flight, the forced queue would
+        // start it right after the failure — either path proves the
+        // flag reset.
+        handle
+            .send_event(InboundEvent::Message(message("m4", 4, true)))
+            .await
+            .expect("send succeeds");
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "recovered reply");
+        assert_eq!(reply_to, Some("m4".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        // The forced wake bypassed the gate: still one gate call.
+        assert_eq!(gate.call_count(), 1);
+        assert_eq!(reply.call_count(), 1);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_failed_wake_rolls_back_and_the_next_natural_wake_re_presents_the_messages() {
+        // Decision 65 rollback: the failed wake's messages are NOT
+        // lost. `wake_last_row_id` rolls back to its pre-wake value;
+        // the next NATURAL trigger (the count threshold — the
+        // reset-at-start floor/threshold still gates, so no immediate
+        // retry storm) re-presents the same messages.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let gate = PanicThenGate::yes_after(1, GateTarget::Last);
+        let reply = ScriptedReply::new("second wake reply");
+        let (handle, mut outbound) = spawn_with_wake_doubles(
+            &fixture,
+            wake_config(3),
+            Arc::new(NoopRecall),
+            gate.clone(),
+            reply.clone(),
+        );
+
+        // Wake 1 fires on the count threshold; its gate call panics.
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        // The failure log proves the completion handler ran — the
+        // rollback lands BEFORE that log line.
+        wait_for_event(&capture, "task panicked: the gate model exploded").await;
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 0);
+        // The wake-skip semantics are unchanged: nothing sent, no
+        // participation, the start-time counter bump stands.
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            None
+        );
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+
+        // Three more messages reach the threshold again (the count was
+        // reset at wake 1's start): the natural retry. The gate input
+        // RE-PRESENTS the failed wake's messages — rows 1-3 again, plus
+        // the new rows 4-6.
+        for index in 4..=6 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "second wake reply");
+        assert_eq!(reply_to, Some("m6".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        // The fallback gate recorded exactly one call (the first call
+        // panicked before delegating); its input is the re-presented
+        // full range.
+        let inputs = gate
+            .fallback
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(inputs.len(), 1);
+        let row_ids: Vec<i64> = inputs[0]
+            .new_messages
+            .iter()
+            .map(|msg| msg.row_id)
+            .collect();
+        assert_eq!(row_ids, vec![1, 2, 3, 4, 5, 6]);
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 6);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_failed_forced_wake_requeues_once_and_responds() {
+        // Decision 65: a failed FORCED wake requeues into
+        // `forced_pending` ONCE and starts immediately after the
+        // failure (the Section 8.1 must-respond obligation gets one
+        // bounded retry). A forced wake bypasses the gate, so the
+        // failure comes from the reply model. The retry responds to the
+        // SAME forcing message.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::no();
+        let reply = FailThenReply::new(1, "obliged reply");
+        // A high count: only the mention can fire the wake.
+        let (handle, mut outbound) = spawn_with_wake_doubles(
+            &fixture,
+            wake_config(100),
+            Arc::new(NoopRecall),
+            gate.clone(),
+            reply.clone(),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+
+        // The first reply call fails; the requeued forced wake's second
+        // call succeeds.
+        let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "obliged reply");
+        assert_eq!(reply_to, Some("m1".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        assert_eq!(reply.call_count(), 2);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        // The forced wake bypassed the gate on both runs (Section 8.1).
+        assert_eq!(gate.call_count(), 0);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_twice_failed_forced_wake_drops_with_a_distinct_error() {
+        // Decision 65: the requeued forced wake fails AGAIN — the entry
+        // drops (NO second requeue) with a distinct ERROR naming the
+        // unmet Section 8.1 must-respond obligation.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let gate = ScriptedGate::no();
+        let reply = FailThenReply::new(2, "late reply");
+        let (handle, mut outbound) = spawn_with_wake_doubles(
+            &fixture,
+            wake_config(100),
+            Arc::new(NoopRecall),
+            gate.clone(),
+            reply.clone(),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+
+        // The distinct drop line proves both failures ran their course.
+        wait_for_event(
+            &capture,
+            "the must-respond obligation of specs.md Section 8.1 is unmet",
+        )
+        .await;
+        // Exactly two reply calls (the failure plus the one requeue),
+        // nothing sent, no participation.
+        assert_eq!(reply.call_count(), 2);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert_eq!(
+            counter_value(&fixture.store, "participations_total").await,
+            None
+        );
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+
+        // The queue is clean: a fresh mention forces a normal wake with
+        // a full retry budget.
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, true)))
+            .await
+            .expect("send succeeds");
+        let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "late reply");
+        assert_eq!(reply_to, Some("m2".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        assert_eq!(reply.call_count(), 3);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
     async fn forced_wake_bypasses_the_gate() {
         // Section 8.1: a mention forces a wake. The gate double RECORDS
         // its calls; the forced path must record ZERO calls and target
@@ -4119,6 +5602,244 @@ mod tests {
         wait_for_counter(&fixture.store, "participations_total", 3).await;
         assert_eq!(gate.call_count(), 1);
         assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(4));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_a_missing_wake_marker_to_the_raw_log_tail() {
+        // Decision 65 (the K2-latent marker fix), the ABSENT-key shape:
+        // rows land in the raw log WITHOUT any actor run, so no state
+        // row was ever written (wake services previously disabled, or
+        // an old-session group). The startup repair moves
+        // `wake_last_row_id` to the raw-log tail — "start from now" —
+        // so the next wake presents only post-restart messages instead
+        // of the ENTIRE log.
+        let fixture = make_fixture();
+        let prior: Vec<_> = (1..=3)
+            .map(|index| message(&format!("old{index}"), index, false))
+            .collect();
+        insert_messages_without_session(&fixture, &prior).await;
+
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("post-restart reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(2),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+
+        // The repair ran at startup (the snapshot is a FIFO barrier):
+        // the marker sits at the tail (row 3), one WARN line reported
+        // the repair, and the repaired value is persisted.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 3);
+        assert!(
+            capture.contains("wake_last_row_id missing or malformed; repaired to the raw-log tail")
+        );
+        assert_eq!(
+            counter_value(&fixture.store, "wake_last_row_id").await,
+            Some(3)
+        );
+
+        // Two post-restart messages reach the count threshold: the
+        // gate input is ONLY the post-restart rows 4 and 5 — the
+        // repair stopped the full-log re-presentation.
+        for index in 4..=5 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "post-restart reply");
+        assert_eq!(reply_to, Some("m5".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        let inputs = gate
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(inputs.len(), 1);
+        let row_ids: Vec<i64> = inputs[0]
+            .new_messages
+            .iter()
+            .map(|msg| msg.row_id)
+            .collect();
+        assert_eq!(row_ids, vec![4, 5]);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_a_malformed_wake_marker_to_the_raw_log_tail() {
+        // The MALFORMED-key shape of the same repair: decode cannot
+        // tell a malformed value from an absent key (both fall back to
+        // the fresh default), so the startup repair treats the two
+        // shapes identically. Wake services stay unwired here: the
+        // repair is independent of the disabled/enabled path.
+        let fixture = make_fixture();
+        let prior: Vec<_> = (1..=2)
+            .map(|index| message(&format!("old{index}"), index, false))
+            .collect();
+        insert_messages_without_session(&fixture, &prior).await;
+        set_state_directly(&fixture, "wake_last_row_id", "not-a-number").await;
+
+        let handle = spawn_on(&fixture, TriggerConfig::default());
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 2);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_a_valid_wake_marker() {
+        // No regression of the normal restart path: a PRESENT,
+        // well-formed marker (here 3, advanced by a live wake) is kept
+        // as persisted — the startup repair must not move it and must
+        // not log.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("reply one");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // The restart on the same store: the marker key exists and
+        // parses, so the repair stays out.
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let restarted = spawn_on(&fixture, TriggerConfig::default());
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 3);
+        assert!(!capture.contains("repaired to the raw-log tail"));
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn an_empty_group_keeps_the_wake_marker_at_zero() {
+        // The repair needs a tail: a group with NO log rows keeps the
+        // fresh default 0 and nothing is logged or written.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let handle = spawn_on(&fixture, TriggerConfig::default());
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 0);
+        assert!(!capture.contains("repaired to the raw-log tail"));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn disabled_wake_services_still_advance_the_wake_marker() {
+        // Decision 65: with no gate/reply provider wired (wake: None),
+        // a wake that WOULD fire still advances `wake_last_row_id`
+        // past the messages it would have presented, so the presented
+        // range cannot grow without bound while the services are off.
+        // The scheduler reset of the suppressed trigger fire is
+        // unchanged; no gate/reply call and no outbound exist on this
+        // path by construction.
+        let fixture = make_fixture();
+        let handle = spawn_on(&fixture, wake_config(2));
+
+        // m1: below the threshold; the marker stays put.
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 0);
+
+        // m2: the count threshold fires; the suppressed wake advances
+        // the marker past m1-m2 (the Section 9.6 gather range).
+        handle
+            .send_event(InboundEvent::Message(message("m2", 2, false)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 2);
+        assert_eq!(
+            counter_value(&fixture.store, "wake_last_row_id").await,
+            Some(2),
+            "the suppressed wake persisted the advanced marker"
+        );
+
+        // m3: counting again toward the next wake; the marker stays.
+        handle
+            .send_event(InboundEvent::Message(message("m3", 3, false)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 2);
+
+        // m4: the threshold fires again; the marker covers m3-m4.
+        handle
+            .send_event(InboundEvent::Message(message("m4", 4, false)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 4);
+
+        // A mention is a wake that WOULD be forced (Section 8.1); the
+        // disabled path advances the marker past it too.
+        handle
+            .send_event(InboundEvent::Message(message("m5", 5, true)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 5);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn disabled_wake_services_advance_the_marker_on_a_tick_wake() {
+        // The tick half of the disabled path: an interval fire with
+        // wake: None advances the marker exactly like the intake fire.
+        // Count 100 so only the interval can fire; the tick sits far
+        // past every jittered interval.
+        let fixture = make_fixture();
+        let config = TriggerConfig {
+            wake_msg_count: 100,
+            wake_floor: Duration::ZERO,
+            wake_interval: Duration::from_secs(60),
+            ..TriggerConfig::default()
+        };
+        let handle = spawn_on(&fixture, config);
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 0);
+
+        handle
+            .send(ActorCommand::Tick(t0() + time::Duration::hours(2)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 1);
         handle.shutdown().await.expect("shutdown succeeds");
     }
 

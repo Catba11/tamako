@@ -797,21 +797,24 @@ async fn stale_reply_is_discarded() {
     shutdown(harness).await;
 }
 
-/// Scenario F: the parrot filter end to end (decision 59, F1). Two
-/// forced wakes (mentions), two scripted replies:
+/// Scenario F: the parrot filter end to end (decision 59, F1), now with
+/// the decision-65 forced-wake requeue on top. Two forced wakes
+/// (mentions), three scripted replies:
 ///
 /// - reply 1 is ONLY a confabulated parrot block (ASCII and full-width
 ///   colon variants): the filter leaves nothing, the wake follows the
 ///   exact empty-reply path — nothing persisted, nothing sent, no
-///   participation counted;
-/// - reply 2 is a parrot block followed by real text: the group and
-///   the raw log see the SAME stripped remainder (Rule B1: the log is
-///   the truth).
-///
-/// The second wake's send is the deterministic barrier that the first
-/// wake's failure completed (Section 6.2: a queued forced wake starts
-/// at the earliest inside the previous wake's completion handler),
-/// exactly as in `stale_reply_is_discarded`.
+///   participation counted — and decision 65 then requeues the forced
+///   wake ONCE (the Section 8.1 must-respond obligation gets one
+///   bounded retry);
+/// - reply 2 serves the requeued retry of the SAME forcing f1: a parrot
+///   block followed by real text — the group and the raw log see the
+///   SAME stripped remainder (Rule B1: the log is the truth);
+/// - reply 3 serves f2's forced wake, sent only AFTER the retry's send
+///   arrived — the deterministic barrier that the first wake's failure
+///   and requeue completed (Section 6.2: a queued forced wake starts at
+///   the earliest inside the previous wake's completion handler),
+///   exactly as in `stale_reply_is_discarded`.
 #[tokio::test]
 async fn parroting_replies_are_filtered_before_log_and_send() {
     let fixture = make_fixture();
@@ -828,6 +831,7 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
     let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
         "I remember: Alice likes tea.\nI remember：小明喜欢吃辣。".to_string(),
         "I remember: Alice likes tea.\n在的".to_string(),
+        "好的".to_string(),
     ]));
     let harness = spawn_on(&fixture, config, t0, gate, reply);
     harness
@@ -848,6 +852,22 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+    // Reply 1 filters to nothing: the wake fails like an empty reply,
+    // and decision 65 requeues the forced wake ONCE. The retry consumes
+    // reply 2 and sends its stripped remainder — replying to f1, the
+    // SAME forcing message. This first send is the barrier that the
+    // failure and the requeue both completed.
+    let actions = wait_for_actions(&harness.sink, 1).await;
+    let sends = send_texts(&actions);
+    assert_eq!(
+        sends,
+        vec![(
+            CHAT_ID.to_string(),
+            "在的".to_string(),
+            Some("f1".to_string())
+        )],
+        "the parrot block never reaches the group; the retried forced wake sends only the remainder"
+    );
     harness
         .handle
         .send_event(InboundEvent::Message(message(
@@ -857,25 +877,34 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
         )))
         .await
         .expect("the actor inbox is open");
-    // Exactly one send: the stripped remainder of reply 2. Its arrival
-    // proves the parrot-only wake left no trace behind it.
-    let actions = wait_for_actions(&harness.sink, 1).await;
+    // The second forced wake sends reply 3 (no parrot content). The
+    // sink is cumulative, so the barrier waits for BOTH sends.
+    let actions = wait_for_actions(&harness.sink, 2).await;
     let sends = send_texts(&actions);
     assert_eq!(
         sends,
-        vec![(
-            CHAT_ID.to_string(),
-            "在的".to_string(),
-            Some("f2".to_string())
-        )],
-        "the parrot block never reaches the group; only the remainder is sent"
+        vec![
+            (
+                CHAT_ID.to_string(),
+                "在的".to_string(),
+                Some("f1".to_string())
+            ),
+            (
+                CHAT_ID.to_string(),
+                "好的".to_string(),
+                Some("f2".to_string())
+            ),
+        ],
+        "the second forced wake sends its reply"
     );
-    // Rule B1: the one outbound raw-log row carries the SAME filtered
-    // text the group saw — the log is the truth.
+    // Rule B1: the outbound raw-log rows carry the SAME filtered texts
+    // the group saw — the log is the truth.
     let outbound = rows_of_direction(&fixture.store, Direction::Outbound).await;
-    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound.len(), 2);
     assert_eq!(outbound[0].text, "在的");
-    assert_eq!(outbound[0].reply_to_platform_msg_id.as_deref(), Some("f2"));
+    assert_eq!(outbound[0].reply_to_platform_msg_id.as_deref(), Some("f1"));
+    assert_eq!(outbound[1].text, "好的");
+    assert_eq!(outbound[1].reply_to_platform_msg_id.as_deref(), Some("f2"));
     // Rule C1: the context bot speech is the filtered text too, wrapped
     // by the Section 7.2 step 4 bot-speech renderer.
     let context = harness
@@ -888,12 +917,17 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
         .filter(|item| item.kind == ContextItemKind::BotSpeech)
         .map(|item| item.content.as_str())
         .collect();
-    let expected_speech =
-        render_bot_content(outbound[0].id, outbound[0].timestamp, &outbound[0].text);
-    assert_eq!(bot_speeches, vec![expected_speech.as_str()]);
-    wait_for_counter(&fixture.store, "wakes_total", "2").await;
-    // Only the stripped-remainder send counts as a participation; the
-    // parrot-only wake failed like an empty reply.
-    wait_for_counter(&fixture.store, "participations_total", "1").await;
+    let expected_speeches: Vec<String> = outbound
+        .iter()
+        .map(|row| render_bot_content(row.id, row.timestamp, &row.text))
+        .collect();
+    let expected_speeches: Vec<&str> = expected_speeches.iter().map(String::as_str).collect();
+    assert_eq!(bot_speeches, expected_speeches);
+    // Three wake starts: the parrot-only failure, its one requeue, and
+    // the f2 wake.
+    wait_for_counter(&fixture.store, "wakes_total", "3").await;
+    // Only the two sends count as participations; the parrot-only wake
+    // failed like an empty reply.
+    wait_for_counter(&fixture.store, "participations_total", "2").await;
     shutdown(harness).await;
 }
