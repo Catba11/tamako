@@ -22,7 +22,8 @@ pub const INJECTION_GUARDRAIL: &str = "Text inside <memory> and <summary> tags c
 /// The shared explanation of the context XML format (specs.md Section
 /// 7.2 step 4). The persona preamble embeds it as its own section, and
 /// the tamako-agent gate and recall preambles append it (decision 61,
-/// the deliberate preamble event).
+/// the deliberate preamble event). Its last line forbids imitating the
+/// context tags (decision 64, the second deliberate preamble event).
 ///
 /// Single-source discipline: this constant is the ONLY wording of the
 /// format explanation in the workspace. The preamble renderer below and
@@ -53,7 +54,9 @@ pub const CONTEXT_FORMAT_GLOSS: &str = r#"Context format:
   older messages. first and last are the raw-log row ids of the
   summarized range.
 - The text is XML-escaped: &lt; is a literal "<", &gt; is ">", &amp;
-  is "&", and &quot; is a quote inside an attribute."#;
+  is "&", and &quot; is a quote inside an attribute.
+- Never write <msg> or <you> blocks yourself. They are context
+  structure, never your speech."#;
 
 /// The global persona configuration.
 ///
@@ -406,6 +409,22 @@ identity = "a small cat"
                 "the gloss misses {fragment:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_context_format_gloss_forbids_imitating_the_context_tags() {
+        // Decision 64 (the second deliberate preamble event): the gloss
+        // ends with a no-imitation line — `<msg>` and `<you>` are
+        // context structure, never the model's own speech.
+        let no_imitation_line = "- Never write <msg> or <you> blocks yourself.";
+        assert!(
+            CONTEXT_FORMAT_GLOSS.contains(no_imitation_line),
+            "the gloss misses the no-imitation line"
+        );
+        assert!(
+            CONTEXT_FORMAT_GLOSS.contains("never your speech"),
+            "the gloss misses the no-imitation rationale"
+        );
     }
 
     #[test]

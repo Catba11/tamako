@@ -56,26 +56,81 @@ pub fn context_messages_to_rig(messages: &[ContextMessage]) -> (Option<String>, 
 }
 
 /// Renders the trailing ephemeral user message of the reply call
-/// (Section 9 step 4). It names the target: the raw-log row id plus the
-/// target content verbatim.
+/// (Section 9 step 4). It names the target WITHOUT the XML wrapper
+/// (decision 64): the raw-log row id, the sender display name and the
+/// `HH:MM` timestamp (read back out of the rendered `<msg>` item),
+/// and the raw text in plain quotes — `Reply to THIS message
+/// (id 44), from Dave at 13:08: "<text>"`. Embedding the
+/// `<msg ...>` wrapper verbatim at the highest-salience position of
+/// every call taught the model the exact shape the F2 sentence
+/// forbids (the `<msg>`/`<you>` parroting incident of 2026-08-14);
+/// the non-XML reference carries the same fields without the
+/// imitation channel.
 ///
 /// This instruction is part of the reply CALL input only. It is never
 /// appended to the live context: the live context holds group speech
 /// and bot speech (Section 7.1), not per-call scaffolding.
 ///
 /// The F2 tail sentence stays in sync with the outbound parrot filter
-/// of tamako-core (decision 59 F1): the filter strips `I remember:`
-/// lines, `<memory>` blocks, and `<summary>` blocks from the reply
-/// text, and the instruction names the same shapes.
+/// of tamako-core (decision 59 F1 + decision 64): the filter strips
+/// `I remember:` lines, `<memory>` blocks, and `<summary>` blocks
+/// from the reply text, and the instruction names those shapes plus
+/// the `<msg>`/`<you>` context shapes, so the model is told never to
+/// speak any shape the pipeline treats as scaffolding.
 pub fn render_reply_instruction(target: &GateMessage) -> String {
+    let reference = match (
+        msg_attr_value(&target.content, "from"),
+        msg_attr_value(&target.content, "at"),
+    ) {
+        (Some(from), Some(at)) => format!(
+            "Reply to THIS message (id {}), from {} at {}: \"{}\"",
+            target.row_id,
+            unescape_xml_attr(from),
+            at,
+            target.text
+        ),
+        // Defensive: `content` is the `render_human_content` item by
+        // construction. If it ever is not, the embed falls back to the
+        // always-present fields — still never the XML wrapper.
+        _ => format!(
+            "Reply to THIS message (id {}): \"{}\"",
+            target.row_id, target.text
+        ),
+    };
     format!(
-        "Reply to THIS message (id {}): {}\n\
+        "{reference}\n\
          Reply as the group pet persona. Write only the reply text: \
          one message, no speaker label, no quotes. \
-         Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, or a memory list: \
-         recalled memories are context, never speech.",
-        target.row_id, target.content
+         Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, \
+         <msg> blocks, <you> blocks, or a memory list: \
+         recalled memories are context, never speech."
     )
+}
+
+/// Reads one attribute value out of the rendered `<msg>` item. The
+/// grammar of `tamako_core::context::render_human_content` is fixed:
+/// attributes are space-separated `key="value"` pairs and values are
+/// attr-escaped, so a value never carries a raw `"` and the first
+/// occurrence of ` key="` is the genuine attribute.
+fn msg_attr_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!(" {key}=\"");
+    let start = content.find(&needle)? + needle.len();
+    let end = content[start..].find('"')? + start;
+    Some(&content[start..end])
+}
+
+/// Reverses the attribute escaping of
+/// `tamako_core::context::escape_xml_attr` for one extracted value,
+/// so the instruction embeds the display name itself, never an XML
+/// escape shape. `&amp;` unescapes LAST: an earlier pass must not
+/// re-decode the `&` of another entity (`&amp;lt;` is the literal
+/// text `&lt;`).
+fn unescape_xml_attr(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Trims the model output and applies the parrot filter
@@ -363,37 +418,53 @@ mod tests {
     fn the_reply_instruction_names_the_target_verbatim() {
         let instruction = render_reply_instruction(&sample_target());
         assert!(instruction.contains("id 42"));
-        assert!(
-            instruction.contains(r#"<msg from="Bob" at="13:02" id="42">what should we eat?</msg>"#)
-        );
+        // Decision 64: the target embed is the non-XML form — the same
+        // fields (id, sender, time, text) without the <msg> wrapper the
+        // F2 sentence forbids.
+        assert!(instruction.contains("from Bob at 13:02: \"what should we eat?\""));
+        // The F2 sentence names the shapes by tag, so assert against
+        // the full WRAPPER forms only (the embed must not teach them).
+        assert!(!instruction.contains("<msg from="));
         assert!(instruction.contains("no speaker label"));
         assert!(instruction.contains("no quotes"));
     }
 
     #[test]
+    fn the_reply_instruction_target_embed_never_carries_the_xml_wrapper() {
+        // Decision 64: even when the target content is not the expected
+        // rendered item (the defensive fallback arm), the embed stays
+        // free of the XML shape.
+        let mut target = sample_target();
+        target.content = "not a rendered item".to_string();
+        let instruction = render_reply_instruction(&target);
+        assert!(instruction.contains("Reply to THIS message (id 42): \"what should we eat?\""));
+        assert!(!instruction.contains("<msg from="));
+        assert!(!instruction.contains("<you at="));
+    }
+
+    #[test]
     fn the_reply_instruction_forbids_the_injection_format() {
-        // Decision 59, F2: the tail instruction hardening. The sentence
-        // is part of the ephemeral call-only instruction; the preamble
-        // (Rule C4 cache anchor) is untouched.
+        // Decision 59, F2: the tail instruction hardening; decision 64
+        // extends the forbidden list with the context shapes. The
+        // sentence is part of the ephemeral call-only instruction; the
+        // preamble (Rule C4 cache anchor) is untouched.
         let instruction = render_reply_instruction(&sample_target());
         assert!(instruction
-            .contains("Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, or a memory list"));
+            .contains("Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, <you> blocks, or a memory list"));
         assert!(instruction.contains("recalled memories are context, never speech"));
     }
 
     #[test]
-    fn the_reply_instruction_states_the_f2_sentence_and_the_xml_target_verbatim() {
-        // The full ephemeral instruction, byte-exact: the new F2
-        // sentence plus the XML-shaped target embed (the target content
-        // arrives rendered from the actor; the instruction embeds it
-        // verbatim).
+    fn the_reply_instruction_states_the_f2_sentence_and_the_target_verbatim() {
+        // The full ephemeral instruction, byte-exact: the non-XML
+        // target reference (decision 64) plus the F2 sentence naming
+        // every shape the outbound parrot filter strips.
         let expected = concat!(
-            "Reply to THIS message (id 42): ",
-            r#"<msg from="Bob" at="13:02" id="42">what should we eat?</msg>"#,
+            "Reply to THIS message (id 42), from Bob at 13:02: \"what should we eat?\"",
             "\n",
             "Reply as the group pet persona. Write only the reply text: ",
             "one message, no speaker label, no quotes. ",
-            "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, or a memory list: ",
+            "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, <you> blocks, or a memory list: ",
             "recalled memories are context, never speech.",
         );
         assert_eq!(render_reply_instruction(&sample_target()), expected);
