@@ -362,6 +362,21 @@ impl LiveContext {
     /// persisted row. Leftover injections (position matches no row id,
     /// e.g. a position beyond the current tail) are appended at the tail
     /// in injection-row order.
+    ///
+    /// Multi-edge collapse (decision 65): `injected_memories` persists
+    /// ONE ROW PER EDGE (Section 9.3 dedup), while the live wake path
+    /// appends ONE RecallInjection item per PLANNED injection — the N
+    /// edges of one multi-edge injection persist N consecutive rows
+    /// with the same (injection_position, content) but produce a single
+    /// live item. The rebuild therefore collapses every RUN of
+    /// consecutive rows sharing (injection_position, content) into one
+    /// item, keeping the rebuilt context bit-identical to the live one
+    /// (Rule P1). Non-consecutive duplicates and rows with different
+    /// content or position never collapse: they are genuinely distinct
+    /// injections. NOTE: this changes the rebuilt context bytes of
+    /// groups with persisted multi-edge injections (fewer duplicate
+    /// `<memory>` items) — one deliberate invalidation, deployed
+    /// together with decision 64.
     pub fn rebuild(
         preamble: String,
         rows: &[MessageRow],
@@ -416,25 +431,37 @@ impl LiveContext {
                 Direction::Outbound => context.append_bot_speech(row.id, row.timestamp, &row.text),
             }
             if let Some(here) = injections_by_position.remove(&row.id) {
-                for injection in here {
-                    context.append_recall_injection(
-                        injection.injection_position,
-                        injection.content.clone(),
-                    );
-                }
+                append_injections_collapsed(&mut context, &here);
             }
         }
         // Leftover injections: the position matches no row id. Append them
         // at the tail in injection-row order.
         for (_, here) in injections_by_position {
-            for injection in here {
-                context.append_recall_injection(
-                    injection.injection_position,
-                    injection.content.clone(),
-                );
-            }
+            append_injections_collapsed(&mut context, &here);
         }
         context
+    }
+}
+
+/// Appends one RecallInjection item per RUN of consecutive rows that
+/// share (injection_position, content) — the decision 65 multi-edge
+/// collapse of [`LiveContext::rebuild`]. The store persists one
+/// `injected_memories` row per EDGE of a planned injection, and the
+/// per-edge insert loop of the wake completion handler lands those rows
+/// consecutively (row-id order) with identical position and content,
+/// while the live context received ONE item for the whole injection.
+/// Collapsing exactly the identical-content runs reproduces the live
+/// view; rows with different content or position are distinct
+/// injections and always append.
+fn append_injections_collapsed(context: &mut LiveContext, injections: &[&InjectedMemoryRow]) {
+    let mut previous: Option<(i64, &str)> = None;
+    for injection in injections {
+        let key = (injection.injection_position, injection.content.as_str());
+        if previous == Some(key) {
+            continue;
+        }
+        context.append_recall_injection(injection.injection_position, injection.content.clone());
+        previous = Some(key);
     }
 }
 
@@ -1057,6 +1084,226 @@ mod tests {
             LiveContext::rebuild("P".to_string(), &rows, &injections, &reply_targets, &[]);
 
         assert_eq!(rebuilt, live);
+    }
+
+    #[test]
+    fn rebuild_collapses_multi_edge_rows_into_the_one_live_item() {
+        // Decision 65 bit-identity fix: the live wake path appends ONE
+        // RecallInjection item per PlannedInjection, while
+        // `injected_memories` persists ONE ROW PER EDGE — the N edges of
+        // one multi-edge injection persist N consecutive rows with the
+        // same (injection_position, content). The rebuild must collapse
+        // that run into one item, or the post-restart context carries
+        // duplicate `<memory>` items (the Rule P1 violation this test
+        // would have caught).
+        let mut live = LiveContext::new("P".to_string());
+        live.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "tea?",
+        );
+        live.append_bot_speech(2, at_1307(), "always");
+        // One multi-edge injection: ONE item in the live context.
+        live.append_recall_injection(2, "<memory>Alice likes tea</memory>".to_string());
+
+        let rows = vec![
+            row(
+                1,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                None,
+                "tea?",
+            ),
+            row(
+                2,
+                Direction::Outbound,
+                EventType::Message,
+                "Tamako",
+                None,
+                "always",
+            ),
+        ];
+        // The persisted form: one row PER EDGE of the injection, the
+        // same position and content, consecutive row ids (the per-edge
+        // insert loop of the wake completion handler).
+        let injections = vec![
+            injection(10, 2, "<memory>Alice likes tea</memory>"),
+            injection(11, 2, "<memory>Alice likes tea</memory>"),
+            injection(12, 2, "<memory>Alice likes tea</memory>"),
+        ];
+        let rebuilt =
+            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+
+        assert_eq!(rebuilt, live);
+    }
+
+    #[test]
+    fn rebuild_collapses_a_multi_edge_run_beyond_the_tail() {
+        // The leftover path (the position matches no row id) collapses
+        // the same way: the live append would have pushed one item at
+        // the tail.
+        let rows = vec![row(
+            1,
+            Direction::Inbound,
+            EventType::Message,
+            "Alice",
+            None,
+            "one",
+        )];
+        let injections = vec![
+            injection(10, 99, "leftover memory"),
+            injection(11, 99, "leftover memory"),
+        ];
+        let context =
+            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+
+        let kinds: Vec<(ContextItemKind, String)> = context
+            .items()
+            .iter()
+            .map(|item| (item.kind.clone(), item.content.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (ContextItemKind::Preamble, "P".to_string()),
+                (
+                    ContextItemKind::HumanMessage,
+                    r#"<msg from="Alice" at="13:07" id="1">one</msg>"#.to_string()
+                ),
+                (
+                    ContextItemKind::RecallInjection,
+                    "leftover memory".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebuild_does_not_collapse_distinct_or_non_consecutive_injections() {
+        // Only true runs collapse. Same position but different content,
+        // same content but not consecutive, and same content at a
+        // different position are genuinely distinct injections: every
+        // one renders its own item.
+        let rows = vec![
+            row(
+                1,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                None,
+                "one",
+            ),
+            row(
+                2,
+                Direction::Outbound,
+                EventType::Message,
+                "Tamako",
+                None,
+                "two",
+            ),
+            row(
+                3,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                None,
+                "three",
+            ),
+        ];
+        let injections = vec![
+            injection(10, 2, "memory X"),
+            // Same position, different content: no collapse.
+            injection(11, 2, "memory Y"),
+            // Same content as row 10 but NOT consecutive: no collapse.
+            injection(12, 2, "memory X"),
+            // Same content, different position: no collapse.
+            injection(13, 3, "memory X"),
+        ];
+        let context =
+            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+
+        let rendered: Vec<(ContextItemKind, String, Option<RangeTag>)> = context
+            .items()
+            .iter()
+            .map(|item| {
+                (
+                    item.kind.clone(),
+                    item.content.clone(),
+                    item.range_tag.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (ContextItemKind::Preamble, "P".to_string(), None),
+                (
+                    ContextItemKind::HumanMessage,
+                    r#"<msg from="Alice" at="13:07" id="1">one</msg>"#.to_string(),
+                    Some(RangeTag::single(1))
+                ),
+                (
+                    ContextItemKind::BotSpeech,
+                    r#"<you at="13:07" id="2">two</you>"#.to_string(),
+                    Some(RangeTag::single(2))
+                ),
+                (
+                    ContextItemKind::RecallInjection,
+                    "memory X".to_string(),
+                    Some(RangeTag::single(2))
+                ),
+                (
+                    ContextItemKind::RecallInjection,
+                    "memory Y".to_string(),
+                    Some(RangeTag::single(2))
+                ),
+                (
+                    ContextItemKind::RecallInjection,
+                    "memory X".to_string(),
+                    Some(RangeTag::single(2))
+                ),
+                (
+                    ContextItemKind::HumanMessage,
+                    r#"<msg from="Alice" at="13:07" id="3">three</msg>"#.to_string(),
+                    Some(RangeTag::single(3))
+                ),
+                (
+                    ContextItemKind::RecallInjection,
+                    "memory X".to_string(),
+                    Some(RangeTag::single(3))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_a_single_edge_injection_unchanged() {
+        // The legacy one-row-per-injection data is unaffected: one row
+        // still renders exactly one item (decision 65 changes nothing
+        // for single-edge groups).
+        let rows = vec![row(
+            1,
+            Direction::Inbound,
+            EventType::Message,
+            "Alice",
+            None,
+            "one",
+        )];
+        let injections = vec![injection(10, 1, "I remember: Alice likes tea.")];
+        let context =
+            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+
+        assert_eq!(context.items().len(), 3);
+        let injection = &context.items()[2];
+        assert_eq!(injection.kind, ContextItemKind::RecallInjection);
+        assert_eq!(injection.content, "I remember: Alice likes tea.");
+        assert_eq!(injection.range_tag, Some(RangeTag::single(1)));
     }
 
     #[test]
