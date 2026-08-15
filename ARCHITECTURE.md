@@ -34,7 +34,8 @@ tamako ──▶ tamako-core ──▶ tamako-store
    ├──▶ tamako-store  ──── (all lower crates are independent)
    ├──▶ tamako-memory
    ├──▶ tamako-persona
-   ├──▶ tamako-agent ──▶ tamako-core (contract), tamako-store, tamako-memory
+   ├──▶ tamako-agent ──▶ tamako-core (contract), tamako-store, tamako-memory,
+   │                     tamako-persona (the shared context-format gloss, decision 63)
    ├──▶ tamako-adapter-mock ──▶ tamako-core (types only)
    └──▶ tamako-adapter-teloxide ──▶ tamako-core (types only)
 ```
@@ -44,7 +45,9 @@ tamako ──▶ tamako-core ──▶ tamako-store
   depends on `tamako-core` except adapters and `tamako-agent`, and
   adapters use the normalized types only (Rule A1, Rule P7).
 - `tamako-agent` owns every LLM concern and is the only crate that
-  depends on `rig` (rig-core 0.41). `tamako-core` defines the digest
+  depends on `rig` (rig-core 0.41). It also depends on
+  `tamako-persona` for the shared context-format gloss (decision 63).
+  `tamako-core` defines the digest
   pipeline CONTRACT (`tamako_core::digest`) so the actor drives the
   pipeline without a dependency on the agent crate. No cycles.
 - `tamako-store`, `tamako-memory`, and `tamako-persona` do not depend on
@@ -61,7 +64,8 @@ tamako ──▶ tamako-core ──▶ tamako-store
 - Outbound: `execute()` takes `OutboundAction` values (`SendText`,
   `SendMedia`, `React`).
 - A `NormalizedMessage` carries the platform message id, an RFC 3339
-  timestamp, the sender id and display name, the text, the reply-to id,
+  timestamp, the sender id and display name, the optional username
+  (decision 61), the text, the reply-to id,
   and two mention flags (`mentions_bot`, `is_reply_to_bot`). Rule A4
   applies. No platform type crosses this boundary.
 
@@ -225,8 +229,10 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   specs.md Section 10.3). Before the removal, the removed chunk
   `(prev_boundary.unwrap_or(0), b_old]` is LLM-summarized from the
   raw log (digest flat-label dialect, injections excluded) through
-  the injected `SummaryProvider` (its call rides the same spawned
-  digest task as the pipeline — no FIFO blocking); the summary row
+  the injected `SummaryProvider` (its call runs in its OWN spawned
+  task and reports through `ActorCommand::SummaryCompleted` — no FIFO
+  blocking, and `summary_pending` suppresses a second digest while a
+  summary is in flight); the summary row
   persists BEFORE the removal (Rule P1), the re-run of a crashed
   completion finds the row on the natural range key and skips the LLM
   call, and the context summary segment is replaced via
@@ -303,12 +309,14 @@ only inside the actor loop (Section 6.1, rule 2).
   `reload_preamble` (the Rule C4 item-0 replacement; a preamble
   change is a deliberate full invalidation event).
 - **Restart rebuild (Rule P1)**: `LiveContext::rebuild(preamble, rows,
-  injections, summaries)` reconstructs the context from the raw-log
+  injections, summaries, reply_targets)` reconstructs the context from
+  the raw-log
   rows above the removal cutoff
   (`prev_digest_boundary_msg_id.unwrap_or(0)`), the
-  `injected_memories` rows above the same cutoff, and the TWO newest
+  `injected_memories` rows above the same cutoff, the TWO newest
   persisted `context_summaries` rows (oldest first, directly after
-  the preamble — decision 62). Injections land directly after the row
+  the preamble — decision 62), and the reply-target map resolved
+  through `Store::find_reply_target` (decision 61). Injections land directly after the row
   at their recorded position (Rule C2) — with the decision-65 (H2)
   multi-edge collapse: consecutive rows sharing
   (injection_position, content) replay as ONE item, matching the live

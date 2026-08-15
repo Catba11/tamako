@@ -100,7 +100,9 @@ test-group soak (`docs/soak-runbook.md`).
     default 5). Zero candidates never call the cheap model
     (Section 9.1); any gate failure means inject nothing. The
     injection protocol of Sections 9.3–9.5 is complete: exactly one
-    "I remember: ..." assistant message per wake appended at the tail
+    `<memory>...</memory>` assistant message per wake appended at the
+    tail (the legacy "I remember: ..." form of the M5 era was replaced
+    in decision 61; the guardrail renamed the tags in decision 63)
     (Rule C2, applied by the actor before the participation outcome is
     known — a silent pet still remembers), one `injected_memories` row
     per edge id (the dedup key is the edge natural key), the C3 prune
@@ -618,7 +620,11 @@ test-group soak (`docs/soak-runbook.md`).
     were deliberately NOT done: one session id per deployment. The key
     sits in both `TriggerConfig` and `TriggerConfigToml` like the
     `structured_output` keys (a group table could set it, harmless) —
-    the agent layer reads the global value only. Alongside it, every
+    the agent layer reads the global value only. (Corrected
+    2026-08-15: `llm_config_values` copies from the per-group
+    effective `TriggerConfig`, so a group table CAN set the session id
+    and it takes effect per group. The intent stays one session id per
+    deployment; specs.md Section 13 updated.) Alongside it, every
     successful completion (repair calls included) logs the rig `Usage`
     fields `input_tokens` / `cached_input_tokens` /
     `cache_creation_input_tokens` / `output_tokens` at DEBUG, so the
@@ -916,9 +922,11 @@ test-group soak (`docs/soak-runbook.md`).
     `summary_structured_output`, env overrides `TAMAKO_SUMMARY_*` —
     LANDED in specs.md Sections 5.2, 7.1, 7.2 (C3/C5), 7.3, 9.4,
     10.2 step 4, and 13. The binary wires the summarizer from the
-    resolved summary endpoint like the other purposes; the LLM call rides the same
-    spawned digest task as the pipeline (no new inbox plumbing, no
-    FIFO blocking — the Section 6.1 rule 3 analog holds).
+    resolved summary endpoint like the other purposes; the summary LLM
+    call runs in its OWN spawned task and reports through
+    `ActorCommand::SummaryCompleted` (no FIFO blocking — the Section
+    6.1 rule 3 analog), and `summary_pending` suppresses a second
+    digest while a summary is in flight.
     **Parrot discipline (decisions 59/61).** The summary shape is a
     new model-visible format: the tag constants live once next to the
     other injection constants, the F2 ephemeral tail instruction now

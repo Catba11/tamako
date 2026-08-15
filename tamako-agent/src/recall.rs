@@ -352,7 +352,7 @@ pub fn recall_preamble(injection_cap: u32) -> String {
 
 /// The full system preamble of the relevance-gate call:
 /// [`recall_preamble`] plus the shared context-format gloss of
-/// tamako-persona (decision 61, the deliberate preamble event). The
+/// tamako-persona (decision 63, the deliberate preamble event). The
 /// gloss is the SINGLE source in tamako-persona: the persona preamble
 /// and the participation-gate preamble embed the same constant. The
 /// relevance gate consumes the same XML-shaped
