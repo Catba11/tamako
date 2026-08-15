@@ -24,7 +24,10 @@
 //!   offsets.
 //! - Timestamps: teloxide uses chrono `DateTime<Utc>`. We convert through
 //!   the unix timestamp to `time::OffsetDateTime` (the project standard,
-//!   AGENT.md: the project uses the time crate, not chrono).
+//!   AGENT.md: the project uses the time crate, not chrono). Edited
+//!   messages carry their EDIT date: the adapter routes them through
+//!   `normalize_edited_message`, not `normalize_message`. See the cutover
+//!   note on that function.
 
 use tamako_core::event::{InboundEvent, MemberEvent, NormalizedMessage, ReactionEvent};
 use teloxide::types::{
@@ -83,9 +86,9 @@ pub fn chat_id_string(chat: &Chat) -> String {
 /// chat username, then the id). This is a documented, deliberate mapping:
 /// the platform gives no user identity for these messages.
 ///
-/// Note: edited messages use this same function. The adapter wraps the
-/// result in `InboundEvent::EditedMessage` instead of
-/// `InboundEvent::Message`.
+/// Note: edited messages do NOT use this function. The adapter routes
+/// `UpdateKind::EditedMessage` through `normalize_edited_message`, which
+/// stamps the edit date into the timestamp slot.
 pub fn normalize_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedMessage> {
     let text = msg.text()?;
 
@@ -105,6 +108,30 @@ pub fn normalize_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedM
             .and_then(|m| m.from.as_ref())
             .is_some_and(|author| author.id.0 == bot.id),
     })
+}
+
+/// An edited text message -> `NormalizedMessage`. Identical to
+/// `normalize_message`, except the timestamp is the EDIT date
+/// (`Message::edit_date`), not the original send date. teloxide 0.17
+/// (teloxide-core 0.13.0) types `edit_date` as
+/// `Option<DateTime<Utc>>`; the Bot API always sets it on an
+/// edited-message update, so the fallback to `msg.date` is defensive
+/// only.
+///
+/// Rule A1: pure, like every function in this module. The adapter wraps
+/// the result in `InboundEvent::EditedMessage`.
+///
+/// Timestamp cutover (specs.md Section 4.2 backfill note): edit rows
+/// persisted before this entry point existed carry the ORIGINAL send
+/// date in their timestamp slot. The raw log is append-only (Rule P1);
+/// no cleanup migration rewrites them. Readers of the log see mixed
+/// edit-timestamp semantics across the cutover.
+pub fn normalize_edited_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedMessage> {
+    let mut normalized = normalize_message(msg, bot)?;
+    if let Some(edit_date) = msg.edit_date() {
+        normalized.timestamp = unix_to_offset(edit_date.timestamp());
+    }
+    Some(normalized)
 }
 
 /// Service messages -> `MemberJoin` / `MemberLeave`. One event per user in
@@ -477,14 +504,33 @@ mod tests {
     }
 
     #[test]
-    fn edited_message_uses_the_same_path() {
-        // The adapter wraps the result in InboundEvent::EditedMessage; the
-        // normalization itself is identical (rule A4 fields are the same).
+    fn normalize_message_ignores_the_edit_date() {
+        // normalize_message stays pure and always stamps the SEND date.
+        // Only the adapter's edited-message path (normalize_edited_message)
+        // stamps the edit date. This test pins the separation.
         let msg = message(json!({ "text": "edited text", "edit_date": DATE + 5 }));
         let normalized = normalize_message(&msg, &bot()).expect("a text message");
+        assert_eq!(normalized.timestamp, unix_to_offset(DATE));
+    }
+
+    #[test]
+    fn edited_message_carries_the_edit_date() {
+        // K3 fix: an edit row's timestamp is the EDIT date, not the
+        // original send date. The other fields normalize identically
+        // (rule A4 fields are the same).
+        let msg = message(json!({ "text": "edited text", "edit_date": DATE + 5 }));
+        let normalized = normalize_edited_message(&msg, &bot()).expect("a text message");
         assert_eq!(normalized.text, "edited text");
         assert_eq!(normalized.username, Some("alice".to_string()));
-        // The event timestamp stays the send date, not the edit date.
+        assert_eq!(normalized.timestamp, unix_to_offset(DATE + 5));
+    }
+
+    #[test]
+    fn edited_message_falls_back_to_the_send_date_without_an_edit_date() {
+        // The Bot API always sets edit_date on an edited-message update;
+        // the fallback to msg.date is defensive only.
+        let msg = message(json!({ "text": "edited text" }));
+        let normalized = normalize_edited_message(&msg, &bot()).expect("a text message");
         assert_eq!(normalized.timestamp, unix_to_offset(DATE));
     }
 
