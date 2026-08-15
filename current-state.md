@@ -143,9 +143,11 @@ test-group soak (`docs/soak-runbook.md`).
   to the reply model, the same constant feeds the gate and recall
   relevance-gate preambles, and the amended `INJECTION_GUARDRAIL`
   names the `<memory>`/`<summary>` tags (still rendering last). The
-  integration replays now exercise summaries across restarts and in
-  the stability loop. Decisions 61/62/63 deploy in one restart
-  (deploy date: PENDING operator).
+   integration replays now exercise summaries across restarts and in
+   the stability loop. Decisions 61/62/63 deployed in one restart on
+   2026-08-13 (binary rebuilt 10:54 EDT; one full provider-cache
+   invalidation, all groups). The operator stopped the bot cleanly on
+   2026-08-15 (~00:05 EDT) pending the decision-64/65 fix round.
 - Verification: `cargo build --workspace`, `cargo test --workspace`
   (475 tests, 0 failures, 4 ignored live tests: the live-API smoke
   tests of tamako-agent — extraction and wake — and the live Telegram
@@ -816,10 +818,10 @@ test-group soak (`docs/soak-runbook.md`).
     deploying restart (user-accepted; the preamble anchor is
     byte-identical so the prefix re-warms from item 0;
     `llm_session_id` affinity of decision 57 is unaffected). Deploy
-     date: PENDING operator. **Known follow-up:** the preamble's
-     `INJECTION_GUARDRAIL` text still names the old `I remember:`
-     shape; amending it is a separate deliberate preamble event (Rule
-     C4), not this round.
+     date: 2026-08-13. **Known follow-up, RESOLVED in decision 63
+     (same deploy):** the preamble's `INJECTION_GUARDRAIL` text named
+     the old `I remember:` shape; decision 63 amended it to name the
+     `<memory>`/`<summary>` tags.
 
 62. **Segmented C3 summarization: the chunk Rule C3 removes is
     LLM-summarized before removal, and the context keeps the TWO
@@ -958,7 +960,7 @@ test-group soak (`docs/soak-runbook.md`).
     event:** decisions 61/62/63 now deploy in ONE restart = one full
     provider-cache invalidation for all groups (the preamble anchor
     itself changed with the gloss; prefix re-warms from item 0).
-    Deploy date: PENDING operator.
+    Deploy date: 2026-08-13.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
@@ -1019,6 +1021,29 @@ Deliberately not done, in priority order:
     produces the `RecallInjection` items through
     `append_recall_injection` and the `injected_memories` dedup table;
     the M2 lifecycle (bit-identical rebuild, C3 prune) covers them.
+
+### Known issues under investigation
+
+- **Repeated replies to the same message across two interval wakes**
+  (observed 2026-08-13/14, after the decision-61/62/63 deploy): the
+  operator observed the bot selecting the SAME message for a reply in
+  two consecutive interval-triggered wakes. The 2026-08-14 code review
+  traced the wake pipeline and refuted the pipeline-level causes
+  (`wake_last_row_id` advances at every wake start, forced wakes
+  included; a wake with no new messages exits before the gate; the
+  gate cannot target a message outside its presented set), so the
+  mechanism is UNKNOWN. Shelved per operator decision. Candidates for
+  the next investigation: the gate's target selection over the
+  presented set, the `forced_pending` interplay, and the restart edge
+  cases of `wake_last_row_id` (the review's latent fallback-to-0
+  finding, fixed in decision 65).
+- **Forced-wake chains bypass the floor (conforming; spec question
+  pending)**: a human replying to the bot's answer triggers another
+  forced wake (specs.md Section 8.1), which bypasses the gate, the
+  monologue lock, AND `wake_floor` — mention/reply chains can produce
+  back-to-back replies seconds apart. Conforming to the spec as
+  written; a forced-wake cooldown is a spec-revision candidate the
+  operator has not ruled on.
 
 ## 5. Phase 1 milestones
 
