@@ -324,7 +324,11 @@ pub trait RelevanceGate: Send + Sync {
     >;
 }
 
-/// The system preamble of the relevance-gate call (Section 9.2).
+/// The static head of the relevance-gate system preamble (Section
+/// 9.2): the role, the output shape, and rules 1-3. Rule 4 carries
+/// the injection cap, which is configurable (the config key
+/// `recall_injection_cap`), so the full preamble is rendered per call
+/// by [`recall_preamble`] (decision 65).
 pub const RECALL_PREAMBLE: &str = "\
 You select memories for a group pet. The pet is a member of a group chat. Before the pet speaks, it recalls memories of the group.
 Output shape (field names exactly as written): {\"selected\":[<1-based integers>],\"reason\":\"...\"}
@@ -332,20 +336,33 @@ Output shape (field names exactly as written): {\"selected\":[<1-based integers>
 Rules:
 1. Read the new group messages. Read the candidate memories.
 2. Select a candidate memory ONLY when omitting it would materially reduce the quality of the reply or of the participation decision.
-3. When in doubt, select nothing. Selecting nothing is the normal case. A memory that is loosely related is not enough.
-4. Give the 1-based numbers of the selected memories in descending relevance. Select at most 5 memories.
-5. Output only the JSON object of the required schema. Give one short reason. No commentary.";
+3. When in doubt, select nothing. Selecting nothing is the normal case. A memory that is loosely related is not enough.";
+
+/// Renders the full system preamble of the relevance-gate call
+/// (Section 9.2) for one injection cap: [`RECALL_PREAMBLE`] plus rule
+/// 4, whose "at most N" is the configured `recall_injection_cap`
+/// rendered per call (decision 65), and rule 5.
+pub fn recall_preamble(injection_cap: u32) -> String {
+    format!(
+        "{RECALL_PREAMBLE}\n\
+         4. Give the 1-based numbers of the selected memories in descending relevance. Select at most {injection_cap} memories.\n\
+         5. Output only the JSON object of the required schema. Give one short reason. No commentary."
+    )
+}
 
 /// The full system preamble of the relevance-gate call:
-/// [`RECALL_PREAMBLE`] plus the shared context-format gloss of
+/// [`recall_preamble`] plus the shared context-format gloss of
 /// tamako-persona (decision 61, the deliberate preamble event). The
 /// gloss is the SINGLE source in tamako-persona: the persona preamble
 /// and the participation-gate preamble embed the same constant. The
 /// relevance gate consumes the same XML-shaped
 /// `GateMessage.content` lines as the participation gate, so it must
 /// read the same explanation.
-pub fn recall_system_preamble() -> String {
-    format!("{RECALL_PREAMBLE}\n\n{CONTEXT_FORMAT_GLOSS}")
+pub fn recall_system_preamble(injection_cap: u32) -> String {
+    format!(
+        "{}\n\n{CONTEXT_FORMAT_GLOSS}",
+        recall_preamble(injection_cap)
+    )
 }
 
 /// The date format of the candidate list: YYYY-MM-DD, UTC.
@@ -353,15 +370,23 @@ const YMD_FORMAT: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]");
 
 /// Renders the user prompt of the relevance-gate call (Section 9.2):
-/// one line per new message as `{row_id} {content}` (the same shape as
-/// the participation gate), then a numbered candidate list
-/// `1. {edge_text} (since {YYYY-MM-DD of valid_at, UTC})`.
+/// one line per new message as the XML-tagged `content`, then a
+/// numbered candidate list `1. {edge_text} (since {YYYY-MM-DD of
+/// valid_at, UTC})`.
+///
+/// Unlike the participation gate, the recall prompt renders NO
+/// `{row_id}` prefix (decision 65): the selection contract
+/// ([`RecallSelection`]) speaks 1-based candidate INDICES only — the
+/// post-validation of `recall_inner` checks `index < candidates.len()`
+/// and never a row id — and the message id already rides inside the
+/// content as the `id="…"` attribute (with `reply_to_id="…"` for the
+/// reply linkage), so a separate prefix duplicated it.
 pub fn render_recall_prompt(input: &RelevanceInput) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "New messages (id and XML-tagged content):");
+    let _ = writeln!(out, "New messages (XML-tagged content):");
     for message in &input.new_messages {
-        let _ = writeln!(out, "{} {}", message.row_id, message.content);
+        let _ = writeln!(out, "{}", message.content);
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "Candidate memories (number, text, validity start):");
@@ -427,6 +452,11 @@ fn zero_based_indices(selection: &RecallSelection) -> Vec<usize> {
 pub struct RigRelevanceGate {
     client: EndpointClient,
     max_tokens: u64,
+    /// The Section 9.2 hard cap (the config key
+    /// `recall_injection_cap`): rendered into the preamble per call
+    /// (decision 65), so the model reads the same cap the
+    /// post-validation of `ShallowRecall` enforces.
+    injection_cap: u32,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -443,17 +473,25 @@ impl std::fmt::Debug for RigRelevanceGate {
 
 impl RigRelevanceGate {
     /// Builds the relevance gate from an endpoint client.
-    pub fn new(client: EndpointClient, max_tokens: u64) -> Self {
-        RigRelevanceGate { client, max_tokens }
+    pub fn new(client: EndpointClient, max_tokens: u64, injection_cap: u32) -> Self {
+        RigRelevanceGate {
+            client,
+            max_tokens,
+            injection_cap,
+        }
     }
 
     /// Builds the relevance gate for one resolved endpoint (the `gate`
     /// purpose, specs.md Section 13). Returns `AgentError::ProviderConfig`
     /// when the family API key is missing.
-    pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
+    pub fn from_endpoint(
+        endpoint: &EndpointConfig,
+        injection_cap: u32,
+    ) -> Result<Self, AgentError> {
         Ok(RigRelevanceGate::new(
             EndpointClient::build(endpoint)?,
             RECALL_DEFAULT_MAX_TOKENS,
+            injection_cap,
         ))
     }
 }
@@ -471,9 +509,10 @@ impl RelevanceGate for RigRelevanceGate {
             let selection = self
                 .client
                 .complete_structured::<RecallSelection>(
-                    // The preamble plus the shared format gloss becomes
-                    // the system message.
-                    Some(recall_system_preamble()),
+                    // The preamble (with the configured cap rendered
+                    // in) plus the shared format gloss becomes the
+                    // system message.
+                    Some(recall_system_preamble(self.injection_cap)),
                     vec![Message::user(render_recall_prompt(input))],
                     schemars::schema_for!(RecallSelection),
                     self.max_tokens,
@@ -985,7 +1024,9 @@ mod tests {
         GateMessage {
             row_id,
             platform_msg_id: format!("m{row_id}"),
-            content: format!("[Sender {sender_id} 13:01] {text}"),
+            // The production content shape of context.rs: the message
+            // id rides inside the XML as the `id` attribute.
+            content: format!(r#"<msg from="{sender_id}" at="13:01" id="{row_id}">{text}</msg>"#),
             sender_id: sender_id.to_string(),
             reply_to_platform_msg_id: None,
             text: text.to_string(),
@@ -1218,9 +1259,15 @@ mod tests {
     #[test]
     fn the_prompt_renders_messages_and_numbered_candidates() {
         let prompt = render_recall_prompt(&sample_input());
-        // One line per new message: `{row_id} {content}`.
-        assert!(prompt.contains("41 [Sender u1 13:01] has anyone tried the new cafe?"));
-        assert!(prompt.contains("42 [Sender u2 13:01] the espresso is great"));
+        // One line per new message: the XML-tagged content only. The
+        // selection contract speaks candidate indices, so there is NO
+        // duplicated row-id prefix (decision 65); the message id rides
+        // inside the content as the `id` attribute.
+        assert!(prompt
+            .contains(r#"<msg from="u1" at="13:01" id="41">has anyone tried the new cafe?</msg>"#));
+        assert!(prompt.contains(r#"<msg from="u2" at="13:01" id="42">the espresso is great</msg>"#));
+        assert!(!prompt.contains("41 <msg"));
+        assert!(!prompt.contains("42 <msg"));
         // The numbered candidate list: 1-based, YYYY-MM-DD of valid_at.
         assert!(prompt.contains("1. Alice likes espresso. (since 2026-08-07)"));
         assert!(prompt.contains("2. Bob plays go. (since 2025-12-31)"));
@@ -1228,15 +1275,34 @@ mod tests {
 
     #[test]
     fn the_preamble_states_the_conservative_rules() {
-        // Section 9.2: conservative by default.
-        assert!(RECALL_PREAMBLE.contains("materially reduce the quality"));
-        assert!(RECALL_PREAMBLE.contains("select nothing"));
-        assert!(RECALL_PREAMBLE.contains("the normal case"));
-        assert!(RECALL_PREAMBLE.contains("the JSON object of the required schema"));
+        // Section 9.2: conservative by default. The cap sentence of
+        // rule 4 is rendered per call by `recall_preamble` (decision
+        // 65), so the assertions run on the rendered preamble.
+        let preamble = recall_preamble(5);
+        assert!(preamble.contains("materially reduce the quality"));
+        assert!(preamble.contains("select nothing"));
+        assert!(preamble.contains("the normal case"));
+        assert!(preamble.contains("the JSON object of the required schema"));
         // The preamble states the exact output field names (a minimal
         // skeleton): field names must not rely on schema enforcement.
-        assert!(RECALL_PREAMBLE.contains("\"selected\""));
-        assert!(RECALL_PREAMBLE.contains("\"reason\""));
+        assert!(preamble.contains("\"selected\""));
+        assert!(preamble.contains("\"reason\""));
+        // The static head carries rules 1-3; the full preamble starts
+        // with it.
+        assert!(preamble.starts_with(RECALL_PREAMBLE));
+    }
+
+    #[test]
+    fn the_preamble_renders_the_configured_injection_cap() {
+        // Decision 65: the cap is the configured `recall_injection_cap`,
+        // rendered per call — not a hardcoded 5.
+        let preamble = recall_preamble(3);
+        assert!(preamble.contains("Select at most 3 memories."));
+        assert!(!preamble.contains("at most 5"));
+        // The default cap still renders its number.
+        assert!(recall_preamble(5).contains("Select at most 5 memories."));
+        // The static head carries no cap sentence at all.
+        assert!(!RECALL_PREAMBLE.contains("at most"));
     }
 
     #[test]
@@ -1246,8 +1312,8 @@ mod tests {
         // participation-gate preamble (single source in
         // tamako-persona). The conservative rules stay first; the
         // gloss appends as a clearly separated section.
-        let preamble = recall_system_preamble();
-        assert!(preamble.starts_with(RECALL_PREAMBLE));
+        let preamble = recall_system_preamble(5);
+        assert!(preamble.starts_with(&recall_preamble(5)));
         assert!(preamble.ends_with(&format!("\n\n{CONTEXT_FORMAT_GLOSS}")));
         assert!(preamble.contains(CONTEXT_FORMAT_GLOSS));
         // The conservative rules are unchanged and still present.
@@ -1361,7 +1427,7 @@ mod tests {
             structured_output: crate::endpoint::StructuredOutputMode::Schema,
             session_id: crate::endpoint::DEFAULT_SESSION_ID.to_string(),
         };
-        let result = RigRelevanceGate::from_endpoint(&endpoint);
+        let result = RigRelevanceGate::from_endpoint(&endpoint, 5);
         if let Some(key) = saved_key {
             std::env::set_var(crate::endpoint::ANTHROPIC_API_KEY_ENV_VAR, key);
         }
