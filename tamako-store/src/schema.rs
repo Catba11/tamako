@@ -4,6 +4,13 @@
 //! (version, sql). The runner applies each pending version in one
 //! transaction and records the version in `schema_migrations`. Opening an
 //! existing database a second time is a no-op.
+//!
+//! Timestamp cutover note (specs.md Section 4.2 backfill note): edit rows
+//! persisted before the K3 fix (the `normalize_edited_message` entry
+//! point) carry the ORIGINAL send date in their `timestamp` column; edit
+//! rows persisted after the fix carry the edit date. The raw log is
+//! append-only (Rule P1), so no migration rewrites the old rows. Readers
+//! of the log see mixed edit-timestamp semantics across the cutover.
 
 use rusqlite::Connection;
 use time::format_description::well_known::Rfc3339;
@@ -135,6 +142,31 @@ CREATE TABLE context_summaries (
 -- existing row and skips the LLM call.
 CREATE UNIQUE INDEX context_summaries_dedup
     ON context_summaries (first_msg_id, last_msg_id);
+",
+    ),
+    (
+        6,
+        "\
+-- H1 edit-dedup collapse fix (decision 65). The v1 messages_dedup key
+-- (platform_msg_id, direction, event_type, timestamp) collapsed every
+-- same-second edit of one message into the first persisted edit: raw-log
+-- loss under Rule P1. Adding `text` to the key distinguishes edits.
+-- Inbound redelivery is byte-identical, so message dedup still holds.
+-- Same-second IDENTICAL-text edits still collapse; that case is
+-- semantically harmless (nothing changed) and documented as such.
+--
+-- This migration is INDEX-ONLY: it drops and recreates an index. No
+-- table rebuild, no data touched, nothing is lost.
+--
+-- Query-plan audit (store.rs): every messages-table query that filters
+-- platform_msg_id (find_reply_target, find_sender_by_platform_msg_id,
+-- find_latest_message_by_platform_msg_id) uses `platform_msg_id = ?`,
+-- which matches the new index's leftmost column. No query depends on
+-- the old index shape.
+DROP INDEX messages_dedup;
+
+CREATE UNIQUE INDEX messages_dedup
+    ON messages (platform_msg_id, direction, event_type, timestamp, text);
 ",
     ),
 ];

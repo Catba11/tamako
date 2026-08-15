@@ -283,7 +283,10 @@ fn events_of_update(update: &Update, bot: &BotIdentity) -> Vec<GroupEvent> {
             }
         }
         UpdateKind::EditedMessage(msg) => {
-            let Some(message) = normalize::normalize_message(msg, bot) else {
+            // K3 fix: edit rows carry the EDIT date in the timestamp slot
+            // (specs.md Section 4.2), so the edited path has its own entry
+            // point. normalize_message would stamp the original send date.
+            let Some(message) = normalize::normalize_edited_message(msg, bot) else {
                 debug!("edited message without text; skipping");
                 return Vec::new();
             };
@@ -444,7 +447,17 @@ mod tests {
         }));
         let events = events_of_update(&upd, &bot());
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].event, InboundEvent::EditedMessage(_)));
+        match &events[0].event {
+            // The edit update routes through normalize_edited_message: the
+            // timestamp is the edit date, not the original send date.
+            InboundEvent::EditedMessage(message) => {
+                assert_eq!(
+                    message.timestamp,
+                    time::OffsetDateTime::from_unix_timestamp(DATE + 5).expect("valid timestamp")
+                );
+            }
+            other => panic!("expected EditedMessage, got {other:?}"),
+        }
     }
 
     #[test]

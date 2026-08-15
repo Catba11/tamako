@@ -263,7 +263,10 @@ impl Store {
     }
 
     /// Rule P1: append to the raw log. Idempotent: UNIQUE(platform_msg_id,
-    /// direction, event_type, timestamp) + INSERT OR IGNORE.
+    /// direction, event_type, timestamp, text) + INSERT OR IGNORE. The
+    /// `text` column in the key (migration v6, decision 65) keeps
+    /// same-second edits with different text distinct; byte-identical
+    /// redelivery still dedups.
     pub fn insert_message(&self, chat_id: &str, msg: &NewMessage) -> Result<InsertOutcome> {
         self.with_conn(chat_id, |conn| {
             let timestamp = schema::format_rfc3339(msg.timestamp)?;
@@ -412,6 +415,35 @@ impl Store {
                             display_name: row.get("sender_display_name")?,
                         })
                     },
+                )
+                .optional()?;
+            Ok(row)
+        })
+    }
+
+    /// The NEWEST raw-log row (highest `id`) for one platform message id,
+    /// any event type, or None when the platform id is absent from the
+    /// log. Edit rows share `platform_msg_id` with their original
+    /// (specs.md Section 15), so the newest row is the latest edit when
+    /// edits exist, else the original message.
+    ///
+    /// No direction filter: outbound rows use synthetic `bot-out:{nanos}`
+    /// ids that never collide with real platform ids (see
+    /// find_reply_target).
+    pub fn find_latest_message_by_platform_msg_id(
+        &self,
+        chat_id: &str,
+        platform_msg_id: &str,
+    ) -> Result<Option<MessageRow>> {
+        self.with_conn(chat_id, |conn| {
+            let row = conn
+                .query_row(
+                    &format!(
+                        "SELECT {MESSAGE_COLUMNS} FROM messages
+                         WHERE platform_msg_id = ?1 ORDER BY id DESC LIMIT 1"
+                    ),
+                    rusqlite::params![platform_msg_id],
+                    message_row,
                 )
                 .optional()?;
             Ok(row)
@@ -1188,7 +1220,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1198,7 +1230,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -1216,6 +1248,127 @@ mod tests {
         })
         .optional()
         .expect("context_summaries table must exist");
+
+        // Migration v6 rebuilt messages_dedup with `text` in the key.
+        let dedup_columns = index_columns(&conn, "messages_dedup");
+        assert_eq!(
+            dedup_columns,
+            vec![
+                "platform_msg_id",
+                "direction",
+                "event_type",
+                "timestamp",
+                "text"
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_v6_upgrades_a_v5_database_in_place() {
+        // A database created by the previous release carries migrations
+        // v1-v5 and live data. Opening it with this build must apply only
+        // v6 (index-only: no data touched), keep the data, and be a no-op
+        // on reopen.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let group_dir = dir.path().join("c1");
+        std::fs::create_dir_all(&group_dir).expect("create group dir");
+        {
+            let conn = Connection::open(group_dir.join("store.db")).expect("open v5 db");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("create schema_migrations");
+            // Replay the v5-era runner: migrations 1-5 only, each with its
+            // recorded applied_at.
+            for (version, sql) in schema::MIGRATIONS.iter().take(5) {
+                conn.execute_batch(sql).expect("apply v5 migration");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![version, schema::now_rfc3339().expect("timestamp")],
+                )
+                .expect("record v5 migration");
+            }
+            // The v5-era index shape: no `text` column in the key.
+            assert_eq!(
+                index_columns(&conn, "messages_dedup"),
+                vec!["platform_msg_id", "direction", "event_type", "timestamp"]
+            );
+            // Data written by the v5-era bot must survive the upgrade.
+            let msg = sample_message();
+            let timestamp = schema::format_rfc3339(msg.timestamp).expect("format");
+            conn.execute(
+                "INSERT INTO messages (
+                    platform_msg_id, direction, event_type, timestamp,
+                    sender_id, sender_display_name, sender_username, text,
+                    reply_to_platform_msg_id, mentions_bot, is_reply_to_bot
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    msg.platform_msg_id,
+                    msg.direction.as_str(),
+                    msg.event_type.as_str(),
+                    timestamp,
+                    msg.sender_id,
+                    msg.sender_display_name,
+                    msg.sender_username,
+                    msg.text,
+                    msg.reply_to_platform_msg_id,
+                    msg.mentions_bot,
+                    msg.is_reply_to_bot,
+                ],
+            )
+            .expect("insert v5 message");
+        }
+
+        // The upgrade open applies v6. A reopen is a no-op.
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("c1").expect("upgrade open");
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen after upgrade");
+
+        // The v5-era message survives the index-only upgrade.
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].platform_msg_id, "m1");
+
+        // The index now carries `text`; the migration is index-only, so
+        // the name is unchanged and no other index appeared.
+        let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
+        assert_eq!(
+            index_columns(&conn, "messages_dedup"),
+            vec![
+                "platform_msg_id",
+                "direction",
+                "event_type",
+                "timestamp",
+                "text"
+            ]
+        );
+
+        // Migration bookkeeping: exactly one version was added.
+        let versions: Vec<u32> = {
+            let mut stmt = conn
+                .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .expect("prepare versions");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query versions")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect versions")
+        };
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// The column names of one index, in key order, via PRAGMA index_info.
+    fn index_columns(conn: &Connection, index: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA index_info({index})"))
+            .expect("prepare index_info");
+        stmt.query_map([], |row| row.get::<_, String>(2))
+            .expect("query index_info")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect index_info")
     }
 
     #[test]
@@ -1288,7 +1441,7 @@ mod tests {
             .expect("insert summary");
         assert!(summary_id > 0);
 
-        // Migration bookkeeping: exactly one version was added.
+        // Migration bookkeeping: the upgrade applied v5 and v6.
         let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
         let versions: Vec<u32> = {
             let mut stmt = conn
@@ -1299,7 +1452,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -1369,6 +1522,175 @@ mod tests {
         assert_eq!(rows[2].event_type, EventType::Edit);
         assert_eq!(rows[1].text, "hello (edited)");
         assert_eq!(rows[2].text, "hello (edited again)");
+    }
+
+    #[test]
+    fn byte_identical_inbound_redelivery_still_dedups_to_one_row() {
+        // Migration v6 (decision 65) added `text` to the dedup key. An
+        // inbound redelivery is byte-identical, so message dedup holds.
+        let (_dir, store) = temp_store();
+        let msg = sample_message();
+
+        assert!(matches!(
+            store.insert_message("c1", &msg).expect("first insert"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert_eq!(
+            store.insert_message("c1", &msg).expect("redelivery"),
+            InsertOutcome::Duplicate
+        );
+        assert_eq!(store.list_messages("c1").expect("list").len(), 1);
+    }
+
+    #[test]
+    fn same_second_edits_with_different_text_both_persist() {
+        // The H1 fix (migration v6, decision 65): the pre-v6 dedup key
+        // collapsed the second edit into the first. With `text` in the
+        // key, two same-second edits with different text both land.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let edit_timestamp =
+            OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("valid timestamp");
+        let edit1 = NewMessage {
+            event_type: EventType::Edit,
+            timestamp: edit_timestamp,
+            text: "hello (edit A)".to_string(),
+            ..base.clone()
+        };
+        let edit2 = NewMessage {
+            event_type: EventType::Edit,
+            timestamp: edit_timestamp,
+            text: "hello (edit B)".to_string(),
+            ..base.clone()
+        };
+
+        assert!(matches!(
+            store.insert_message("c1", &base).expect("insert message"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &edit1).expect("insert edit A"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &edit2).expect("insert edit B"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].text, "hello (edit A)");
+        assert_eq!(rows[2].text, "hello (edit B)");
+    }
+
+    #[test]
+    fn same_second_identical_text_edits_collapse() {
+        // The documented harmless case of migration v6 (decision 65): two
+        // same-second edits with IDENTICAL text share the full dedup key,
+        // so the second collapses. Nothing changed between them, so no
+        // information is lost.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let edit = NewMessage {
+            event_type: EventType::Edit,
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("valid timestamp"),
+            text: "hello (edited)".to_string(),
+            ..base.clone()
+        };
+
+        assert!(matches!(
+            store.insert_message("c1", &base).expect("insert message"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &edit).expect("insert edit"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert_eq!(
+            store
+                .insert_message("c1", &edit)
+                .expect("insert identical edit"),
+            InsertOutcome::Duplicate
+        );
+
+        // The original plus one edit row: the collapse keeps the count at 2.
+        assert_eq!(store.list_messages("c1").expect("list").len(), 2);
+    }
+
+    #[test]
+    fn find_latest_message_by_platform_msg_id_returns_the_newest_row() {
+        // Edit rows share platform_msg_id with their original (specs.md
+        // Section 15). The newest row (highest id) is the latest edit.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let original = NewMessage {
+            platform_msg_id: "m-edit".to_string(),
+            text: "original text".to_string(),
+            ..base.clone()
+        };
+        let edit = NewMessage {
+            platform_msg_id: "m-edit".to_string(),
+            event_type: EventType::Edit,
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_100).expect("valid timestamp"),
+            text: "edited text".to_string(),
+            ..base.clone()
+        };
+        let edit2 = NewMessage {
+            platform_msg_id: "m-edit".to_string(),
+            event_type: EventType::Edit,
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_200).expect("valid timestamp"),
+            text: "edited text v2".to_string(),
+            ..base
+        };
+
+        assert!(matches!(
+            store
+                .insert_message("c1", &original)
+                .expect("insert original"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &edit).expect("insert edit"),
+            InsertOutcome::Inserted(_)
+        ));
+        let latest_id = match store.insert_message("c1", &edit2).expect("insert edit 2") {
+            InsertOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let latest = store
+            .find_latest_message_by_platform_msg_id("c1", "m-edit")
+            .expect("lookup")
+            .expect("the row exists");
+        assert_eq!(latest.id, latest_id);
+        assert_eq!(latest.event_type, EventType::Edit);
+        assert_eq!(latest.text, "edited text v2");
+        assert_eq!(latest.platform_msg_id, "m-edit");
+    }
+
+    #[test]
+    fn find_latest_message_by_platform_msg_id_returns_none_when_absent() {
+        let (_dir, store) = temp_store();
+        assert!(matches!(
+            store
+                .insert_message("c1", &sample_message())
+                .expect("insert"),
+            InsertOutcome::Inserted(_)
+        ));
+
+        assert_eq!(
+            store
+                .find_latest_message_by_platform_msg_id("c1", "m-missing")
+                .expect("missing lookup"),
+            None
+        );
+        // Rule P5: one group's data never crosses into another group.
+        assert_eq!(
+            store
+                .find_latest_message_by_platform_msg_id("c2", "m1")
+                .expect("other group lookup"),
+            None
+        );
     }
 
     #[test]
