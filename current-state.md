@@ -1224,7 +1224,16 @@ Deliberately not done, in priority order:
   the next investigation: the gate's target selection over the
   presented set, the `forced_pending` interplay, and the restart edge
   cases of `wake_last_row_id` (the review's latent fallback-to-0
-  finding, fixed in decision 65).
+  finding, fixed in decision 65). Update 2026-08-15: the operator
+  reports NO recurrence since the decision-64/65 deploy. The
+  plausible candidate fix is the decision-65 marker repair (commit
+  1d1813b: startup repair of a missing/malformed `wake_last_row_id`
+  to the raw-log tail, and the disabled-services path advancing the
+  marker) together with the M2 wake-failure rollback — any path that
+  let two wakes see an overlapping window would reproduce K2. One
+  clean stretch is weak evidence for a rare, mechanism-unknown bug,
+  so the entry STAYS OPEN with a sunset criterion: close it after
+  four weeks of live operation without a recurrence.
 - **Forced-wake chains bypass the floor (conforming; spec question
   pending)**: a human replying to the bot's answer triggers another
   forced wake (specs.md Section 8.1), which bypasses the gate, the

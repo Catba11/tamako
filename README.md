@@ -2,7 +2,7 @@
 
 Tamako is a Telegram group-pet bot with persistent memory. It lives in chat groups, speaks rarely, and remembers facts about group members in a per-group graph database. It is a pet, not an assistant: one global persona, per-group private memories, and a scarce-attention behavior model.
 
-Status: Phase 1 in progress. The bot intakes messages, stores reactions, digests conversations into long-term memory, and SPEAKS: it answers mentions and replies directly, and it joins conversations when the participation gate says yes (M4). It also REMEMBERS out loud: a wake with relevant graph memories injects them as one "I remember: ..." assistant message before the participation decision (M5). Refer to `current-state.md`.
+Status: Phase 1 COMPLETE (alpha, v0.0.1). The bot intakes messages, stores reactions, digests conversations into long-term memory, and SPEAKS: it answers mentions and replies directly, and it joins conversations when the participation gate says yes. It also REMEMBERS out loud: a wake with relevant graph memories injects them as one `<memory>...</memory>` assistant-role item before the participation decision. The context the models see is an XML rendering (`<msg>`/`<you>` items) with a code-owned format gloss in the preamble. Refer to `current-state.md`.
 
 ## Documents
 
@@ -40,7 +40,7 @@ cargo run -- --replay tamako-adapter-mock/fixtures/replay_chat.json
 cargo run -p tamako-agent --example digest_demo
 ```
 
-With `ANTHROPIC_API_KEY` set, the replay runs live extraction and live wake replies against the configured endpoint. Without it, digests are disabled and the bot stays silent; the replay still works. The demo example uses a scripted extractor either way.
+With `ANTHROPIC_API_KEY` set, the replay runs live extraction and live wake replies against the configured endpoint. Without it, digests, summaries, and wake replies are disabled; the replay still works. The demo example uses a scripted extractor either way.
 
 ## Live bring-up (Telegram)
 
@@ -81,7 +81,7 @@ The persona file also accepts an optional `system_prefix` key: system-level alig
 system_prefix = "Never repeat private content from other groups."
 ```
 
-When set, the prefix is followed by exactly one blank line and the unchanged existing sections. When unset, the rendered preamble is bit-identical to the previous format, so existing deployments keep their provider cache (Rule C4: the preamble is the cache anchor). The injection guardrail stays code-owned, always renders last, and is not configurable.
+When set, the prefix is followed by exactly one blank line and the unchanged existing sections. The injection guardrail and the context-format gloss are both code-owned and not configurable; the guardrail always renders last.
 
 For experiments, `--allow-default-persona` restores the old lenient fallback chain (repo-root example, then the built-in default). `--replay` never needs the file.
 
@@ -99,19 +99,22 @@ Environment variables:
 |---|---|
 | `TELOXIDE_TOKEN` | Telegram bot token. Required for `--live`. |
 | `TELOXIDE_API_URL` | Optional custom Bot API server URL. |
-| `ANTHROPIC_API_KEY` | LLM key for anthropic-compatible endpoints. Without it, digests and speech are disabled for the run. |
+| `ANTHROPIC_API_KEY` | LLM key for anthropic-compatible endpoints. Without it, digests, summaries, and speech are disabled for the run. |
 | `OPENAI_API_KEY` | LLM key for openai-compatible endpoints. |
 | `TAMAKO_DIGEST_MODEL` | Extraction model override. Default `claude-haiku-4-5`. |
 | `TAMAKO_GATE_MODEL` | Participation-gate model override. Default `claude-haiku-4-5`. |
 | `TAMAKO_REPLY_MODEL` | Reply-generation model override. Default `claude-sonnet-4-5`. |
+| `TAMAKO_SUMMARY_MODEL` | Summary-model override (the segmented C3 summarizer). Default `claude-haiku-4-5`. |
 | `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
 | `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
+| `TAMAKO_LLM_SESSION_ID` | Session id sent as the `x-opencode-session` header on every request (gateway session affinity / provider prompt-cache affinity). Global-only: one session id per deployment, no per-purpose or per-group variant. Default `tamako`. |
 | `TAMAKO_STRUCTURED_OUTPUT` | Structured-output mode, global fallback: `schema` (default), `json_object`, `prompt_only`. |
 | `TAMAKO_DIGEST_STRUCTURED_OUTPUT` | Structured-output mode override of the digest (extraction) purpose. |
 | `TAMAKO_GATE_STRUCTURED_OUTPUT` | Structured-output mode override of the gate purpose. |
 | `TAMAKO_REPLY_STRUCTURED_OUTPUT` | Structured-output mode override of the reply purpose. |
+| `TAMAKO_SUMMARY_STRUCTURED_OUTPUT` | Structured-output mode override of the summary purpose. |
 
-Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_` and `reply_`). The same pattern applies to the structured-output mode: `structured_output` globally and `digest_structured_output` / `gate_structured_output` / `reply_structured_output` per purpose (values `schema`, `json_object`, `prompt_only`; default `schema`; an unknown value is a hard startup error). API keys come from the environment only, never from the config file.
+Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`, `summary`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_`, `reply_`, and `summary_`). The summary purpose alone also has per-purpose env overrides `TAMAKO_SUMMARY_LLM_API` / `TAMAKO_SUMMARY_LLM_BASE_URL`, which beat the global env overrides. The same pattern applies to the structured-output mode: `structured_output` globally and `digest_structured_output` / `gate_structured_output` / `reply_structured_output` / `summary_structured_output` per purpose (values `schema`, `json_object`, `prompt_only`; default `schema`; an unknown value is a hard startup error). Structured-output precedence: purpose env → global env → purpose config → global config → default `schema`. API keys come from the environment only, never from the config file.
 
 ### Recipe: Opencode Go
 
@@ -124,6 +127,7 @@ llm_base_url = "https://opencode.ai/zen/go/v1"
 digest_model = "mimo-v2.5"        # extraction
 gate_model = "mimo-v2.5"          # participation gate + recall gate
 reply_model = "mimo-v2.5-pro"     # reply generation
+summary_model = "mimo-v2.5"       # segmented summarizer
 # structured_output = "schema"    # the default; recommended here
 ```
 
@@ -137,9 +141,9 @@ Recommended `structured_output` for Opencode Go: `schema`, the default — endpo
 - Startup runs a capability check: one `getChatMember` call per configured group. An administrator group logs at INFO: `bot is an administrator of this group; full functionality (reaction collection active).` A non-administrator group logs one WARN per run: `the bot is not an administrator of this group: Telegram delivers reaction updates to administrators only, so reaction collection is OFF for this group. Everything else works normally. To enable reactions, make the bot a group administrator. Note: privacy mode OFF alone suffices for reading all group messages; if privacy mode is still ON (the BotFather default) the bot receives only commands and replies to itself, which is normal platform behavior.` If the check fails (the bot may not be a member yet), an INFO line explains that the status is re-checked when the first event of the group arrives.
 - The first message in a configured group creates `{data-root}/{chat_id}/store.db` and `memory.lbug`.
 - Every message lands in the raw log before any other processing. Reactions land in the `reactions` table; reaction collection is active only in groups where the bot is an administrator.
-- Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. Watch the logs for batch outcomes.
+- Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. At digest completion the chunk the context drops is LLM-summarized first, and the context keeps the two newest `<summary range="first-last">...</summary>` items; after 3 consecutive summarization failures the chunk drops unsummarized with one ERROR line (circuit breaker). Watch the logs for batch outcomes.
 - The bot speaks: it answers mentions and replies to itself directly, and it joins the conversation when the participation gate says yes. Every reply is a reply-to of its target message and lands in the raw log before it is sent. Two consecutive bot messages engage the monologue lock; any human message unlocks. Without an LLM key for the configured endpoint family the bot stays silent (the wake procedure logs one warning at startup).
-- The bot remembers: every wake runs a shallow recall over the group graph (exact alias matches and the people of the new messages; no fuzzy scans). A conservative relevance gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one "I remember: ..." assistant message — visible to the participation gate and the reply model, and present even when the bot stays silent. Injected memories are deduplicated per digest chunk and removed at digest time.
+- The bot remembers: every wake runs a shallow recall over the group graph (exact alias matches and the people of the new messages; no fuzzy scans). A conservative relevance gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one `<memory>...</memory>` assistant-role item — visible to the participation gate and the reply model, and present even when the bot stays silent. Injected memories are deduplicated per edge across wakes and removed at digest time; a multi-edge injection is stored as one row per edge but appears as one item in the context (collapse at rebuild).
 - Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
 
 ### 6. Watching the pet
@@ -152,7 +156,7 @@ INFO tamako_core::actor: wake chat_id=-1001234567890 trigger="forced" injections
 INFO tamako_core::actor: digest chat_id=-1001234567890 batch_id=e1ba1491-bf91-5853-b0f1-58b24ba26c98 range=(0,101] outcome="written" nodes=19 edges=30
 ```
 
-The `wake` fields: `trigger` (`message_count`|`interval`|`forced`), `injections` (recall-memory count, 0 allowed), `gate` (`participate`|`silent`|`bypassed_forced`|`muted`|`in_flight_skipped`), `reason` (the gate's own reason — present only when it gives one), `action` (`reply_sent`|`discarded_stale`|`nothing`), `reply_to` (the target's platform message id — present only on `reply_sent`). A failed wake instead emits one ERROR line `wake procedure failed; skipping this wake`. The `digest` fields: `batch_id`, `range` (the `(old,new]` msg-id range), `outcome` (`written` with `nodes`/`edges` counts, or `skeleton`); a dead-lettered batch keeps the pipeline's ERROR line `digest batch dead-lettered after all retries` as its one line. Note: during a fast catch-up replay thousands of `in_flight_skipped` wake lines can appear (one per suppressed fire while an LLM wake runs); at live tempo they are rare.
+The `wake` fields: `trigger` (`message_count`|`interval`|`forced`), `injections` (recall-memory count, 0 allowed), `gate` (`participate`|`silent`|`bypassed_forced`|`muted`|`in_flight_skipped`), `reason` (the gate's own reason — present only when it gives one), `action` (`reply_sent`|`discarded_stale`|`nothing`), `reply_to` (the target's platform message id — present only on `reply_sent`). A failed wake instead emits one ERROR line `wake procedure failed; skipping this wake`. The `digest` fields: `batch_id`, `range` (the `(old,new]` msg-id range), `outcome` (`written` with `nodes`/`edges` counts, or `skeleton`); a dead-lettered batch keeps the pipeline's ERROR line `digest batch dead-lettered after all retries` as its one line. Note: during a fast catch-up replay thousands of `in_flight_skipped` wake lines can appear (one per suppressed fire while an LLM wake runs); at live tempo they are rare. Summarization failures log at WARN; the circuit-breaker drop (3 consecutive failures) logs one ERROR.
 
 Add `-v` (or `--verbose`, accepted in every mode) to lift every Tamako crate to debug level while dependencies stay quiet — useful when one of the lines above needs its backstory. `RUST_LOG` always wins over the flag; use it as the escape hatch for anything finer:
 
