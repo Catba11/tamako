@@ -480,11 +480,10 @@ async fn monologue_lock_survives_a_restart_and_unlocks_on_a_human_message() {
     let sends = send_texts(&actions);
     assert_eq!(
         sends,
-        vec![(
-            CHAT_ID.to_string(),
-            "r3".to_string(),
-            Some("u3".to_string())
-        )],
+        // The unforced unlock wake targets u3, the LATEST message: zero
+        // newer human messages, so decision 70 (specs.md Section 6.2)
+        // sends r3 as a plain standalone message with no quote.
+        vec![(CHAT_ID.to_string(), "r3".to_string(), None)],
         "the lock disengaged: the threshold wake spoke after the restart"
     );
     wait_for_counter(&fixture.store, "wakes_total", "4").await;

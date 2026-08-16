@@ -2299,11 +2299,27 @@ async fn handle_wake_report(
         );
         return Ok(());
     }
+    // Decision 70 (specs.md Section 6.2): the send-time quote decision
+    // reuses the SAME distance the recency re-check computed. A forced
+    // wake always quotes (the human engaged the bot directly); a
+    // non-forced wake quotes only when the conversation moved past the
+    // target (MORE than `reply_quote_threshold` newer human messages).
+    // A recent target gets a plain standalone message: a Telegram reply
+    // notifies the author, and a recent target needs no context anchor.
+    let quote_target = if report.forced || newer > config.reply_quote_threshold {
+        Some(target.platform_msg_id.clone())
+    } else {
+        None
+    };
     // a. Rules B1/P1: persist the outbound raw-log row FIRST — the log
     // is the source of truth; never speak without logging. The
     // synthetic id: the adapter contract (Rule A3) returns no platform
     // id for a sent message, so the row carries a local synthetic id;
-    // nanosecond time keeps the idempotency key unique.
+    // nanosecond time keeps the idempotency key unique. The row keeps
+    // naming the INTERNAL reply target whether or not the platform
+    // send quotes it (the same rule as the curated wake line's
+    // `reply_to`, decision 53 freeze): the quote decision touches only
+    // the outbound action.
     let now = OffsetDateTime::now_utc();
     let row = NewMessage {
         platform_msg_id: format!("bot-out:{}", now.unix_timestamp_nanos()),
@@ -2345,7 +2361,7 @@ async fn handle_wake_report(
     let action = OutboundAction::SendText {
         chat_id: chat_id.to_string(),
         text: text.clone(),
-        reply_to_platform_msg_id: Some(target.platform_msg_id.clone()),
+        reply_to_platform_msg_id: quote_target,
     };
     match outbound {
         Some(sink) => {
@@ -5155,11 +5171,14 @@ mod tests {
                 .expect("send succeeds");
         }
 
-        // The reply goes out as a SendText with reply-to the target.
+        // The reply goes out as a SendText. Decision 70: the target is
+        // the LAST new message (0 newer human messages ≤ the quote
+        // threshold), so the send is a plain standalone message with NO
+        // reply target.
         let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
         assert_eq!(chat_id, CHAT_ID);
         assert_eq!(text, "a thoughtful reply");
-        assert_eq!(reply_to, Some("m3".to_string()));
+        assert_eq!(reply_to, None);
 
         // participations_total lands at the END of the completion
         // handler, so this wait covers the whole send path.
@@ -5376,7 +5395,9 @@ mod tests {
         }
         let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
         assert_eq!(text, "second wake reply");
-        assert_eq!(reply_to, Some("m6".to_string()));
+        // Decision 70: m6 is the last new message (recent target), so
+        // the send is a plain standalone message.
+        assert_eq!(reply_to, None);
         wait_for_counter(&fixture.store, "participations_total", 1).await;
         // The fallback gate recorded exactly one call (the first call
         // panicked before delegating); its input is the re-presented
@@ -5598,7 +5619,9 @@ mod tests {
                 .expect("send succeeds");
         }
         let (_, _, third_reply_to) = expect_send_text(next_action(&mut outbound).await);
-        assert_eq!(third_reply_to, Some("c3".to_string()));
+        // Decision 70: c3 is the last new message (recent target) of
+        // this unforced wake, so the send is a plain standalone message.
+        assert_eq!(third_reply_to, None);
         wait_for_counter(&fixture.store, "participations_total", 3).await;
         assert_eq!(gate.call_count(), 1);
         assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(4));
@@ -5660,7 +5683,9 @@ mod tests {
         }
         let (_chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
         assert_eq!(text, "post-restart reply");
-        assert_eq!(reply_to, Some("m5".to_string()));
+        // Decision 70: m5 is the last new message (recent target), so
+        // the send is a plain standalone message.
+        assert_eq!(reply_to, None);
         wait_for_counter(&fixture.store, "participations_total", 1).await;
         let inputs = gate
             .calls
@@ -5887,6 +5912,110 @@ mod tests {
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
+    #[tokio::test]
+    async fn a_recent_target_sends_a_plain_standalone_message() {
+        // Decision 70 (specs.md Section 6.2): a NON-forced wake reply
+        // quotes its target only when MORE than `reply_quote_threshold`
+        // (default 10) newer human messages arrived after it. The gate
+        // targets the LAST new message (distance 0), so the send is a
+        // plain standalone message: a Telegram reply notifies the
+        // author, and a recent target needs no context anchor.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("standalone reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "standalone reply");
+        assert_eq!(reply_to, None);
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+
+        // The raw-log row still names the INTERNAL target (the same
+        // rule as the curated wake line's `reply_to`, decision 53
+        // freeze): the quote decision touches only the platform send.
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].direction, Direction::Outbound);
+        assert_eq!(rows[3].reply_to_platform_msg_id, Some("m3".to_string()));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_stale_target_within_the_staleness_threshold_is_quoted() {
+        // Decision 70 with the SAME distance metric as the Section 6.2
+        // staleness re-check. The gate targets the FIRST new message
+        // (m1); eleven newer human messages arrive while the wake is in
+        // flight — past `reply_quote_threshold` (10) but within
+        // `reply_staleness_threshold` (20): the reply is SENT (not
+        // discarded) and it QUOTES the target — a stale target needs
+        // the context anchor.
+        let fixture = make_fixture();
+        let hold = Arc::new(Notify::new());
+        let gate = ScriptedGate::yes(GateTarget::First);
+        let reply = ScriptedReply::held("quoted reply", Arc::clone(&hold));
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        // The count threshold fires the wake; the reply generation
+        // blocks on the hold, so the wake stays in flight.
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_reply_calls(&reply, 1).await;
+        // Eleven newer human messages after the target. Their count
+        // fires are in-flight no-ops (Section 6.2: inbound messages
+        // during a running wake do not interrupt the call).
+        for index in 4..=14 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        hold.notify_one();
+
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "quoted reply");
+        assert_eq!(reply_to, Some("m1".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        // No further event arrives, so the pending count fires of the
+        // in-flight period never turn into a second wake.
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_timer_driver_evaluates_a_silent_group() {
         // The M4 timer driver end to end: only the interval can fire
@@ -5927,9 +6056,10 @@ mod tests {
         wait_for_counter(&fixture.store, "wakes_total", 1).await;
         let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
         // The live wake path ran (the stub path sends nothing and never
-        // participates).
+        // participates). Decision 70: m1 is the only new message
+        // (recent target), so the send is a plain standalone message.
         assert_eq!(text, "timer reply");
-        assert_eq!(reply_to, Some("m1".to_string()));
+        assert_eq!(reply_to, None);
         wait_for_counter(&fixture.store, "participations_total", 1).await;
         assert_eq!(gate.call_count(), 1);
         handle.shutdown().await.expect("shutdown succeeds");
@@ -5972,10 +6102,13 @@ mod tests {
         hold.notify_one();
 
         // BOTH replies arrive, in order: the running wake first, the
-        // forced one second.
+        // forced one second. Decision 70: the first wake is unforced
+        // and its target p3 is recent (one newer human message ≤ the
+        // quote threshold), so it sends a plain standalone message; the
+        // forced wake always quotes.
         let (_, _, first_reply_to) = expect_send_text(next_action(&mut outbound).await);
         let (_, _, second_reply_to) = expect_send_text(next_action(&mut outbound).await);
-        assert_eq!(first_reply_to, Some("p3".to_string()));
+        assert_eq!(first_reply_to, None);
         assert_eq!(second_reply_to, Some("m4".to_string()));
         wait_for_counter(&fixture.store, "participations_total", 2).await;
         // The gate ran exactly once: the forced wake bypassed it
@@ -6256,10 +6389,12 @@ mod tests {
             r#"<msg from="Bob" at="22:13" id="3" reply="user" reply_to_name="Alice" reply_to_id="1">text of m3</msg>"#
         );
 
-        // The reply goes out targeting the last new message.
+        // The reply goes out targeting the last new message. Decision
+        // 70: m3 is recent (distance 0), so the send is a plain
+        // standalone message with no reply target.
         let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
         assert_eq!(text, "gate reply");
-        assert_eq!(reply_to, Some("m3".to_string()));
+        assert_eq!(reply_to, None);
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
