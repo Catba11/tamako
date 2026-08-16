@@ -389,7 +389,11 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
     wait_for_counter(&fixture.store, "wakes_total", "3").await;
     wait_for_counter(&fixture.store, "participations_total", "3").await;
 
-    // Three SendText actions in order, each a reply to its target.
+    // Three SendText actions in order. The forced wakes (r1, r2) quote
+    // their targets; the unforced count wake (r3) targets the LATEST
+    // message — zero newer human messages, below
+    // `reply_quote_threshold` — so decision 70 (specs.md Section 6.2)
+    // sends it as a plain standalone message with no quote.
     let sends = send_texts(&harness.sink.recorded_actions());
     assert_eq!(
         sends,
@@ -404,14 +408,13 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
                 "r2".to_string(),
                 Some("48".to_string())
             ),
-            (
-                CHAT_ID.to_string(),
-                "r3".to_string(),
-                Some("51".to_string())
-            ),
+            (CHAT_ID.to_string(), "r3".to_string(), None),
         ]
     );
-    // Rule B1: three outbound rows in the raw log, texts r1/r2/r3.
+    // Rule B1: three outbound rows in the raw log, texts r1/r2/r3. The
+    // row keeps naming the INTERNAL reply target whether or not the
+    // platform send quotes it (decision 53 freeze), so all three rows
+    // carry Some(target) even though r3 went out unquoted.
     let outbound = rows_of_direction(&fixture.store, Direction::Outbound).await;
     assert_eq!(outbound.len(), 3);
     for (row, (text, reply_to)) in outbound
@@ -702,11 +705,10 @@ async fn monologue_lock_suppresses_unforced_wakes_until_a_human_message() {
                 "r2".to_string(),
                 Some("d2".to_string())
             ),
-            (
-                CHAT_ID.to_string(),
-                "r3".to_string(),
-                Some("d5".to_string())
-            ),
+            // The unforced threshold wake targets the LATEST message
+            // (row 7): zero newer human messages, so decision 70 sends
+            // r3 as a plain standalone message with no quote.
+            (CHAT_ID.to_string(), "r3".to_string(), None),
         ]
     );
     wait_for_counter(&fixture.store, "wakes_total", "4").await;
@@ -929,5 +931,73 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
     // Only the two sends count as participations; the parrot-only wake
     // failed like an empty reply.
     wait_for_counter(&fixture.store, "participations_total", "2").await;
+    shutdown(harness).await;
+}
+
+/// Scenario G: the decision-70 quote rule on a STALE target (specs.md
+/// Section 6.2). The gate targets the FIRST of twelve new messages;
+/// when the count threshold fires, eleven newer human messages follow
+/// the target — MORE than `reply_quote_threshold` (default 10) but
+/// within `reply_staleness_threshold` (default 20) — so the unforced
+/// wake still sends and the send IS a Telegram reply-to of the stale
+/// target (the context anchor a late reply needs).
+#[tokio::test]
+async fn stale_target_is_quoted_on_an_unforced_wake() {
+    let fixture = make_fixture();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid timestamp");
+    let config = TriggerConfig {
+        wake_msg_count: 12,
+        wake_floor: Duration::ZERO,
+        wake_interval: HUGE_INTERVAL,
+        ..TriggerConfig::default()
+    };
+    let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
+        participate: true,
+        target_row_id: Some(1),
+        reason: Some("an older point worth answering".to_string()),
+    }]));
+    let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec!["r1".to_string()]));
+    let harness = spawn_on(&fixture, config, t0, gate, reply);
+    for index in 1..=12_i64 {
+        harness
+            .handle
+            .send_event(InboundEvent::Message(message(
+                &format!("g{index}"),
+                t0 + time::Duration::seconds(index),
+                false,
+            )))
+            .await
+            .expect("the actor inbox is open");
+    }
+    let actions = wait_for_actions(&harness.sink, 1).await;
+    let sends = send_texts(&actions);
+    assert_eq!(
+        sends,
+        vec![(
+            CHAT_ID.to_string(),
+            "r1".to_string(),
+            Some("g1".to_string())
+        )],
+        "eleven newer human messages exceed reply_quote_threshold: the stale target is quoted"
+    );
+    // Rule B1: the outbound row names the same internal target.
+    let outbound = rows_of_direction(&fixture.store, Direction::Outbound).await;
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].text, "r1");
+    assert_eq!(outbound[0].reply_to_platform_msg_id.as_deref(), Some("g1"));
+    // The gate ran once, unforced, over all twelve new messages.
+    let inputs = harness.gate.inputs();
+    assert_eq!(inputs.len(), 1);
+    assert!(!inputs[0].forced);
+    assert_eq!(
+        inputs[0]
+            .new_messages
+            .iter()
+            .map(|msg| msg.row_id)
+            .collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<_>>()
+    );
+    wait_for_counter(&fixture.store, "wakes_total", "1").await;
+    wait_for_counter(&fixture.store, "participations_total", "1").await;
     shutdown(harness).await;
 }

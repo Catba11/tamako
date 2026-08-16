@@ -123,6 +123,13 @@ pub struct TriggerConfig {
     /// Deviation of Phase 1 M4: this key is not yet in specs.md
     /// Section 13; it is reported for spec backfill.
     pub reply_staleness_threshold: u32,
+    /// specs.md Section 6.2 (decision 70): a NON-forced wake reply
+    /// quotes (replies-to) its target message only when MORE than this
+    /// many newer human messages arrived after the target; a recent
+    /// target gets a plain standalone message (a Telegram reply
+    /// notifies the author, and a recent target needs no context
+    /// anchor). A forced wake always quotes. Default 10.
+    pub reply_quote_threshold: u32,
     /// The hard cap of injected memories per wake (Section 9.2
     /// conservative default). Default 5. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill (Phase 1 M5).
@@ -173,6 +180,7 @@ impl Default for TriggerConfig {
             reply_structured_output: None,
             summary_structured_output: None,
             reply_staleness_threshold: 20,
+            reply_quote_threshold: 10,
             recall_injection_cap: 5,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
@@ -255,6 +263,8 @@ pub struct TriggerConfigToml {
     /// The recency re-check threshold. Refer to
     /// `TriggerConfig::reply_staleness_threshold`.
     pub reply_staleness_threshold: Option<u32>,
+    /// The quote threshold. Refer to `TriggerConfig::reply_quote_threshold`.
+    pub reply_quote_threshold: Option<u32>,
     /// The injection cap of one wake. Refer to
     /// `TriggerConfig::recall_injection_cap`.
     pub recall_injection_cap: Option<u32>,
@@ -362,6 +372,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.reply_staleness_threshold {
             base.reply_staleness_threshold = value;
+        }
+        if let Some(value) = self.reply_quote_threshold {
+            base.reply_quote_threshold = value;
         }
         if let Some(value) = self.recall_injection_cap {
             base.recall_injection_cap = value;
@@ -481,6 +494,9 @@ wake_floor_secs = 60
         assert_eq!(config.gate_model, None);
         assert_eq!(config.reply_model, None);
         assert_eq!(config.reply_staleness_threshold, 20);
+        // Decision 70 (specs.md Sections 6.2/13): the quote threshold
+        // defaults to 10 newer human messages.
+        assert_eq!(config.reply_quote_threshold, 10);
         // The structured-output mode keys (reported for spec backfill):
         // every Option is None by default; the agent layer resolves
         // the default mode.
@@ -521,6 +537,30 @@ recall_injection_cap = 2
         // A key the TOML does not set keeps the default.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert_eq!(plain.global.recall_injection_cap, 5);
+    }
+
+    #[test]
+    fn toml_override_sets_reply_quote_threshold() {
+        // Decision 70: the quote threshold follows the same per-key
+        // overlay pattern as every other trigger key (AGENT.md Section
+        // 6.3: overridable per group).
+        let text = r#"
+[global]
+reply_quote_threshold = 15
+
+[groups."-100777"]
+reply_quote_threshold = 0
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert_eq!(config.global.reply_quote_threshold, 15);
+        // A group override applies over the global value (0 wins: every
+        // non-forced reply quotes, the pre-decision-70 behavior).
+        assert_eq!(config.for_group("-100777").reply_quote_threshold, 0);
+        // A group without an override receives the global value.
+        assert_eq!(config.for_group("-100999").reply_quote_threshold, 15);
+        // A key the TOML does not set keeps the default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(plain.global.reply_quote_threshold, 10);
     }
 
     #[test]
