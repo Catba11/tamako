@@ -1,7 +1,7 @@
 # Development Roadmap for the Tamako Group-Pet Bot
 
-Version: 0.1 Draft
-Status: For review
+Version: 0.2
+Status: Phase 1 complete (v0.0.1). Phase 2 planned (current-state.md decisions 66–71).
 Companion documents: `specs.md`, `proposed-graph-database-specs.md`
 
 ## 1. Phasing strategy
@@ -50,23 +50,25 @@ Known accepted defect: concept fragmentation from the missing vector pre-screen.
 
 ## 4. Phase 2 — Memory that remembers
 
-Scope:
+Scope (re-sequenced 2026-08; current-state.md decisions 66–70):
 
-1. sqlite-vec sidecar in `store.db`: embedding writes in the digest transaction, name and description embeddings for Person, Alias, and Concept. Refer to `proposed-graph-database-specs.md` Section 7.6.
-2. Vector pre-screen in entity resolution, step 3 with thresholds 0.92 and 0.80, plus the LLM confirmation call for the middle band. Refer to Section 7.4 of that document.
-3. Merge tool for the fragmented Phase 1 graph: candidate pairs from the vector index, one LLM confirmation per pair, edge re-pointing, node tombstone.
-4. Deep recall: graph expansion per the rules of Section 8.2 of that document, the relevance gate, and the "who discussed X" pattern through a full-text sidecar on `edge_text`.
-5. Fact validity: the predicate registry, single-value invalidation in one transaction. No data migration is required; the schema columns exist since Phase 1. Refer to Section 7.5 of that document.
-6. Manual invalidation command for the owner. Refer to `specs.md` Section 14.
-7. Warmup trigger with silence detection, engagement tracking, and the soft backoff. Refer to `specs.md` Sections 8.4 and 8.5.
+1. Embedding sidecar: sqlite-vec in `store.db`, name and description embeddings for Person, Alias, and Concept. Writes go through a `pending_embeddings` queue drained by a rate-limited worker — NOT through the digest transaction (decision 66). Provider: `qwen/qwen3-embedding-8b` via OpenRouter, 4096 dimensions pinned. The first startup backfills every existing node. Refer to `proposed-graph-database-specs.md` Section 7.6.
+2. Vector pre-screen in entity resolution, step 3 with the PROVISIONAL thresholds 0.92 and 0.80, plus the budget-capped LLM confirmation call for the middle band. Calibration happens against live five-group operation, not a soak. Refer to Section 7.4 of that document.
+3. Merge tool for the fragmented Phase 1 graph: candidate pairs from the vector index, one LLM confirmation per pair, edge re-pointing, node tombstone (which also deletes the vec rows), and a merge audit trail — the graph's first destructive operation class.
+4. Fact validity: the predicate registry, single-value invalidation in one transaction. No data migration is required; the schema columns exist since Phase 1. Refer to Section 7.5 of that document.
+5. Manual invalidation command for the owner. Refer to `specs.md` Section 14.
+6. Deep recall: graph expansion per the rules of Section 8.2 of that document, the relevance gate, and the "who discussed X" pattern through a full-text sidecar on `edge_text`.
+7. Warmup trigger with silence detection, engagement tracking, and the soft backoff. The content strategy samples interest Concept nodes from the group's own graph, with a per-topic cooldown and the person-attached-interest framing rule (decision 69). Refer to `specs.md` Sections 8.4 and 8.5.
 8. Persona hot reload. Cache invalidation is an accepted, deliberate event. Rule C4 of `specs.md` applies.
-9. Metrics backend with the full metric set of `specs.md` Section 12.
+9. Metrics backend LAST: Grafana-compatible. Prometheus naming is frozen in `specs.md` Section 12 from day one; the sink (in-bot `/metrics` pull endpoint or OTLP push) is chosen at implementation time (decision 68). No billing or token accounting (operator ruling, decision 68).
+
+Phase 2 entry conditions (replacing the two-week soak as the gate): five-group continuous operation, and the K2 sunset (four clean weeks from 2026-08-15). The soak-based calibration plan is superseded by live observation (decision 66).
 
 Exit criteria:
 
 - The injection rate settles in the healthy band of 20 to 40 percent.
 - The fallback attachment rate stops rising after the merge tool runs.
-- Warmup messages produce measurable engagement in at least one group.
+- Warmup messages produce measurable engagement in at least one group. In non-administrator groups engagement is measured by human replies within a follow-up window (decision 69).
 
 ## 5. Phase 3 — Deferred and open
 
@@ -75,7 +77,7 @@ Ordered by expected value:
 1. Vision captioning under the constraints of `specs.md` Section 14. The caption model has no tool access; caption text is data, marked with delimiters in the digest input.
 2. Negation detection and the `supersedes` edge. Refer to `proposed-graph-database-specs.md` Section 7.5.
 3. The repair tool for dead-letter batches, using the retained raw log.
-4. `EditedMessage` semantics. The Phase 1 behavior ignores edits and logs them.
+4. `EditedMessage` retraction semantics: edits carry full intake semantics since schema v6 (decision 65: `edit_date` timestamps, text-aware dedup, invisible-edit drop). What remains open is retracting facts extracted from pre-edit text. Refer to `specs.md` Section 15.
 5. The `is_a` concept hierarchy.
 6. The Matrix adapter. The contract of `specs.md` Section 4 is the acceptance test.
 
@@ -119,4 +121,4 @@ Within Phase 1, the build order is:
 5. Shallow recall with the full injection protocol.
 6. Two-week test-group soak, then Phase 2 planning with real calibration data.
 
-The thresholds 0.92 and 0.80, the relevance gate, and the participation gate are calibrated with the data of the Phase 1 soak. Refer to the open items of both specifications.
+The thresholds 0.92 and 0.80, the relevance gate, and the participation gate are calibrated against live five-group operation; the original soak-calibration plan was superseded (decision 66). Refer to the open items of both specifications.

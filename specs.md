@@ -101,6 +101,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 - If several triggers are pending, `Digest` runs before `Wake`. Recall sees the freshest graph.
 - A forced `Wake` (mention or reply to the bot) moves to the head of the queue. It does not preempt a running call.
 - Inbound messages during a running `Wake` are logged and appended to the context. They do not interrupt the running call. Before the bot sends a reply, the actor re-checks the recency of the target message. If the number of newer human messages after the target exceeds `reply_staleness_threshold` (20), the reply is discarded, not regenerated. The next wake is the natural retry.
+- A non-forced wake reply quotes (replies-to) its target message only when the number of newer human messages after the target exceeds `reply_quote_threshold` (10). A recent target gets a plain standalone message: a Telegram reply notifies the author, and a recent target needs no context anchor. A forced wake always quotes — the human engaged the bot directly.
 - If a wake fails, `wake_last_row_id` rolls back to its pre-wake value: the messages are presented again at the next wake. A failed forced wake requeues once. A second failure emits a distinct error, because Section 8.1 obliges the bot to respond.
 
 ## 7. Context lifecycle
@@ -286,6 +287,7 @@ Global defaults. Every item is overridable per group.
 | `warmup_silence` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
 | `reply_staleness_threshold` | 20 newer human messages | 6.2 |
+| `reply_quote_threshold` | 10 newer human messages | 6.2 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):

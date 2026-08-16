@@ -1150,6 +1150,115 @@ test-group soak (`docs/soak-runbook.md`).
     event:** decisions 64+65 deploy in ONE restart; deploy date
     PENDING operator.
 
+66. **Phase 2 embedding pipeline rulings (2026-08-16).** The
+    roadmap's "embedding writes in the digest transaction" is
+    OVERRULED: embeddings are derivable, recomputable data, and a
+    network call inside the decision-65-hardened digest failure
+    semantics is a regression. The digest transaction writes graph
+    rows only and enqueues into a new `pending_embeddings` queue
+    table (node id + content hash); a rate-limited background worker
+    drains it (embeddings API down → the queue grows and WARNs,
+    digest unaffected); crash-safe and idempotent by content hash.
+    Descriptions evolve with new facts, so a changed hash re-embeds.
+    Merge-tool tombstones (decision 67) must delete the vec rows.
+    Provider: `qwen/qwen3-embedding-8b` via OpenRouter
+    (openai-compatible `/v1/embeddings`, zero data retention,
+    ~$0.01/M tokens — embedding cost is negligible at node scale).
+    Dimension pinned at 4096: the sqlite-vec virtual-table dimension
+    is fixed at creation, and MRL truncation stays available as a
+    later re-embed job. New config keys `embedding_model` and
+    `embedding_llm_base_url`; the key comes from `OPENAI_API_KEY`.
+    The first Phase-2 startup backfills embeddings for every
+    existing node (batched, throttled). The resolution thresholds
+    0.92/0.80 become PROVISIONAL placeholders: the roadmap's
+    two-week-soak calibration plan is superseded by five-group live
+    observation, and the numbers tune against real feedback. The
+    middle-band LLM confirmation call gets a per-batch budget cap —
+    a fragmented old group must not burn unbounded tokens.
+
+67. **Phase 2 sequencing: memory quality first (2026-08-16).** The
+    graph is fragmenting under five-group live traffic (the soak's
+    first week produced far more engagement than projected; the
+    operator fielded donation offers for token budget), so the
+    vector track deploys before duplicate edges pile up. Order:
+    embedding sidecar → vector pre-screen → merge tool → fact
+    validity + the owner's manual invalidation → deep recall →
+    warmup (decision 68) → persona hot reload → metrics LAST. The
+    merge tool gains an audit trail (which node pair, who confirmed,
+    when): tombstone + edge re-pointing is the graph's first
+    destructive operation class after a year of append-only. Phase 2
+    entry conditions replace the two-week-soak line: five-group
+    continuous operation, the K2 four-week sunset (from 2026-08-15),
+    and the forced-wake cooldown SHELVED per operator — observed
+    reply-model cost runs BELOW the cheap purposes, and the cause is
+    cache asymmetry (decision 71), not a defect the cooldown would
+    fix.
+
+68. **Metrics deferred, Grafana-compatible, no billing (2026-08-16).**
+    The metrics backend closes Phase 2 instead of opening it.
+    Headroom is reserved NOW by discipline, not code: specs.md
+    Section 12 metric names freeze Prometheus-compatible (snake_case,
+    `_total` counters — the existing counters already comply); the
+    state-table counters stay the single source of truth; the sink
+    decision (in-bot `/metrics` pull endpoint vs OTLP push) is made
+    at implementation time. The operator ruled OUT billing/token
+    accounting: serious billing would pull this friends-and-family
+    deployment under PIPEDA obligations for no benefit.
+
+69. **Warmup content strategy (2026-08-16).** Warmup topics come
+    from the group's own memory graph: sample interest/hobby Concept
+    nodes weighted by mention frequency × recency, with a per-topic
+    cooldown in the state table (a cooled-down topic is ineligible
+    for N days). One social-safety rule joins the warmup spec:
+    prefer group-level concepts; when an interest attaches to a
+    specific person, frame it as an open question to the group,
+    never as "X likes Y" — graph content is reference material and
+    the bot speaks in its own voice (the Section 9.4 guardrail
+    spirit, extended from injections to warmup). Engagement tracking
+    is half-blind in non-administrator groups (reaction updates
+    reach administrators only, Section 4.2), so warmup engagement is
+    measured by human replies within a follow-up window; the Phase 2
+    exit criterion reads accordingly.
+
+70. **Reply notification rule: non-forced replies quote only stale
+    targets (2026-08-16).** A Telegram reply notifies the target's
+    author; a pet that pings someone on every spontaneous reply is a
+    nuisance. Non-forced wakes (message-count and interval triggers)
+    quote the target ONLY when the number of newer human messages
+    after the target exceeds `reply_quote_threshold` (default 10,
+    per-group overridable, same distance metric as
+    `reply_staleness_threshold`) — a stale target needs the context
+    anchor or the group loses the thread; a recent target gets a
+    plain standalone message. Forced wakes always quote: the human
+    engaged the bot directly. Spec backfill: Sections 6.2 and 13.
+
+71. **Gate cache investigation: the gate prompt carries no window
+    (2026-08-16).** Operator question: why is the gate model's cache
+    hit rate far below the reply model's — does the window slide per
+    request? Traced answer: the gate never receives the window at
+    all. Its user message is the per-wake DELTA (raw-log rows above
+    `wake_last_row_id` plus this wake's injections); two successful
+    gate calls share zero message-level bytes. The only stable
+    prefix is the gate preamble plus the context-format gloss
+    (~700 tokens), which sits BELOW the ~1024-token minimum of
+    typical automatic prefix caching — the gate may be uncacheable
+    by construction. The gate endpoint bucket is further diluted by
+    three preambles (participation gate, recall relevance gate,
+    repair retry) competing for the same session-affinity cache. The
+    reply purpose, by contrast, sends the persona preamble + the
+    append-only context tail — a long shared prefix invalidated only
+    at digest tempo. Fix options on file: (A) rig `cache_control`
+    breakpoints — anthropic-family only, cheap; (B) give the gate
+    input a bounded SHARED context tail (last N items, same rendered
+    bytes as the reply path) so consecutive gate calls share a
+    cacheable prefix — decision-class: it changes the Section 9.6
+    gate input and may shift gate behavior; (C) unify gate input
+    with the reply snapshot — maximal sharing, but only pays if both
+    purposes resolve to the same model; (D) de-dilute the gate
+    bucket — marginal. Option B with A as a complementary toggle is
+    the recommendation; AWAITS operator ruling before it becomes
+    work.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
