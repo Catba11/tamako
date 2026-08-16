@@ -169,6 +169,52 @@ CREATE UNIQUE INDEX messages_dedup
     ON messages (platform_msg_id, direction, event_type, timestamp, text);
 ",
     ),
+    (
+        7,
+        "\
+-- Embedding sidecar (decision 66). The digest transaction writes graph
+-- rows and ENQUEUES (node_id, content_hash) here; a rate-limited
+-- background worker drains the queue and writes the vectors. An
+-- embeddings-API outage grows the queue but never blocks a digest.
+-- Rows are never deleted by the worker: 'failed' rows (attempts cap
+-- reached) stay inspectable. Timestamps are RFC 3339 TEXT written from
+-- the Rust side, the house idiom.
+CREATE TABLE pending_embeddings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id      TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'done', 'failed')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+-- Idempotent enqueue: the same (node, content) pair queued twice is one
+-- row. A changed description hash enqueues a NEW row for the same node,
+-- so a re-embed follows every content change.
+CREATE UNIQUE INDEX pending_embeddings_dedup
+    ON pending_embeddings (node_id, content_hash);
+
+-- The vectors themselves. vec0 (sqlite-vec 0.1.9) virtual table; the
+-- TEXT primary key is the graph node id (vec0 backs it with an int64
+-- rowid + a text-unique shadow column). The dimension is fixed at
+-- creation and pinned to 4096 by decision 66. chunk_size = 128 gives
+-- 2 MiB preallocation granules (128 * 4096 * 4 bytes) instead of the
+-- 16 MiB default — the scale-appropriate choice for per-group node
+-- counts in the low thousands. Revisitable by recreating the table:
+-- embeddings are recomputable from node content.
+--
+-- The vec0 module must be registered on the connection BEFORE this
+-- migration runs (register_sqlite_vec in Store::open_group);
+-- registration is per-connection and never persisted.
+CREATE VIRTUAL TABLE node_embeddings USING vec0(
+    node_id TEXT PRIMARY KEY,
+    embedding float[4096],
+    chunk_size=128
+);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.

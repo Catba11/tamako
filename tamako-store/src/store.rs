@@ -227,6 +227,54 @@ pub struct ReactionRow {
     pub timestamp: OffsetDateTime,
 }
 
+/// Embedding dimension pinned by current-state.md decision 66. The vec0
+/// virtual-table dimension is fixed at table creation (migration v7).
+pub const EMBEDDING_DIM: usize = 4096;
+
+/// A claimed row of the `pending_embeddings` queue (migration v7,
+/// decision 66).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEmbedding {
+    pub id: i64,
+    pub node_id: String,
+    pub content_hash: String,
+    pub attempts: u32,
+}
+
+/// Registers the sqlite-vec (vec0) extension on a connection. Migration
+/// v7's node_embeddings table and every vec0 query need it; registration
+/// is PER-CONNECTION and never persisted, so every open path
+/// (Store::open_group, the read-only status path) calls this
+/// unconditionally.
+///
+/// # Safety contained here
+/// `sqlite-vec` 0.1.9 exports only the raw C entry point
+/// `sqlite3_vec_init`, declared (incorrectly, with no parameters) as a
+/// Rust extern. The real C signature (compiled with `SQLITE_CORE`) is
+/// the standard 3-argument SQLite extension entry point, so we
+/// transmute the symbol address to the correct fn pointer type and call
+/// it per connection. Sound on the SysV/Win64 ABIs and the same pattern
+/// the crate's own test uses for `sqlite3_auto_extension`.
+/// (`rusqlite::ffi` re-exports `libsqlite3-sys`; `Connection::handle()`
+/// is unconditionally available.)
+pub fn register_sqlite_vec(conn: &Connection) -> Result<()> {
+    type VecInit = unsafe extern "C" fn(
+        db: *mut rusqlite::ffi::sqlite3,
+        pz_err_msg: *mut *mut std::ffi::c_char,
+        p_api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::ffi::c_int;
+    let init: VecInit = unsafe { std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()) };
+    let rc = unsafe { init(conn.handle(), std::ptr::null_mut(), std::ptr::null()) };
+    if rc != rusqlite::ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rc),
+            Some("sqlite3_vec_init failed".to_string()),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Synchronous store rooted at one data root. One connection per group,
 /// opened lazily and cached. Refer to specs.md Section 5.
 pub struct Store {
@@ -257,6 +305,10 @@ impl Store {
         // Refer to specs.md Section 5.1: WAL mode, synchronous=NORMAL.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Registration is per-connection and never persisted; the vec0
+        // module must resolve before migration v7 (and any later reopen)
+        // touches node_embeddings.
+        register_sqlite_vec(&conn)?;
         schema::run_migrations(&mut conn)?;
         self.lock().insert(chat_id.to_string(), conn);
         Ok(())
@@ -779,6 +831,225 @@ impl Store {
         })
     }
 
+    /// Enqueues (node_id, content_hash) pairs into the embedding queue
+    /// (decision 66). INSERT OR IGNORE dedups through the
+    /// pending_embeddings_dedup UNIQUE index; returns the number of
+    /// rows actually inserted. A pair already queued (or already done)
+    /// inserts nothing; a changed hash for a known node inserts a new
+    /// row.
+    pub fn enqueue_embeddings(&self, items: &[(String, String)]) -> Result<usize> {
+        self.with_embedding_conn(|conn| {
+            let now = schema::now_rfc3339()?;
+            let mut stmt = conn.prepare(
+                "INSERT OR IGNORE INTO pending_embeddings
+                    (node_id, content_hash, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+            )?;
+            let mut inserted = 0;
+            for (node_id, content_hash) in items {
+                inserted += stmt.execute(rusqlite::params![node_id, content_hash, now])?;
+            }
+            Ok(inserted)
+        })
+    }
+
+    /// Claims the oldest pending queue rows for the embedding worker:
+    /// status='pending' and attempts below the cap, ordered by id. This
+    /// is a pure SELECT — the store side keeps no claim state and no
+    /// backoff column; the worker paces itself via its own interval and
+    /// a crash simply re-claims the same rows (idempotent by content
+    /// hash).
+    pub fn claim_embedding_batch(&self, limit: usize) -> Result<Vec<PendingEmbedding>> {
+        self.with_embedding_conn(|conn| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, node_id, content_hash, attempts
+                 FROM pending_embeddings
+                 WHERE status = 'pending' AND attempts < {MAX_EMBEDDING_ATTEMPTS}
+                 ORDER BY id LIMIT ?1"
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit], pending_embedding_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Marks a claimed queue row done after its vector was written.
+    pub fn mark_embedding_done(&self, id: i64) -> Result<()> {
+        self.with_embedding_conn(|conn| {
+            conn.execute(
+                "UPDATE pending_embeddings
+                 SET status = 'done', updated_at = ?2
+                 WHERE id = ?1",
+                rusqlite::params![id, schema::now_rfc3339()?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Records a failed embedding attempt: attempts += 1. When the
+    /// attempts cap is reached the row flips to 'failed' and stays
+    /// inspectable; below the cap it stays 'pending' and is re-claimed
+    /// on a later pass.
+    pub fn mark_embedding_attempt_failed(&self, id: i64) -> Result<()> {
+        self.with_embedding_conn(|conn| {
+            conn.execute(
+                &format!(
+                    "UPDATE pending_embeddings
+                     SET attempts = attempts + 1,
+                         status = CASE WHEN attempts + 1 >= {MAX_EMBEDDING_ATTEMPTS}
+                                       THEN 'failed' ELSE status END,
+                         updated_at = ?2
+                     WHERE id = ?1"
+                ),
+                rusqlite::params![id, schema::now_rfc3339()?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Writes (or overwrites) the embedding of one graph node. The
+    /// vector is stored as a little-endian f32 blob of EMBEDDING_DIM
+    /// dimensions; any other length is rejected before hitting sqlite.
+    ///
+    /// vec0 0.1.9 does not implement INSERT OR REPLACE on a TEXT primary
+    /// key (it raises the UNIQUE constraint error instead of
+    /// replacing), so the upsert is DELETE + INSERT in one transaction.
+    pub fn upsert_node_embedding(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        let blob = embedding_to_blob(embedding)?;
+        self.with_embedding_conn(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM node_embeddings WHERE node_id = ?1", [node_id])?;
+            tx.execute(
+                "INSERT INTO node_embeddings (node_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![node_id, blob],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// The tombstone-cleanup primitive (decisions 66/67): removes every
+    /// trace of a merged-away node — its vec row AND all its queue rows
+    /// — in one transaction.
+    pub fn delete_node_embedding_rows(&self, node_id: &str) -> Result<()> {
+        self.with_embedding_conn(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM node_embeddings WHERE node_id = ?1", [node_id])?;
+            tx.execute(
+                "DELETE FROM pending_embeddings WHERE node_id = ?1",
+                [node_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// KNN over node_embeddings with the vec0 0.1.x idiom
+    /// (`embedding MATCH ? AND k = ?`). Returns (node_id, distance)
+    /// pairs, nearest first; fewer than k rows when the table holds
+    /// fewer vectors.
+    pub fn knn_node_embeddings(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
+        let blob = embedding_to_blob(query)?;
+        self.with_embedding_conn(|conn| {
+            let k = i64::try_from(k).unwrap_or(i64::MAX);
+            let mut stmt = conn.prepare(
+                "SELECT node_id, distance FROM node_embeddings
+                 WHERE embedding MATCH ?1 AND k = ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![blob, k], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// The latest done (node_id, content_hash) of every node: the
+    /// first-startup backfill (decision 66) diffs the graph against
+    /// this set to find nodes whose current content was never embedded.
+    /// A node may hold several done rows from successive contents; the
+    /// row with the max id per node wins.
+    pub fn done_embedding_hashes(&self) -> Result<Vec<(String, String)>> {
+        self.with_embedding_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT node_id, content_hash FROM pending_embeddings AS done
+                 WHERE done.status = 'done'
+                   AND done.id = (
+                       SELECT MAX(id) FROM pending_embeddings
+                       WHERE node_id = done.node_id AND status = 'done'
+                   )
+                 ORDER BY node_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// The done-JOURNAL of the embedding sidecar (decision 66): records
+    /// the (node_id, content_hash) pair that was ACTUALLY embedded. The
+    /// recorded hash is the hash of the STORED node content, which can
+    /// differ from the claimed row's candidate hash under alias drift
+    /// (the stored properties win the MERGE coalesce, Rule R4), so the
+    /// worker journals what it embedded instead of trusting the claim.
+    /// `done_embedding_hashes` then reflects reality.
+    ///
+    /// INSERT OR IGNORE through the pending_embeddings_dedup UNIQUE
+    /// index: re-recording the same pair (or recording a pair whose row
+    /// the worker just marked done) is a no-op.
+    pub fn record_node_embedded(&self, node_id: &str, content_hash: &str) -> Result<()> {
+        self.with_embedding_conn(|conn| {
+            let now = schema::now_rfc3339()?;
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_embeddings
+                    (node_id, content_hash, status, attempts, created_at, updated_at)
+                 VALUES (?1, ?2, 'done', 0, ?3, ?3)",
+                rusqlite::params![node_id, content_hash, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every node id known to the embedding sidecar: the UNION of vec
+    /// rows and queue rows. Reconciliation diffs this against the graph
+    /// to detect orphans (vec rows whose node was deleted without a
+    /// tombstone cleanup).
+    pub fn all_embedding_node_ids(&self) -> Result<Vec<String>> {
+        self.with_embedding_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT node_id FROM node_embeddings
+                 UNION
+                 SELECT node_id FROM pending_embeddings
+                 ORDER BY node_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Runs `f` on the embedding sidecar's connection. The embedding
+    /// helpers take no chat_id (their interface is pinned by the
+    /// parallel subtasks), so they operate on the Store's single open
+    /// group: a Store used for embedding work must have exactly one
+    /// group open. Rule P5 still holds — the connection is the same
+    /// per-group store.db; the group was fixed at open_group time.
+    fn with_embedding_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        let mut guard = self.lock();
+        if guard.len() != 1 {
+            return Err(StoreError::AmbiguousGroup(guard.len()));
+        }
+        let conn = guard.values_mut().next().expect("len checked above");
+        f(conn)
+    }
+
     /// Opens the group connection when it is not cached, then runs `f`
     /// on it.
     fn with_conn<T>(
@@ -812,6 +1083,34 @@ const MESSAGE_COLUMNS: &str = "id, platform_msg_id, direction, event_type, times
         sender_id, sender_display_name, sender_username, text,
         reply_to_platform_msg_id, mentions_bot, is_reply_to_bot";
 
+/// Attempts cap of the embedding queue (decision 66). At the cap a row
+/// flips from 'pending' to 'failed' and stays inspectable.
+const MAX_EMBEDDING_ATTEMPTS: u32 = 3;
+
+/// Encodes an f32 vector as the little-endian byte blob vec0 accepts
+/// for `float[N]` columns. The length is validated against the pinned
+/// dimension so a wrong-dimension call fails with a store error instead
+/// of vec0's less contextual message.
+fn embedding_to_blob(embedding: &[f32]) -> Result<Vec<u8>> {
+    if embedding.len() != EMBEDDING_DIM {
+        return Err(StoreError::InvalidValue {
+            key: "embedding_dim".to_string(),
+            value: format!("expected {EMBEDDING_DIM}, got {}", embedding.len()),
+        });
+    }
+    Ok(embedding.iter().flat_map(|f| f.to_le_bytes()).collect())
+}
+
+/// Maps one row of a pending_embeddings SELECT to a `PendingEmbedding`.
+fn pending_embedding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEmbedding> {
+    Ok(PendingEmbedding {
+        id: row.get("id")?,
+        node_id: row.get("node_id")?,
+        content_hash: row.get("content_hash")?,
+        attempts: row.get("attempts")?,
+    })
+}
+
 /// Maps one row of a dead_letter SELECT to a `DeadLetterRow`.
 /// `list_dead_letters` and `read_group_status` share it.
 fn dead_letter_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {
@@ -823,6 +1122,20 @@ fn dead_letter_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {
         error: row.get("error")?,
         created_at: schema::parse_rfc3339(&created_at)?,
     })
+}
+
+/// Opens a group store.db READ-ONLY with a 2 s busy timeout and
+/// registers sqlite-vec. Registration is per-connection: even a status
+/// reader must register, or any query touching node_embeddings fails
+/// with "no such module: vec0".
+///
+/// Brief SQLITE_BUSY windows exist while the bot shuts down or recovers;
+/// the busy timeout waits them out before failing.
+fn open_read_only(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    register_sqlite_vec(&conn)?;
+    Ok(conn)
 }
 
 /// Opens the group store.db READ-ONLY (SQLITE_OPEN_READ_ONLY, no
@@ -850,10 +1163,7 @@ pub fn read_group_status(
     if !path.exists() {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    // Brief SQLITE_BUSY windows exist while the bot shuts down or
-    // recovers; wait up to 2 s before failing.
-    conn.busy_timeout(Duration::from_secs(2))?;
+    let conn = open_read_only(&path)?;
 
     // The state-table key set is open: read all pairs, never an
     // enumerated key list.
@@ -1220,7 +1530,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1230,7 +1540,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -1261,14 +1571,29 @@ mod tests {
                 "text"
             ]
         );
+
+        // Migration v7 added the embedding sidecar. This connection is
+        // NOT registered with sqlite-vec, so node_embeddings cannot be
+        // queried here; its existence is proven via sqlite_master.
+        let node_embeddings_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'node_embeddings'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("node_embeddings lookup");
+        assert!(node_embeddings_exists, "node_embeddings must exist");
     }
 
     #[test]
     fn migration_v6_upgrades_a_v5_database_in_place() {
         // A database created by the previous release carries migrations
         // v1-v5 and live data. Opening it with this build must apply only
-        // v6 (index-only: no data touched), keep the data, and be a no-op
-        // on reopen.
+        // v6 (index-only: no data touched) and v7 (additive embedding
+        // sidecar), keep the data, and be a no-op on reopen.
         let dir = tempfile::tempdir().expect("tempdir");
         let group_dir = dir.path().join("c1");
         std::fs::create_dir_all(&group_dir).expect("create group dir");
@@ -1322,7 +1647,7 @@ mod tests {
             .expect("insert v5 message");
         }
 
-        // The upgrade open applies v6. A reopen is a no-op.
+        // The upgrade open applies v6 and v7. A reopen is a no-op.
         let store = Store::new(dir.path().to_path_buf());
         store.open_group("c1").expect("upgrade open");
         let store2 = Store::new(dir.path().to_path_buf());
@@ -1347,7 +1672,7 @@ mod tests {
             ]
         );
 
-        // Migration bookkeeping: exactly one version was added.
+        // Migration bookkeeping: exactly two versions were added.
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1357,7 +1682,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     /// The column names of one index, in key order, via PRAGMA index_info.
@@ -1441,7 +1766,7 @@ mod tests {
             .expect("insert summary");
         assert!(summary_id > 0);
 
-        // Migration bookkeeping: the upgrade applied v5 and v6.
+        // Migration bookkeeping: the upgrade applied v5, v6, and v7.
         let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
         let versions: Vec<u32> = {
             let mut stmt = conn
@@ -1452,7 +1777,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -2335,5 +2660,315 @@ mod tests {
         assert_eq!(all.len(), 5);
         assert_eq!(all[0].id, ids[0]);
         assert_eq!(all[4].id, ids[4]);
+    }
+
+    // --- Embedding sidecar (migration v7, decision 66) ---------------
+
+    /// Deterministic test vector: a gradient seeded by `seed`, always
+    /// EMBEDDING_DIM long.
+    fn test_vector(seed: u32) -> Vec<f32> {
+        (0..EMBEDDING_DIM)
+            .map(|i| ((i as u32).wrapping_mul(seed) % 997) as f32 / 997.0)
+            .collect()
+    }
+
+    /// Opens group "c1" so the chat_id-less embedding helpers resolve to
+    /// its connection.
+    fn embedding_store() -> (tempfile::TempDir, Store) {
+        let (dir, store) = temp_store();
+        store.open_group("c1").expect("open group");
+        (dir, store)
+    }
+
+    #[test]
+    fn migration_v7_creates_embedding_tables_and_is_idempotent_on_reopen() {
+        let (_dir, store) = embedding_store();
+        store
+            .with_conn("c1", |conn| {
+                // The queue table, the vec0 virtual table, and its shadow
+                // tables all exist after v7.
+                let tables: Vec<String> = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert!(tables.iter().any(|t| t == "pending_embeddings"));
+                assert!(tables.iter().any(|t| t == "node_embeddings"));
+                assert!(
+                    tables.iter().any(|t| t == "node_embeddings_rowids"),
+                    "vec0 shadow tables must exist: {tables:?}"
+                );
+                // v7 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 7)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v7 must be recorded in schema_migrations");
+                Ok(())
+            })
+            .expect("v7 assertions");
+
+        // Reopen: migrations are a no-op, the connection re-registers
+        // vec0, and the queue keeps working.
+        store.open_group("c1").expect("reopen");
+        assert_eq!(
+            store
+                .enqueue_embeddings(&[("n1".to_string(), "h1".to_string())])
+                .expect("enqueue after reopen"),
+            1
+        );
+    }
+
+    #[test]
+    fn enqueue_embeddings_dedups_and_requeues_on_a_new_hash() {
+        let (_dir, store) = embedding_store();
+        let pair = || ("n1".to_string(), "h1".to_string());
+
+        assert_eq!(store.enqueue_embeddings(&[pair()]).expect("enqueue"), 1);
+        // The same pair again inserts nothing (UNIQUE index + OR IGNORE).
+        assert_eq!(store.enqueue_embeddings(&[pair()]).expect("dedup"), 0);
+        // A mixed batch reports only the rows actually inserted.
+        assert_eq!(
+            store
+                .enqueue_embeddings(&[pair(), ("n2".to_string(), "h1".to_string())])
+                .expect("mixed batch"),
+            1
+        );
+        // A changed hash for a KNOWN node is a new row (re-embed).
+        assert_eq!(
+            store
+                .enqueue_embeddings(&[("n1".to_string(), "h2".to_string())])
+                .expect("new hash"),
+            1
+        );
+        assert_eq!(store.claim_embedding_batch(100).expect("claim").len(), 3);
+    }
+
+    #[test]
+    fn embedding_queue_claim_done_failed_lifecycle() {
+        let (_dir, store) = embedding_store();
+        store
+            .enqueue_embeddings(&[
+                ("n1".to_string(), "h1".to_string()),
+                ("n2".to_string(), "h2".to_string()),
+                ("n3".to_string(), "h3".to_string()),
+            ])
+            .expect("enqueue");
+
+        // Claim: oldest first, all three pending.
+        let batch = store.claim_embedding_batch(10).expect("claim");
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].node_id, "n1");
+        assert_eq!(batch[0].attempts, 0);
+        // The limit truncates the batch.
+        assert_eq!(store.claim_embedding_batch(2).expect("claim 2").len(), 2);
+
+        // Done rows leave the claim set.
+        store.mark_embedding_done(batch[0].id).expect("done");
+        let remaining = store.claim_embedding_batch(10).expect("claim after done");
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].node_id, "n2");
+
+        // Failures below the cap keep the row pending with attempts + 1.
+        store
+            .mark_embedding_attempt_failed(batch[1].id)
+            .expect("fail 1");
+        store
+            .mark_embedding_attempt_failed(batch[1].id)
+            .expect("fail 2");
+        let batch2 = store
+            .claim_embedding_batch(10)
+            .expect("claim after 2 fails");
+        let n2 = batch2
+            .iter()
+            .find(|p| p.node_id == "n2")
+            .expect("n2 pending");
+        assert_eq!(n2.attempts, 2);
+
+        // The third failure hits the cap: the row flips to 'failed',
+        // leaves the claim set, and stays inspectable.
+        store
+            .mark_embedding_attempt_failed(batch[1].id)
+            .expect("fail 3");
+        let batch3 = store.claim_embedding_batch(10).expect("claim after cap");
+        assert_eq!(batch3.len(), 1);
+        assert_eq!(batch3[0].node_id, "n3");
+        store
+            .with_conn("c1", |conn| {
+                let (status, attempts): (String, i64) = conn.query_row(
+                    "SELECT status, attempts FROM pending_embeddings WHERE id = ?1",
+                    [batch[1].id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(status, "failed");
+                assert_eq!(attempts, 3);
+                Ok(())
+            })
+            .expect("failed row stays inspectable");
+    }
+
+    #[test]
+    fn node_embedding_vec_roundtrip_replace_and_delete() {
+        let (_dir, store) = embedding_store();
+        let v1 = test_vector(7);
+        let v2 = test_vector(13);
+
+        store.upsert_node_embedding("n1", &v1).expect("upsert n1");
+        store.upsert_node_embedding("n2", &v2).expect("upsert n2");
+
+        // KNN with an inserted vector: itself first at distance 0.
+        let hits = store.knn_node_embeddings(&v1, 2).expect("knn");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "n1");
+        assert!(hits[0].1.abs() < 1e-6, "distance ~0, got {}", hits[0].1);
+
+        // A wrong-dimension vector is rejected before hitting sqlite.
+        assert!(store.upsert_node_embedding("nx", &[1.0; 8]).is_err());
+        assert!(store.knn_node_embeddings(&[1.0; 8], 1).is_err());
+
+        // Replace overwrites: n1 now holds the new vector v3 and ranks
+        // first for a v3 query; the old v1 row is gone, so a v1 query
+        // has no exact match left.
+        let v3 = test_vector(29);
+        store.upsert_node_embedding("n1", &v3).expect("replace n1");
+        let hits = store
+            .knn_node_embeddings(&v3, 2)
+            .expect("knn after replace");
+        assert_eq!(hits[0].0, "n1");
+        assert!(hits[0].1.abs() < 1e-6, "replaced vector matches at ~0");
+        let hits = store.knn_node_embeddings(&v1, 2).expect("knn stale query");
+        assert!(
+            hits[0].1 > 0.0,
+            "the replaced-away vector must have no exact match left"
+        );
+
+        // The tombstone primitive clears the vec row AND the queue rows.
+        store
+            .enqueue_embeddings(&[("n1".to_string(), "h1".to_string())])
+            .expect("enqueue n1");
+        store.delete_node_embedding_rows("n1").expect("tombstone");
+        assert_eq!(
+            store.all_embedding_node_ids().expect("node ids"),
+            vec!["n2".to_string()]
+        );
+        let hits = store.knn_node_embeddings(&v2, 5).expect("knn after delete");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "n2");
+    }
+
+    #[test]
+    fn done_embedding_hashes_returns_the_latest_done_row_per_node() {
+        let (_dir, store) = embedding_store();
+        store
+            .enqueue_embeddings(&[
+                ("n1".to_string(), "h-old".to_string()),
+                ("n1".to_string(), "h-new".to_string()),
+                ("n2".to_string(), "h2".to_string()),
+                ("n3".to_string(), "h3".to_string()),
+            ])
+            .expect("enqueue");
+        let batch = store.claim_embedding_batch(10).expect("claim");
+        // n1 embedded twice (successive contents), n2 done, n3 pending.
+        for row in batch.iter().filter(|p| p.node_id != "n3") {
+            store.mark_embedding_done(row.id).expect("done");
+        }
+
+        let done = store.done_embedding_hashes().expect("done hashes");
+        assert_eq!(
+            done,
+            vec![
+                ("n1".to_string(), "h-new".to_string()),
+                ("n2".to_string(), "h2".to_string())
+            ],
+            "only the latest done hash per node; pending n3 excluded"
+        );
+    }
+
+    #[test]
+    fn record_node_embedded_journals_the_actual_hash_and_dedups() {
+        let (_dir, store) = embedding_store();
+
+        // The journal entry appears in done_embedding_hashes without a
+        // claim/mark-done round trip.
+        store
+            .record_node_embedded("n1", "h-stored")
+            .expect("record");
+        assert_eq!(
+            store.done_embedding_hashes().expect("done hashes"),
+            vec![("n1".to_string(), "h-stored".to_string())]
+        );
+
+        // A duplicate record is a no-op (INSERT OR IGNORE through the
+        // dedup index): still exactly one done row for the node.
+        store
+            .record_node_embedded("n1", "h-stored")
+            .expect("duplicate record");
+        assert_eq!(
+            store.done_embedding_hashes().expect("done hashes"),
+            vec![("n1".to_string(), "h-stored".to_string())]
+        );
+
+        // Journal rows are status='done': they never enter the claim
+        // set.
+        assert!(store.claim_embedding_batch(10).expect("claim").is_empty());
+    }
+
+    #[test]
+    fn sqlite_vec_is_registered_on_both_open_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("c1").join("store.db");
+        let v1 = test_vector(7);
+
+        // First Store instance writes vec rows, then closes (drop).
+        {
+            let store = Store::new(dir.path().to_path_buf());
+            store.open_group("c1").expect("open");
+            store.upsert_node_embedding("n1", &v1).expect("upsert");
+        }
+
+        // Reopen via open_group on a NEW Store (fresh connection):
+        // registration ran, KNN works.
+        {
+            let store = Store::new(dir.path().to_path_buf());
+            store.open_group("c1").expect("reopen");
+            let hits = store
+                .knn_node_embeddings(&v1, 1)
+                .expect("knn via open_group");
+            assert_eq!(hits[0].0, "n1");
+            assert!(hits[0].1.abs() < 1e-6);
+        }
+
+        // Reopen via the read-only status path: registration ran there
+        // too, so vec0 resolves on the read-only connection.
+        let conn = open_read_only(&db_path).expect("read-only open");
+        let (node_id, distance): (String, f32) = conn
+            .query_row(
+                "SELECT node_id, distance FROM node_embeddings
+                 WHERE embedding MATCH ?1 AND k = ?2",
+                rusqlite::params![embedding_to_blob(&v1).expect("blob"), 1i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("knn via read-only path");
+        assert_eq!(node_id, "n1");
+        assert!(distance.abs() < 1e-6);
+    }
+
+    #[test]
+    fn embedding_helpers_reject_an_ambiguous_store() {
+        // The chat_id-less embedding helpers require exactly one open
+        // group; zero or several groups is an operator-visible error,
+        // never a silent write to the wrong group (Rule P5).
+        let (_dir, store) = temp_store();
+        let err = store
+            .enqueue_embeddings(&[("n1".to_string(), "h1".to_string())])
+            .expect_err("no open group must fail");
+        assert!(matches!(err, StoreError::AmbiguousGroup(0)));
+
+        store.open_group("c1").expect("open c1");
+        store.open_group("c2").expect("open c2");
+        let err = store
+            .claim_embedding_batch(1)
+            .expect_err("two open groups must fail");
+        assert!(matches!(err, StoreError::AmbiguousGroup(2)));
     }
 }

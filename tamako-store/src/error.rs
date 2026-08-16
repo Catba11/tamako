@@ -12,6 +12,10 @@ pub enum StoreError {
     InvalidChatId(String),
     #[error("invalid stored value for key {key}: {value}")]
     InvalidValue { key: String, value: String },
+    #[error(
+        "embedding helpers take no chat_id and need exactly one open group on this Store, found {0}"
+    )]
+    AmbiguousGroup(usize),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

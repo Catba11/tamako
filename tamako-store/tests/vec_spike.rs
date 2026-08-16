@@ -16,51 +16,24 @@
 //!    vs the naive 4096*4 = 16384 baseline).
 //!
 //! Registration idiom: `sqlite-vec` 0.1.9 exports only the raw C entry
-//! point `sqlite3_vec_init`, declared (incorrectly, with no parameters) as
-//! a Rust extern. The real C signature is the standard SQLite extension
-//! entry point, so we transmute the symbol address to the correct fn
-//! pointer type and call it per connection. (`rusqlite::ffi` re-exports
-//! `libsqlite3-sys`; `Connection::handle()` is unconditionally available.)
+//! point `sqlite3_vec_init`, declared (incorrectly, with no parameters)
+//! as a Rust extern. The canonical helper `tamako_store::register_sqlite_vec`
+//! (used by both Store open paths) contains the documented transmute;
+//! this spike switches to it so there is exactly one copy.
 
 #![cfg(test)]
 
-use rusqlite::{ffi, Connection};
-use std::ffi::c_char;
+use rusqlite::Connection;
 use std::path::Path;
+use tamako_store::register_sqlite_vec;
 
 /// Embedding dimension pinned by current-state.md decision 66.
 const DIM: usize = 4096;
 
-/// Registers sqlite-vec on a connection. Mirrors what migration v7 /
-/// `Store::open_group` must do for every newly opened connection in the
-/// production implementation.
-///
-/// # Safety contained here
-/// The crate declares `sqlite3_vec_init()` with no parameters, but the C
-/// definition (compiled with `SQLITE_CORE`) is the standard 3-argument
-/// SQLite extension entry point. Transmuting the symbol address to the
-/// real signature is sound on the SysV/Win64 ABIs and is the same pattern
-/// the crate's own test uses for `sqlite3_auto_extension`.
-fn register_sqlite_vec(conn: &Connection) -> rusqlite::Result<()> {
-    type VecInit = unsafe extern "C" fn(
-        db: *mut ffi::sqlite3,
-        pz_err_msg: *mut *mut c_char,
-        p_api: *const ffi::sqlite3_api_routines,
-    ) -> std::ffi::c_int;
-    let init: VecInit = unsafe { std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()) };
-    let rc = unsafe { init(conn.handle(), std::ptr::null_mut(), std::ptr::null()) };
-    if rc != ffi::SQLITE_OK {
-        return Err(rusqlite::Error::SqliteFailure(
-            ffi::Error::new(rc),
-            Some("sqlite3_vec_init failed".to_string()),
-        ));
-    }
-    Ok(())
-}
-
 /// Opens a file DB exactly like `Store::open_group` does: WAL +
-/// synchronous=NORMAL, then registers sqlite-vec.
-fn open_spike_db(path: &Path) -> rusqlite::Result<Connection> {
+/// synchronous=NORMAL, then registers sqlite-vec via the canonical
+/// helper.
+fn open_spike_db(path: &Path) -> tamako_store::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
