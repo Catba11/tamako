@@ -72,6 +72,38 @@ pub trait PostDigestHook: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
+/// The content hash of one embedding-queue row (decision 66). FNV-1a,
+/// 64-bit, over the byte layout `name ++ b"\n" ++ description` (the
+/// pipeline-known candidate content of one graph node), hex-encoded as
+/// 16 lowercase zero-padded characters.
+///
+/// Stability contract: the offset basis and prime below are fixed, the
+/// input is the UTF-8 byte sequence only, and the arithmetic wraps, so
+/// the hash is stable across builds, platforms, and process restarts.
+/// It is NOT cryptographic; it is a change detector. Any change to the
+/// candidate name or description changes the hash, and the new hash
+/// re-queues the node for embedding (the queue dedups on the
+/// (node_id, content_hash) pair). A candidate name containing '\n' can
+/// alias a different (name, description) split; extracted entity names
+/// are single-line surface forms, so the ambiguity is accepted for a
+/// change detector.
+pub fn embedding_content_hash(name: &str, description: &str) -> String {
+    // The FNV-1a 64-bit constants, fixed forever by the doc above.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in name
+        .as_bytes()
+        .iter()
+        .chain(b"\n")
+        .chain(description.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// The no-op hook. The Rule C3 context removal lives in the actor (the
 /// context is actor-owned state, specs.md Section 6.1); this hook stays
 /// a seam for observers that need no actor state.
@@ -90,6 +122,32 @@ impl PostDigestHook for NoopPostDigestHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_embedding_content_hash_matches_a_pinned_vector() {
+        // Pinned: FNV-1a 64-bit over the UTF-8 bytes of
+        // "Alice\nA group member who deploys." (name + '\n' +
+        // description). A change here is a breaking change of the queue
+        // semantics: every stored hash re-embeds.
+        assert_eq!(
+            embedding_content_hash("Alice", "A group member who deploys."),
+            "81cb73b05134403d"
+        );
+    }
+
+    #[test]
+    fn the_embedding_content_hash_is_sensitive_to_both_fields() {
+        let base = embedding_content_hash("Alice", "deploys nightly");
+        assert_ne!(embedding_content_hash("Bob", "deploys nightly"), base);
+        assert_ne!(embedding_content_hash("Alice", "deploys weekly"), base);
+        assert_ne!(embedding_content_hash("Alic", "e deploys nightly"), base);
+        // Empty fields hash fine; only the enqueue side skips them.
+        assert_eq!(
+            embedding_content_hash("", "").len(),
+            16,
+            "the hash is always 16 hex chars"
+        );
+    }
 
     #[test]
     fn every_variant_reports_its_new_boundary() {

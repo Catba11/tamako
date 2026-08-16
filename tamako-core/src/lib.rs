@@ -21,6 +21,7 @@ pub mod adapter;
 pub mod config;
 pub mod context;
 pub mod digest;
+pub mod embedding;
 pub mod event;
 pub mod session;
 pub mod summary;
