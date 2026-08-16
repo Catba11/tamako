@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
+use tamako_agent::endpoint::{EmbeddingEndpoint, RigEmbeddingProvider};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
     RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, RigSummary, ShallowRecall,
@@ -28,6 +29,7 @@ use tamako_core::actor::{
 use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::{BotConfig, TriggerConfig};
 use tamako_core::digest::DigestPipeline;
+use tamako_core::embedding::{EmbeddingError, EmbeddingWorker, GroupEmbeddingTarget};
 use tamako_core::event::OutboundAction;
 use tamako_core::summary::SummaryProvider;
 use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
@@ -303,6 +305,12 @@ fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
         gate_structured_output: config.gate_structured_output.clone(),
         reply_structured_output: config.reply_structured_output.clone(),
         summary_structured_output: config.summary_structured_output.clone(),
+        // Decision 66 (global-only): the config always carries the
+        // resolved value; TAMAKO_EMBEDDING_MODEL /
+        // TAMAKO_EMBEDDING_BASE_URL win inside EmbeddingEndpoint::resolve
+        // (the same env-wins idiom as the purpose keys).
+        embedding_model: Some(config.embedding_model.clone()),
+        embedding_llm_base_url: Some(config.embedding_llm_base_url.clone()),
     }
 }
 
@@ -323,22 +331,42 @@ fn resolve_endpoints(config: &TriggerConfig) -> Result<LlmEndpoints> {
 /// family API key (`EndpointClient::build` reports it as
 /// `AgentError::ProviderConfig`, either family) degrades to `None` with
 /// a warning; every other build error propagates.
+///
+/// Decision 66: the pipeline's embedding enqueue needs a DEDICATED
+/// one-group Store (the chat_id-less embedding helpers require exactly
+/// one open group per Store instance — `StoreError::AmbiguousGroup`
+/// otherwise — while the shared store opens one group per served
+/// chat), opened here through `GroupEmbeddingTarget::open`, the same
+/// shape as the embedding worker's per-group target. A failed open
+/// degrades the enqueue ALONE to disabled with a WARN — never a
+/// startup failure; the worker's startup reconciliation heals the loss
+/// through its own stores.
 fn build_digest_pipeline(
     store: &Arc<Store>,
     memory: &Arc<LbugBackend>,
     endpoint: &EndpointConfig,
+    data_root: &Path,
+    chat_id: &str,
 ) -> Result<Option<Arc<dyn DigestPipeline>>> {
     let model = endpoint.model.clone();
     match RigExtractor::from_endpoint(endpoint) {
         Ok(extractor) => {
             info!(model = %model, "digest pipeline wired (live extraction)");
-            Ok(Some(Arc::new(AgentDigestPipeline::new(
+            let pipeline = AgentDigestPipeline::new(
                 Arc::clone(store),
                 Arc::clone(memory),
                 Arc::new(extractor),
                 // specs.md Section 13: max_retries = 5.
                 PipelineConfig::default(),
-            )) as Arc<dyn DigestPipeline>))
+            );
+            let pipeline = match GroupEmbeddingTarget::open(data_root, chat_id) {
+                Ok(target) => pipeline.with_embedding_store(target.store),
+                Err(error) => {
+                    warn!(chat_id = %chat_id, %error, "embedding enqueue disabled: the dedicated group store failed to open; the startup reconciliation will repair the loss");
+                    pipeline
+                }
+            };
+            Ok(Some(Arc::new(pipeline) as Arc<dyn DigestPipeline>))
         }
         Err(AgentError::ProviderConfig(error)) => {
             warn!(%error, "digest pipeline disabled: no provider configuration; digests will not run");
@@ -442,6 +470,73 @@ fn build_wake_services(
     }
 }
 
+/// Adapts the tamako-agent embedding provider onto the tamako-core
+/// embedding seam (the contract-in-core pattern of the digest pipeline:
+/// tamako-core cannot depend on tamako-agent, AGENT.md Section 4, so
+/// the trait lives in tamako-core and the binary bridges it).
+struct AgentEmbeddingProvider(RigEmbeddingProvider);
+
+impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Vec<f32>, EmbeddingError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            tamako_agent::endpoint::EmbeddingProvider::embed(&self.0, text)
+                .await
+                .map_err(|error| EmbeddingError::Provider(error.to_string()))
+        })
+    }
+}
+
+/// Spawns the process-wide embedding worker (decision 66): ONE
+/// background interval task drains every group's `pending_embeddings`
+/// queue, after a per-group startup reconciliation pass. The embedding
+/// endpoint is global-only (config.rs, decision 66), so resolution uses
+/// the GLOBAL trigger config. The degrade mirrors the per-purpose
+/// builders: a missing `OPENAI_API_KEY` logs one WARN inside
+/// `RigEmbeddingProvider::build` and the worker is not spawned.
+///
+/// The groups are enumerated from the group stores on disk (the same
+/// Rule P5 enumeration as `--status-all`); each group gets its OWN
+/// Store instance because the chat_id-less embedding helpers require
+/// exactly one open group per Store (`StoreError::AmbiguousGroup`). A
+/// group store that fails to open logs a WARN and is skipped — its
+/// actor still works; the group's embeddings wait for the next run. A
+/// group first served AFTER startup is picked up on the next restart's
+/// reconciliation (the queue rows wait store-side, inspectable).
+fn spawn_embedding_worker(setup: &SharedSetup) -> Option<tokio::task::JoinHandle<()>> {
+    let endpoint = EmbeddingEndpoint::resolve(&llm_config_values(&setup.bot_config.global));
+    let provider = RigEmbeddingProvider::build(&endpoint).map(|provider| {
+        Arc::new(AgentEmbeddingProvider(provider))
+            as Arc<dyn tamako_core::embedding::EmbeddingProvider>
+    });
+    let data_root = setup.store.data_root().to_path_buf();
+    let chat_ids = match list_group_chat_ids(&data_root) {
+        Ok(chat_ids) => chat_ids,
+        Err(error) => {
+            warn!(%error, "embedding worker disabled: failed to enumerate the group stores");
+            return None;
+        }
+    };
+    let mut targets = Vec::new();
+    for chat_id in chat_ids {
+        match GroupEmbeddingTarget::open(&data_root, &chat_id) {
+            Ok(target) => targets.push(target),
+            Err(error) => {
+                warn!(chat_id = %chat_id, %error, "embedding worker: the group store failed to open; the group's embeddings wait for the next run");
+            }
+        }
+    }
+    EmbeddingWorker::new(provider, Arc::clone(&setup.memory), targets).spawn()
+}
+
 /// The run setup shared by both modes: bot configuration, the rendered
 /// persona preamble, the persona name (the sender display name of
 /// outbound raw-log rows), and the two storage backends.
@@ -519,7 +614,7 @@ async fn run_replay(
     // The endpoints, the digest pipeline, and the wake services are
     // built after the chat_id is known and before the actor spawns.
     let endpoints = resolve_endpoints(&group_config)?;
-    let digest = build_digest_pipeline(&store, &memory, &endpoints.digest)?;
+    let digest = build_digest_pipeline(&store, &memory, &endpoints.digest, data_root, &chat_id)?;
     let wake = build_wake_services(
         &store,
         &memory,
@@ -530,6 +625,9 @@ async fn run_replay(
     // degrades to the old C3 behavior (drop without a summary) with one
     // startup warning inside `build_summary_provider`.
     let summary_provider = build_summary_provider(&endpoints.summary)?;
+    // Decision 66: NO embedding worker in replay. Replay runs the mock
+    // adapter and must stay deterministic and network-free; embeddings
+    // are a live-mode sidecar (spawn_embedding_worker in run_live).
     let handle = spawn_group_actor(GroupActorParams {
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
@@ -660,30 +758,37 @@ fn run_status(cli: &Cli, chat_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `--status-all` run: one status block per group store under the
-/// data root, sorted by chat id. No stores at all is not an error.
-fn run_status_all(cli: &Cli) -> Result<()> {
-    let bot_config = load_bot_config(cli.config.as_deref())?;
+/// The group-store enumeration shared by `--status-all` and the
+/// embedding-worker wiring: the chat ids of every group store under the
+/// data root, sorted by chat id. Rule P5: a group store is a
+/// subdirectory that contains store.db. Other files of the data root
+/// (persona.toml) are skipped. No stores at all is not an error.
+fn list_group_chat_ids(data_root: &Path) -> Result<Vec<String>> {
     let mut chat_ids: Vec<String> = Vec::new();
-    if cli.data_root.is_dir() {
-        for entry in std::fs::read_dir(&cli.data_root)
-            .with_context(|| format!("failed to list the data root {}", cli.data_root.display()))?
+    if data_root.is_dir() {
+        for entry in std::fs::read_dir(data_root)
+            .with_context(|| format!("failed to list the data root {}", data_root.display()))?
         {
             let entry = entry?;
-            // Rule P5: a group store is a subdirectory that contains
-            // store.db. Other files of the data root (persona.toml) are
-            // skipped.
             let path = entry.path();
             if path.is_dir() && path.join("store.db").is_file() {
                 chat_ids.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
     }
+    chat_ids.sort();
+    Ok(chat_ids)
+}
+
+/// The `--status-all` run: one status block per group store under the
+/// data root, sorted by chat id. No stores at all is not an error.
+fn run_status_all(cli: &Cli) -> Result<()> {
+    let bot_config = load_bot_config(cli.config.as_deref())?;
+    let chat_ids = list_group_chat_ids(&cli.data_root)?;
     if chat_ids.is_empty() {
         println!("no group stores under {}", cli.data_root.display());
         return Ok(());
     }
-    chat_ids.sort();
     let mut blocks = Vec::new();
     for chat_id in &chat_ids {
         let status = read_group_status(&cli.data_root, chat_id, STATUS_RECENT_DEAD_LETTERS)
@@ -960,6 +1065,15 @@ async fn run_live(
     // A fatal error to surface after the shutdown flush below.
     let mut fatal: Option<anyhow::Error> = None;
 
+    // The process-wide embedding worker (decision 66), a live-mode
+    // sidecar: one interval task drains every group's embedding queue
+    // after the startup reconciliation pass. REPLAY MODE spawns no
+    // worker: replay runs the mock adapter and must stay deterministic
+    // and network-free; embeddings are a live-mode sidecar. The handle
+    // is kept only for readability — dropping it detaches, never
+    // cancels, the task.
+    let _embedding_worker = spawn_embedding_worker(setup);
+
     loop {
         tokio::select! {
             result = adapter.next_group_event() => match result {
@@ -996,7 +1110,7 @@ async fn run_live(
                                 }
                             };
                             let digest =
-                                match build_digest_pipeline(&setup.store, &setup.memory, &endpoints.digest) {
+                                match build_digest_pipeline(&setup.store, &setup.memory, &endpoints.digest, setup.store.data_root(), &chat_id) {
                                     Ok(digest) => digest,
                                     Err(error) => {
                                         fatal = Some(error);
@@ -1383,6 +1497,37 @@ mod tests {
     fn unknown_argument_is_a_usage_error() {
         let error = parse(&["--wat"]).expect_err("an unknown argument must fail");
         assert!(error.contains("unknown argument: --wat"));
+    }
+
+    #[test]
+    fn llm_config_values_maps_the_embedding_keys() {
+        // Decision 66: the global-only embedding keys map straight
+        // through; the env-wins step lives in tamako-agent's
+        // EmbeddingEndpoint::resolve (tested there).
+        let config = TriggerConfig {
+            embedding_model: "some-embedding-model".to_string(),
+            embedding_llm_base_url: "https://embeddings.example/v1".to_string(),
+            ..TriggerConfig::default()
+        };
+        let values = llm_config_values(&config);
+        assert_eq!(
+            values.embedding_model.as_deref(),
+            Some("some-embedding-model")
+        );
+        assert_eq!(
+            values.embedding_llm_base_url.as_deref(),
+            Some("https://embeddings.example/v1")
+        );
+        // The defaults map through as concrete values too.
+        let values = llm_config_values(&TriggerConfig::default());
+        assert_eq!(
+            values.embedding_model.as_deref(),
+            Some("qwen/qwen3-embedding-8b")
+        );
+        assert_eq!(
+            values.embedding_llm_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
     }
 
     #[test]
