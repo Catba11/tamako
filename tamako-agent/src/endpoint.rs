@@ -101,8 +101,9 @@
 
 use std::time::Duration;
 
-use rig::client::CompletionClient;
+use rig::client::{CompletionClient, EmbeddingsClient as _};
 use rig::completion::{AssistantContent, Message};
+use rig::embeddings::EmbeddingModel as _;
 use rig::providers::{anthropic, openai};
 
 use crate::extract::AgentError;
@@ -164,6 +165,15 @@ pub const REPLY_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_REPLY_STRUCTURED_OUTPU
 /// Environment override of the summary structured-output mode.
 pub const SUMMARY_STRUCTURED_OUTPUT_ENV_VAR: &str = "TAMAKO_SUMMARY_STRUCTURED_OUTPUT";
 
+/// Environment override of the embedding model (current-state.md
+/// decision 66). Global-only: one embedding endpoint per deployment,
+/// no per-purpose or per-group variant.
+pub const EMBEDDING_MODEL_ENV_VAR: &str = "TAMAKO_EMBEDDING_MODEL";
+
+/// Environment override of the embedding base URL (decision 66).
+/// Global-only; refer to [`EMBEDDING_MODEL_ENV_VAR`].
+pub const EMBEDDING_BASE_URL_ENV_VAR: &str = "TAMAKO_EMBEDDING_BASE_URL";
+
 /// API key env var of the anthropic-compatible family (specs.md
 /// Section 13: API keys come from the environment only).
 pub const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
@@ -187,6 +197,20 @@ pub const DEFAULT_REPLY_MODEL: &str = "claude-sonnet-4-5";
 /// model as the gate. Reported for spec backfill with the
 /// `summary_*` keys.
 pub const DEFAULT_SUMMARY_MODEL: &str = anthropic::completion::CLAUDE_HAIKU_4_5;
+
+/// The default embedding model (current-state.md decision 66).
+pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
+
+/// The default embedding base URL (decision 66): OpenRouter's
+/// openai-compatible endpoint. rig uses the base URL verbatim, so the
+/// request lands on `{base}/embeddings`.
+pub const DEFAULT_EMBEDDING_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// The pinned embedding dimension (decision 66). rig sends it as the
+/// openai-compatible `dimensions` request field
+/// (`embedding_model_with_ndims`); a response vector of any other
+/// length is a hard error (the store schema pins the dimension).
+pub const EMBEDDING_DIMS: usize = 4096;
 
 /// The per-attempt completion timeout (H4b). One bound around every
 /// endpoint completion attempt: the first call AND the one repair
@@ -466,6 +490,13 @@ pub struct LlmConfigValues {
     /// Summary-specific structured-output mode
     /// (`summary_structured_output`, reported for spec backfill).
     pub summary_structured_output: Option<String>,
+    /// The embedding model (`embedding_model`; decision 66,
+    /// global-only). The binary always maps the resolved config value
+    /// here; `None` selects [`DEFAULT_EMBEDDING_MODEL`].
+    pub embedding_model: Option<String>,
+    /// The embedding base URL (`embedding_llm_base_url`; decision 66,
+    /// global-only). `None` selects [`DEFAULT_EMBEDDING_BASE_URL`].
+    pub embedding_llm_base_url: Option<String>,
 }
 
 impl LlmConfigValues {
@@ -648,6 +679,26 @@ fn resolve_session_id(values: &LlmConfigValues) -> String {
         .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string())
 }
 
+/// Builds the default-header map carrying the gateway
+/// session-affinity header (module docs): `x-opencode-session` with
+/// the resolved session id. The map REPLACES the client's default
+/// headers; the client `build()` inserts the API-key auth header when
+/// the map does not carry it, so the two never clash. Shared by
+/// [`EndpointClient::build`] (completions) and
+/// [`RigEmbeddingProvider::from_endpoint`] (embeddings): the session
+/// affinity carries over to both. A session id that is not a valid
+/// header value is `AgentError::ProviderConfig`.
+fn session_header_map(session_id: &str) -> Result<rig::http_client::HeaderMap, AgentError> {
+    let mut headers = rig::http_client::HeaderMap::new();
+    headers.insert(
+        "x-opencode-session",
+        rig::http_client::HeaderValue::from_str(session_id).map_err(|error| {
+            AgentError::ProviderConfig(format!("invalid llm_session_id {session_id:?}: {error}"))
+        })?,
+    );
+    Ok(headers)
+}
+
 /// The rig completion model handle of one family. rig 0.41 has two
 /// distinct model types; the enum hides the split.
 enum EndpointModel {
@@ -708,20 +759,9 @@ impl EndpointClient {
                 endpoint.api
             ))
         })?;
-        // The gateway session-affinity header (module docs). The map
-        // replaces the client's default headers; `build()` inserts the
-        // API-key auth header when the map does not carry it, so the
-        // two never clash.
-        let mut headers = rig::http_client::HeaderMap::new();
-        headers.insert(
-            "x-opencode-session",
-            rig::http_client::HeaderValue::from_str(&endpoint.session_id).map_err(|error| {
-                AgentError::ProviderConfig(format!(
-                    "invalid llm_session_id {:?}: {error}",
-                    endpoint.session_id
-                ))
-            })?,
-        );
+        // The gateway session-affinity header (module docs); refer to
+        // `session_header_map`.
+        let headers = session_header_map(&endpoint.session_id)?;
         match endpoint.api {
             LlmApi::AnthropicCompatible => {
                 let mut builder = anthropic::Client::builder()
@@ -888,6 +928,210 @@ impl EndpointClient {
         )
         .await
     }
+}
+
+/// The resolved embedding endpoint (current-state.md decision 66).
+/// Global-only: one embedding endpoint per deployment, no per-purpose
+/// or per-group machinery (the same standing as the session id).
+/// Embeddings always use the openai-compatible family
+/// (`POST {base}/embeddings`), so — unlike [`EndpointConfig`] — the
+/// family is fixed and the base URL is concrete (decision 66 pins the
+/// default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingEndpoint {
+    /// The base URL of the openai-compatible embedding endpoint.
+    /// Never empty: resolution falls back to
+    /// [`DEFAULT_EMBEDDING_BASE_URL`].
+    pub base_url: String,
+    /// The embedding model name. Never empty: resolution falls back
+    /// to [`DEFAULT_EMBEDDING_MODEL`].
+    pub model: String,
+    /// The resolved session id, sent as the `x-opencode-session`
+    /// header on every embedding request (the same global value as
+    /// the completion endpoints; refer to [`EndpointConfig::session_id`]).
+    pub session_id: String,
+}
+
+impl EmbeddingEndpoint {
+    /// Resolves the embedding endpoint from the config values and the
+    /// environment (the same env-wins idiom as
+    /// [`LlmEndpoints::resolve`]):
+    ///
+    /// - Model: env `TAMAKO_EMBEDDING_MODEL` → config
+    ///   `embedding_model` → [`DEFAULT_EMBEDDING_MODEL`].
+    /// - Base URL: env `TAMAKO_EMBEDDING_BASE_URL` → config
+    ///   `embedding_llm_base_url` → [`DEFAULT_EMBEDDING_BASE_URL`].
+    /// - Session id: the global chain of [`LlmEndpoints::resolve`]
+    ///   (env `TAMAKO_LLM_SESSION_ID` → config `llm_session_id` →
+    ///   [`DEFAULT_SESSION_ID`]).
+    ///
+    /// Empty strings count as unset, in env and config alike. The
+    /// values are free-form strings (rig never validates model
+    /// names), so resolution is infallible.
+    pub fn resolve(values: &LlmConfigValues) -> Self {
+        let model = env_value(EMBEDDING_MODEL_ENV_VAR)
+            .or_else(|| {
+                values
+                    .embedding_model
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+        let base_url = env_value(EMBEDDING_BASE_URL_ENV_VAR)
+            .or_else(|| {
+                values
+                    .embedding_llm_base_url
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string());
+        EmbeddingEndpoint {
+            base_url,
+            model,
+            session_id: resolve_session_id(values),
+        }
+    }
+}
+
+/// The embedding seam of the Phase 2 sidecar (decision 66). One text
+/// in, one [`EMBEDDING_DIMS`]-dimensional vector out. Object-safe
+/// (the same `Pin<Box>` convention as [`crate::KnowledgeExtractor`]).
+///
+/// The seam exists so the KNOWN WATCH ITEM of the rig 0.41 embedding
+/// surface stays contained: rig's openai-compatible embedding
+/// response type REQUIRES a `usage` object and fails with a
+/// `MissingUsage`-class error when the provider (OpenRouter) omits
+/// it. If that bites in production, the swap to a direct reqwest
+/// `POST {base}/embeddings` call replaces the body of
+/// [`RigEmbeddingProvider::embed`] only; the trait, the error class,
+/// the dimension pin, and every caller stay unchanged.
+pub trait EmbeddingProvider: Send + Sync {
+    /// Embeds one text. Errors: provider/transport failures and a
+    /// response vector whose length is not [`EMBEDDING_DIMS`] (the
+    /// dimension is pinned) are `AgentError::Extraction`; a stalled
+    /// attempt (no response within [`ENDPOINT_TIMEOUT`], the H4b
+    /// bound mirrored from completions) is an `AgentError::Extraction`
+    /// whose message starts with `endpoint timeout after`.
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<f32>, AgentError>> + Send + 'a>,
+    >;
+}
+
+/// The live [`EmbeddingProvider`] over rig's openai-compatible
+/// embedding surface (decision 66): the SAME
+/// [`openai::CompletionsClient`] family the endpoint layer builds for
+/// openai-compatible completions, extended with
+/// `embedding_model_with_ndims(model, EMBEDDING_DIMS)`. The
+/// `x-opencode-session` default header carries over via
+/// [`session_header_map`]. Refer to [`EmbeddingProvider`] for the
+/// MissingUsage watch item this type contains.
+pub struct RigEmbeddingProvider {
+    model: openai::GenericEmbeddingModel<openai::OpenAICompletionsExt>,
+}
+
+// The rig model handle does not implement Debug. A manual impl keeps
+// RigEmbeddingProvider printable in test failures and logs (the same
+// pattern as EndpointClient).
+impl std::fmt::Debug for RigEmbeddingProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RigEmbeddingProvider")
+            .field("model", &self.model.model)
+            .field("ndims", &EMBEDDING_DIMS)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RigEmbeddingProvider {
+    /// Builds the provider for the resolved embedding endpoint. Reads
+    /// `OPENAI_API_KEY` from the environment (specs.md Section 13:
+    /// API keys come from the environment only; the embedding endpoint
+    /// is openai-compatible). Every build failure is
+    /// `AgentError::ProviderConfig` (the same shape as
+    /// [`EndpointClient::build`]): a missing or empty key, an invalid
+    /// session-id header value, or a rig client-build error.
+    pub fn from_endpoint(endpoint: &EmbeddingEndpoint) -> Result<Self, AgentError> {
+        let api_key = env_value(OPENAI_API_KEY_ENV_VAR).ok_or_else(|| {
+            AgentError::ProviderConfig(format!(
+                "missing API key: set {OPENAI_API_KEY_ENV_VAR} for openai-compatible endpoints"
+            ))
+        })?;
+        // The same builder + session-affinity header as
+        // EndpointClient::build's openai-compatible branch.
+        let client = openai::CompletionsClient::builder()
+            .api_key(api_key)
+            .base_url(&endpoint.base_url)
+            .http_headers(session_header_map(&endpoint.session_id)?)
+            .build()
+            .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
+        Ok(RigEmbeddingProvider {
+            model: client.embedding_model_with_ndims(&endpoint.model, EMBEDDING_DIMS),
+        })
+    }
+
+    /// The degrade seam (decision 66): `None` means embeddings are
+    /// disabled for this run. Mirrors the per-purpose degrade of the
+    /// binary (a missing family key degrades with ONE startup warning,
+    /// never a hard error — the `build_digest_pipeline` /
+    /// `build_wake_services` shape in tamako/src/main.rs): every build
+    /// failure is `AgentError::ProviderConfig`, logged once at WARN,
+    /// and the caller wires `None`.
+    pub fn build(endpoint: &EmbeddingEndpoint) -> Option<Self> {
+        match Self::from_endpoint(endpoint) {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                tracing::warn!(%error, "embedding provider disabled: no provider configuration; embeddings will not run");
+                None
+            }
+        }
+    }
+}
+
+impl EmbeddingProvider for RigEmbeddingProvider {
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<f32>, AgentError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            // The per-attempt bound of H4b, mirrored from completions:
+            // a stalled embedding is bounded, a slow-but-progressing
+            // response is untouched.
+            let embedding = tokio::time::timeout(ENDPOINT_TIMEOUT, self.model.embed_text(text))
+                .await
+                .map_err(|_| {
+                    AgentError::Extraction(format!(
+                        "endpoint timeout after {ENDPOINT_TIMEOUT:?}: no embedding response from the endpoint"
+                    ))
+                })?
+                .map_err(|error| AgentError::Extraction(format!("embedding failed: {error}")))?;
+            checked_embedding_vector(embedding.vec)
+        })
+    }
+}
+
+/// The dimension pin of decision 66 and the f64→f32 narrowing (the
+/// store schema holds f32). A vector of any length other than
+/// [`EMBEDDING_DIMS`] is a HARD error: a wrong-dimension vector must
+/// never reach the store. Pure, so the pin and the narrowing are
+/// unit-testable without a network.
+fn checked_embedding_vector(vec: Vec<f64>) -> Result<Vec<f32>, AgentError> {
+    if vec.len() != EMBEDDING_DIMS {
+        return Err(AgentError::Extraction(format!(
+            "embedding dimension mismatch: expected {EMBEDDING_DIMS} (decision 66 pins the dimension), got {}",
+            vec.len()
+        )));
+    }
+    // The f64→f32 narrowing is the deliberate store-schema
+    // conversion (embeddings are unit-magnitude; f32 is the stored
+    // precision of the sidecar index).
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(vec.into_iter().map(|value| value as f32).collect())
 }
 
 /// The shared completion flow of both families. The request shape is
@@ -1100,6 +1344,8 @@ mod tests {
         GATE_STRUCTURED_OUTPUT_ENV_VAR,
         REPLY_STRUCTURED_OUTPUT_ENV_VAR,
         SUMMARY_STRUCTURED_OUTPUT_ENV_VAR,
+        EMBEDDING_MODEL_ENV_VAR,
+        EMBEDDING_BASE_URL_ENV_VAR,
         ANTHROPIC_API_KEY_ENV_VAR,
         OPENAI_API_KEY_ENV_VAR,
     ];
@@ -1737,6 +1983,145 @@ mod tests {
         let client = EndpointClient::build(&endpoint).expect("openai client");
         // H4b: no config key; production always uses the constant.
         assert_eq!(client.timeout, ENDPOINT_TIMEOUT);
+    }
+
+    // --- The embedding endpoint (decision 66) ---
+
+    #[test]
+    fn embedding_resolution_defaults_to_the_decision_66_values() {
+        let (_lock, _env) = EnvGuard::cleared();
+        let endpoint = EmbeddingEndpoint::resolve(&LlmConfigValues::default());
+        assert_eq!(
+            endpoint,
+            EmbeddingEndpoint {
+                base_url: DEFAULT_EMBEDDING_BASE_URL.to_string(),
+                model: DEFAULT_EMBEDDING_MODEL.to_string(),
+                session_id: DEFAULT_SESSION_ID.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn embedding_resolution_env_wins_over_config() {
+        let (_lock, env) = EnvGuard::cleared();
+        let values = LlmConfigValues {
+            embedding_model: Some("config-embedding-model".to_string()),
+            embedding_llm_base_url: Some("https://config.example/v1".to_string()),
+            llm_session_id: Some("config-session".to_string()),
+            ..LlmConfigValues::default()
+        };
+        // Config wins over the defaults.
+        let endpoint = EmbeddingEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, "config-embedding-model");
+        assert_eq!(endpoint.base_url, "https://config.example/v1");
+        // The session id shares the global chain of the purposes.
+        assert_eq!(endpoint.session_id, "config-session");
+        // The env wins over the config.
+        env.set(EMBEDDING_MODEL_ENV_VAR, "env-embedding-model");
+        env.set(EMBEDDING_BASE_URL_ENV_VAR, "https://env.example/v1");
+        let endpoint = EmbeddingEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, "env-embedding-model");
+        assert_eq!(endpoint.base_url, "https://env.example/v1");
+    }
+
+    #[test]
+    fn empty_embedding_values_count_as_unset() {
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(EMBEDDING_MODEL_ENV_VAR, "");
+        env.set(EMBEDDING_BASE_URL_ENV_VAR, "");
+        let values = LlmConfigValues {
+            embedding_model: Some(String::new()),
+            embedding_llm_base_url: Some(String::new()),
+            ..LlmConfigValues::default()
+        };
+        let endpoint = EmbeddingEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, DEFAULT_EMBEDDING_MODEL);
+        assert_eq!(endpoint.base_url, DEFAULT_EMBEDDING_BASE_URL);
+        // An empty env falls through to the config.
+        let values = LlmConfigValues {
+            embedding_model: Some("config-embedding-model".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoint = EmbeddingEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, "config-embedding-model");
+    }
+
+    #[test]
+    fn embedding_build_without_an_api_key_degrades_to_none() {
+        // The degrade seam: a missing OPENAI_API_KEY is a WARN + None,
+        // never a hard error (the per-purpose degrade shape of the
+        // binary).
+        let (_lock, env) = EnvGuard::cleared();
+        let endpoint = EmbeddingEndpoint::resolve(&LlmConfigValues::default());
+        match RigEmbeddingProvider::from_endpoint(&endpoint) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        assert!(RigEmbeddingProvider::build(&endpoint).is_none());
+        // An empty key counts as missing.
+        env.set(OPENAI_API_KEY_ENV_VAR, "");
+        assert!(RigEmbeddingProvider::build(&endpoint).is_none());
+    }
+
+    #[test]
+    fn embedding_build_constructs_a_client_with_a_key() {
+        // Client construction performs no I/O; no network call here.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        let endpoint = EmbeddingEndpoint {
+            base_url: "http://localhost:9998/v1".to_string(),
+            model: "local-embedding-model".to_string(),
+            session_id: "test-session-embedding".to_string(),
+        };
+        let provider = RigEmbeddingProvider::build(&endpoint).expect("the provider builds");
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("local-embedding-model"));
+        assert!(debug.contains("4096"));
+    }
+
+    #[test]
+    fn embedding_build_with_an_invalid_session_id_degrades_to_none() {
+        // The same ProviderConfig class as EndpointClient::build: a
+        // newline is never a valid header value.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        let endpoint = EmbeddingEndpoint {
+            base_url: DEFAULT_EMBEDDING_BASE_URL.to_string(),
+            model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            session_id: "bad\nsession".to_string(),
+        };
+        match RigEmbeddingProvider::from_endpoint(&endpoint) {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+        assert!(RigEmbeddingProvider::build(&endpoint).is_none());
+    }
+
+    #[test]
+    fn the_dimension_pin_accepts_exactly_4096_and_narrows_to_f32() {
+        let vec: Vec<f64> = (0..EMBEDDING_DIMS).map(|i| i as f64 * 0.5).collect();
+        let narrowed = checked_embedding_vector(vec).expect("4096 passes the pin");
+        assert_eq!(narrowed.len(), EMBEDDING_DIMS);
+        assert_eq!(narrowed[3], 1.5_f32);
+    }
+
+    #[test]
+    fn the_dimension_pin_rejects_any_other_length() {
+        for wrong in [
+            vec![0.0; EMBEDDING_DIMS - 1],
+            vec![0.0; EMBEDDING_DIMS + 1],
+            Vec::new(),
+        ] {
+            match checked_embedding_vector(wrong) {
+                Err(AgentError::Extraction(message)) => {
+                    assert!(
+                        message.starts_with("embedding dimension mismatch"),
+                        "message: {message}"
+                    );
+                }
+                other => panic!("expected an Extraction error, got {other:?}"),
+            }
+        }
     }
 
     // --- Wire fakes (local TcpListener, no external network) ---

@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tamako_core::actor::CoreError;
-use tamako_core::digest::{DigestOutcome, DigestPipeline};
+use tamako_core::digest::{embedding_content_hash, DigestOutcome, DigestPipeline};
 use tamako_memory::identifiers::{batch_id as message_batch_id, normalize};
-use tamako_memory::{MemoryBackend, MemoryBatch};
+use tamako_memory::{MemoryBackend, MemoryBatch, NodeType};
 use tamako_store::{MessageRow, Store, StoreError};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -20,6 +20,7 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,
 };
+use crate::graph::KnowledgeGraph;
 use crate::resolve::{message_batch_node, resolve_batch};
 use crate::skeleton::is_skeleton_batch;
 use crate::validate::validate_relationship_name;
@@ -59,6 +60,15 @@ impl Default for PipelineConfig {
 /// `Arc<dyn DigestPipeline>`.
 pub struct AgentDigestPipeline<M: MemoryBackend> {
     store: Arc<Store>,
+    /// The group's DEDICATED one-group Store of the decision-66
+    /// embedding enqueue. The chat_id-less embedding helpers require
+    /// exactly one open group per Store instance
+    /// (`StoreError::AmbiguousGroup` otherwise), while the shared
+    /// `store` above opens one group per served chat — in live mode
+    /// with 2+ groups an enqueue through the shared store always
+    /// fails. `None` disables the enqueue (a construction degrade);
+    /// the worker's startup reconciliation heals the loss.
+    embedding_store: Option<Arc<Store>>,
     memory: Arc<M>,
     extractor: Arc<dyn KnowledgeExtractor>,
     config: PipelineConfig,
@@ -73,14 +83,41 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
     ) -> Self {
         AgentDigestPipeline {
             store,
+            embedding_store: None,
             memory,
             extractor,
             config,
         }
     }
 
-    /// Runs one store call inside `tokio::task::spawn_blocking`
-    /// (AGENT.md Section 6.2 — the same pattern the actor uses).
+    /// Wires the group's dedicated one-group embedding Store (decision
+    /// 66). Builder-style so the plain `new` keeps working for callers
+    /// without the embedding sidecar; a pipeline built without this
+    /// store still digests, with the enqueue disabled.
+    pub fn with_embedding_store(mut self, store: Arc<Store>) -> Self {
+        self.embedding_store = Some(store);
+        self
+    }
+
+    /// Runs one store call against `store` inside
+    /// `tokio::task::spawn_blocking` (AGENT.md Section 6.2 — the same
+    /// pattern the actor uses).
+    async fn run_on_store<T>(
+        store: Arc<Store>,
+        f: impl FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, AgentError>
+    where
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|error| AgentError::Join(error.to_string()))?
+            .map_err(AgentError::Store)
+    }
+
+    /// Runs one store call against the shared multi-group store (the
+    /// digest reads and counters — correct with any open-group count,
+    /// the chat id is always explicit).
     async fn run_store<T>(
         &self,
         f: impl FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
@@ -88,11 +125,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
     where
         T: Send + 'static,
     {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || f(&store))
-            .await
-            .map_err(|error| AgentError::Join(error.to_string()))?
-            .map_err(AgentError::Store)
+        Self::run_on_store(self.store.clone(), f).await
     }
 
     /// The backoff delay after failed attempt n (1-based): base *
@@ -154,8 +187,39 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         let node_count = batch.nodes.len();
         let edge_count = batch.edges.len();
         self.memory.upsert_batch(chat_id, &batch).await?;
-        // PHASE 2 HOOK: write name/description embeddings to the sidecar
-        // vector index here (Section 7.6 step 5).
+        // Decision 66: immediately AFTER the graph commit, enqueue the
+        // (node_id, content-hash) pairs into the per-group
+        // pending_embeddings queue. The sidecar vector write of Section
+        // 7.6 step 5 is the embedding worker's job, not the digest's.
+        // The enqueue goes through the DEDICATED one-group embedding
+        // store (`with_embedding_store`): the chat_id-less embedding
+        // helpers reject a Store with 2+ open groups
+        // (`StoreError::AmbiguousGroup`), so the shared multi-group
+        // digest store cannot carry this call in live mode. A `None`
+        // embedding store skips the enqueue entirely (a construction
+        // degrade). Cross-store atomicity is impossible (graph =
+        // LadybugDB, queue = SQLite), so the enqueue is BEST EFFORT: a
+        // failure logs a WARN and never fails the digest; the startup
+        // reconciliation repairs the enqueue loss. An empty item list
+        // is a no-op (and skips the store call entirely).
+        let items = embedding_enqueue_items(&graph, &batch);
+        if !items.is_empty() {
+            if let Some(embedding_store) = &self.embedding_store {
+                let result = Self::run_on_store(Arc::clone(embedding_store), move |store| {
+                    store.enqueue_embeddings(&items)
+                })
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(
+                        chat_id,
+                        batch_id = %frame.batch_id,
+                        error = %error,
+                        "embedding enqueue failed after the graph commit; \
+                         the startup reconciliation will repair the loss"
+                    );
+                }
+            }
+        }
         Ok((node_count, edge_count))
     }
 
@@ -372,6 +436,43 @@ impl BatchFrame {
     }
 }
 
+/// Builds the (node_id, content_hash) enqueue pairs of one committed
+/// batch (decision 66). One pair per extracted entity: the post-resolve
+/// node id plus the hash of the pipeline-known candidate content (the
+/// extracted name and description). The surface-form Alias nodes and
+/// the MessageBatch node carry no embedding. An entity with an empty
+/// candidate name is skipped. The embedding worker re-reads the stored
+/// content and rehashes it, so alias drift needs no handling here.
+fn embedding_enqueue_items(graph: &KnowledgeGraph, batch: &MemoryBatch) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    for extracted in &graph.nodes {
+        if extracted.name.is_empty() {
+            continue;
+        }
+        // The resolved entity node carries the extracted name. Prefer
+        // the Person/Concept node over the surface-form Alias node of
+        // the same name; the Section 7.4 step-4 fallback has no entity
+        // node at all — its Alias node doubles as the entity node.
+        let entity = batch
+            .nodes
+            .iter()
+            .filter(|node| node.name == extracted.name)
+            .find(|node| matches!(node.node_type, NodeType::Person | NodeType::Concept))
+            .or_else(|| {
+                batch
+                    .nodes
+                    .iter()
+                    .find(|node| node.name == extracted.name && node.node_type == NodeType::Alias)
+            });
+        let Some(node) = entity else {
+            continue;
+        };
+        let hash = embedding_content_hash(&extracted.name, &extracted.description);
+        items.push((node.id.clone(), hash));
+    }
+    items
+}
+
 /// Maps the crate error to the core error (the `DigestPipeline`
 /// contract). Store/Memory/Join map to their CoreError counterparts;
 /// Extraction/ProviderConfig become CoreError::Digest.
@@ -474,6 +575,10 @@ fn push_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{ExtractedEdge, ExtractedNode, ExtractedNodeType};
+    use tamako_memory::identifiers::{concept_id, person_id};
+    use tamako_memory::{LbugBackend, MemoryNode};
+    use tamako_store::{Direction, EventType, NewMessage};
 
     #[test]
     fn the_retry_delay_doubles_and_caps_at_60_seconds() {
@@ -510,5 +615,423 @@ mod tests {
         // the impl object-safe-compatible.
         fn assert_pipeline(_: Option<Arc<dyn DigestPipeline>>) {}
         assert_pipeline(None);
+    }
+
+    // ---- Decision 66: enqueue into pending_embeddings after the graph
+    // commit. Real temp Store + real LbugBackend, scripted extractor
+    // (the pattern of tamako-agent/tests/pipeline.rs). ----
+
+    const ENQUEUE_CHAT: &str = "enqueue_test";
+
+    fn enqueue_fixtures() -> (tempfile::TempDir, Arc<Store>, Arc<LbugBackend>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::new(dir.path()));
+        let memory = Arc::new(LbugBackend::new(dir.path()));
+        (dir, store, memory)
+    }
+
+    fn inbound(platform_id: &str, sender_id: &str, display_name: &str, text: &str) -> NewMessage {
+        NewMessage {
+            platform_msg_id: platform_id.to_string(),
+            direction: Direction::Inbound,
+            event_type: EventType::Message,
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp"),
+            sender_id: sender_id.to_string(),
+            sender_display_name: display_name.to_string(),
+            sender_username: None,
+            text: text.to_string(),
+            reply_to_platform_msg_id: None,
+            mentions_bot: false,
+            is_reply_to_bot: false,
+        }
+    }
+
+    fn alice_deploy_graph() -> KnowledgeGraph {
+        KnowledgeGraph {
+            nodes: vec![
+                ExtractedNode {
+                    name: "Alice".to_string(),
+                    node_type: ExtractedNodeType::Person,
+                    description: "A group member who deploys.".to_string(),
+                },
+                ExtractedNode {
+                    name: "the deploy".to_string(),
+                    node_type: ExtractedNodeType::Concept,
+                    description: "The nightly deploy.".to_string(),
+                },
+            ],
+            edges: vec![ExtractedEdge {
+                source: "Alice".to_string(),
+                target: "the deploy".to_string(),
+                relationship_name: "works_on".to_string(),
+                description: "Alice deploys the fix tonight.".to_string(),
+            }],
+        }
+    }
+
+    /// The group's dedicated one-group embedding Store of decision 66
+    /// (the same shape as the worker's `GroupEmbeddingTarget::open`):
+    /// a separate Store instance with exactly one open group.
+    fn dedicated_embedding_store(dir: &tempfile::TempDir) -> Arc<Store> {
+        let store = Arc::new(Store::new(dir.path()));
+        store.open_group(ENQUEUE_CHAT).expect("open group");
+        store
+    }
+
+    /// Builds the pipeline the way live mode does: the shared
+    /// multi-group store for the digest reads plus, when given, the
+    /// dedicated one-group embedding store for the enqueue. `None` is
+    /// the construction degrade (enqueue disabled).
+    fn enqueue_pipeline(
+        store: &Arc<Store>,
+        memory: &Arc<LbugBackend>,
+        extractor: crate::ScriptedExtractor,
+        embedding_store: Option<Arc<Store>>,
+    ) -> AgentDigestPipeline<LbugBackend> {
+        let pipeline = AgentDigestPipeline::new(
+            Arc::clone(store),
+            Arc::clone(memory),
+            Arc::new(extractor),
+            PipelineConfig {
+                max_retries: 2,
+                retry_base_delay: Duration::from_millis(1),
+            },
+        );
+        match embedding_store {
+            Some(store) => pipeline.with_embedding_store(store),
+            None => pipeline,
+        }
+    }
+
+    fn enqueue_pairs(store: &Store) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = store
+            .claim_embedding_batch(100)
+            .expect("claim")
+            .into_iter()
+            .map(|row| (row.node_id, row.content_hash))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[tokio::test]
+    async fn the_graph_commit_enqueues_the_entity_embedding_pairs() {
+        // Decision 66: after upsert_batch commits, one queue row per
+        // extracted entity carries the post-resolve node id and the hash
+        // of the pipeline-known candidate content. The Alias nodes and
+        // the MessageBatch node are NOT queued.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // Section 7.4 step 1: Alice binds to person_id("1001") through
+        // the sender mention binding; the concept takes the
+        // deterministic id.
+        assert_eq!(
+            enqueue_pairs(&embedding_store),
+            vec![
+                (
+                    concept_id("the deploy"),
+                    embedding_content_hash("the deploy", "The nightly deploy.")
+                ),
+                (
+                    person_id("1001"),
+                    embedding_content_hash("Alice", "A group member who deploys.")
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_enqueue_never_fails_the_digest() {
+        // Decision 66 best-effort discipline: an embedding Store rigged
+        // to fail the enqueue (two groups open -> the chat_id-less
+        // embedding helper returns StoreError::AmbiguousGroup) still
+        // yields a successful digest, and the failure never enters the
+        // Phase 1 digest error taxonomy.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        // The rig: the embedding helpers require EXACTLY ONE open group
+        // per Store instance.
+        let embedding_store = dedicated_embedding_store(&dir);
+        embedding_store
+            .open_group("enqueue_test_other")
+            .expect("open");
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph()]),
+            Some(embedding_store),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("the digest is Ok despite the enqueue failure")
+            .expect("non-empty tail");
+        match outcome {
+            // Person + Concept + 2 Alias + MessageBatch.
+            DigestOutcome::Extracted { node_count, .. } => assert_eq!(node_count, 5),
+            other => panic!("expected Extracted, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "digest_failures_total")
+                .expect("state"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn repeating_the_digest_dedups_the_enqueue_rows() {
+        // INSERT OR IGNORE on UNIQUE(node_id, content_hash): the same
+        // digest twice queues the same rows, no duplicates.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph(), alice_deploy_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        );
+
+        for run in 1..=2 {
+            let outcome = pipeline
+                .run_digest(ENQUEUE_CHAT, 0)
+                .await
+                .expect("digest")
+                .expect("non-empty tail");
+            assert!(
+                matches!(outcome, DigestOutcome::Extracted { .. }),
+                "run {run} must extract"
+            );
+        }
+
+        assert_eq!(
+            enqueue_pairs(&embedding_store),
+            vec![
+                (
+                    concept_id("the deploy"),
+                    embedding_content_hash("the deploy", "The nightly deploy.")
+                ),
+                (
+                    person_id("1001"),
+                    embedding_content_hash("Alice", "A group member who deploys.")
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_multi_group_topology_enqueues_through_the_dedicated_store() {
+        // The LIVE-mode topology (the S5 defect): the shared digest
+        // store opens one group per served chat, so with 2+ groups an
+        // enqueue through it would AmbiguousGroup-fail on every digest.
+        // The pipeline must instead enqueue through its dedicated
+        // one-group embedding store while the shared store keeps
+        // serving the multi-group digest reads.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        // The second served group on the SHARED store (the second live
+        // actor): the enqueue helpers can no longer resolve the group
+        // on this instance.
+        store
+            .insert_message(
+                "enqueue_chat_other",
+                &inbound("x1", "9009", "Carol", "an unrelated chat"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // The queue rows land in the group's own store, readable
+        // through the dedicated one-group handle despite the two open
+        // groups on the shared store.
+        assert_eq!(
+            enqueue_pairs(&embedding_store),
+            vec![
+                (
+                    concept_id("the deploy"),
+                    embedding_content_hash("the deploy", "The nightly deploy.")
+                ),
+                (
+                    person_id("1001"),
+                    embedding_content_hash("Alice", "A group member who deploys.")
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_digest_runs_with_the_embedding_enqueue_disabled() {
+        // The construction degrade of main.rs (WARN + proceed with a
+        // None embedding store): the digest still runs; the enqueue is
+        // skipped and the startup reconciliation heals the loss.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph()]),
+            None,
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("the digest is Ok with the enqueue disabled")
+            .expect("non-empty tail");
+        match outcome {
+            // Person + Concept + 2 Alias + MessageBatch.
+            DigestOutcome::Extracted { node_count, .. } => assert_eq!(node_count, 5),
+            other => panic!("expected Extracted, got {other:?}"),
+        }
+
+        // Nothing was queued.
+        let reader = dedicated_embedding_store(&dir);
+        assert!(enqueue_pairs(&reader).is_empty());
+    }
+
+    #[test]
+    fn the_enqueue_items_cover_entities_and_the_alias_fallback() {
+        // The pure pairing rule: the entity node wins over the
+        // surface-form Alias of the same name; the Section 7.4 step-4
+        // fallback Alias doubles as the entity node; empty candidate
+        // names and non-entity nodes are skipped.
+        let now = OffsetDateTime::now_utc();
+        let node = |id: &str, name: &str, node_type: NodeType| MemoryNode {
+            id: id.to_string(),
+            name: name.to_string(),
+            node_type,
+            created_at: now,
+            updated_at: now,
+            properties: None,
+        };
+        let graph = KnowledgeGraph {
+            nodes: vec![
+                ExtractedNode {
+                    name: "Alice".to_string(),
+                    node_type: ExtractedNodeType::Person,
+                    description: "deploys.".to_string(),
+                },
+                ExtractedNode {
+                    name: "tama".to_string(),
+                    node_type: ExtractedNodeType::Person,
+                    description: "a cat.".to_string(),
+                },
+                ExtractedNode {
+                    name: String::new(),
+                    node_type: ExtractedNodeType::Concept,
+                    description: "no name.".to_string(),
+                },
+            ],
+            edges: vec![],
+        };
+        let batch = MemoryBatch {
+            batch_id: "b1".to_string(),
+            nodes: vec![
+                node("alias-alice", "Alice", NodeType::Alias),
+                node("person-alice", "Alice", NodeType::Person),
+                // The step-4 fallback: the Alias node IS the entity node.
+                node("alias-tama", "tama", NodeType::Alias),
+                node("b1", "b1", NodeType::MessageBatch),
+            ],
+            edges: vec![],
+        };
+
+        assert_eq!(
+            embedding_enqueue_items(&graph, &batch),
+            vec![
+                (
+                    "person-alice".to_string(),
+                    embedding_content_hash("Alice", "deploys.")
+                ),
+                (
+                    "alias-tama".to_string(),
+                    embedding_content_hash("tama", "a cat.")
+                ),
+            ]
+        );
     }
 }
