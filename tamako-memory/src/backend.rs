@@ -150,6 +150,19 @@ impl NeighborEdge {
     }
 }
 
+/// Phase 2 (current-state.md decision 66): the STORED display content of
+/// one node, read back from the graph. The embedding worker drains the
+/// `pending_embeddings` queue against these values: pipeline-known values
+/// are not authoritative post-merge, because alias-bound nodes keep their
+/// stored properties through the MERGE coalesce (Rule R4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeContent {
+    pub name: String,
+    /// The `description` field of the `properties` JSON blob. Empty when
+    /// the node carries no description.
+    pub description: String,
+}
+
 /// The graph memory backend. One database file per group at
 /// `{data_root}/{chat_id}/memory.lbug` (Section 5.1, Rule P5).
 ///
@@ -206,6 +219,39 @@ pub trait MemoryBackend: Send + Sync {
         chat_id: &'a str,
         node_id: &'a str,
     ) -> impl Future<Output = Result<Vec<NeighborEdge>>> + Send + 'a;
+
+    /// Phase 2 (current-state.md decision 66): the stored name and
+    /// description of one node, entered through the node identifier
+    /// (Rule R5). Returns `None` when the node does not exist, which
+    /// covers the existence checks of the merge-tool tombstone cleanup
+    /// (decision 67).
+    ///
+    /// The default returns `None` so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn node_content<'a>(
+        &'a self,
+        chat_id: &'a str,
+        node_id: &'a str,
+    ) -> impl Future<Output = Result<Option<NodeContent>>> + Send + 'a {
+        let _ = (chat_id, node_id);
+        async { Ok(None) }
+    }
+
+    /// Phase 2 (current-state.md decision 66): the stored name and
+    /// description of EVERY node of the group, as (node_id, content)
+    /// pairs. Backs the startup reconciliation pass of the embedding
+    /// worker. Node counts are hundreds-to-low-thousands, so the full
+    /// listing carries no paging.
+    ///
+    /// The default returns an empty vec so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn list_node_contents<'a>(
+        &'a self,
+        chat_id: &'a str,
+    ) -> impl Future<Output = Result<Vec<(String, NodeContent)>>> + Send + 'a {
+        let _ = chat_id;
+        async { Ok(Vec::new()) }
+    }
 
     /// Closes the cached handle of the group. Later calls reopen it.
     fn close<'a>(&'a self, chat_id: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;

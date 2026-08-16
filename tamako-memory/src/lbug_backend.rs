@@ -43,8 +43,8 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 use crate::backend::{
-    AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NeighborEdge, NodeType, Result,
-    NEIGHBOR_EXPANSION_LIMIT,
+    AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NeighborEdge, NodeContent, NodeType,
+    Result, NEIGHBOR_EXPANSION_LIMIT,
 };
 
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
@@ -114,6 +114,19 @@ RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at,
 ORDER BY r.created_at DESC
 LIMIT ";
 
+// Phase 2 (current-state.md decision 66): the stored display content of
+// one node. The query enters the graph through the node identifier (Rule
+// R5); the node id is a $param (Section 5.2 rule 4).
+const NODE_CONTENT: &str = "MATCH (n:Node {id: $node_id})
+RETURN n.name, n.properties";
+
+// Phase 2 (current-state.md decision 66): the stored display content of
+// every node of the group, for the startup reconciliation pass of the
+// embedding worker. Node counts are hundreds-to-low-thousands, so the
+// full scan needs no paging.
+const LIST_NODE_CONTENTS: &str = "MATCH (n:Node)
+RETURN n.id, n.name, n.properties";
+
 fn backend(error: lbug::Error) -> MemoryError {
     MemoryError::Backend(error.to_string())
 }
@@ -130,6 +143,33 @@ fn opt_timestamp(value: Option<OffsetDateTime>) -> Value {
         Some(value) => Value::Timestamp(value),
         None => Value::Null(LogicalType::Timestamp),
     }
+}
+
+/// Decision 66: the description lives in the `description` field of the
+/// `properties` JSON blob (written by the digest pipeline). A NULL blob,
+/// malformed JSON, or a missing/non-string field yields an empty
+/// description — the read path skips, it does not fail (the same policy
+/// as `alias_targets`).
+fn description_of(properties: Option<String>) -> String {
+    properties
+        .and_then(|blob| serde_json::from_str::<serde_json::Value>(&blob).ok())
+        .and_then(|value| value.get("description")?.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Decodes one `n.name, n.properties` (or `n.id, n.name, n.properties`)
+/// column tail into a `NodeContent`. Returns `None` on an unexpected
+/// shape: the row is skipped, it does not fail the query.
+fn node_content_of(name: Option<Value>, properties: Option<Value>) -> Option<NodeContent> {
+    let Some(Value::String(name)) = name else {
+        return None;
+    };
+    let properties = match properties {
+        Some(Value::String(blob)) => Some(blob),
+        _ => None,
+    };
+    let description = description_of(properties);
+    Some(NodeContent { name, description })
 }
 
 /// Renders one `lbug::Value` as a display string. Used by the read
@@ -438,6 +478,47 @@ impl MemoryBackend for LbugBackend {
                 });
             }
             Ok(edges)
+        })
+        .await
+    }
+
+    async fn node_content(&self, chat_id: &str, node_id: &str) -> Result<Option<NodeContent>> {
+        // Decision 66. None means the node does not exist.
+        let node_id = node_id.to_string();
+        self.with_conn(chat_id, move |conn| {
+            let mut statement = conn.prepare(NODE_CONTENT).map_err(backend)?;
+            let mut result = conn
+                .execute(&mut statement, vec![("node_id", Value::String(node_id))])
+                .map_err(backend)?;
+            // The id is the primary key: at most one row.
+            match result.next() {
+                Some(row) => {
+                    let mut columns = row.into_iter();
+                    Ok(node_content_of(columns.next(), columns.next()))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn list_node_contents(&self, chat_id: &str) -> Result<Vec<(String, NodeContent)>> {
+        // Decision 66: the startup reconciliation pass lists every node.
+        self.with_conn(chat_id, |conn| {
+            let result = conn.query(LIST_NODE_CONTENTS).map_err(backend)?;
+            let mut contents = Vec::new();
+            for row in result {
+                let mut columns = row.into_iter();
+                let decoded = (columns.next(), columns.next(), columns.next());
+                // A row with an unexpected shape is skipped, it does not
+                // fail the query (same policy as `alias_targets`).
+                if let (Some(Value::String(node_id)), name, properties) = decoded {
+                    if let Some(content) = node_content_of(name, properties) {
+                        contents.push((node_id, content));
+                    }
+                }
+            }
+            Ok(contents)
         })
         .await
     }
@@ -831,6 +912,170 @@ mod tests {
                 "rank {rank} must be Target{index:04}"
             );
         }
+    }
+
+    /// Decision 66 test data: one Concept node whose properties carry a
+    /// description, one Person node whose properties carry tg_user_id
+    /// plus a description, and one node without properties.
+    fn content_batch() -> (MemoryBatch, [MemoryNode; 3]) {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let concept = MemoryNode {
+            id: crate::identifiers::concept_id("GRPO"),
+            name: "GRPO".to_string(),
+            node_type: NodeType::Concept,
+            created_at: base,
+            updated_at: base,
+            properties: Some(
+                serde_json::json!({ "description": "A training method." }).to_string(),
+            ),
+        };
+        let person = MemoryNode {
+            id: crate::identifiers::person_id("1001"),
+            name: "Tama".to_string(),
+            node_type: NodeType::Person,
+            created_at: base,
+            updated_at: base,
+            properties: Some(
+                serde_json::json!({
+                    "tg_user_id": "1001",
+                    "display_name": "Tama",
+                    "description": "A group member.",
+                })
+                .to_string(),
+            ),
+        };
+        let bare = MemoryNode {
+            id: crate::identifiers::concept_id("Bare"),
+            name: "Bare".to_string(),
+            node_type: NodeType::Concept,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(4, 80),
+            nodes: vec![concept.clone(), person.clone(), bare.clone()],
+            edges: vec![],
+        };
+        (batch, [concept, person, bare])
+    }
+
+    #[tokio::test]
+    async fn node_content_returns_the_stored_name_and_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [concept, person, _bare]) = content_batch();
+        backend.upsert_batch("chat_k", &batch).await.unwrap();
+
+        // Decision 66: the values come from the STORED row, not from the
+        // pipeline's in-memory knowledge.
+        let content = backend
+            .node_content("chat_k", &concept.id)
+            .await
+            .unwrap()
+            .expect("the concept node exists");
+        assert_eq!(
+            content,
+            NodeContent {
+                name: "GRPO".to_string(),
+                description: "A training method.".to_string(),
+            }
+        );
+        // The description sits next to other fields in the same blob.
+        let content = backend
+            .node_content("chat_k", &person.id)
+            .await
+            .unwrap()
+            .expect("the person node exists");
+        assert_eq!(
+            content,
+            NodeContent {
+                name: "Tama".to_string(),
+                description: "A group member.".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn node_content_of_a_missing_node_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [_concept, _person, _bare]) = content_batch();
+        backend.upsert_batch("chat_l", &batch).await.unwrap();
+
+        // None covers the existence checks of the tombstone cleanup.
+        let content = backend
+            .node_content("chat_l", &crate::identifiers::concept_id("nobody"))
+            .await
+            .unwrap();
+        assert_eq!(content, None);
+    }
+
+    #[tokio::test]
+    async fn node_content_without_a_description_yields_an_empty_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [_concept, _person, bare]) = content_batch();
+        backend.upsert_batch("chat_m", &batch).await.unwrap();
+
+        // A NULL properties blob is not an error.
+        let content = backend
+            .node_content("chat_m", &bare.id)
+            .await
+            .unwrap()
+            .expect("the bare node exists");
+        assert_eq!(
+            content,
+            NodeContent {
+                name: "Bare".to_string(),
+                description: String::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn list_node_contents_returns_all_upserted_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [concept, person, bare]) = content_batch();
+        backend.upsert_batch("chat_n", &batch).await.unwrap();
+
+        let mut contents = backend.list_node_contents("chat_n").await.unwrap();
+        contents.sort_by(|(left, _), (right, _)| left.cmp(right));
+        // The MessageBatch skeleton node rides along: the listing covers
+        // every node of the group, the embedding worker filters.
+        let mut expected: Vec<(String, NodeContent)> = vec![
+            (
+                batch.batch_id.clone(),
+                NodeContent {
+                    name: batch.batch_id.clone(),
+                    description: String::new(),
+                },
+            ),
+            (
+                concept.id,
+                NodeContent {
+                    name: "GRPO".to_string(),
+                    description: "A training method.".to_string(),
+                },
+            ),
+            (
+                bare.id,
+                NodeContent {
+                    name: "Bare".to_string(),
+                    description: String::new(),
+                },
+            ),
+            (
+                person.id,
+                NodeContent {
+                    name: "Tama".to_string(),
+                    description: "A group member.".to_string(),
+                },
+            ),
+        ];
+        expected.sort_by(|(left, _), (right, _)| left.cmp(right));
+        assert_eq!(contents, expected);
     }
 
     #[test]
