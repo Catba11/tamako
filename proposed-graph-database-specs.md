@@ -230,7 +230,7 @@ This version does not implement LLM negation detection. The interface is reserve
 2. On match, update scalar columns only. Rule R4 applies.
 3. If a new description is longer than 1 KB, append a new description edge. Do not rewrite the old value.
 4. Run `CHECKPOINT` at the end of the transaction.
-5. Write the embeddings of the name and the description of each Person, Alias, and Concept to the sidecar vector index in parallel.
+5. Write the embeddings of the name and the description of each Person, Alias, and Concept to the sidecar vector index. NOT in the graph transaction (current-state.md decision 66): after the commit, enqueue each new or changed node into the `pending_embeddings` queue of `specs.md` Section 5.2, best-effort. A background worker drains the queue, calls the embeddings endpoint, and writes the vector index. A startup reconciliation pass diffs graph nodes against embedded content hashes and enqueues the missing or stale ones, and drops vector and queue rows whose node no longer exists. Backfill, steady-state repair, and merge-tombstone cleanup all ride this one mechanism.
 
 ## 8. Read path
 

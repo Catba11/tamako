@@ -108,6 +108,8 @@ Environment variables:
 | `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
 | `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
 | `TAMAKO_LLM_SESSION_ID` | Session id sent as the `x-opencode-session` header on every request (gateway session affinity / provider prompt-cache affinity). Global-only: one session id per deployment, no per-purpose or per-group variant. Default `tamako`. |
+| `TAMAKO_EMBEDDING_MODEL` | Embedding-model override for the vector sidecar. Default `qwen/qwen3-embedding-8b`. Global only. |
+| `TAMAKO_EMBEDDING_BASE_URL` | Embedding-endpoint base-URL override. Default `https://openrouter.ai/api/v1`. Global only. |
 | `TAMAKO_STRUCTURED_OUTPUT` | Structured-output mode, global fallback: `schema` (default), `json_object`, `prompt_only`. |
 | `TAMAKO_DIGEST_STRUCTURED_OUTPUT` | Structured-output mode override of the digest (extraction) purpose. |
 | `TAMAKO_GATE_STRUCTURED_OUTPUT` | Structured-output mode override of the gate purpose. |
@@ -115,6 +117,8 @@ Environment variables:
 | `TAMAKO_SUMMARY_STRUCTURED_OUTPUT` | Structured-output mode override of the summary purpose. |
 
 Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`, `summary`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_`, `reply_`, and `summary_`). The summary purpose alone also has per-purpose env overrides `TAMAKO_SUMMARY_LLM_API` / `TAMAKO_SUMMARY_LLM_BASE_URL`, which beat the global env overrides. The same pattern applies to the structured-output mode: `structured_output` globally and `digest_structured_output` / `gate_structured_output` / `reply_structured_output` / `summary_structured_output` per purpose (values `schema`, `json_object`, `prompt_only`; default `schema`; an unknown value is a hard startup error). Structured-output precedence: purpose env → global env → purpose config → global config → default `schema`. API keys come from the environment only, never from the config file.
+
+Embeddings (specs.md Section 13, schema v7): the vector sidecar embeds Person/Alias/Concept names and descriptions through an openai-compatible `/v1/embeddings` endpoint — the default pair is OpenRouter + `qwen/qwen3-embedding-8b` (zero data retention), keyed by `OPENAI_API_KEY`. The digest pipeline enqueues changed nodes after the graph commit; a background worker (30 s cadence, live mode only) drains the queue, and a startup reconciliation pass backfills or repairs the index, so the sidecar is always rebuildable derived data. A missing key degrades embeddings to a startup warning; the digest pipeline is unaffected.
 
 ### Recipe: Opencode Go
 
