@@ -746,6 +746,7 @@ fn format_group_status(
     let participations = counter("participations_total");
     let injection_wakes = counter("injection_wakes_total");
     let digest_failures = counter("digest_failures_total");
+    let summaries_failed = counter("summaries_failed_total");
     let dead_letters_counter = counter("dead_letters_total");
     let last_boundary = counter("last_digest_boundary_msg_id");
     let prev_boundary = counter("prev_digest_boundary_msg_id");
@@ -760,6 +761,11 @@ fn format_group_status(
     let _ = writeln!(out, "    {:<27}{participations}", "participations_total:");
     let _ = writeln!(out, "    {:<27}{injection_wakes}", "injection_wakes_total:");
     let _ = writeln!(out, "    {:<27}{digest_failures}", "digest_failures_total:");
+    let _ = writeln!(
+        out,
+        "    {:<27}{summaries_failed}",
+        "summaries_failed_total:"
+    );
     let _ = writeln!(
         out,
         "    {:<27}{dead_letters_counter}",
@@ -1503,7 +1509,7 @@ mod tests {
         );
         // Counter keys absent from the state table print as 0.
         assert!(
-            text.contains("wakes_total:               0"),
+            text.contains("summaries_failed_total:    0"),
             "text:\n{text}"
         );
         assert!(
@@ -1531,6 +1537,7 @@ mod tests {
                 ("participations_total", "12"),
                 ("injection_wakes_total", "6"),
                 ("digest_failures_total", "0"),
+                ("summaries_failed_total", "3"),
                 ("dead_letters_total", "2"),
                 ("last_digest_boundary_msg_id", "91"),
                 ("prev_digest_boundary_msg_id", "82"),
@@ -1580,6 +1587,10 @@ mod tests {
         );
         assert!(
             text.contains("muted:                     true"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("summaries_failed_total:    3"),
             "text:\n{text}"
         );
         assert!(
