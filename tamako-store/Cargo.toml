@@ -9,11 +9,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
+# Embedding sidecar (decision 66): sqlite-vec FFI bindings, pinned
+# because the vec0 constructor/KNN idiom is version-sensitive. The crate
+# has zero runtime deps (rusqlite is a dev-dep of the crate itself) and
+# compiles sqlite-vec.c with cc + SQLITE_CORE, so vec0 resolves SQLite
+# symbols from OUR bundled libsqlite3-sys at link time — no second
+# SQLite copy.
+sqlite-vec = "=0.1.9"
 
 [dev-dependencies]
 tempfile = "3"
-# Spike S1 only: sqlite-vec FFI bindings. The crate has zero runtime deps
-# (rusqlite is a dev-dep of the crate itself) and compiles sqlite-vec.c with
-# cc + SQLITE_CORE, so vec0 resolves SQLite symbols from OUR bundled
-# libsqlite3-sys at link time — no second SQLite copy.
-sqlite-vec = "0.1.9"
