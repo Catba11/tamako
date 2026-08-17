@@ -215,6 +215,43 @@ CREATE VIRTUAL TABLE node_embeddings USING vec0(
 );
 ",
     ),
+    (
+        8,
+        "\
+-- Metric cutover (decision 73). The v7 node_embeddings table shipped
+-- with the vec0 DEFAULT distance metric (L2), but the decision-73
+-- vector pre-screen thresholds (vector_match_threshold 0.92,
+-- vector_candidate_threshold 0.80) are COSINE similarities. The pinned
+-- sqlite-vec 0.1.9 supports cosine as a per-vector-column option
+-- (sqlite-vec.c: parsing in the float[N] column clause, KNN dispatch
+-- to distance_cosine_float, which returns 1 - cosine_similarity), so
+-- the table is dropped and recreated with distance_metric=cosine. No
+-- L2<->cosine conversion hack: embeddings are derived data,
+-- recomputable from node content, so dropping them is free. The DROP
+-- removes the vec0 shadow tables; the CREATE rebuilds a fresh set.
+DROP TABLE node_embeddings;
+
+-- Same shape as v7 (TEXT primary key, 4096 dims, chunk_size = 128)
+-- plus the cosine metric on the vector column. Registration of the
+-- vec0 module still happens before migrations in Store::open_group.
+CREATE VIRTUAL TABLE node_embeddings USING vec0(
+    node_id TEXT PRIMARY KEY,
+    embedding float[4096] distance_metric=cosine,
+    chunk_size=128
+);
+
+-- Done-journal reset (decision 66 reconciliation contract): the
+-- status='done' rows of pending_embeddings are the journal telling
+-- startup reconciliation which (node, content_hash) pairs already live
+-- in node_embeddings. The recreation above just invalidated every one
+-- of those claims, so they are deleted. The next startup
+-- reconciliation diffs the graph against the now-empty journal and
+-- re-enqueues every node, producing a full re-embed into the fresh
+-- cosine table. 'pending' and 'failed' rows SURVIVE: they remain
+-- claimable and will embed into the new table.
+DELETE FROM pending_embeddings WHERE status = 'done';
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
