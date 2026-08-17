@@ -79,6 +79,31 @@ pub trait EmbeddingProvider: Send + Sync {
         &'a self,
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, EmbeddingError>> + Send + 'a>>;
+
+    /// Embeds a batch of texts, one vector per input in INPUT ORDER
+    /// (decision 73: the entity resolver makes ONE batched embeddings
+    /// call per digest batch for all entities reaching step 3 — the
+    /// embeddings API takes input arrays). Batch semantics: a provider
+    /// with a native batch surface SHOULD override this with one
+    /// provider call; the DEFAULT implementation loops [`embed`]
+    /// sequentially, the correct fallback for any provider (the
+    /// existing worker and its test doubles stay source-compatible).
+    /// The dimension pin (4096) applies per element — the `embed`
+    /// implementations enforce it, and the default loop inherits that
+    /// enforcement.
+    #[allow(clippy::type_complexity)]
+    fn embed_texts<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, EmbeddingError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                vectors.push(self.embed(text).await?);
+            }
+            Ok(vectors)
+        })
+    }
 }
 
 /// The embedded text layout (decision 66): the node name, one newline,
@@ -634,6 +659,43 @@ mod tests {
         assert!(!is_embedded_kind("9b2f…", &batch));
         let person = content("Tama", "a cat");
         assert!(is_embedded_kind("9b2f…", &person));
+    }
+
+    #[tokio::test]
+    async fn the_default_batch_impl_composes_the_single_embed_calls() {
+        let provider = ScriptedProvider::succeeding();
+        let texts: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_string()).collect();
+
+        let vectors = provider.embed_texts(&texts).await.expect("batch");
+
+        // N sequential single calls compose the batch result, in input
+        // order; the scripted fallback vector carries through.
+        assert_eq!(provider.texts(), texts);
+        assert_eq!(vectors, vec![vec![1.0; EMBEDDING_DIM]; 3]);
+    }
+
+    #[tokio::test]
+    async fn the_default_batch_impl_propagates_the_first_single_failure() {
+        let provider = ScriptedProvider::failing();
+        let texts: Vec<String> = ["a", "b"].iter().map(|s| (*s).to_string()).collect();
+
+        match provider.embed_texts(&texts).await {
+            Err(EmbeddingError::Provider(message)) => assert_eq!(message, "boom"),
+            other => panic!("expected a Provider error, got {other:?}"),
+        }
+        // The loop short-circuits: the first failure stops the batch.
+        assert_eq!(provider.texts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_default_batch_impl_returns_empty_for_empty_input() {
+        let provider = ScriptedProvider::succeeding();
+        let vectors = provider.embed_texts(&[]).await.expect("empty batch");
+        assert!(vectors.is_empty());
+        assert!(
+            provider.texts().is_empty(),
+            "no single calls for an empty batch"
+        );
     }
 
     #[tokio::test]

@@ -151,6 +151,22 @@ pub struct TriggerConfig {
     /// calls share a growing byte prefix (provider prompt cache).
     /// `false` restores the delta-only input. Default true.
     pub gate_context: bool,
+    /// proposed-graph-database-specs.md Section 7.4 step 3 (decision
+    /// 73): the vector pre-screen in entity resolution. `false` skips
+    /// step 3 entirely (byte-identical Phase 1 behavior path, not even
+    /// the embeddings call). Default true.
+    pub vector_resolution: bool,
+    /// Decision 73: the cosine SIMILARITY at or above which the best
+    /// compatible sidecar hit binds without a confirmation call.
+    /// Default 0.92.
+    pub vector_match_threshold: f64,
+    /// Decision 73: the lower bound of the LLM confirmation band;
+    /// below it the entity creates a new node. Default 0.80.
+    pub vector_candidate_threshold: f64,
+    /// Decision 73: the cap of LLM confirmation calls per digest
+    /// batch; an exhausted budget treats middle-band entities as
+    /// below-threshold. Default 5.
+    pub resolution_confirm_budget: u32,
     /// The hard cap of injected memories per wake (Section 9.2
     /// conservative default). Default 5. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill (Phase 1 M5).
@@ -205,6 +221,10 @@ impl Default for TriggerConfig {
             reply_staleness_threshold: 20,
             reply_quote_threshold: 10,
             gate_context: true,
+            vector_resolution: true,
+            vector_match_threshold: 0.92,
+            vector_candidate_threshold: 0.80,
+            resolution_confirm_budget: 5,
             recall_injection_cap: 5,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
@@ -298,6 +318,18 @@ pub struct TriggerConfigToml {
     /// The gate context-view switch (decision 72). Refer to
     /// `TriggerConfig::gate_context`.
     pub gate_context: Option<bool>,
+    /// The vector pre-screen switch (decision 73). Refer to
+    /// `TriggerConfig::vector_resolution`.
+    pub vector_resolution: Option<bool>,
+    /// The auto-match similarity. Refer to
+    /// `TriggerConfig::vector_match_threshold`.
+    pub vector_match_threshold: Option<f64>,
+    /// The confirmation-band lower bound. Refer to
+    /// `TriggerConfig::vector_candidate_threshold`.
+    pub vector_candidate_threshold: Option<f64>,
+    /// The per-batch confirmation budget. Refer to
+    /// `TriggerConfig::resolution_confirm_budget`.
+    pub resolution_confirm_budget: Option<u32>,
     /// The injection cap of one wake. Refer to
     /// `TriggerConfig::recall_injection_cap`.
     pub recall_injection_cap: Option<u32>,
@@ -417,6 +449,18 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.gate_context {
             base.gate_context = value;
+        }
+        if let Some(value) = self.vector_resolution {
+            base.vector_resolution = value;
+        }
+        if let Some(value) = self.vector_match_threshold {
+            base.vector_match_threshold = value;
+        }
+        if let Some(value) = self.vector_candidate_threshold {
+            base.vector_candidate_threshold = value;
+        }
+        if let Some(value) = self.resolution_confirm_budget {
+            base.resolution_confirm_budget = value;
         }
         if let Some(value) = self.recall_injection_cap {
             base.recall_injection_cap = value;
@@ -542,6 +586,12 @@ wake_floor_secs = 60
         // Decision 72 (specs.md Sections 9.2/9.6/13): the gates receive
         // the shared context view by default.
         assert!(config.gate_context);
+        // Decision 73 (proposed-graph-database-specs.md Section 7.4
+        // step 3, specs.md Section 13): the vector pre-screen defaults.
+        assert!(config.vector_resolution);
+        assert_eq!(config.vector_match_threshold, 0.92);
+        assert_eq!(config.vector_candidate_threshold, 0.80);
+        assert_eq!(config.resolution_confirm_budget, 5);
         // The structured-output mode keys (reported for spec backfill):
         // every Option is None by default; the agent layer resolves
         // the default mode.
@@ -630,6 +680,44 @@ gate_context = true
         // A key the TOML does not set keeps the default (true).
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert!(plain.global.gate_context);
+    }
+
+    #[test]
+    fn toml_override_sets_decision_73_keys() {
+        // Decision 73: the vector pre-screen keys follow the same
+        // per-key overlay pattern as every other trigger key (AGENT.md
+        // Section 6.3: overridable per group).
+        let text = r#"
+[global]
+vector_resolution = false
+vector_match_threshold = 0.95
+vector_candidate_threshold = 0.75
+resolution_confirm_budget = 2
+
+[groups."-100777"]
+vector_resolution = true
+vector_match_threshold = 0.90
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert!(!config.global.vector_resolution);
+        assert_eq!(config.global.vector_match_threshold, 0.95);
+        assert_eq!(config.global.vector_candidate_threshold, 0.75);
+        assert_eq!(config.global.resolution_confirm_budget, 2);
+        // A group override applies over the global value.
+        assert!(config.for_group("-100777").vector_resolution);
+        assert_eq!(config.for_group("-100777").vector_match_threshold, 0.90);
+        // Keys the group does not override inherit the global values.
+        assert_eq!(config.for_group("-100777").vector_candidate_threshold, 0.75);
+        assert_eq!(config.for_group("-100777").resolution_confirm_budget, 2);
+        // A group without an override receives the global values.
+        assert!(!config.for_group("-100999").vector_resolution);
+        assert_eq!(config.for_group("-100999").vector_match_threshold, 0.95);
+        // Keys the TOML does not set keep the decision-73 defaults.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert!(plain.global.vector_resolution);
+        assert_eq!(plain.global.vector_match_threshold, 0.92);
+        assert_eq!(plain.global.vector_candidate_threshold, 0.80);
+        assert_eq!(plain.global.resolution_confirm_budget, 5);
     }
 
     #[test]
