@@ -289,6 +289,26 @@ pub trait RecallProvider: Send + Sync {
         chat_id: &'a str,
         new_messages: &'a [GateMessage],
     ) -> Pin<Box<dyn Future<Output = Result<RecallOutcome, CoreError>> + Send + 'a>>;
+
+    /// The decision-72 entry point (specs.md Sections 9.2 and 9.6):
+    /// `recall` plus the shared context view. `Some(view)` carries the
+    /// `LiveContext::gate_context_view` bytes the actor renders once
+    /// per wake (bound: the pre-advance marker); `None` is the pre-72
+    /// delta-only input (the `gate_context` kill switch).
+    ///
+    /// The DEFAULT ignores the view and delegates to `recall`, so
+    /// existing implementations stay valid unchanged; the live
+    /// `ShallowRecall` (tamako-agent) overrides it to forward the view
+    /// to the relevance gate.
+    fn recall_with_context<'a>(
+        &'a self,
+        chat_id: &'a str,
+        new_messages: &'a [GateMessage],
+        context_view: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<RecallOutcome, CoreError>> + Send + 'a>> {
+        let _ = context_view;
+        self.recall(chat_id, new_messages)
+    }
 }
 
 /// The no-op recall: no injections. The binary wires it when no LLM
@@ -317,6 +337,28 @@ pub trait ParticipationGate: Send + Sync {
         &'a self,
         input: &'a GateInput,
     ) -> Pin<Box<dyn Future<Output = Result<GateDecision, CoreError>> + Send + 'a>>;
+
+    /// The decision-72 entry point (specs.md Section 9.6): `decide`
+    /// plus the shared context view. `Some(view)` renders the view
+    /// AHEAD of the per-call sections (the prefix-extension cache
+    /// property: consecutive gate calls share a growing byte prefix);
+    /// `None` renders the pre-72 delta-only prompt byte-identically
+    /// (the `gate_context` kill switch). The view is reference
+    /// material only: the targetable set stays the wake's new
+    /// messages, stated by the prompt's tail instruction and enforced
+    /// by the post-validation of the presented set.
+    ///
+    /// The DEFAULT ignores the view and delegates to `decide`, so
+    /// existing implementations stay valid unchanged; the live
+    /// `RigGate` (tamako-agent) overrides it.
+    fn decide_with_context<'a>(
+        &'a self,
+        input: &'a GateInput,
+        context_view: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<GateDecision, CoreError>> + Send + 'a>> {
+        let _ = context_view;
+        self.decide(input)
+    }
 }
 
 /// The reply request: the live context as LLM-facing messages (preamble

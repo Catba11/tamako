@@ -2011,6 +2011,23 @@ async fn start_wake(
         return Ok(());
     }
 
+    // Decision 72 (specs.md Sections 9.2 and 9.6): the shared context
+    // view, rendered ONCE per wake. The bound is `after_id` — the
+    // PRE-ADVANCE marker read at step 2 (the step-3 advance above
+    // already moved `session.wake_last_row_id`): the wake's new
+    // messages stay OUT of the view and render in the gates' per-call
+    // sections. The SAME bytes reach both gate calls of this wake (the
+    // recall relevance gate and the participation gate), so the two
+    // calls warm the SAME provider prefix; across wakes the view is a
+    // prefix-extension (the append-only tail, Rules C1/C2). The
+    // `gate_context` kill switch passes None and restores the pre-72
+    // delta-only input.
+    let context_view = if config.gate_context {
+        Some(context.gate_context_view(after_id))
+    } else {
+        None
+    };
+
     // Step 5: the LLM calls run in a spawned task (the Section 6.1
     // rule 3 analog). The context is actor-owned (Section 6.1 rule 2),
     // so the task gets a SNAPSHOT taken NOW; it touches NO actor state
@@ -2045,6 +2062,7 @@ async fn start_wake(
                 run_forced,
                 tail_id,
                 trigger,
+                context_view,
             )
             .await
         })
@@ -2070,7 +2088,11 @@ async fn start_wake(
 /// id computed at wake start; the completion handler uses it as the
 /// Rule C2 position of the injections. `trigger` is the telemetry
 /// spelling of what started this wake; it passes through to the report
-/// for the curated wake log line.
+/// for the curated wake log line. `context_view` is the decision-72
+/// shared context view (`Some`) rendered once at wake start from the
+/// pre-advance marker, or `None` (the `gate_context` kill switch); the
+/// SAME bytes go to the recall relevance gate and the participation
+/// gate, so both calls of one wake warm the same provider prefix.
 #[allow(clippy::too_many_arguments)]
 async fn run_wake_calls(
     chat_id: &str,
@@ -2082,6 +2104,7 @@ async fn run_wake_calls(
     forced: Option<GateMessage>,
     injection_position: i64,
     trigger: &'static str,
+    context_view: Option<String>,
 ) -> Result<WakeReport, CoreError> {
     // Step 2 (Sections 9.1-9.5): recall before the gate. The rendered
     // injection texts enter the gate input (Section 9.6: the recall
@@ -2090,8 +2113,11 @@ async fn run_wake_calls(
     // reply model of step 4 sees it (Section 9.4, Rule C2 tail
     // position). The dedup rows and the context append happen in the
     // completion handler (Section 9.3), regardless of the gate
-    // outcome.
-    let recall_outcome = recall.recall(chat_id, &new_messages).await?;
+    // outcome. Decision 72: the relevance gate receives the shared
+    // context view ahead of its per-call sections (Section 9.2).
+    let recall_outcome = recall
+        .recall_with_context(chat_id, &new_messages, context_view.as_deref())
+        .await?;
     let injections = recall_outcome.injections;
     let injection_texts: Vec<String> = injections
         .iter()
@@ -2114,11 +2140,16 @@ async fn run_wake_calls(
             reason: None,
         },
         None => {
-            gate.decide(&GateInput {
-                new_messages: new_messages.clone(),
-                injections: injection_texts,
-                forced: false,
-            })
+            // Decision 72: the SAME view bytes the recall gate received
+            // — one wake, one prefix.
+            gate.decide_with_context(
+                &GateInput {
+                    new_messages: new_messages.clone(),
+                    injections: injection_texts,
+                    forced: false,
+                },
+                context_view.as_deref(),
+            )
             .await?
         }
     };
@@ -2139,6 +2170,9 @@ async fn run_wake_calls(
     };
     // Target resolution. An id outside the presented set is treated as
     // no-participation (the gate named a message the wake never saw).
+    // Decision 72: a target naming a CONTEXT-VIEW message (a row id at
+    // or below the pre-advance marker) is outside the presented set by
+    // construction, so this check already covers it.
     let target = if !decision.participate {
         None
     } else if let Some(forcing) = &forced {
@@ -4633,11 +4667,14 @@ mod tests {
     /// A scripted participation gate (the `ScriptedDigest` pattern). The
     /// double runs inside the spawned wake task, so it computes its
     /// decision from the input: participate and target the first/last
-    /// new message. Every `decide` call is recorded.
+    /// new message. Every `decide` call is recorded, together with the
+    /// decision-72 context view of each call (`views`; `None` = the
+    /// pre-72 delta-only shape).
     struct ScriptedGate {
         participate: bool,
         target: GateTarget,
         calls: Mutex<Vec<GateInput>>,
+        views: Mutex<Vec<Option<String>>>,
     }
 
     impl ScriptedGate {
@@ -4646,6 +4683,7 @@ mod tests {
                 participate: true,
                 target,
                 calls: Mutex::new(Vec::new()),
+                views: Mutex::new(Vec::new()),
             })
         }
 
@@ -4654,6 +4692,7 @@ mod tests {
                 participate: false,
                 target: GateTarget::Last,
                 calls: Mutex::new(Vec::new()),
+                views: Mutex::new(Vec::new()),
             })
         }
 
@@ -4662,6 +4701,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
+        }
+
+        /// Every context view the gate received, in call order
+        /// (decision 72).
+        fn views(&self) -> Vec<Option<String>> {
+            self.views
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -4694,6 +4742,20 @@ mod tests {
                 })
             })
         }
+
+        fn decide_with_context<'a>(
+            &'a self,
+            input: &'a GateInput,
+            context_view: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GateDecision, CoreError>> + Send + 'a>> {
+            // Decision 72: record the view, then the SAME decision
+            // logic as `decide`.
+            self.views
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(context_view.map(str::to_string));
+            self.decide(input)
+        }
     }
 
     /// A gate double whose first `panics` `decide` calls panic INSIDE
@@ -4713,6 +4775,7 @@ mod tests {
                     participate: true,
                     target,
                     calls: Mutex::new(Vec::new()),
+                    views: Mutex::new(Vec::new()),
                 },
                 panics_remaining: Mutex::new(panics),
                 calls: Mutex::new(0),
@@ -4889,10 +4952,13 @@ mod tests {
 
     /// A scripted recall provider (the `ScriptedGate` pattern). Each
     /// `recall` call pops one queued `RecallOutcome` (an empty queue
-    /// yields the empty outcome) and records its input.
+    /// yields the empty outcome) and records its input, together with
+    /// the decision-72 context view of each call (`views`; `None` =
+    /// the pre-72 delta-only shape).
     struct ScriptedRecall {
         outcomes: Mutex<std::collections::VecDeque<crate::wake::RecallOutcome>>,
         calls: Mutex<Vec<(String, Vec<GateMessage>)>>,
+        views: Mutex<Vec<Option<String>>>,
     }
 
     impl ScriptedRecall {
@@ -4900,11 +4966,21 @@ mod tests {
             Arc::new(Self {
                 outcomes: Mutex::new(outcomes.into()),
                 calls: Mutex::new(Vec::new()),
+                views: Mutex::new(Vec::new()),
             })
         }
 
         fn calls(&self) -> Vec<(String, Vec<GateMessage>)> {
             self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        /// Every context view the recall received, in call order
+        /// (decision 72).
+        fn views(&self) -> Vec<Option<String>> {
+            self.views
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
@@ -4929,6 +5005,22 @@ mod tests {
                 .pop_front()
                 .unwrap_or_default();
             Box::pin(async move { Ok(outcome) })
+        }
+
+        fn recall_with_context<'a>(
+            &'a self,
+            chat_id: &'a str,
+            new_messages: &'a [GateMessage],
+            context_view: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::wake::RecallOutcome, CoreError>> + Send + 'a>>
+        {
+            // Decision 72: record the view, then the SAME recall
+            // logic as `recall`.
+            self.views
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(context_view.map(str::to_string));
+            self.recall(chat_id, new_messages)
         }
     }
 
@@ -5255,6 +5347,154 @@ mod tests {
             None
         );
         assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_wake_passes_the_same_context_view_to_both_gates() {
+        // Decision 72 (specs.md Sections 9.2 and 9.6): with
+        // `gate_context` on (the default), the actor renders the
+        // shared context view ONCE per wake from the PRE-ADVANCE
+        // marker and hands the SAME bytes to the recall relevance
+        // gate and the participation gate (one wake, one provider
+        // prefix). The wake's new messages stay OUT of the view.
+        let fixture = make_fixture();
+        let recall = ScriptedRecall::with_outcomes(vec![]);
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("a reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(3),
+            Arc::clone(&recall) as Arc<dyn RecallProvider>,
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+
+        // Wake 1 over rows 1-3: the pre-advance marker is 0, so no
+        // context item qualifies — the view is the EMPTY string (the
+        // gates render the explicit empty marker; the prompt shape is
+        // stable). The gate participates; the reply completes the
+        // wake (participations_total lands at the END of the
+        // completion handler, so the wait covers wake_in_flight).
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        assert_eq!(gate.views(), vec![Some(String::new())]);
+        assert_eq!(recall.views(), vec![Some(String::new())]);
+
+        // Wake 2 over rows 5-7 (row 4 is the bot's own reply; the
+        // outbound row is never a gate message): the pre-advance
+        // marker is 3, so the view is exactly the rows 1-3 items —
+        // byte-identical to `gate_context_view(3)` — and EXCLUDES
+        // both the bot's reply (row 4, above the marker) and the new
+        // messages (rows 5-7).
+        for index in 5..=7 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        wait_for_counter(&fixture.store, "participations_total", 2).await;
+
+        let expected_view = [
+            render_human_content(
+                1,
+                "Alice",
+                None,
+                t0() + time::Duration::seconds(1),
+                false,
+                false,
+                ReplyRender::None,
+                "text of m1",
+            ),
+            render_human_content(
+                2,
+                "Alice",
+                None,
+                t0() + time::Duration::seconds(2),
+                false,
+                false,
+                ReplyRender::None,
+                "text of m2",
+            ),
+            render_human_content(
+                3,
+                "Alice",
+                None,
+                t0() + time::Duration::seconds(3),
+                false,
+                false,
+                ReplyRender::None,
+                "text of m3",
+            ),
+        ]
+        .join("\n");
+        // Both gates of wake 2 received the SAME view bytes.
+        assert_eq!(gate.views()[1], Some(expected_view.clone()));
+        assert_eq!(recall.views()[1], Some(expected_view.clone()));
+        assert_eq!(gate.views().len(), 2);
+        assert_eq!(recall.views().len(), 2);
+        // The presented (targetable) set of wake 2 is its NEW
+        // messages only — the context view changed nothing about the
+        // GateInput.
+        let calls = gate
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let row_ids: Vec<i64> = calls[1].new_messages.iter().map(|msg| msg.row_id).collect();
+        assert_eq!(row_ids, vec![5, 6, 7]);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_gate_context_switch_restores_the_delta_only_input() {
+        // Decision 72 kill switch (specs.md Sections 9.2/9.6/13):
+        // `gate_context = false` passes None to both gates — the
+        // pre-72 delta-only prompt shape.
+        let fixture = make_fixture();
+        let recall = ScriptedRecall::with_outcomes(vec![]);
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("never used");
+        let mut config = wake_config(3);
+        config.gate_context = false;
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            config,
+            Arc::clone(&recall) as Arc<dyn RecallProvider>,
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for index in 1..=3 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        wait_for_gate_calls(&gate, 1).await;
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        // The recall call ran before the gate call, so both views are
+        // recorded by now.
+        assert_eq!(gate.views(), vec![None]);
+        assert_eq!(recall.views(), vec![None]);
         handle.shutdown().await.expect("shutdown succeeds");
     }
 

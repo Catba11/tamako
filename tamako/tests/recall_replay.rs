@@ -41,7 +41,9 @@ use tamako_core::actor::{
 };
 use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::TriggerConfig;
-use tamako_core::context::{ContextItem, ContextItemKind, ContextRole, RangeTag};
+use tamako_core::context::{
+    render_human_content, ContextItem, ContextItemKind, ContextRole, RangeTag, ReplyRender,
+};
 use tamako_core::digest::DigestPipeline;
 use tamako_core::event::{InboundEvent, NormalizedMessage, OutboundAction};
 use tamako_core::wake::{GateDecision, ParticipationGate, ReplyGenerator, WakeServices};
@@ -290,6 +292,17 @@ impl RelevanceGate for SharedRelevanceGate {
         input: &'a RelevanceInput,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>> {
         self.0.select(input)
+    }
+
+    // Decision 72: forward the shared context view — the trait's
+    // DEFAULT `select_with_context` drops it, which would record a
+    // false `None` (the kill-switch shape) on every call of this suite.
+    fn select_with_context<'a>(
+        &'a self,
+        input: &'a RelevanceInput,
+        context_view: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>> {
+        self.0.select_with_context(input, context_view)
     }
 }
 
@@ -606,6 +619,18 @@ async fn injection_flows_end_to_end_over_a_seeded_graph() {
         "Alice likes tea."
     );
 
+    // Decision 72: within a single wake the participation gate and the
+    // recall relevance gate received the SAME context-view bytes (the
+    // actor renders the view once per wake and passes it to both).
+    // This first wake's marker is 0 over an empty context, so the
+    // shared view is the empty string.
+    assert_eq!(doubles.gate.context_views(), vec![Some(String::new())]);
+    assert_eq!(
+        doubles.relevance.context_views(),
+        doubles.gate.context_views(),
+        "one wake, one prefix: both gates received the same view bytes"
+    );
+
     handle.shutdown().await.expect("the actor reports no error");
     shutdown_pump(pump).await;
 }
@@ -697,6 +722,43 @@ async fn an_injected_edge_is_not_reinjected_in_the_same_chunk() {
             .all(|candidate| candidate.edge_id != tea_edge_id),
         "the already-injected edge is never presented again"
     );
+
+    // Decision 72, byte-exact: the second wake's context view is the
+    // first wake's view EXTENDED by wake 1's new-messages item bytes
+    // AND wake 1's injection (Rule C2: the RecallInjection item rides
+    // at the tail row it follows — position 3 is AT the bound, so the
+    // injection joins the view). The `injection_wakes_total` barrier
+    // above ordered the completion-handler append before wake 2
+    // rendered its view.
+    let rendered = |row: i64, seconds: i64| {
+        render_human_content(
+            row,
+            "Alice",
+            None,
+            t0() + time::Duration::seconds(seconds),
+            false,
+            false,
+            ReplyRender::None,
+            STOPWORD_TEXT,
+        )
+    };
+    let expected_second_view = [
+        rendered(1, 1),
+        rendered(2, 2),
+        rendered(3, 3),
+        "<memory>Alice likes tea.</memory>".to_string(),
+    ]
+    .join("\n");
+    let relevance_views = doubles.relevance.context_views();
+    assert_eq!(relevance_views.len(), 2);
+    assert_eq!(relevance_views[0].as_deref(), Some(""));
+    assert_eq!(
+        relevance_views[1].as_deref(),
+        Some(expected_second_view.as_str()),
+        "view(2) == view(1) extended by wake 1's new items and its injection"
+    );
+    // Both gates of the wake received the SAME view bytes.
+    assert_eq!(doubles.gate.context_views(), relevance_views);
 
     // No second injection: one RecallInjection item, one dedup row,
     // the metric stays 1.
