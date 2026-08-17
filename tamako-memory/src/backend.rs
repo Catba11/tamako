@@ -163,6 +163,17 @@ pub struct NodeContent {
     pub description: String,
 }
 
+/// Decision 73: the per-candidate resolution info of the vector
+/// pre-screen of entity resolution. The kind comes from the stored
+/// `type` column (the closed set of Section 6.2). `alias_target` is the
+/// source node id of a `known_as`/`also_known_as` edge into the alias
+/// (Section 7.4 step 2) and is `Some` only for Alias nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeResolutionInfo {
+    pub kind: NodeType,
+    pub alias_target: Option<String>,
+}
+
 /// The graph memory backend. One database file per group at
 /// `{data_root}/{chat_id}/memory.lbug` (Section 5.1, Rule P5).
 ///
@@ -250,6 +261,26 @@ pub trait MemoryBackend: Send + Sync {
         chat_id: &'a str,
     ) -> impl Future<Output = Result<Vec<(String, NodeContent)>>> + Send + 'a {
         let _ = chat_id;
+        async { Ok(Vec::new()) }
+    }
+
+    /// Decision 73: the kind and, for Alias nodes, the alias-bound
+    /// target of each given node id, entered through the node
+    /// identifiers (Rule R5). Backs the vector pre-screen of entity
+    /// resolution: one call covers the whole KNN overfetch. A missing
+    /// node id simply does not occur in the result, and neither does a
+    /// node whose stored type string sits outside the closed set of
+    /// Section 6.2 (read paths skip, they do not fail). An empty id
+    /// list yields an empty vec.
+    ///
+    /// The default returns an empty vec so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn node_resolution_infos<'a>(
+        &'a self,
+        chat_id: &'a str,
+        node_ids: &'a [String],
+    ) -> impl Future<Output = Result<Vec<(String, NodeResolutionInfo)>>> + Send + 'a {
+        let _ = (chat_id, node_ids);
         async { Ok(Vec::new()) }
     }
 
