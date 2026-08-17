@@ -7,6 +7,6 @@ mod lbug_backend;
 
 pub use backend::{
     AliasTarget, MemoryBackend, MemoryBatch, MemoryEdge, MemoryError, MemoryNode, NeighborEdge,
-    NodeContent, NodeType, Result, NEIGHBOR_EXPANSION_LIMIT,
+    NodeContent, NodeResolutionInfo, NodeType, Result, NEIGHBOR_EXPANSION_LIMIT,
 };
 pub use lbug_backend::LbugBackend;

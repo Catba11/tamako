@@ -43,8 +43,8 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 use crate::backend::{
-    AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NeighborEdge, NodeContent, NodeType,
-    Result, NEIGHBOR_EXPANSION_LIMIT,
+    AliasTarget, MemoryBackend, MemoryBatch, MemoryError, NeighborEdge, NodeContent,
+    NodeResolutionInfo, NodeType, Result, NEIGHBOR_EXPANSION_LIMIT,
 };
 
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
@@ -126,6 +126,22 @@ RETURN n.name, n.properties";
 // full scan needs no paging.
 const LIST_NODE_CONTENTS: &str = "MATCH (n:Node)
 RETURN n.id, n.name, n.properties";
+
+// Decision 73: the vector pre-screen of entity resolution needs, per
+// candidate node id, the node kind and, for Alias nodes, the bound
+// target. One query covers the whole KNN overfetch: the id list is a
+// single LIST parameter (Section 5.2 rule 4), so k round trips and k
+// op-lock acquisitions collapse into one. The OPTIONAL MATCH mirrors
+// ALIAS_TARGETS: alias edges point INTO the alias node, so the target
+// is the SOURCE of a known_as/also_known_as edge. An alias carries at
+// most one row per alias edge; ORDER BY makes the first-wins pick of
+// the decoder deterministic.
+const NODE_RESOLUTION_INFOS: &str = "MATCH (n:Node)
+WHERE n.id IN $node_ids
+OPTIONAL MATCH (s:Node)-[r:EDGE]->(n)
+WHERE r.relationship_name IN ['known_as', 'also_known_as']
+RETURN n.id, n.type, s.id
+ORDER BY n.id, s.id";
 
 fn backend(error: lbug::Error) -> MemoryError {
     MemoryError::Backend(error.to_string())
@@ -519,6 +535,78 @@ impl MemoryBackend for LbugBackend {
                 }
             }
             Ok(contents)
+        })
+        .await
+    }
+
+    async fn node_resolution_infos(
+        &self,
+        chat_id: &str,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, NodeResolutionInfo)>> {
+        // Decision 73. An empty pre-screen short-circuits without
+        // opening the database of the group.
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let node_ids = node_ids.to_vec();
+        self.with_conn(chat_id, move |conn| {
+            let mut statement = conn.prepare(NODE_RESOLUTION_INFOS).map_err(backend)?;
+            let result = conn
+                .execute(
+                    &mut statement,
+                    vec![(
+                        "node_ids",
+                        Value::List(
+                            LogicalType::String,
+                            node_ids.into_iter().map(Value::String).collect(),
+                        ),
+                    )],
+                )
+                .map_err(backend)?;
+            let mut infos: Vec<(String, NodeResolutionInfo)> = Vec::new();
+            for row in result {
+                let mut columns = row.into_iter();
+                let decoded = (columns.next(), columns.next(), columns.next());
+                // A row with an unexpected shape or an unknown type
+                // string is skipped, it does not fail the query (same
+                // policy as `alias_targets`).
+                let (Some(Value::String(node_id)), Some(Value::String(type_string)), target) =
+                    decoded
+                else {
+                    continue;
+                };
+                let Some(kind) = NodeType::from_str(&type_string) else {
+                    continue;
+                };
+                let target = match target {
+                    Some(Value::String(target)) => Some(target),
+                    _ => None,
+                };
+                // ORDER BY n.id groups the rows of one node; first-wins
+                // under ORDER BY s.id keeps the alias-target pick
+                // deterministic when an alias carries several alias
+                // edges. Only an Alias binds a target.
+                match infos.last_mut() {
+                    Some((last_id, info)) if *last_id == node_id => {
+                        if info.alias_target.is_none() {
+                            info.alias_target = target;
+                        }
+                    }
+                    _ => infos.push((
+                        node_id,
+                        NodeResolutionInfo {
+                            kind,
+                            alias_target: if kind == NodeType::Alias {
+                                target
+                            } else {
+                                None
+                            },
+                        },
+                    )),
+                }
+            }
+            Ok(infos)
         })
         .await
     }
@@ -1076,6 +1164,148 @@ mod tests {
         ];
         expected.sort_by(|(left, _), (right, _)| left.cmp(right));
         assert_eq!(contents, expected);
+    }
+
+    /// Decision 73 test graph: a Person and a Concept, each with a
+    /// surface Alias (known_as / also_known_as), plus the MessageBatch
+    /// skeleton that `upsert_batch` always writes.
+    fn resolution_batch() -> (MemoryBatch, MemoryNode, MemoryNode, MemoryNode, MemoryNode) {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let person = MemoryNode {
+            id: crate::identifiers::person_id("1001"),
+            name: "Tama".to_string(),
+            node_type: NodeType::Person,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        let concept = concept_node("GRPO", base);
+        let person_alias = MemoryNode {
+            id: crate::identifiers::alias_id("tama"),
+            name: "tama".to_string(),
+            node_type: NodeType::Alias,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        let concept_alias = MemoryNode {
+            id: crate::identifiers::alias_id("grpo"),
+            name: "grpo".to_string(),
+            node_type: NodeType::Alias,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        let edges = vec![
+            fact_edge(&person.id, &person_alias.id, "known_as", None, base),
+            fact_edge(&concept.id, &concept_alias.id, "also_known_as", None, base),
+        ];
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(5, 90),
+            nodes: vec![
+                person.clone(),
+                concept.clone(),
+                person_alias.clone(),
+                concept_alias.clone(),
+            ],
+            edges,
+        };
+        (batch, person, concept, person_alias, concept_alias)
+    }
+
+    #[tokio::test]
+    async fn node_resolution_infos_reports_kinds_and_alias_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, person, concept, person_alias, concept_alias) = resolution_batch();
+        backend.upsert_batch("chat_o", &batch).await.unwrap();
+
+        let ids = vec![
+            batch.batch_id.clone(),
+            person.id.clone(),
+            concept.id.clone(),
+            person_alias.id.clone(),
+            concept_alias.id.clone(),
+        ];
+        let infos: HashMap<String, NodeResolutionInfo> = backend
+            .node_resolution_infos("chat_o", &ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(infos.len(), 5);
+        // The MessageBatch skeleton of Section 7.2 step 5 is detectable
+        // by kind, so the resolver can exclude it.
+        assert_eq!(
+            infos[&batch.batch_id],
+            NodeResolutionInfo {
+                kind: NodeType::MessageBatch,
+                alias_target: None,
+            }
+        );
+        assert_eq!(
+            infos[&person.id],
+            NodeResolutionInfo {
+                kind: NodeType::Person,
+                alias_target: None,
+            }
+        );
+        assert_eq!(
+            infos[&concept.id],
+            NodeResolutionInfo {
+                kind: NodeType::Concept,
+                alias_target: None,
+            }
+        );
+        // An alias binds to the source of its known_as edge.
+        assert_eq!(
+            infos[&person_alias.id],
+            NodeResolutionInfo {
+                kind: NodeType::Alias,
+                alias_target: Some(person.id.clone()),
+            }
+        );
+        // ... and of its also_known_as edge.
+        assert_eq!(
+            infos[&concept_alias.id],
+            NodeResolutionInfo {
+                kind: NodeType::Alias,
+                alias_target: Some(concept.id.clone()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn node_resolution_infos_skips_missing_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, person, _concept, _person_alias, _concept_alias) = resolution_batch();
+        backend.upsert_batch("chat_p", &batch).await.unwrap();
+
+        let ids = vec![person.id.clone(), crate::identifiers::person_id("nobody")];
+        let infos = backend.node_resolution_infos("chat_p", &ids).await.unwrap();
+        // A missing id does not occur in the result (the batched shape
+        // of the None semantics).
+        assert_eq!(
+            infos,
+            vec![(
+                person.id.clone(),
+                NodeResolutionInfo {
+                    kind: NodeType::Person,
+                    alias_target: None,
+                },
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_resolution_infos_of_an_empty_id_list_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        // The empty pre-screen short-circuits: no database is opened.
+        let infos = backend.node_resolution_infos("chat_q", &[]).await.unwrap();
+        assert!(infos.is_empty());
+        assert!(!dir.path().join("chat_q").exists());
     }
 
     #[test]
