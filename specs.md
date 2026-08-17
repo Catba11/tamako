@@ -187,7 +187,7 @@ One wake executes these steps in this sequence:
 
 ### 9.1 Recall call
 
-- The recall worker reads the new messages of this wake and queries the memory backend through the read path of `proposed-graph-database-specs.md` Section 8. Entry resolution: mentions and replies, exact alias match, then vector search.
+- The recall worker reads the new messages of this wake and queries the memory backend through the read path of `proposed-graph-database-specs.md` Section 8. Entry resolution: mentions and replies, exact alias match, then vector search. Candidate generation reads the new messages only; widening it is the deep-recall item of the roadmap (Phase 2).
 - The recall worker uses a cheap model. It never calls the main model.
 - If the decision at step 3 is negative, the main model is never called. The recall cost is the fixed cost of every wake.
 
@@ -197,6 +197,7 @@ One wake executes these steps in this sequence:
 - If nothing is relevant, nothing is injected. An empty injection is forbidden.
 - At most `recall_injection_cap` (5) memories are injected per wake.
 - The injection rate is a metric. The expected healthy range is 20 to 40 percent of wakes.
+- The relevance gate receives the same shared context view of Section 9.6, rendered ahead of the new messages and the candidate list. The `gate_context` switch applies to it equally.
 
 ### 9.3 Deduplication
 
@@ -216,7 +217,7 @@ One wake executes these steps in this sequence:
 
 ### 9.6 Participation decision
 
-- Input: the new messages plus the injected memories.
+- Input: the new messages plus the injected memories. Ahead of them the gate receives the shared context view: the same rendered bytes the reply model sees (the two newest summaries, the previous chunk, the current tail up to this wake's marker). Only the new messages of this wake are targetable; the context view is reference material for judgment quality. The view renders ahead of the per-call sections so consecutive gate calls share a growing byte prefix (provider prompt cache; invalidation rides digest tempo, the same rhythm as the reply path). Setting `gate_context` to false restores the delta-only input.
 - Output: a binary decision, with the target message for the reply.
 - The decision uses a cheap model. The main model runs only on a positive decision.
 - The recall result is part of the input on purpose: a topic with strong personal memories is a valid reason to participate.
@@ -290,6 +291,7 @@ Global defaults. Every item is overridable per group.
 | `monologue_limit` | 2 | 8.5 |
 | `reply_staleness_threshold` | 20 newer human messages | 6.2 |
 | `reply_quote_threshold` | 10 newer human messages | 6.2 |
+| `gate_context` | true | 9.6 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
