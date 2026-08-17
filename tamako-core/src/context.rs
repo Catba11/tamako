@@ -329,6 +329,57 @@ impl LiveContext {
             .collect()
     }
 
+    /// The shared context view of the decision-72 gates (specs.md
+    /// Sections 9.2 and 9.6): the same rendered item bytes
+    /// [`LiveContext::messages_for_llm`] produces, for every item at or
+    /// below `up_to_row_id`, EXCLUDING the persona preamble (item 0 —
+    /// the gates keep their own preambles) and INCLUDING the keep-two
+    /// summary block regardless of the bound.
+    ///
+    /// Bound semantics: `up_to_row_id` is an INCLUSIVE raw-log row id.
+    /// The actor passes the wake's marker (`wake_last_row_id`), so the
+    /// view is "everything up to the marker" and the wake's new
+    /// messages stay out — they render in the gate's per-call section.
+    /// Row-id mapping: HumanMessage and BotSpeech items carry their own
+    /// row id; a RecallInjection carries the id of the log row it
+    /// directly follows (Rule C2), so a previous wake's injection enters
+    /// the view together with that wake's range; Summary items are
+    /// exempt from the bound (their retention is the keep-two upsert,
+    /// never a row-id cutoff — the same exemption as
+    /// [`LiveContext::remove_at_or_below`]).
+    ///
+    /// The selected items join in context order with a single newline
+    /// between items (no trailing newline). An empty selection — an
+    /// empty context, or a bound below every item with no summaries —
+    /// renders the EMPTY STRING: the gate prompt then shows no view
+    /// section (the presentation is the caller's decision).
+    ///
+    /// Cache property (decision 72): the tail is append-only between
+    /// digests (Rules C1/C2), so within one digest cycle
+    /// `gate_context_view(b1)` is an exact byte prefix of
+    /// `gate_context_view(b2)` for `b1 <= b2`, and the suffix is the
+    /// newline-joined bytes of the items in `(b1, b2]`. Consecutive
+    /// gate calls therefore share a growing byte prefix, invalidated
+    /// only at digest tempo — the reply path's rhythm.
+    pub fn gate_context_view(&self, up_to_row_id: i64) -> String {
+        self.items
+            .iter()
+            .filter(|item| match item.kind {
+                // The gates keep their own preambles (decision 72).
+                ContextItemKind::Preamble => false,
+                // The summary block is always in the view.
+                ContextItemKind::Summary => true,
+                _ => match &item.range_tag {
+                    Some(tag) => tag.last_msg_id <= up_to_row_id,
+                    // Defensive: only the preamble carries no tag.
+                    None => false,
+                },
+            })
+            .map(|item| item.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Item count and the sum of the content lengths in UTF-8 bytes.
     pub fn stats(&self) -> ContextStats {
         ContextStats {
@@ -1881,5 +1932,199 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn gate_context_view_renders_the_items_at_or_below_the_bound() {
+        // Decision 72: the view is the messages_for_llm item bytes
+        // (preamble excluded), newline-joined in context order, for the
+        // items at or below the wake's marker. A previous wake's
+        // injection joins with the range it follows (Rule C2).
+        let mut context = LiveContext::new("You are Tamako.".to_string());
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "one",
+        );
+        context.append_bot_speech(2, at_1307(), "two");
+        context.append_recall_injection(2, "<memory>Alice likes tea</memory>".to_string());
+        context.append_human_message(
+            3,
+            "Bob",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "three",
+        );
+
+        let view = context.gate_context_view(2);
+        assert_eq!(
+            view,
+            [
+                r#"<msg from="Alice" at="13:07" id="1">one</msg>"#,
+                r#"<you at="13:07" id="2">two</you>"#,
+                "<memory>Alice likes tea</memory>",
+            ]
+            .join("\n")
+        );
+        // Single-source check: the view bytes are exactly the item
+        // contents messages_for_llm renders for the same items.
+        let llm_bytes: Vec<String> = context
+            .messages_for_llm()
+            .into_iter()
+            .map(|message| message.content)
+            .filter(|content| *content != "You are Tamako.")
+            .collect();
+        assert_eq!(view, llm_bytes[..3].join("\n"));
+
+        // A wider bound adds exactly the remaining item.
+        assert_eq!(
+            context.gate_context_view(3),
+            format!("{view}\n<msg from=\"Bob\" at=\"13:07\" id=\"3\">three</msg>")
+        );
+    }
+
+    #[test]
+    fn gate_context_view_excludes_the_preamble_and_includes_the_summary_block() {
+        // The gates keep their own preambles (decision 72): the
+        // preamble bytes never enter the view. The keep-two summary
+        // block is always in the view, exempt from the row-id bound
+        // (the same exemption as remove_at_or_below) — even a bound
+        // below the whole summary range keeps the block.
+        let mut context = LiveContext::new("PREAMBLE-MARKER-BYTES".to_string());
+        context.upsert_summaries(&[
+            summary_row(10, 1, 3, "chunk one"),
+            summary_row(11, 4, 6, "chunk two"),
+        ]);
+        context.append_human_message(
+            7,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "seven",
+        );
+
+        let view = context.gate_context_view(6);
+        assert!(!view.contains("PREAMBLE-MARKER-BYTES"));
+        assert_eq!(
+            view,
+            [
+                r#"<summary range="1-3">chunk one</summary>"#,
+                r#"<summary range="4-6">chunk two</summary>"#,
+            ]
+            .join("\n")
+        );
+        // The summary block is in the view even at a zero bound.
+        assert_eq!(context.gate_context_view(0), view);
+    }
+
+    #[test]
+    fn gate_context_view_is_empty_for_an_empty_context_or_a_zero_bound() {
+        // The empty-view representation is the empty String: the gate
+        // prompt then shows no view section.
+        let empty = LiveContext::new("P".to_string());
+        assert_eq!(empty.gate_context_view(10), "");
+
+        let mut context = LiveContext::new("P".to_string());
+        context.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "one",
+        );
+        assert_eq!(context.gate_context_view(0), "");
+    }
+
+    #[test]
+    fn gate_context_view_extends_byte_for_byte_across_consecutive_wakes() {
+        // The decision-72 cache property, context level: wake k's
+        // new-messages item bytes reappear inside wake k+1's view
+        // BYTE-IDENTICALLY. Render at the marker b1, let wake k's new
+        // messages and its injection enter the context through the
+        // normal intake path (append_human_message / append_bot_speech
+        // / append_recall_injection), render at the new marker b2:
+        // view(b2) == view(b1) + "\n" + the newly appended items'
+        // rendered bytes, byte-for-byte.
+        let mut context = LiveContext::new("P".to_string());
+        context.upsert_summaries(&[summary_row(10, 1, 3, "digested chunk")]);
+        context.append_human_message(
+            4,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "before the marker",
+        );
+        context.append_recall_injection(4, "<memory>earlier recall</memory>".to_string());
+
+        // Wake k's marker: everything up to row 4 (plus the summary
+        // block, bound-exempt).
+        let b1 = 4;
+        let view1 = context.gate_context_view(b1);
+        assert_eq!(
+            view1,
+            [
+                r#"<summary range="1-3">digested chunk</summary>"#,
+                r#"<msg from="Alice" at="13:07" id="4">before the marker</msg>"#,
+                "<memory>earlier recall</memory>",
+            ]
+            .join("\n")
+        );
+
+        // Wake k's new messages (and its injection) enter the context
+        // via the normal intake path.
+        context.append_human_message(
+            5,
+            "Bob",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            "wake k new",
+        );
+        context.append_bot_speech(6, at_1307(), "the reply");
+        context.append_recall_injection(6, "<memory>Bob likes hotpot</memory>".to_string());
+
+        // Wake k+1's marker.
+        let b2 = 6;
+        let view2 = context.gate_context_view(b2);
+
+        // Formulation: view(b1) is an exact byte prefix of view(b2),
+        // and the suffix is the newline-joined bytes of the items in
+        // (b1, b2] — the injection of wake k included.
+        assert!(view2.starts_with(&view1));
+        let new_bytes = [
+            render_human_content(
+                5,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                "wake k new",
+            ),
+            render_bot_content(6, at_1307(), "the reply"),
+            "<memory>Bob likes hotpot</memory>".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(view2, format!("{view1}\n{new_bytes}"));
     }
 }

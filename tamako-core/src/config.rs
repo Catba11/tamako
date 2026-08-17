@@ -144,6 +144,13 @@ pub struct TriggerConfig {
     /// notifies the author, and a recent target needs no context
     /// anchor). A forced wake always quotes. Default 10.
     pub reply_quote_threshold: u32,
+    /// specs.md Section 9.6 (decision 72): the participation gate and
+    /// the recall relevance gate receive the SHARED CONTEXT VIEW (the
+    /// same rendered bytes the reply model sees, up to the wake's
+    /// marker) ahead of their per-call sections, so consecutive gate
+    /// calls share a growing byte prefix (provider prompt cache).
+    /// `false` restores the delta-only input. Default true.
+    pub gate_context: bool,
     /// The hard cap of injected memories per wake (Section 9.2
     /// conservative default). Default 5. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill (Phase 1 M5).
@@ -197,6 +204,7 @@ impl Default for TriggerConfig {
             summary_structured_output: None,
             reply_staleness_threshold: 20,
             reply_quote_threshold: 10,
+            gate_context: true,
             recall_injection_cap: 5,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
@@ -287,6 +295,9 @@ pub struct TriggerConfigToml {
     pub reply_staleness_threshold: Option<u32>,
     /// The quote threshold. Refer to `TriggerConfig::reply_quote_threshold`.
     pub reply_quote_threshold: Option<u32>,
+    /// The gate context-view switch (decision 72). Refer to
+    /// `TriggerConfig::gate_context`.
+    pub gate_context: Option<bool>,
     /// The injection cap of one wake. Refer to
     /// `TriggerConfig::recall_injection_cap`.
     pub recall_injection_cap: Option<u32>,
@@ -403,6 +414,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.reply_quote_threshold {
             base.reply_quote_threshold = value;
+        }
+        if let Some(value) = self.gate_context {
+            base.gate_context = value;
         }
         if let Some(value) = self.recall_injection_cap {
             base.recall_injection_cap = value;
@@ -525,6 +539,9 @@ wake_floor_secs = 60
         // Decision 70 (specs.md Sections 6.2/13): the quote threshold
         // defaults to 10 newer human messages.
         assert_eq!(config.reply_quote_threshold, 10);
+        // Decision 72 (specs.md Sections 9.2/9.6/13): the gates receive
+        // the shared context view by default.
+        assert!(config.gate_context);
         // The structured-output mode keys (reported for spec backfill):
         // every Option is None by default; the agent layer resolves
         // the default mode.
@@ -589,6 +606,30 @@ reply_quote_threshold = 0
         // A key the TOML does not set keeps the default.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert_eq!(plain.global.reply_quote_threshold, 10);
+    }
+
+    #[test]
+    fn toml_override_sets_gate_context() {
+        // Decision 72: the context-view kill switch follows the same
+        // per-key overlay pattern as every other trigger key (AGENT.md
+        // Section 6.3: overridable per group).
+        let text = r#"
+[global]
+gate_context = false
+
+[groups."-100777"]
+gate_context = true
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert!(!config.global.gate_context);
+        // A group override applies over the global value (true wins:
+        // the view returns for this group only).
+        assert!(config.for_group("-100777").gate_context);
+        // A group without an override receives the global value.
+        assert!(!config.for_group("-100999").gate_context);
+        // A key the TOML does not set keeps the default (true).
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert!(plain.global.gate_context);
     }
 
     #[test]
