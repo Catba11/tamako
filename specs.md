@@ -75,7 +75,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 - `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag, rendered content. The rendered content is stored so a restart rebuild is bit-identical without graph queries. Refer to Section 9.5.
 - `context_summaries` table: one row per summarized removed chunk. Columns: the message-id range `(first_msg_id, last_msg_id]` as the natural dedup key, the rendered summary text, and a creation timestamp. The text is persisted at creation time so a restart rebuild is bit-identical without re-calling the model. Rule P1 applies. Rows of rotated-out summaries stay for forensics.
 - `pending_embeddings` table (schema v7): the embedding work queue. One row per (node id, content hash) pair — the unique key makes re-enqueue retry-safe. Columns: status (`pending`/`done`/`failed`), attempts, timestamps. The digest pipeline enqueues after the graph commit (best-effort); the embedding worker drains it. Refer to `proposed-graph-database-specs.md` Section 7.6.
-- `node_embeddings` virtual table (schema v7): the sqlite-vec `vec0` sidecar index, one 4096-dimension embedding per node id. Derived, recomputable data — never the source of truth. The sqlite-vec extension registers at connection open on every code path that opens a store; a connection without it cannot even SELECT the virtual table.
+- `node_embeddings` virtual table (schema v7): the sqlite-vec `vec0` sidecar index, one 4096-dimension embedding per node id. Derived, recomputable data — never the source of truth. The sqlite-vec extension registers at connection open on every code path that opens a store; a connection without it cannot even SELECT the virtual table. Schema v8 recreates the table with `distance_metric=cosine` (dropping the v7 L2 table; the reconciliation pass re-embeds — derived data).
 - Vector index: sqlite-vec virtual tables in the same file. The embeddings of Person, Alias, and Concept names and descriptions live here. Refer to `proposed-graph-database-specs.md` Section 7.6.
 
 To delete the memory of a group, delete the directory. Both files share one lifecycle.
@@ -267,6 +267,7 @@ Metrics per group:
 | Fallback attachment rate | Refer to `proposed-graph-database-specs.md` Section 10. Primary entity-resolution quality metric. |
 | Wake rate | Wakes per hour. Watch against the floor configuration. |
 | Summarization failures | `summaries_failed_total`, cumulative. A rising count warns of a stuck summarizer before the circuit breaker of Section 10.2 engages. |
+| Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. |
 
 The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the counters, the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
@@ -292,6 +293,10 @@ Global defaults. Every item is overridable per group.
 | `reply_staleness_threshold` | 20 newer human messages | 6.2 |
 | `reply_quote_threshold` | 10 newer human messages | 6.2 |
 | `gate_context` | true | 9.6 |
+| `vector_resolution` | true | graph 7.4 |
+| `vector_match_threshold` | 0.92 (provisional) | graph 7.4 |
+| `vector_candidate_threshold` | 0.80 (provisional) | graph 7.4 |
+| `resolution_confirm_budget` | 5 per digest batch | graph 7.4 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
