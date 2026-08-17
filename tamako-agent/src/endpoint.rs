@@ -1020,6 +1020,30 @@ pub trait EmbeddingProvider: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<f32>, AgentError>> + Send + 'a>,
     >;
+
+    /// Embeds a batch of texts, one vector per input in INPUT ORDER
+    /// (decision 73: the entity resolver makes ONE batched embeddings
+    /// call per digest batch). The same error classes as [`embed`],
+    /// applied per element. The DEFAULT implementation loops
+    /// [`EmbeddingProvider::embed`] sequentially — the correct
+    /// fallback for any provider; a provider with a native batch
+    /// surface overrides it with ONE provider call (the per-attempt
+    /// [`ENDPOINT_TIMEOUT`] bound then covers the whole batch call).
+    #[allow(clippy::type_complexity)]
+    fn embed_texts<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, AgentError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                vectors.push(self.embed(text).await?);
+            }
+            Ok(vectors)
+        })
+    }
 }
 
 /// The live [`EmbeddingProvider`] over rig's openai-compatible
@@ -1113,6 +1137,42 @@ impl EmbeddingProvider for RigEmbeddingProvider {
             checked_embedding_vector(embedding.vec)
         })
     }
+
+    fn embed_texts<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, AgentError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            // An empty batch never reaches the endpoint.
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            // ONE batched provider call (decision 73): rig's openai
+            // surface asserts the response row count equals the input
+            // count and zips rows with inputs in order, so the output
+            // order is the input order. The same per-attempt bound of
+            // H4b covers the whole batch call.
+            let embeddings = tokio::time::timeout(
+                ENDPOINT_TIMEOUT,
+                self.model.embed_texts(texts.iter().cloned()),
+            )
+            .await
+            .map_err(|_| {
+                AgentError::Extraction(format!(
+                    "endpoint timeout after {ENDPOINT_TIMEOUT:?}: no embedding response from the endpoint"
+                ))
+            })?
+            .map_err(|error| AgentError::Extraction(format!("embedding failed: {error}")))?;
+            checked_batch_vectors(
+                embeddings
+                    .into_iter()
+                    .map(|embedding| embedding.vec)
+                    .collect(),
+            )
+        })
+    }
 }
 
 /// The dimension pin of decision 66 and the f64→f32 narrowing (the
@@ -1132,6 +1192,14 @@ fn checked_embedding_vector(vec: Vec<f64>) -> Result<Vec<f32>, AgentError> {
     // precision of the sidecar index).
     #[allow(clippy::cast_possible_truncation)]
     Ok(vec.into_iter().map(|value| value as f32).collect())
+}
+
+/// The batch flavor of [`checked_embedding_vector`] (decision 73): the
+/// dimension pin and the f64→f32 narrowing applied per element, the
+/// input order carried through. Pure, so the batched shape logic is
+/// unit-testable without a network.
+fn checked_batch_vectors(vecs: Vec<Vec<f64>>) -> Result<Vec<Vec<f32>>, AgentError> {
+    vecs.into_iter().map(checked_embedding_vector).collect()
 }
 
 /// The shared completion flow of both families. The request shape is
@@ -2122,6 +2190,68 @@ mod tests {
                 other => panic!("expected an Extraction error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn the_batch_dimension_pin_accepts_n_vectors_of_4096_in_input_order() {
+        let vecs: Vec<Vec<f64>> = (0..3)
+            .map(|row| (0..EMBEDDING_DIMS).map(|i| (row + i) as f64).collect())
+            .collect();
+
+        let narrowed = checked_batch_vectors(vecs).expect("three 4096-vectors pass the pin");
+
+        assert_eq!(narrowed.len(), 3);
+        // Input order carried through; every element pinned + narrowed.
+        for (row, vector) in narrowed.iter().enumerate() {
+            assert_eq!(vector.len(), EMBEDDING_DIMS);
+            assert_eq!(vector[1], (row + 1) as f32);
+        }
+    }
+
+    #[test]
+    fn the_batch_dimension_pin_rejects_a_batch_with_one_wrong_length() {
+        let mut vecs = vec![vec![0.0; EMBEDDING_DIMS]; 2];
+        vecs.insert(1, vec![0.0; EMBEDDING_DIMS - 1]);
+
+        match checked_batch_vectors(vecs) {
+            Err(AgentError::Extraction(message)) => {
+                assert!(
+                    message.starts_with("embedding dimension mismatch"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected an Extraction error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_batch_dimension_pin_passes_an_empty_batch_through() {
+        let narrowed = checked_batch_vectors(Vec::new()).expect("empty batch");
+        assert!(narrowed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_never_reaches_the_endpoint() {
+        // The provider points at an unreachable port: any provider
+        // call would fail fast with a transport error. The empty-input
+        // guard returns before the call, so this succeeds offline.
+        // The env guards are scoped so no MutexGuard is held across
+        // the await.
+        let provider = {
+            let (_lock, env) = EnvGuard::cleared();
+            env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+            let endpoint = EmbeddingEndpoint {
+                base_url: "http://localhost:9998/v1".to_string(),
+                model: "local-embedding-model".to_string(),
+                session_id: "test-session-embedding".to_string(),
+            };
+            RigEmbeddingProvider::build(&endpoint).expect("the provider builds")
+        };
+
+        let vectors = EmbeddingProvider::embed_texts(&provider, &[])
+            .await
+            .expect("the empty-input guard returns before any provider call");
+        assert!(vectors.is_empty());
     }
 
     // --- Wire fakes (local TcpListener, no external network) ---

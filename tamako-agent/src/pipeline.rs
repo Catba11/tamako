@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tamako_core::actor::CoreError;
 use tamako_core::digest::{embedding_content_hash, DigestOutcome, DigestPipeline};
+use tamako_core::embedding::EmbeddingProvider as CoreEmbeddingProvider;
 use tamako_memory::identifiers::{batch_id as message_batch_id, normalize};
 use tamako_memory::{MemoryBackend, MemoryBatch, NodeType};
 use tamako_store::{MessageRow, Store, StoreError};
@@ -21,7 +22,10 @@ use crate::extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,
 };
 use crate::graph::KnowledgeGraph;
-use crate::resolve::{message_batch_node, resolve_batch};
+use crate::resolve::{
+    message_batch_node, resolve_batch, ResolutionConfirmer, VectorPrescreen,
+    VectorResolutionConfig, VectorResolutionStats,
+};
 use crate::skeleton::is_skeleton_batch;
 use crate::validate::validate_relationship_name;
 
@@ -71,7 +75,27 @@ pub struct AgentDigestPipeline<M: MemoryBackend> {
     embedding_store: Option<Arc<Store>>,
     memory: Arc<M>,
     extractor: Arc<dyn KnowledgeExtractor>,
+    /// The decision-73 step-3 pre-screen parts (provider, confirmer,
+    /// thresholds). `None` keeps the byte-identical Phase 1 behavior:
+    /// the pipeline was built without the vector sidecar (replay mode,
+    /// or a missing embedding provider key).
+    vector: Option<VectorParts>,
     config: PipelineConfig,
+}
+
+/// The held parts of the decision-73 vector pre-screen. Assembled into
+/// a [`VectorPrescreen`] per digest call (the KNN also needs the
+/// one-group embedding store, which the pipeline holds separately).
+struct VectorParts {
+    /// The shared embedding provider (the same `Arc` the decision-66
+    /// worker uses; the binary adapts the rig provider onto the core
+    /// seam).
+    provider: Arc<dyn CoreEmbeddingProvider>,
+    /// The middle-band confirmation seam over the digest endpoint.
+    confirmer: Arc<dyn ResolutionConfirmer>,
+    /// The resolved per-group thresholds and the `vector_resolution`
+    /// toggle.
+    config: VectorResolutionConfig,
 }
 
 impl<M: MemoryBackend> AgentDigestPipeline<M> {
@@ -86,6 +110,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             embedding_store: None,
             memory,
             extractor,
+            vector: None,
             config,
         }
     }
@@ -97,6 +122,44 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
     pub fn with_embedding_store(mut self, store: Arc<Store>) -> Self {
         self.embedding_store = Some(store);
         self
+    }
+
+    /// Wires the decision-73 vector pre-screen (Section 7.4 step 3).
+    /// Builder-style, like [`Self::with_embedding_store`]: a pipeline
+    /// built without it keeps the byte-identical Phase 1 resolution.
+    /// The pre-screen also needs the dedicated embedding store (the KNN
+    /// read), so BOTH builders must run for step 3 to activate; the
+    /// `vector_resolution` toggle lives in `config`.
+    pub fn with_vector_prescreen(
+        mut self,
+        provider: Arc<dyn CoreEmbeddingProvider>,
+        confirmer: Arc<dyn ResolutionConfirmer>,
+        config: VectorResolutionConfig,
+    ) -> Self {
+        self.vector = Some(VectorParts {
+            provider,
+            confirmer,
+            config,
+        });
+        self
+    }
+
+    /// Assembles the per-call step-3 bundle. `None` when the pre-screen
+    /// parts are not wired, the toggle is off, or the dedicated
+    /// embedding store is missing (the decision-66 construction
+    /// degrade) — every `None` is the byte-identical Phase 1 behavior.
+    fn vector_prescreen(&self) -> Option<VectorPrescreen<'_>> {
+        let parts = self.vector.as_ref()?;
+        if !parts.config.enabled {
+            return None;
+        }
+        let embedding_store = self.embedding_store.as_ref()?;
+        Some(VectorPrescreen {
+            provider: &*parts.provider,
+            embedding_store,
+            confirmer: &*parts.confirmer,
+            config: &parts.config,
+        })
     }
 
     /// Runs one store call against `store` inside
@@ -144,14 +207,47 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
     /// counter failure is logged, never propagated. The batch outcome
     /// does not depend on its metrics.
     async fn bump_counter(&self, chat_id: &str, key: &str) {
+        self.bump_counter_by(chat_id, key, 1).await;
+    }
+
+    /// The delta form of [`Self::bump_counter`]. A non-positive delta
+    /// skips the store call entirely.
+    async fn bump_counter_by(&self, chat_id: &str, key: &str, delta: i64) {
+        if delta <= 0 {
+            return;
+        }
         let chat_id = chat_id.to_string();
         let key = key.to_string();
         if let Err(error) = self
-            .run_store(move |store| store.increment_counter(&chat_id, &key, 1))
+            .run_store(move |store| store.increment_counter(&chat_id, &key, delta))
             .await
         {
             tracing::warn!(error = %error, "failed to increment a digest counter");
         }
+    }
+
+    /// The decision-73 step-3 counters (specs.md Section 12 naming
+    /// discipline: Prometheus-compatible, `_total` suffix). Best
+    /// effort, like every counter of the pipeline.
+    async fn bump_vector_counters(&self, chat_id: &str, stats: VectorResolutionStats) {
+        self.bump_counter_by(
+            chat_id,
+            "vector_resolution_matched_total",
+            i64::from(stats.auto_matched),
+        )
+        .await;
+        self.bump_counter_by(
+            chat_id,
+            "vector_resolution_confirmed_total",
+            i64::from(stats.confirmed),
+        )
+        .await;
+        self.bump_counter_by(
+            chat_id,
+            "vector_resolution_rejected_total",
+            i64::from(stats.rejected),
+        )
+        .await;
     }
 
     /// One batch attempt: extraction, post-validation, resolution, and
@@ -170,7 +266,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             .iter()
             .map(|edge| validate_relationship_name(&edge.relationship_name))
             .collect();
-        let batch = resolve_batch(
+        let resolved = resolve_batch(
             &*self.memory,
             chat_id,
             &graph,
@@ -182,8 +278,17 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             frame.batch_end,
             frame.msg_count,
             frame.started_at,
+            // Decision 73: the step-3 vector pre-screen (`None` = the
+            // byte-identical Phase 1 behavior).
+            self.vector_prescreen().as_ref(),
         )
         .await?;
+        // The step-3 outcome counters (Section 12). Best effort, after
+        // the resolution they describe; the retry loop may re-resolve,
+        // the same per-attempt counting as digest_failures_total.
+        self.bump_vector_counters(chat_id, resolved.vector_stats)
+            .await;
+        let batch = resolved.batch;
         let node_count = batch.nodes.len();
         let edge_count = batch.edges.len();
         self.memory.upsert_batch(chat_id, &batch).await?;
@@ -576,6 +681,7 @@ fn push_binding(
 mod tests {
     use super::*;
     use crate::graph::{ExtractedEdge, ExtractedNode, ExtractedNodeType};
+    use std::collections::VecDeque;
     use tamako_memory::identifiers::{concept_id, person_id};
     use tamako_memory::{LbugBackend, MemoryNode};
     use tamako_store::{Direction, EventType, NewMessage};
@@ -1032,6 +1138,257 @@ mod tests {
                     embedding_content_hash("tama", "a cat.")
                 ),
             ]
+        );
+    }
+
+    // ---- Decision 73: the vector pre-screen wired end to end. Real
+    // tempdir Stores + real LbugBackend, scripted extractor/provider/
+    // confirmer doubles. ----
+
+    /// A scripted core embedding provider for the pipeline-level
+    /// pre-screen tests (the same shape as the resolve.rs double).
+    struct ScriptedEmbedder {
+        batches: std::sync::Mutex<VecDeque<Result<Vec<Vec<f32>>, String>>>,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedEmbedder {
+        fn with_batches(batches: Vec<Vec<Vec<f32>>>) -> Self {
+            ScriptedEmbedder {
+                batches: std::sync::Mutex::new(
+                    batches.into_iter().map(Ok).collect::<VecDeque<_>>(),
+                ),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+    }
+
+    impl CoreEmbeddingProvider for ScriptedEmbedder {
+        fn embed<'a>(
+            &'a self,
+            text: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Vec<f32>, tamako_core::embedding::EmbeddingError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let texts = [text.to_string()];
+                let mut batches = self.embed_texts(&texts).await?;
+                Ok(batches.remove(0))
+            })
+        }
+
+        fn embed_texts<'a>(
+            &'a self,
+            texts: &'a [String],
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Vec<Vec<f32>>, tamako_core::embedding::EmbeddingError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(texts.to_vec());
+            let result = self
+                .batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or_else(|| Err("scripted embedder: exhausted queue".to_string()));
+            Box::pin(
+                async move { result.map_err(tamako_core::embedding::EmbeddingError::Provider) },
+            )
+        }
+    }
+
+    /// A 4096-dimensional unit basis vector (the pinned sidecar
+    /// dimension); identical query/candidate vectors give cosine
+    /// similarity 1.0, above the 0.92 match threshold.
+    fn prescreen_unit_vector(dim: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; crate::endpoint::EMBEDDING_DIMS];
+        vector[dim] = 1.0;
+        vector
+    }
+
+    /// Seeds one bare Person node (a pre-screen candidate; no alias
+    /// edges, so step 2 never fires for the entity under test).
+    async fn seed_person_node(memory: &LbugBackend, id: &str, name: &str) {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        memory.ensure_schema(ENQUEUE_CHAT).await.expect("schema");
+        let batch = MemoryBatch {
+            batch_id: format!("seed-{id}"),
+            nodes: vec![MemoryNode {
+                id: id.to_string(),
+                name: name.to_string(),
+                node_type: NodeType::Person,
+                created_at: now,
+                updated_at: now,
+                properties: None,
+            }],
+            edges: vec![],
+        };
+        memory
+            .upsert_batch(ENQUEUE_CHAT, &batch)
+            .await
+            .expect("seed");
+    }
+
+    /// The decision-73 digest graph: the extracted person "Al" matches
+    /// NO mention binding (the senders are Alice/Bob) and no alias, so
+    /// it reaches step 3.
+    fn al_graph() -> KnowledgeGraph {
+        KnowledgeGraph {
+            nodes: vec![ExtractedNode {
+                name: "Al".to_string(),
+                node_type: ExtractedNodeType::Person,
+                description: "Alice, the group member who deploys.".to_string(),
+            }],
+            edges: vec![],
+        }
+    }
+
+    fn al_messages(store: &Store) {
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+    }
+
+    #[tokio::test]
+    async fn the_auto_match_binds_and_increments_the_matched_counter() {
+        // Decision 73 end to end: "Al" reaches step 3, the seeded
+        // person node is a top-band hit (sim 1.0 >= 0.92), the entity
+        // reuses the node id, no confirmation call runs, and the
+        // state-table counter increments (the house counter mechanism
+        // of specs.md Section 12).
+        let (dir, store, memory) = enqueue_fixtures();
+        al_messages(&store);
+        seed_person_node(&memory, &person_id("1001"), "Alice").await;
+        let embedding_store = dedicated_embedding_store(&dir);
+        embedding_store
+            .upsert_node_embedding(&person_id("1001"), &prescreen_unit_vector(0))
+            .expect("seed embedding");
+
+        let provider = Arc::new(ScriptedEmbedder::with_batches(vec![vec![
+            prescreen_unit_vector(0),
+        ]]));
+        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![]));
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![al_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        )
+        .with_vector_prescreen(
+            Arc::clone(&provider) as Arc<dyn CoreEmbeddingProvider>,
+            Arc::clone(&confirmer) as Arc<dyn crate::resolve::ResolutionConfirmer>,
+            VectorResolutionConfig::default(),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // The entity bound to the existing node: its embedding enqueue
+        // pair carries the REUSED id.
+        assert_eq!(
+            enqueue_pairs(&embedding_store),
+            vec![(
+                person_id("1001"),
+                embedding_content_hash("Al", "Alice, the group member who deploys.")
+            )]
+        );
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
+                .expect("state"),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "vector_resolution_confirmed_total")
+                .expect("state"),
+            None
+        );
+        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_disabled_vector_toggle_never_calls_the_provider() {
+        // `vector_resolution` false: step 3 is skipped entirely. The
+        // provider is never called, no counters move, and the outcome
+        // is the byte-identical Phase 1 behavior (the entity attaches
+        // to its fallback Alias node).
+        let (dir, store, memory) = enqueue_fixtures();
+        al_messages(&store);
+        seed_person_node(&memory, &person_id("1001"), "Alice").await;
+        let embedding_store = dedicated_embedding_store(&dir);
+        embedding_store
+            .upsert_node_embedding(&person_id("1001"), &prescreen_unit_vector(0))
+            .expect("seed embedding");
+
+        let provider = Arc::new(ScriptedEmbedder::with_batches(vec![vec![
+            prescreen_unit_vector(0),
+        ]]));
+        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![]));
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![al_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        )
+        .with_vector_prescreen(
+            Arc::clone(&provider) as Arc<dyn CoreEmbeddingProvider>,
+            Arc::clone(&confirmer) as Arc<dyn crate::resolve::ResolutionConfirmer>,
+            VectorResolutionConfig {
+                enabled: false,
+                ..VectorResolutionConfig::default()
+            },
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        match outcome {
+            // Phase 1: the fallback Alias node doubles as the entity
+            // node; plus the MessageBatch node. No person node.
+            DigestOutcome::Extracted { node_count, .. } => assert_eq!(node_count, 2),
+            other => panic!("expected Extracted, got {other:?}"),
+        }
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
+                .expect("state"),
+            None
         );
     }
 }
