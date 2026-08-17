@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::endpoint::{EmbeddingEndpoint, RigEmbeddingProvider};
+use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
     RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, RigSummary, ShallowRecall,
@@ -341,12 +342,28 @@ fn resolve_endpoints(config: &TriggerConfig) -> Result<LlmEndpoints> {
 /// degrades the enqueue ALONE to disabled with a WARN — never a
 /// startup failure; the worker's startup reconciliation heals the loss
 /// through its own stores.
+///
+/// Decision 73: `embedding_provider` is the shared provider of
+/// [`build_embedding_provider`] (ONE `Arc` per process, the same
+/// instance the embedding worker uses). `Some` wires the step-3 vector
+/// pre-screen with the confirmer built from the SAME digest endpoint
+/// the extractor uses (the confirmation's latency lands on the digest
+/// path, like the extraction retries); `None` (replay mode, or a
+/// missing `OPENAI_API_KEY`) keeps the byte-identical Phase 1
+/// resolution. A confirmer build failure degrades the pre-screen
+/// ALONE to disabled with a WARN, mirroring the store-open degrade.
+/// The four decision-73 keys (`vector_resolution` /
+/// `vector_match_threshold` / `vector_candidate_threshold` /
+/// `resolution_confirm_budget`) come from the resolved per-group
+/// `trigger_config` (specs.md Section 13).
 fn build_digest_pipeline(
     store: &Arc<Store>,
     memory: &Arc<LbugBackend>,
     endpoint: &EndpointConfig,
     data_root: &Path,
     chat_id: &str,
+    embedding_provider: Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>>,
+    trigger_config: &tamako_core::config::TriggerConfig,
 ) -> Result<Option<Arc<dyn DigestPipeline>>> {
     let model = endpoint.model.clone();
     match RigExtractor::from_endpoint(endpoint) {
@@ -365,6 +382,27 @@ fn build_digest_pipeline(
                     warn!(chat_id = %chat_id, %error, "embedding enqueue disabled: the dedicated group store failed to open; the startup reconciliation will repair the loss");
                     pipeline
                 }
+            };
+            // Decision 73: the vector pre-screen. Both the provider AND
+            // the dedicated store must be wired for step 3 to activate
+            // (the KNN read rides the one-group store).
+            let vector_config = VectorResolutionConfig {
+                enabled: trigger_config.vector_resolution,
+                match_threshold: trigger_config.vector_match_threshold,
+                candidate_threshold: trigger_config.vector_candidate_threshold,
+                confirm_budget: trigger_config.resolution_confirm_budget,
+            };
+            let pipeline = match embedding_provider {
+                Some(provider) => match EndpointResolutionConfirmer::from_endpoint(endpoint) {
+                    Ok(confirmer) => {
+                        pipeline.with_vector_prescreen(provider, Arc::new(confirmer), vector_config)
+                    }
+                    Err(error) => {
+                        warn!(chat_id = %chat_id, %error, "vector pre-screen disabled: the resolution confirmer failed to build; resolution falls back to the Phase 1 steps");
+                        pipeline
+                    }
+                },
+                None => pipeline,
             };
             Ok(Some(Arc::new(pipeline) as Arc<dyn DigestPipeline>))
         }
@@ -493,15 +531,53 @@ impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
                 .map_err(|error| EmbeddingError::Provider(error.to_string()))
         })
     }
+
+    fn embed_texts<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Vec<Vec<f32>>, EmbeddingError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        // Decision 73: forward to the rig impl's ONE batched HTTP call.
+        // The core trait's default would loop `embed` sequentially —
+        // one HTTP call per text — which would multiply the digest
+        // path's endpoint latency by the unresolved-entity count.
+        Box::pin(async move {
+            tamako_agent::endpoint::EmbeddingProvider::embed_texts(&self.0, texts)
+                .await
+                .map_err(|error| EmbeddingError::Provider(error.to_string()))
+        })
+    }
+}
+
+/// Builds the process-wide embedding provider (decision 66), shared by
+/// the embedding worker AND the decision-73 vector pre-screen of every
+/// group's digest pipeline: ONE `Arc` instance, so the resolver's
+/// batched embeddings calls and the worker's drain calls ride the same
+/// rig client. The embedding endpoint is global-only (config.rs,
+/// decision 66), so resolution uses the GLOBAL trigger config. The
+/// degrade mirrors the per-purpose builders: a missing `OPENAI_API_KEY`
+/// logs one WARN inside `RigEmbeddingProvider::build` and the result is
+/// `None` (the worker is not spawned; the pre-screen stays inert).
+fn build_embedding_provider(
+    setup: &SharedSetup,
+) -> Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>> {
+    let endpoint = EmbeddingEndpoint::resolve(&llm_config_values(&setup.bot_config.global));
+    RigEmbeddingProvider::build(&endpoint).map(|provider| {
+        Arc::new(AgentEmbeddingProvider(provider))
+            as Arc<dyn tamako_core::embedding::EmbeddingProvider>
+    })
 }
 
 /// Spawns the process-wide embedding worker (decision 66): ONE
 /// background interval task drains every group's `pending_embeddings`
-/// queue, after a per-group startup reconciliation pass. The embedding
-/// endpoint is global-only (config.rs, decision 66), so resolution uses
-/// the GLOBAL trigger config. The degrade mirrors the per-purpose
-/// builders: a missing `OPENAI_API_KEY` logs one WARN inside
-/// `RigEmbeddingProvider::build` and the worker is not spawned.
+/// queue, after a per-group startup reconciliation pass. The provider
+/// comes from [`build_embedding_provider`] (shared with the digest
+/// pipelines' vector pre-screen, decision 73).
 ///
 /// The groups are enumerated from the group stores on disk (the same
 /// Rule P5 enumeration as `--status-all`); each group gets its OWN
@@ -511,12 +587,10 @@ impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
 /// actor still works; the group's embeddings wait for the next run. A
 /// group first served AFTER startup is picked up on the next restart's
 /// reconciliation (the queue rows wait store-side, inspectable).
-fn spawn_embedding_worker(setup: &SharedSetup) -> Option<tokio::task::JoinHandle<()>> {
-    let endpoint = EmbeddingEndpoint::resolve(&llm_config_values(&setup.bot_config.global));
-    let provider = RigEmbeddingProvider::build(&endpoint).map(|provider| {
-        Arc::new(AgentEmbeddingProvider(provider))
-            as Arc<dyn tamako_core::embedding::EmbeddingProvider>
-    });
+fn spawn_embedding_worker(
+    setup: &SharedSetup,
+    provider: Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let data_root = setup.store.data_root().to_path_buf();
     let chat_ids = match list_group_chat_ids(&data_root) {
         Ok(chat_ids) => chat_ids,
@@ -614,7 +688,19 @@ async fn run_replay(
     // The endpoints, the digest pipeline, and the wake services are
     // built after the chat_id is known and before the actor spawns.
     let endpoints = resolve_endpoints(&group_config)?;
-    let digest = build_digest_pipeline(&store, &memory, &endpoints.digest, data_root, &chat_id)?;
+    // Decision 73: NO embedding provider in replay (same discipline as
+    // the decision-66 worker below): replay runs the mock adapter and
+    // must stay deterministic and network-free, so the pipeline's
+    // vector pre-screen stays inert (Phase 1 resolution behavior).
+    let digest = build_digest_pipeline(
+        &store,
+        &memory,
+        &endpoints.digest,
+        data_root,
+        &chat_id,
+        None,
+        &group_config,
+    )?;
     let wake = build_wake_services(
         &store,
         &memory,
@@ -1071,8 +1157,11 @@ async fn run_live(
     // worker: replay runs the mock adapter and must stay deterministic
     // and network-free; embeddings are a live-mode sidecar. The handle
     // is kept only for readability — dropping it detaches, never
-    // cancels, the task.
-    let _embedding_worker = spawn_embedding_worker(setup);
+    // cancels, the task. The provider instance is SHARED with the
+    // digest pipelines' decision-73 vector pre-screen (ONE Arc per
+    // process, built once).
+    let embedding_provider = build_embedding_provider(setup);
+    let _embedding_worker = spawn_embedding_worker(setup, embedding_provider.clone());
 
     loop {
         tokio::select! {
@@ -1110,7 +1199,7 @@ async fn run_live(
                                 }
                             };
                             let digest =
-                                match build_digest_pipeline(&setup.store, &setup.memory, &endpoints.digest, setup.store.data_root(), &chat_id) {
+                                match build_digest_pipeline(&setup.store, &setup.memory, &endpoints.digest, setup.store.data_root(), &chat_id, embedding_provider.clone(), &group_config) {
                                     Ok(digest) => digest,
                                     Err(error) => {
                                         fatal = Some(error);
