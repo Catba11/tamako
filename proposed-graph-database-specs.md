@@ -193,10 +193,11 @@ Do these steps in this sequence for each extracted entity:
 
 1. If the entity is a mention or a reply, get the user identifier from the Telegram API. Bind the entity to the Person node.
 2. If the normalized name matches one Alias with one target, bind the entity to that target.
-3. Do a vector search on name and description embeddings in the sidecar index:
-   - If the top score is 0.92 or more, reuse the node identifier.
-   - If the top score is between 0.80 and 0.92, do one LLM confirmation call.
-   - If the top score is below 0.80, create a new node.
+3. Do a vector search on name and description embeddings in the sidecar index. The score is cosine similarity. The thresholds are PROVISIONAL, tuned against live operation (current-state.md decisions 66 and 73):
+   - If the top score is `vector_match_threshold` (0.92) or more, reuse the node identifier. An Alias match binds to the alias target.
+   - If the top score is between `vector_candidate_threshold` (0.80) and `vector_match_threshold`, do one LLM confirmation call on the digest purpose. A per-batch budget (`resolution_confirm_budget`, default 5) caps these calls; a batch that exhausts the budget treats the remaining middle-band entities as below-threshold. A wrong binding is worse than a missing fact; fragmentation is repairable by the merge tool.
+   - If the top score is below `vector_candidate_threshold`, create a new node.
+   Setting `vector_resolution` to false skips this step entirely, restoring the Phase 1 behavior (steps 1, 2, 4 only).
 4. If two or more persons in the group share the alias, use the context: recent speakers and topic relevance. If the ambiguity remains, attach the fact to the Alias node. Do not guess. A wrong binding is worse than a missing fact. A person with no mention binding and no alias match (zero-target person) receives the same treatment: attach the fact to the Alias node with an `attachment: "fallback"` mark. This rate feeds the fallback attachment metric of Section 10.
 5. After the binding or the creation, add new surface forms as Alias nodes with alias edges.
 
