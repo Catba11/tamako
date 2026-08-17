@@ -23,7 +23,9 @@ use tamako_core::actor::{
 };
 use tamako_core::adapter::PlatformAdapter;
 use tamako_core::config::TriggerConfig;
-use tamako_core::context::{render_bot_content, ContextItemKind};
+use tamako_core::context::{
+    render_bot_content, render_human_content, ContextItemKind, ReplyRender,
+};
 use tamako_core::event::{InboundEvent, NormalizedMessage, OutboundAction};
 use tamako_core::session::SessionState;
 use tamako_core::wake::{GateDecision, NoopRecall, WakeServices};
@@ -260,6 +262,25 @@ async fn wait_for_session(
     }
 }
 
+/// Polls the scripted gate until it recorded `min` inputs or the
+/// timeout elapses. The decision-72 context view is recorded together
+/// with the input, so this wait also orders the `context_views()`
+/// assertions (the pattern of recall_replay.rs).
+async fn wait_for_gate_inputs(gate: &Arc<ScriptedGate>, min: usize) {
+    let deadline = std::time::Instant::now() + WAKE_TIMEOUT;
+    loop {
+        let count = gate.inputs().len();
+        if count >= min {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {WAKE_TIMEOUT:?} waiting for {min} gate inputs (got {count})"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 async fn counter(store: &Arc<Store>, key: &str) -> Option<String> {
     let store = Arc::clone(store);
     let key = key.to_string();
@@ -454,6 +475,31 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
         vec![10, 11, 12]
     );
     assert!(!inputs[0].forced);
+    // Decision 72: with `gate_context` on (the default) the gate also
+    // received the shared context view, rendered from the PRE-advance
+    // marker (row 8, the tail of the second forced wake's gather):
+    // every item at or below the bound — messages 41-48 (rows 1-4 and
+    // 6-8) plus the r1 bot speech (row 5) — and NEVER the wake's own
+    // new messages (rows 10-12) nor the rows written after the marker
+    // (the r2 row 9, the edit row 13). The per-call section above
+    // still carries exactly the new messages.
+    let views = harness.gate.context_views();
+    assert_eq!(views.len(), 1);
+    let view = views[0]
+        .as_deref()
+        .expect("gate_context defaults to true: the gate receives Some(view)");
+    for row in 1..=8 {
+        assert!(
+            view.contains(&format!("id=\"{row}\"")),
+            "the view covers the pre-marker row {row}"
+        );
+    }
+    for row in 9..=13 {
+        assert!(
+            !view.contains(&format!("id=\"{row}\"")),
+            "the view excludes the post-marker row {row}"
+        );
+    }
     shutdown(harness).await;
 }
 
@@ -997,7 +1043,263 @@ async fn stale_target_is_quoted_on_an_unforced_wake() {
             .collect::<Vec<_>>(),
         (1..=12).collect::<Vec<_>>()
     );
+    // Decision 72: the first wake of a group renders the view from a
+    // zero marker over an empty context — the recorded view is the
+    // EMPTY string (the prompt shows the explicit "(none yet)"
+    // marker, so the prompt shape stays byte-stable across wakes).
+    assert_eq!(harness.gate.context_views(), vec![Some(String::new())]);
     wait_for_counter(&fixture.store, "wakes_total", "1").await;
     wait_for_counter(&fixture.store, "participations_total", "1").await;
+    shutdown(harness).await;
+}
+
+/// The decision-72 cache property at the prompt level, end to end
+/// through the replay harness: the shared context view of wake k+1 is
+/// wake k's view EXTENDED BYTE FOR BYTE — `view(k)` is an exact byte
+/// prefix of `view(k+1)` and the suffix is the newline-joined bytes of
+/// the items that entered the context between the two markers, as
+/// rendered by the shared decision-61 renderers.
+///
+/// Scenario shape (count-driven wakes of three, NO recall — the
+/// harness uses `NoopRecall`, so no injection bytes join the view; the
+/// injection-carrying extension is covered byte-exactly by
+/// recall_replay.rs `an_injected_edge_is_not_reinjected_in_the_same_chunk`):
+///
+/// - rows 1-3: p1, p2, p3 — wake 1 fires at p3 over an EMPTY context
+///   (marker 0): the recorded view is the empty string. The gate
+///   targets row 3 (the latest: no quote, decision 70); row 4 is the
+///   outbound row of r1 (Rule B1);
+/// - rows 5-7: p4, p5, p6 — wake 2 fires at p6. Its gather picks up
+///   rows 4-7, so its PRE-advance marker is 3: view(2) is exactly the
+///   wake-1 new messages' item bytes (the r1 row 4 sits ABOVE the
+///   bound and stays out). The gate targets row 7; row 8 is r2;
+/// - rows 9-11: p7, p8, p9 — wake 3 fires at p9. Its marker is 7 (the
+///   wake-2 gather tail), so view(3) covers rows 1..=7: view(2)'s
+///   items PLUS the r1 bot speech (row 4) and wake 2's new messages
+///   (rows 5-7). The r2 row 8 is again above the bound.
+///
+/// Every send paces the next batch (Rule B1: the recorded action
+/// orders the outbound-row persistence AND the `wake_in_flight`
+/// reset), so the row ids above are deterministic and no threshold
+/// fire can be skipped as in-flight.
+#[tokio::test]
+async fn the_gate_context_view_extends_byte_for_byte_across_consecutive_wakes() {
+    let fixture = make_fixture();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid timestamp");
+    let config = TriggerConfig {
+        wake_msg_count: 3,
+        wake_floor: Duration::ZERO,
+        wake_interval: HUGE_INTERVAL,
+        ..TriggerConfig::default()
+    };
+    let gate = Arc::new(ScriptedGate::with_decisions(vec![
+        GateDecision {
+            participate: true,
+            target_row_id: Some(3),
+            reason: None,
+        },
+        GateDecision {
+            participate: true,
+            target_row_id: Some(7),
+            reason: None,
+        },
+        GateDecision {
+            participate: false,
+            target_row_id: None,
+            reason: None,
+        },
+    ]));
+    let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
+        "r1".to_string(),
+        "r2".to_string(),
+    ]));
+    let harness = spawn_on(&fixture, config, t0, gate, reply);
+
+    // The decision-61 rendering of the message `id` at raw-log `row`,
+    // with the SAME arguments the intake path used.
+    let rendered = |row: i64, id: &str, seconds: i64| {
+        render_human_content(
+            row,
+            "Alice",
+            None,
+            t0 + time::Duration::seconds(seconds),
+            false,
+            false,
+            ReplyRender::None,
+            &format!("text of {id}"),
+        )
+    };
+    // Wake 1 (rows 1-3), then wake 2 (rows 5-7); each send is the
+    // barrier for the next batch.
+    for (id, seconds) in [("p1", 1), ("p2", 2), ("p3", 3)] {
+        harness
+            .handle
+            .send_event(InboundEvent::Message(message(
+                id,
+                t0 + time::Duration::seconds(seconds),
+                false,
+            )))
+            .await
+            .expect("the actor inbox is open");
+    }
+    wait_for_actions(&harness.sink, 1).await;
+    for (id, seconds) in [("p4", 4), ("p5", 5), ("p6", 6)] {
+        harness
+            .handle
+            .send_event(InboundEvent::Message(message(
+                id,
+                t0 + time::Duration::seconds(seconds),
+                false,
+            )))
+            .await
+            .expect("the actor inbox is open");
+    }
+    wait_for_actions(&harness.sink, 2).await;
+    // Wake 3 (rows 9-11): the gate says no — the third gate input is
+    // the barrier for its view recording.
+    for (id, seconds) in [("p7", 7), ("p8", 8), ("p9", 9)] {
+        harness
+            .handle
+            .send_event(InboundEvent::Message(message(
+                id,
+                t0 + time::Duration::seconds(seconds),
+                false,
+            )))
+            .await
+            .expect("the actor inbox is open");
+    }
+    wait_for_gate_inputs(&harness.gate, 3).await;
+    harness
+        .handle
+        .snapshot()
+        .await
+        .expect("the snapshot succeeds");
+
+    // Both replies went out unquoted: each gate target was the latest
+    // message of its wake (decision 70).
+    let sends = send_texts(&harness.sink.recorded_actions());
+    assert_eq!(
+        sends,
+        vec![
+            (CHAT_ID.to_string(), "r1".to_string(), None),
+            (CHAT_ID.to_string(), "r2".to_string(), None),
+        ]
+    );
+
+    // The per-call sections are unchanged (the pre-72 shape): each
+    // wake's new messages are exactly its own rows — the view never
+    // leaks into them.
+    let inputs = harness.gate.inputs();
+    assert_eq!(inputs.len(), 3);
+    let row_ids_of = |index: usize| {
+        inputs[index]
+            .new_messages
+            .iter()
+            .map(|msg| msg.row_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(row_ids_of(0), vec![1, 2, 3]);
+    assert_eq!(row_ids_of(1), vec![5, 6, 7]);
+    assert_eq!(row_ids_of(2), vec![9, 10, 11]);
+    assert!(inputs.iter().all(|input| !input.forced));
+
+    // The decision-72 property, byte-exact.
+    let views = harness.gate.context_views();
+    assert_eq!(views.len(), 3);
+    // Wake 1: marker 0 over an empty context — the empty view.
+    assert_eq!(views[0].as_deref(), Some(""));
+    // Wake 2: view(2) is EXACTLY wake 1's new-messages item bytes (the
+    // empty-prefix case of the extension: view(1) + the suffix, with no
+    // separator newline because view(1) is empty).
+    let wake1_items = [
+        rendered(1, "p1", 1),
+        rendered(2, "p2", 2),
+        rendered(3, "p3", 3),
+    ];
+    let view2 = views[1].as_deref().expect("gate_context is on");
+    assert_eq!(view2, wake1_items.join("\n"));
+    // Wake 3: view(2) is an exact BYTE PREFIX of view(3); the suffix is
+    // the newline-joined bytes of the items in (marker 3, marker 7] —
+    // the r1 bot speech (row 4, rendered by the decision-61 bot
+    // renderer with the persisted row's id and timestamp) and wake 2's
+    // new messages (rows 5-7).
+    let view3 = views[2].as_deref().expect("gate_context is on");
+    assert!(
+        view3.starts_with(view2),
+        "view(2) is an exact byte prefix of view(3)"
+    );
+    let outbound = rows_of_direction(&fixture.store, Direction::Outbound).await;
+    assert_eq!(outbound.len(), 2);
+    assert_eq!(outbound[0].id, 4);
+    assert_eq!(outbound[0].text, "r1");
+    let suffix = [
+        render_bot_content(outbound[0].id, outbound[0].timestamp, "r1"),
+        rendered(5, "p4", 4),
+        rendered(6, "p5", 5),
+        rendered(7, "p6", 6),
+    ]
+    .join("\n");
+    assert_eq!(view3, format!("{view2}\n{suffix}"));
+
+    wait_for_counter(&fixture.store, "wakes_total", "3").await;
+    wait_for_counter(&fixture.store, "participations_total", "2").await;
+    shutdown(harness).await;
+}
+
+/// The `gate_context` kill switch at the replay level (decision 72,
+/// complementing the actor unit test
+/// `the_gate_context_switch_restores_the_delta_only_input`): with the
+/// switch off the gate receives NO view (`None` — the pre-72
+/// delta-only input, byte-identical prompts), while the per-call
+/// sections are unchanged.
+#[tokio::test]
+async fn gate_context_off_passes_no_view_to_the_gate() {
+    let fixture = make_fixture();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid timestamp");
+    let config = TriggerConfig {
+        wake_msg_count: 3,
+        wake_floor: Duration::ZERO,
+        wake_interval: HUGE_INTERVAL,
+        gate_context: false,
+        ..TriggerConfig::default()
+    };
+    let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
+        participate: false,
+        target_row_id: None,
+        reason: Some("nothing to add".to_string()),
+    }]));
+    let reply = Arc::new(ScriptedReplyGenerator::failing(
+        "the reply model must not be called on a no",
+    ));
+    let harness = spawn_on(&fixture, config, t0, gate, reply);
+    for (index, id) in ["k1", "k2", "k3"].iter().enumerate() {
+        harness
+            .handle
+            .send_event(InboundEvent::Message(message(
+                id,
+                t0 + time::Duration::seconds(index as i64 + 1),
+                false,
+            )))
+            .await
+            .expect("the actor inbox is open");
+    }
+    wait_for_gate_inputs(&harness.gate, 1).await;
+    harness
+        .handle
+        .snapshot()
+        .await
+        .expect("the snapshot succeeds");
+    // The kill switch: no view reached the gate.
+    assert_eq!(harness.gate.context_views(), vec![None]);
+    // The per-call section is the pre-72 shape: exactly the new rows.
+    let inputs = harness.gate.inputs();
+    assert_eq!(
+        inputs[0]
+            .new_messages
+            .iter()
+            .map(|msg| msg.row_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
     shutdown(harness).await;
 }

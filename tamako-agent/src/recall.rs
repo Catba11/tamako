@@ -107,6 +107,10 @@ use time::macros::format_description;
 
 use crate::endpoint::{EndpointClient, EndpointConfig};
 use crate::extract::AgentError;
+// Decision 72: the shared context-view section shape (header and
+// empty marker) is defined ONCE next to the participation gate, so
+// the two gates' view sections can never drift apart.
+use crate::gate::{CONTEXT_VIEW_EMPTY, CONTEXT_VIEW_HEADER};
 
 /// The default max tokens of the relevance-gate response. The output is
 /// one small JSON object (two fields); 262144 tokens is a generous bound
@@ -322,6 +326,28 @@ pub trait RelevanceGate: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
     >;
+
+    /// The decision-72 entry point (specs.md Section 9.2): `select`
+    /// plus the shared context view. `Some(view)` renders the view
+    /// AHEAD of the new messages and the candidate list; `None`
+    /// renders the pre-72 delta-only prompt byte-identically (the
+    /// `gate_context` kill switch). The [`RecallSelection`] index
+    /// contract is unchanged: the view is read-only orientation, never
+    /// a candidate.
+    ///
+    /// The DEFAULT ignores the view and delegates to `select`, so
+    /// existing implementations stay valid unchanged; the live
+    /// `RigRelevanceGate` overrides it.
+    fn select_with_context<'a>(
+        &'a self,
+        input: &'a RelevanceInput,
+        context_view: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
+    > {
+        let _ = context_view;
+        self.select(input)
+    }
 }
 
 /// The static head of the relevance-gate system preamble (Section
@@ -369,10 +395,24 @@ pub fn recall_system_preamble(injection_cap: u32) -> String {
 const YMD_FORMAT: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]");
 
+/// The tail note of the relevance-gate prompt when the shared context
+/// view renders (decision 72): the context is read-only orientation
+/// and the selection contract stays the 1-based candidate numbers
+/// (byte-stable — the view is never a candidate). Rides at the TAIL,
+/// like the participation gate's target instruction.
+pub const RECALL_CONTEXT_NOTE: &str =
+    "The context section is read-only orientation; the selection names candidate numbers only.";
+
 /// Renders the user prompt of the relevance-gate call (Section 9.2):
-/// one line per new message as the XML-tagged `content`, then a
-/// numbered candidate list `1. {edge_text} (since {YYYY-MM-DD of
-/// valid_at, UTC})`.
+/// with `context_view` `Some(view)` (decision 72) the shared context
+/// view renders AHEAD of the per-call sections (the same prefix shape
+/// as the participation gate: [`CONTEXT_VIEW_HEADER`], the view bytes
+/// or [`CONTEXT_VIEW_EMPTY`], then a blank line); then one line per
+/// new message as the XML-tagged `content`, then a numbered candidate
+/// list `1. {edge_text} (since {YYYY-MM-DD of valid_at, UTC})`, then
+/// the [`RECALL_CONTEXT_NOTE`] tail. With `None` (the `gate_context`
+/// kill switch) the prompt is BYTE-IDENTICAL to the pre-72 shape: no
+/// context section, no tail note.
 ///
 /// Unlike the participation gate, the recall prompt renders NO
 /// `{row_id}` prefix (decision 65): the selection contract
@@ -381,9 +421,20 @@ const YMD_FORMAT: &[time::format_description::FormatItem<'_>] =
 /// and never a row id — and the message id already rides inside the
 /// content as the `id="…"` attribute (with `reply_to_id="…"` for the
 /// reply linkage), so a separate prefix duplicated it.
-pub fn render_recall_prompt(input: &RelevanceInput) -> String {
+pub fn render_recall_prompt(input: &RelevanceInput, context_view: Option<&str>) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    // Decision 72: the view section is a clean PREFIX — everything
+    // after it is per-call content.
+    if let Some(view) = context_view {
+        let _ = writeln!(out, "{CONTEXT_VIEW_HEADER}");
+        if view.is_empty() {
+            let _ = writeln!(out, "{CONTEXT_VIEW_EMPTY}");
+        } else {
+            let _ = writeln!(out, "{view}");
+        }
+        let _ = writeln!(out);
+    }
     let _ = writeln!(out, "New messages (XML-tagged content):");
     for message in &input.new_messages {
         let _ = writeln!(out, "{}", message.content);
@@ -402,6 +453,12 @@ pub fn render_recall_prompt(input: &RelevanceInput) -> String {
             candidate.edge_text,
             since
         );
+    }
+    if context_view.is_some() {
+        // The orientation note rides at the TAIL (decision 72):
+        // gate-specific text never enters the shared prefix.
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{RECALL_CONTEXT_NOTE}");
     }
     out
 }
@@ -503,6 +560,17 @@ impl RelevanceGate for RigRelevanceGate {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
     > {
+        // The pre-72 delta-only shape (no shared context view).
+        self.select_with_context(input, None)
+    }
+
+    fn select_with_context<'a>(
+        &'a self,
+        input: &'a RelevanceInput,
+        context_view: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             // The shared structured flow of the endpoint layer
             // (schema per the resolved mode, one-shot repair retry).
@@ -513,7 +581,7 @@ impl RelevanceGate for RigRelevanceGate {
                     // in) plus the shared format gloss becomes the
                     // system message.
                     Some(recall_system_preamble(self.injection_cap)),
-                    vec![Message::user(render_recall_prompt(input))],
+                    vec![Message::user(render_recall_prompt(input, context_view))],
                     schemars::schema_for!(RecallSelection),
                     self.max_tokens,
                     "invalid recall gate JSON",
@@ -544,10 +612,12 @@ enum ScriptedGateMode {
 /// - `ScriptedRelevanceGate::failing(message)`: every call fails.
 ///
 /// Every `RelevanceInput` is recorded for assertions (`inputs()`,
-/// `call_count()`).
+/// `call_count()`), together with the decision-72 context view of each
+/// call (`context_views()`; `None` = the pre-72 delta-only shape).
 pub struct ScriptedRelevanceGate {
     mode: Mutex<ScriptedGateMode>,
     inputs: Mutex<Vec<RelevanceInput>>,
+    context_views: Mutex<Vec<Option<String>>>,
 }
 
 impl ScriptedRelevanceGate {
@@ -557,6 +627,7 @@ impl ScriptedRelevanceGate {
         ScriptedRelevanceGate {
             mode: Mutex::new(ScriptedGateMode::Selections(selections.into())),
             inputs: Mutex::new(Vec::new()),
+            context_views: Mutex::new(Vec::new()),
         }
     }
 
@@ -565,12 +636,22 @@ impl ScriptedRelevanceGate {
         ScriptedRelevanceGate {
             mode: Mutex::new(ScriptedGateMode::Failing(message.into())),
             inputs: Mutex::new(Vec::new()),
+            context_views: Mutex::new(Vec::new()),
         }
     }
 
     /// Every input the gate received, in call order.
     pub fn inputs(&self) -> Vec<RelevanceInput> {
         self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every context view the gate received, in call order (decision
+    /// 72). `None` marks a pre-72 delta-only call.
+    pub fn context_views(&self) -> Vec<Option<String>> {
+        self.context_views
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -584,6 +665,31 @@ impl ScriptedRelevanceGate {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+
+    /// Locks, records, and selects synchronously; the trait methods
+    /// only box the result. A poisoned mutex is recovered; the
+    /// recorded inputs stay valid (same policy as ScriptedGate).
+    fn record_and_select(
+        &self,
+        input: &RelevanceInput,
+        context_view: Option<&str>,
+    ) -> Result<Vec<usize>, AgentError> {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(input.clone());
+        self.context_views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(context_view.map(str::to_string));
+        let mut mode = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *mode {
+            ScriptedGateMode::Selections(selections) => {
+                Ok(selections.pop_front().unwrap_or_default())
+            }
+            ScriptedGateMode::Failing(message) => Err(AgentError::Extraction(message.clone())),
+        }
+    }
 }
 
 impl RelevanceGate for ScriptedRelevanceGate {
@@ -593,22 +699,18 @@ impl RelevanceGate for ScriptedRelevanceGate {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
     > {
-        // Lock, record, and decide synchronously; the future only
-        // carries the result. A poisoned mutex is recovered; the
-        // recorded inputs stay valid (same policy as ScriptedGate).
-        self.inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(input.clone());
-        let result = {
-            let mut mode = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
-            match &mut *mode {
-                ScriptedGateMode::Selections(selections) => {
-                    Ok(selections.pop_front().unwrap_or_default())
-                }
-                ScriptedGateMode::Failing(message) => Err(AgentError::Extraction(message.clone())),
-            }
-        };
+        let result = self.record_and_select(input, None);
+        Box::pin(async move { result })
+    }
+
+    fn select_with_context<'a>(
+        &'a self,
+        input: &'a RelevanceInput,
+        context_view: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<usize>, AgentError>> + Send + 'a>,
+    > {
+        let result = self.record_and_select(input, context_view);
         Box::pin(async move { result })
     }
 }
@@ -735,10 +837,13 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
     /// The recall flow (module docs, steps 1-7, plus the same-fact
     /// collapse of `collapse_same_fact_candidates` between the
     /// neighbor fetch and the Section 9.3 dedup — decision 40).
+    /// `context_view` is the decision-72 shared context view forwarded
+    /// to the relevance gate (`None` = the pre-72 delta-only prompt).
     async fn recall_inner(
         &self,
         chat_id: &str,
         new_messages: &[GateMessage],
+        context_view: Option<&str>,
     ) -> Result<RecallOutcome, CoreError> {
         // Steps 1-2: entry resolution + neighbor fetch. Candidates are
         // deduped by edge_id; the first occurrence wins.
@@ -826,7 +931,7 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             collapsed_count = collapsed_count,
             "recall presents candidates to the relevance gate"
         );
-        let gate_result = self.gate.select(&input).await;
+        let gate_result = self.gate.select_with_context(&input, context_view).await;
 
         // Step 6: post-validation in plain Rust (never trust the model,
         // same principle as validate.rs): in-range indices only,
@@ -1005,7 +1110,19 @@ impl<M: MemoryBackend, G: RelevanceGate> RecallProvider for ShallowRecall<M, G> 
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<RecallOutcome, CoreError>> + Send + 'a>,
     > {
-        Box::pin(async move { self.recall_inner(chat_id, new_messages).await })
+        // The pre-72 delta-only shape (no shared context view).
+        Box::pin(async move { self.recall_inner(chat_id, new_messages, None).await })
+    }
+
+    fn recall_with_context<'a>(
+        &'a self,
+        chat_id: &'a str,
+        new_messages: &'a [GateMessage],
+        context_view: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RecallOutcome, CoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.recall_inner(chat_id, new_messages, context_view).await })
     }
 }
 
@@ -1258,7 +1375,7 @@ mod tests {
 
     #[test]
     fn the_prompt_renders_messages_and_numbered_candidates() {
-        let prompt = render_recall_prompt(&sample_input());
+        let prompt = render_recall_prompt(&sample_input(), None);
         // One line per new message: the XML-tagged content only. The
         // selection contract speaks candidate indices, so there is NO
         // duplicated row-id prefix (decision 65); the message id rides
@@ -1271,6 +1388,81 @@ mod tests {
         // The numbered candidate list: 1-based, YYYY-MM-DD of valid_at.
         assert!(prompt.contains("1. Alice likes espresso. (since 2026-08-07)"));
         assert!(prompt.contains("2. Bob plays go. (since 2025-12-31)"));
+    }
+
+    #[test]
+    fn without_a_context_view_the_prompt_is_byte_identical_to_pre_72() {
+        // The `gate_context` kill switch (decision 72, specs.md Section
+        // 9.2): `None` restores the delta-only input. The expected
+        // bytes are the pre-72 render, written out literally.
+        let prompt = render_recall_prompt(&sample_input(), None);
+        let expected = "\
+New messages (XML-tagged content):
+<msg from=\"u1\" at=\"13:01\" id=\"41\">has anyone tried the new cafe?</msg>
+<msg from=\"u2\" at=\"13:01\" id=\"42\">the espresso is great</msg>
+
+Candidate memories (number, text, validity start):
+1. Alice likes espresso. (since 2026-08-07)
+2. Bob plays go. (since 2025-12-31)
+";
+        assert_eq!(prompt, expected);
+    }
+
+    #[test]
+    fn the_context_view_renders_ahead_of_the_messages_and_candidates() {
+        // Decision 72 (specs.md Section 9.2): the shared context view
+        // is a clean PREFIX — the view section first, then the new
+        // messages, then the numbered candidates, then the orientation
+        // note LAST. The byte-for-byte assertion pins the section
+        // order and the exact headers; the candidate list rendering
+        // and the 1-based index contract are byte-stable.
+        let view = "<msg from=\"u9\" at=\"12:58\" id=\"39\">lunch tomorrow?</msg>";
+        let prompt = render_recall_prompt(&sample_input(), Some(view));
+        let expected = "\
+Context so far:
+<msg from=\"u9\" at=\"12:58\" id=\"39\">lunch tomorrow?</msg>
+
+New messages (XML-tagged content):
+<msg from=\"u1\" at=\"13:01\" id=\"41\">has anyone tried the new cafe?</msg>
+<msg from=\"u2\" at=\"13:01\" id=\"42\">the espresso is great</msg>
+
+Candidate memories (number, text, validity start):
+1. Alice likes espresso. (since 2026-08-07)
+2. Bob plays go. (since 2025-12-31)
+
+The context section is read-only orientation; the selection names candidate numbers only.
+";
+        assert_eq!(prompt, expected);
+    }
+
+    #[test]
+    fn an_empty_context_view_renders_the_explicit_empty_marker() {
+        // Decision 72: an empty view still renders the section with
+        // the `(none yet)` marker, so the prompt SHAPE is stable
+        // across wakes (the same constant-prefix choice as the
+        // participation gate — the header and marker constants are
+        // shared single-source).
+        let prompt = render_recall_prompt(&sample_input(), Some(""));
+        assert!(prompt.starts_with("Context so far:\n(none yet)\n\nNew messages"));
+        assert!(prompt.ends_with(&format!("{RECALL_CONTEXT_NOTE}\n")));
+    }
+
+    #[test]
+    fn the_index_contract_is_unchanged_with_a_context_view() {
+        // The RecallSelection index contract is byte-stable under
+        // decision 72: the candidates keep their 1-based numbers and
+        // the wire-number conversion is untouched.
+        let prompt = render_recall_prompt(&sample_input(), Some("the view bytes"));
+        assert!(prompt.contains("1. Alice likes espresso. (since 2026-08-07)"));
+        assert!(prompt.contains("2. Bob plays go. (since 2025-12-31)"));
+        let selection = RecallSelection {
+            selected: vec![2, 1],
+            reason: "r".to_string(),
+        };
+        assert_eq!(zero_based_indices(&selection), vec![1, 0]);
+        // The note names the contract explicitly.
+        assert!(RECALL_CONTEXT_NOTE.contains("read-only orientation"));
+        assert!(RECALL_CONTEXT_NOTE.contains("candidate numbers"));
     }
 
     #[test]
@@ -1397,6 +1589,28 @@ mod tests {
         assert_eq!(second, Vec::<usize>::new());
         assert_eq!(gate.call_count(), 2);
         assert_eq!(gate.inputs()[0], sample_input());
+        // Both calls went through `select`: no context view (the
+        // pre-72 delta-only shape).
+        assert_eq!(gate.context_views(), vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn the_scripted_gate_records_the_context_view() {
+        // Decision 72: the view is observable through the same capture
+        // pattern as the inputs.
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![0]]);
+        let first = gate
+            .select_with_context(&sample_input(), Some("the view bytes"))
+            .await
+            .expect("first");
+        assert_eq!(first, vec![0]);
+        gate.select_with_context(&sample_input(), None)
+            .await
+            .expect("second");
+        assert_eq!(
+            gate.context_views(),
+            vec![Some("the view bytes".to_string()), None]
+        );
     }
 
     #[tokio::test]
@@ -1558,6 +1772,31 @@ mod tests {
         assert!(texts.contains(&"Tama likes espresso.".to_string()));
         assert!(texts.contains(&"tama is a surface form of Tama.".to_string()));
         assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn recall_with_context_forwards_the_view_to_the_relevance_gate() {
+        // Decision 72 plumbing: the view the actor hands to
+        // `recall_with_context` reaches the relevance gate byte-for-byte;
+        // the plain `recall` entry is the pre-72 delta-only shape.
+        let (_dir, store, memory) = backend().await;
+        seed_person_fact(&memory, "u42", "Alice", "Alice likes espresso.").await;
+
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![], vec![]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5);
+        let messages = vec![gate_message(1, "u42", "espresso?")];
+        recall
+            .recall_with_context(CHAT, &messages, Some("the view bytes"))
+            .await
+            .expect("recall with context");
+        recall.recall(CHAT, &messages).await.expect("recall");
+
+        // Both calls produced candidates, so the gate ran twice.
+        assert_eq!(recall.gate.call_count(), 2);
+        assert_eq!(
+            recall.gate.context_views(),
+            vec![Some("the view bytes".to_string()), None]
+        );
     }
 
     #[tokio::test]
