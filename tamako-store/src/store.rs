@@ -950,6 +950,15 @@ impl Store {
     /// (`embedding MATCH ? AND k = ?`). Returns (node_id, distance)
     /// pairs, nearest first; fewer than k rows when the table holds
     /// fewer vectors.
+    ///
+    /// Metric (migration v8, decision 73): the vector column is
+    /// declared `distance_metric=cosine`, so the returned `distance` is
+    /// the vec0 COSINE DISTANCE, `1 - cosine_similarity`
+    /// (distance_cosine_float in sqlite-vec.c). The decision-73
+    /// thresholds are similarities, so the resolver converts with
+    /// `similarity = 1.0 - distance` (identical vectors -> distance 0,
+    /// orthogonal vectors -> distance 1). Ordering is ascending
+    /// distance = descending similarity, so the best match is first.
     pub fn knn_node_embeddings(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
         let blob = embedding_to_blob(query)?;
         self.with_embedding_conn(|conn| {
@@ -1530,7 +1539,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1540,7 +1549,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -1672,7 +1681,7 @@ mod tests {
             ]
         );
 
-        // Migration bookkeeping: exactly two versions were added.
+        // Migration bookkeeping: exactly three versions were added.
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1682,7 +1691,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     /// The column names of one index, in key order, via PRAGMA index_info.
@@ -1766,7 +1775,7 @@ mod tests {
             .expect("insert summary");
         assert!(summary_id > 0);
 
-        // Migration bookkeeping: the upgrade applied v5, v6, and v7.
+        // Migration bookkeeping: the upgrade applied v5 through v8.
         let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
         let versions: Vec<u32> = {
             let mut stmt = conn
@@ -1777,7 +1786,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -2717,6 +2726,223 @@ mod tests {
                 .expect("enqueue after reopen"),
             1
         );
+    }
+
+    /// Builds a v7-shaped store.db by hand: the v7 DDL (L2-metric
+    /// node_embeddings + the queue), data rows, and schema_migrations
+    /// stamped at 1..=7, so Store::open_group runs ONLY migration v8.
+    fn v7_shaped_db(dir: &std::path::Path) {
+        let group = dir.join("c1");
+        std::fs::create_dir_all(&group).expect("group dir");
+        let conn = Connection::open(group.join("store.db")).expect("open v7 db");
+        register_sqlite_vec(&conn).expect("register vec0");
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .expect("schema_migrations");
+        for version in 1..=7u32 {
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at)
+                 VALUES (?1, '2026-08-16T00:00:00Z')",
+                [version],
+            )
+            .expect("stamp version");
+        }
+        let (_, v7_sql) = schema::MIGRATIONS
+            .iter()
+            .find(|(v, _)| *v == 7)
+            .expect("v7 migration entry");
+        conn.execute_batch(v7_sql).expect("v7 DDL");
+
+        // Queue rows in every status: a pending claim, a failed row,
+        // and two done-journal rows (decision 66 journal).
+        for (node_id, hash, status) in [
+            ("n-pending", "h-p", "pending"),
+            ("n-failed", "h-f", "failed"),
+            ("n-done-1", "h-d1", "done"),
+            ("n-done-2", "h-d2", "done"),
+        ] {
+            conn.execute(
+                "INSERT INTO pending_embeddings
+                    (node_id, content_hash, status, attempts, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, '2026-08-16T00:00:00Z', '2026-08-16T00:00:00Z')",
+                rusqlite::params![node_id, hash, status],
+            )
+            .expect("queue row");
+        }
+
+        // Vectors in the L2 table that v8 must discard.
+        let blob = embedding_to_blob(&test_vector(7)).expect("blob");
+        conn.execute(
+            "INSERT INTO node_embeddings (node_id, embedding) VALUES ('n-done-1', ?1)",
+            [blob],
+        )
+        .expect("vec row");
+    }
+
+    #[test]
+    fn migration_v8_recreates_node_embeddings_with_cosine_and_resets_the_done_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        v7_shaped_db(dir.path());
+
+        // Open through the real path: v8 runs on top of the v7 shape.
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("c1").expect("open_group runs v8");
+
+        store
+            .with_conn("c1", |conn| {
+                // v8 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 8)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v8 must be recorded in schema_migrations");
+
+                // The vec0 table was recreated: a fresh shadow set exists
+                // (the DROP removed the old one — a lingering shadow
+                // table would have failed the CREATE on a name
+                // collision), and the pre-v8 vector is gone.
+                let tables: Vec<String> = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type = 'table' AND name LIKE 'node_embeddings%'",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert!(tables.iter().any(|t| t == "node_embeddings"));
+                assert!(
+                    tables.iter().any(|t| t == "node_embeddings_rowids"),
+                    "fresh vec0 shadow tables must exist: {tables:?}"
+                );
+                let vec_rows: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM node_embeddings", [], |row| row.get(0))?;
+                assert_eq!(vec_rows, 0, "recreation drops the old L2 rows");
+
+                // The done-journal was reset; pending and failed rows
+                // survive and stay claimable.
+                let statuses: Vec<String> = conn
+                    .prepare("SELECT status FROM pending_embeddings ORDER BY node_id")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(statuses, vec!["failed", "pending"]);
+                Ok(())
+            })
+            .expect("v8 assertions");
+
+        assert_eq!(store.done_embedding_hashes().expect("journal"), vec![]);
+        let claimed = store.claim_embedding_batch(10).expect("claim");
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|p| p.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["n-pending"],
+            "the surviving pending row stays claimable"
+        );
+
+        // The fresh cosine table takes new vectors immediately.
+        let v1 = test_vector(7);
+        store.upsert_node_embedding("n-new", &v1).expect("upsert");
+        let hits = store.knn_node_embeddings(&v1, 1).expect("knn");
+        assert_eq!(hits[0].0, "n-new");
+        assert!(hits[0].1.abs() < 1e-6);
+
+        // Tip idempotency: a reopen re-runs nothing, data survives.
+        store.open_group("c1").expect("reopen");
+        let hits = store.knn_node_embeddings(&v1, 1).expect("knn after reopen");
+        assert_eq!(hits[0].0, "n-new");
+        store
+            .with_conn("c1", |conn| {
+                let v8_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 8",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(v8_rows, 1, "v8 recorded exactly once");
+                Ok(())
+            })
+            .expect("reopen assertions");
+    }
+
+    #[test]
+    fn knn_node_embeddings_returns_cosine_distance() {
+        let (_dir, store) = embedding_store();
+
+        // Sparse one-hot-style vectors make the cosine math exact.
+        let base = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[0] = 1.0;
+            v
+        };
+        // Same direction, 3x the magnitude: cosine distance 0. Under
+        // the old L2 metric this row would sit at distance 2.0, so it
+        // discriminates the v8 metric cutover.
+        let scaled = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[0] = 3.0;
+            v
+        };
+        // Near-parallel ("paraphrase-like"): cos = 1/sqrt(1.0625)
+        // ~= 0.970, so similarity clears the decision-73 match
+        // threshold of 0.92.
+        let near = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[0] = 1.0;
+            v[1] = 0.25;
+            v
+        };
+        // Orthogonal: cosine similarity 0, distance exactly 1.
+        let orthogonal = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[1] = 1.0;
+            v
+        };
+
+        store
+            .upsert_node_embedding("n-orth", &orthogonal)
+            .expect("orth");
+        store.upsert_node_embedding("n-near", &near).expect("near");
+        store
+            .upsert_node_embedding("n-scaled", &scaled)
+            .expect("scaled");
+
+        let hits = store.knn_node_embeddings(&base, 3).expect("knn");
+        assert_eq!(hits.len(), 3);
+        let sim = |node_id: &str| {
+            1.0 - hits
+                .iter()
+                .find(|(id, _)| id == node_id)
+                .unwrap_or_else(|| panic!("{node_id} in hits"))
+                .1
+        };
+
+        // Ascending distance = descending similarity, best match first.
+        assert_eq!(hits[0].0, "n-scaled");
+        assert_eq!(hits[1].0, "n-near");
+        assert_eq!(hits[2].0, "n-orth");
+
+        // The documented conversion: similarity = 1 - distance.
+        assert!(
+            (sim("n-scaled") - 1.0).abs() < 1e-6,
+            "same direction, any magnitude: distance 0 under cosine \
+             (L2 would give 2.0)"
+        );
+        assert!(
+            (sim("n-near") - 1.0 / (1.0625f32).sqrt()).abs() < 1e-4,
+            "near-parallel similarity ~0.970, got {}",
+            sim("n-near")
+        );
+        assert!(sim("n-orth").abs() < 1e-6, "orthogonal: distance 1");
+
+        // Decision-73 threshold sanity: the near-parallel vector clears
+        // the 0.92 match threshold; the orthogonal one is below the
+        // 0.80 candidate threshold.
+        assert!(sim("n-near") > 0.92);
+        assert!(sim("n-orth") < 0.80);
     }
 
     #[test]
