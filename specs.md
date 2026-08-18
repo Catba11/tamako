@@ -76,6 +76,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 - `context_summaries` table: one row per summarized removed chunk. Columns: the message-id range `(first_msg_id, last_msg_id]` as the natural dedup key, the rendered summary text, and a creation timestamp. The text is persisted at creation time so a restart rebuild is bit-identical without re-calling the model. Rule P1 applies. Rows of rotated-out summaries stay for forensics.
 - `pending_embeddings` table (schema v7): the embedding work queue. One row per (node id, content hash) pair — the unique key makes re-enqueue retry-safe. Columns: status (`pending`/`done`/`failed`), attempts, timestamps. The digest pipeline enqueues after the graph commit (best-effort); the embedding worker drains it. Refer to `proposed-graph-database-specs.md` Section 7.6.
 - `node_embeddings` virtual table (schema v7): the sqlite-vec `vec0` sidecar index, one 4096-dimension embedding per node id. Derived, recomputable data — never the source of truth. The sqlite-vec extension registers at connection open on every code path that opens a store; a connection without it cannot even SELECT the virtual table. Schema v8 recreates the table with `distance_metric=cosine` (dropping the v7 L2 table; the reconciliation pass re-embeds — derived data).
+- `merge_audit` table (schema v9): one append-only row per merge-tool action. Columns: loser id, survivor id, loser kind/name/description, the three-way verdict (`same`/`related`/`different` — only `same` merges), reason, confirmed_by (`llm:<model>` or `operator`), edge counters (moved, self-loops dropped, deduped), the rollback snapshot (JSON: the loser node and its original edges, plus the created edge identifiers; NULL for non-merge verdicts), a rolled_back flag, and a timestamp. Refer to `proposed-graph-database-specs.md` Section 7.7.
 - Vector index: sqlite-vec virtual tables in the same file. The embeddings of Person, Alias, and Concept names and descriptions live here. Refer to `proposed-graph-database-specs.md` Section 7.6.
 
 To delete the memory of a group, delete the directory. Both files share one lifecycle.
@@ -173,7 +174,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 
 - Hard rule (monologue lock): if the last `monologue_limit` (2) messages in the group are all from the bot, enter the `muted` state. In `muted`, proactive speech and warmup are forbidden. A forced wake is still permitted. Any human message clears the state.
 - Soft rule (warmup backoff): if a warmup message receives zero reactions and zero replies within the reaction window, the effective daily quota decreases and the next warmup interval doubles. The backoff resets on any successful engagement.
-- Participation rate is a metric. A sustained rate above 50 percent indicates that the participation gate is too permissive. Refer to Section 12.
+- Participation rate is a metric. The calibration band is 30 to 60 percent. Refer to Section 12.
 
 ## 9. Wake procedure
 
@@ -259,7 +260,7 @@ Metrics per group:
 
 | Metric | Meaning |
 |---|---|
-| Participation rate | Share of wakes with a positive decision. Healthy target below 50 percent. |
+| Participation rate | Share of wakes with a positive decision. The calibration band is 30 to 60 percent. A sustained rate outside the band in either direction means the gate prompt needs calibration. |
 | Injection rate | Share of wakes with at least one injected memory. Expected 20 to 40 percent. |
 | Warmup engagement rate | Share of warmup messages with a reaction or a reply. Drives the soft backoff. |
 | Digest failure rate | Failed extractions before dead-letter. |
@@ -297,6 +298,7 @@ Global defaults. Every item is overridable per group.
 | `vector_match_threshold` | 0.92 (provisional) | graph 7.4 |
 | `vector_candidate_threshold` | 0.80 (provisional) | graph 7.4 |
 | `resolution_confirm_budget` | 5 per digest batch | graph 7.4 |
+| `merge_candidate_threshold` | 0.85 (provisional) | graph 7.7 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):

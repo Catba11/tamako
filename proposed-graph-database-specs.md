@@ -233,6 +233,21 @@ This version does not implement LLM negation detection. The interface is reserve
 4. Run `CHECKPOINT` at the end of the transaction.
 5. Write the embeddings of the name and the description of each Person, Alias, and Concept to the sidecar vector index. NOT in the graph transaction (current-state.md decision 66): after the commit, enqueue each new or changed node into the `pending_embeddings` queue of `specs.md` Section 5.2, best-effort. A background worker drains the queue, calls the embeddings endpoint, and writes the vector index. A startup reconciliation pass diffs graph nodes against embedded content hashes and enqueues the missing or stale ones, and drops vector and queue rows whose node no longer exists. Backfill, steady-state repair, and merge-tombstone cleanup all ride this one mechanism.
 
+### 7.7 Node merge and tombstone
+
+The merge tool repairs graph fragmentation (current-state.md decision 74). It is an offline operator tool: run it with the bot stopped.
+
+1. Candidate pairs come from the vector index: cosine similarity at or above `merge_candidate_threshold` (0.85, provisional), kind-compatible pairs only (Person↔Person, Concept↔Concept). Pairs already linked by `known_as` are excluded — those are legitimate surface-form links, not duplicates.
+2. Each candidate pair gets one LLM confirmation with a three-way verdict: `same` merges, `related` creates an `also_known_as` edge between the two nodes (the answer for cross-language synonyms; refer to the CAUTION of Section 7.1), `different` skips. The tool is dry-run by default; `--apply` executes the plan. A manual `--merge` form takes an operator-chosen pair directly.
+3. One merge (`merge_nodes(loser, survivor)`) executes in this order, serialized per group:
+   - Survivor selection: the higher edge degree wins; a tie goes to the older `created_at`. The manual form overrides.
+   - Snapshot first: read the loser node and all its edges with properties. The snapshot persists in the `merge_audit` row of `specs.md` Section 5.2 and is the rollback source.
+   - Re-point every edge of the loser to the survivor: copy the properties, create the new edge, delete the old one. All edge types re-point, including `contains` provenance edges and `known_as` alias edges. Edges between the loser and the survivor become self-loops: drop them and count them in the audit row. Skip creating a re-pointed edge when the survivor already has an equivalent one (same relationship name, same other endpoint, same description text); count the skip.
+   - Hard-delete the loser (DETACH DELETE). Delete its vector-index row and its queue rows.
+   - Append the `merge_audit` row.
+4. Rollback (`--merge-rollback <chat_id> <audit_id>`): delete the edges the merge created and restore the loser node with its original edges from the snapshot. Refuse when the survivor was itself tombstoned by a later merge; chained-merge rollback is out of scope. The reconciliation pass re-embeds a restored node automatically.
+5. Re-merging an already-merged loser is a loud error. A memory injected before a merge may re-inject once after it (the dedup keys are edge ids, and re-pointing creates new edges); this is acceptable and noted in the audit remarks.
+
 ## 8. Read path
 
 ### 8.1 Entry resolution
