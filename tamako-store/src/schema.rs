@@ -252,6 +252,43 @@ CREATE VIRTUAL TABLE node_embeddings USING vec0(
 DELETE FROM pending_embeddings WHERE status = 'done';
 ",
     ),
+    (
+        9,
+        "\
+-- Merge audit (decision 74, specs.md Section 5.2, graph-spec Section
+-- 7.7). One append-only row per merge-tool action: a 'same' verdict
+-- merges, 'related' links the pair via also_known_as, 'different'
+-- skips — ALL THREE are audited (the row is the record of the LLM or
+-- operator confirmation). Only a 'same' merge carries a snapshot (JSON:
+-- the loser node and its original edges, plus the created edge
+-- identifiers); non-merge verdicts store NULL. The rolled_back flag
+-- flips when --merge-rollback restores the loser. Timestamps are
+-- RFC 3339 TEXT written from the Rust side, the house idiom.
+--
+-- No indexes beyond the primary key: audit reads are rare (rollback
+-- looks up one row by id; a possible future inspect mode scans the
+-- whole table), and the table grows one row per operator-reviewed
+-- action. A full scan is fine.
+CREATE TABLE merge_audit (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    loser_id           TEXT NOT NULL,
+    survivor_id        TEXT NOT NULL,
+    loser_kind         TEXT NOT NULL,
+    loser_name         TEXT NOT NULL,
+    loser_description  TEXT,
+    verdict            TEXT NOT NULL
+                       CHECK (verdict IN ('same', 'related', 'different')),
+    reason             TEXT NOT NULL,
+    confirmed_by       TEXT NOT NULL,
+    edges_moved        INTEGER NOT NULL DEFAULT 0,
+    self_loops_dropped INTEGER NOT NULL DEFAULT 0,
+    edges_deduped      INTEGER NOT NULL DEFAULT 0,
+    snapshot           TEXT,
+    rolled_back        INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL
+);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
