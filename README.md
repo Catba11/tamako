@@ -184,6 +184,31 @@ cargo run -- --status-all --data-root ./data
 
 `--status` exits with an error when the group has no `store.db` yet. `--status-all` with no group stores prints a note and exits successfully. Caveat: after a CLEAN shutdown the bot removes the WAL files; a read-only status run then still opens the database, but the first query can fail when the directory is not writable — the error message carries a hint. Make the data-root directory writable, or start the bot once and stop it.
 
+The merge modes are the offline graph-repair tool (current-state.md decision 74, `proposed-graph-database-specs.md` Section 7.7): they deduplicate fragmented Person/Concept nodes. Unlike the status modes they WRITE the group's `store.db` and `memory.lbug`, so **stop the bot first** — a running bot holds the group's LadybugDB mutex and the store's single writer.
+
+```sh
+# Scan the vector index for duplicate candidates, confirm each pair once
+# on the digest endpoint (verdicts: same merges, related links
+# also_known_as, different skips), print the plan. DRY RUN: without
+# --apply nothing is written.
+cargo run -- --merge-tool -1001234567890 --data-root ./data --config tamako.toml
+
+# Execute the printed plan. Every action appends a merge_audit row
+# (specs.md Section 5.2); confirmed_by is llm:<digest model>.
+cargo run -- --merge-tool -1001234567890 --apply --data-root ./data --config tamako.toml
+
+# Manual merge, no LLM: merge loser into survivor as an operator-decided
+# 'same' action (confirmed_by "operator"). Prints the audit id.
+cargo run -- --merge -1001234567890 <loser_id> <survivor_id> --data-root ./data
+
+# Roll one 'same' merge back from its audit snapshot; the row is marked
+# rolled back. Refusals (unknown id, non-same row, already rolled back)
+# exit non-zero.
+cargo run -- --merge-rollback -1001234567890 <audit_id> --data-root ./data
+```
+
+Without a digest-endpoint LLM key `--merge-tool` prints only the scan (the candidate pairs above the threshold) with a note that the confirmations were skipped; it writes nothing either way. The candidate threshold is the per-group `merge_candidate_threshold` config key (default 0.85); `--max-confirmations N` caps the LLM confirmation calls of one run (default 50). Rollback does not re-embed the restored node itself: the next startup reconciliation of the embedding worker picks it up automatically (decision 66).
+
 ## Verification commands
 
 ```sh

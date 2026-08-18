@@ -6,7 +6,10 @@
 //! digest pipeline of specs.md Section 10 (M1) and the wake procedure of
 //! specs.md Section 9 (M4) with the shallow recall of Sections 9.1-9.5
 //! (M5) from the resolved LLM endpoints of Section 13; without the
-//! family API key the pipelines degrade to silence.
+//! family API key the pipelines degrade to silence. The `--merge-tool` /
+//! `--merge` / `--merge-rollback` modes are the OFFLINE merge tool of
+//! current-state.md decision 74 (graph-spec Section 7.7): they run with
+//! the bot STOPPED and never start the event loop.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +22,7 @@ use anyhow::{Context, Result};
 use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::endpoint::{EmbeddingEndpoint, RigEmbeddingProvider};
+use tamako_agent::merge_confirm::EndpointMergeConfirmer;
 use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
@@ -32,9 +36,14 @@ use tamako_core::config::{BotConfig, TriggerConfig};
 use tamako_core::digest::DigestPipeline;
 use tamako_core::embedding::{EmbeddingError, EmbeddingWorker, GroupEmbeddingTarget};
 use tamako_core::event::OutboundAction;
+use tamako_core::merge::{
+    apply_merge_plan, plan_merges, rollback_merge_action, scan_merge_candidates, MergeCandidate,
+    MergeConfirmation, MergeError, MergeNodeInfo, MergePlan, MergePlanAction, MergeVerdict,
+    SkipReason,
+};
 use tamako_core::summary::SummaryProvider;
 use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
-use tamako_memory::LbugBackend;
+use tamako_memory::{LbugBackend, MemoryBackend};
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
 use tamako_store::{read_group_status, GroupStatus, Store, StoreError};
 use time::format_description::well_known::Rfc3339;
@@ -48,6 +57,9 @@ Usage:
   tamako --live [--allow-default-persona] [--data-root <dir>] [--config <config.toml>]
   tamako --status <chat_id> [--data-root <dir>] [--config <config.toml>]
   tamako --status-all [--data-root <dir>] [--config <config.toml>]
+  tamako --merge-tool <chat_id> [--apply] [--max-confirmations N] [--data-root <dir>] [--config <config.toml>]
+  tamako --merge <chat_id> <loser_id> <survivor_id> [--data-root <dir>]
+  tamako --merge-rollback <chat_id> <audit_id> [--data-root <dir>]
   tamako --help
 
 Options:
@@ -66,6 +78,34 @@ Options:
                            store.db read-only; safe while the bot runs.
   --status-all             Print the status snapshot of every group store
                            under the data root, sorted by chat id.
+  --merge-tool <chat_id>   The offline merge tool (decision 74, graph-spec
+                           Section 7.7): scans the group's vector index for
+                           duplicate Person/Concept pairs, confirms each
+                           candidate once on the digest endpoint (three-way
+                           verdict: same merges, related links
+                           also_known_as, different skips), and prints the
+                           plan. DRY RUN by default: nothing is written
+                           without --apply. STOP THE BOT FIRST: the tool
+                           opens the group's store.db and memory.lbug as
+                           the single writer and cannot share them with a
+                           running bot. Without a digest-endpoint LLM key
+                           the confirmations are skipped and only the scan
+                           prints; nothing is written either way.
+  --merge <chat_id> <loser_id> <survivor_id>
+                           Manual merge without an LLM: merges loser_id
+                           into survivor_id as an operator-decided 'same'
+                           action (confirmed_by \"operator\") and appends
+                           the audit row. STOP THE BOT FIRST.
+  --merge-rollback <chat_id> <audit_id>
+                           Rolls one 'same' merge back from its audit
+                           snapshot and marks the row rolled back. STOP
+                           THE BOT FIRST. The restored node's embedding
+                           is rebuilt by the next startup reconciliation.
+  --apply                  Only affects --merge-tool: executes the printed
+                           plan (merges, also_known_as links, audit rows)
+                           instead of the dry run.
+  --max-confirmations N    Only affects --merge-tool: caps the LLM
+                           confirmation calls of one run. Default: 50.
   --allow-default-persona  Only affects --live: restores the lenient
                            persona fallback chain (repo-root example, then
                            the built-in default) instead of requiring
@@ -78,17 +118,35 @@ Options:
   --config <config.toml>   Bot configuration file. Optional. A missing file
                            keeps the global defaults. In the status modes it
                            supplies the per-group digest_max_retries of the
-                           attempts display.
+                           attempts display; in --merge-tool it supplies the
+                           per-group merge_candidate_threshold.
   --help                   Show this text.";
 
 /// The run mode. Exactly one of `--replay` / `--live` / `--status` /
-/// `--status-all` is required.
+/// `--status-all` / `--merge-tool` / `--merge` / `--merge-rollback` is
+/// required.
 #[derive(Debug)]
 enum Mode {
-    Replay { fixture: PathBuf },
+    Replay {
+        fixture: PathBuf,
+    },
     Live,
-    Status { chat_id: String },
+    Status {
+        chat_id: String,
+    },
     StatusAll,
+    MergeTool {
+        chat_id: String,
+    },
+    Merge {
+        chat_id: String,
+        loser_id: String,
+        survivor_id: String,
+    },
+    MergeRollback {
+        chat_id: String,
+        audit_id: i64,
+    },
 }
 
 /// The parsed command line.
@@ -99,7 +157,16 @@ struct Cli {
     config: Option<PathBuf>,
     allow_default_persona: bool,
     verbose: bool,
+    /// The `--apply` flag. Only affects --merge-tool (the same
+    /// accepted-everywhere discipline as --allow-default-persona).
+    apply: bool,
+    /// The `--max-confirmations` value of --merge-tool.
+    max_confirmations: usize,
 }
+
+/// The default LLM-confirmation budget of one `--merge-tool` run
+/// (decision 74: one digest-endpoint call per candidate pair).
+const DEFAULT_MAX_CONFIRMATIONS: usize = 50;
 
 /// The result of the command-line parse.
 #[derive(Debug)]
@@ -114,8 +181,13 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     let mut live = false;
     let mut status = None;
     let mut status_all = false;
+    let mut merge_tool = None;
+    let mut merge = None;
+    let mut merge_rollback = None;
     let mut allow_default_persona = false;
     let mut verbose = false;
+    let mut apply = false;
+    let mut max_confirmations = None;
     let mut data_root = None;
     let mut config = None;
     let mut args = args;
@@ -132,6 +204,38 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
                 status = Some(value);
             }
             "--status-all" => status_all = true,
+            "--merge-tool" => {
+                let value = args.next().ok_or("the --merge-tool flag needs a value")?;
+                merge_tool = Some(value);
+            }
+            "--merge" => {
+                let missing =
+                    "the --merge flag needs three values: <chat_id> <loser_id> <survivor_id>";
+                let chat_id = args.next().ok_or(missing)?;
+                let loser_id = args.next().ok_or(missing)?;
+                let survivor_id = args.next().ok_or(missing)?;
+                merge = Some((chat_id, loser_id, survivor_id));
+            }
+            "--merge-rollback" => {
+                let missing = "the --merge-rollback flag needs two values: <chat_id> <audit_id>";
+                let chat_id = args.next().ok_or(missing)?;
+                let audit_id = args.next().ok_or(missing)?;
+                let audit_id = audit_id.parse::<i64>().map_err(|_| {
+                    format!("the --merge-rollback audit id must be an integer, got '{audit_id}'")
+                })?;
+                merge_rollback = Some((chat_id, audit_id));
+            }
+            "--apply" => apply = true,
+            "--max-confirmations" => {
+                let value = args
+                    .next()
+                    .ok_or("the --max-confirmations flag needs a value")?;
+                max_confirmations = Some(value.parse::<usize>().map_err(|_| {
+                    format!(
+                        "the --max-confirmations value must be a non-negative integer, got '{value}'"
+                    )
+                })?);
+            }
             "--allow-default-persona" => allow_default_persona = true,
             "-v" | "--verbose" => verbose = true,
             "--data-root" => {
@@ -145,24 +249,44 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    let mode = match (fixture, live, status, status_all) {
-        (Some(fixture), false, None, false) => Mode::Replay { fixture },
-        (None, true, None, false) => Mode::Live,
-        (None, false, Some(chat_id), false) => Mode::Status { chat_id },
-        (None, false, None, true) => Mode::StatusAll,
-        (None, false, None, false) => {
-            return Err(
-                "one of --replay <fixture.json>, --live, --status <chat_id>, or --status-all \
-                 is required"
-                    .to_string(),
-            )
-        }
+    // Exactly one mode. The candidates collect first so the mutual-
+    // exclusion check stays one comparison for seven modes.
+    let mut modes: Vec<Mode> = Vec::new();
+    if let Some(fixture) = fixture {
+        modes.push(Mode::Replay { fixture });
+    }
+    if live {
+        modes.push(Mode::Live);
+    }
+    if let Some(chat_id) = status {
+        modes.push(Mode::Status { chat_id });
+    }
+    if status_all {
+        modes.push(Mode::StatusAll);
+    }
+    if let Some(chat_id) = merge_tool {
+        modes.push(Mode::MergeTool { chat_id });
+    }
+    if let Some((chat_id, loser_id, survivor_id)) = merge {
+        modes.push(Mode::Merge {
+            chat_id,
+            loser_id,
+            survivor_id,
+        });
+    }
+    if let Some((chat_id, audit_id)) = merge_rollback {
+        modes.push(Mode::MergeRollback { chat_id, audit_id });
+    }
+    const MODE_LIST: &str = "--replay <fixture.json>, --live, --status <chat_id>, \
+         --status-all, --merge-tool <chat_id>, --merge <chat_id> <loser_id> <survivor_id>, \
+         or --merge-rollback <chat_id> <audit_id>";
+    let mode = match modes.len() {
+        1 => modes.pop().expect("exactly one mode collected"),
+        0 => return Err(format!("one of {MODE_LIST} is required")),
         _ => {
-            return Err(
-                "the run modes are mutually exclusive: pick exactly one of --replay \
-                 <fixture.json>, --live, --status <chat_id>, or --status-all"
-                    .to_string(),
-            )
+            return Err(format!(
+                "the run modes are mutually exclusive: pick exactly one of {MODE_LIST}"
+            ))
         }
     };
     Ok(ParseOutcome::Run(Cli {
@@ -171,6 +295,8 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
         config,
         allow_default_persona,
         verbose,
+        apply,
+        max_confirmations: max_confirmations.unwrap_or(DEFAULT_MAX_CONFIRMATIONS),
     }))
 }
 
@@ -647,14 +773,25 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
 
 /// Dispatches to the selected run mode. The status modes are offline
 /// inspection: no persona load, no TELOXIDE_TOKEN, no LLM endpoints, no
-/// actor spawn — status NEVER fails for a missing persona file. The run
-/// modes share one outbound channel for every actor (Rule A3): the
-/// actions carry their chat id, so one pump into the platform adapter is
-/// enough.
+/// actor spawn — status NEVER fails for a missing persona file. The
+/// merge modes are the offline operator tool of decision 74: they open
+/// one group's store and graph directly (the bot must be STOPPED) and
+/// never start the event loop. The run modes share one outbound channel
+/// for every actor (Rule A3): the actions carry their chat id, so one
+/// pump into the platform adapter is enough.
 async fn run(cli: Cli) -> Result<()> {
     match &cli.mode {
         Mode::Status { chat_id } => return run_status(&cli, chat_id),
         Mode::StatusAll => return run_status_all(&cli),
+        Mode::MergeTool { chat_id } => return run_merge_tool(&cli, chat_id).await,
+        Mode::Merge {
+            chat_id,
+            loser_id,
+            survivor_id,
+        } => return run_merge(&cli, chat_id, loser_id, survivor_id).await,
+        Mode::MergeRollback { chat_id, audit_id } => {
+            return run_merge_rollback(&cli, chat_id, *audit_id).await
+        }
         Mode::Replay { .. } | Mode::Live => {}
     }
     let setup = shared_setup(&cli)?;
@@ -664,8 +801,12 @@ async fn run(cli: Cli) -> Result<()> {
             run_replay(&cli.data_root, &setup, fixture, outbound_tx, outbound_rx).await
         }
         Mode::Live => run_live(&setup, outbound_tx, outbound_rx).await,
-        // The status modes returned above.
-        Mode::Status { .. } | Mode::StatusAll => unreachable!(),
+        // The offline modes returned above.
+        Mode::Status { .. }
+        | Mode::StatusAll
+        | Mode::MergeTool { .. }
+        | Mode::Merge { .. }
+        | Mode::MergeRollback { .. } => unreachable!(),
     }
 }
 
@@ -907,6 +1048,439 @@ fn status_read_hint(error: StoreError) -> anyhow::Error {
     } else {
         error
     }
+}
+
+/// Adapts the tamako-agent merge confirmer (decision 74) onto the
+/// tamako-core merge seam (the contract-in-core pattern of
+/// [`AgentEmbeddingProvider`]: tamako-core cannot depend on
+/// tamako-agent, AGENT.md Section 4, so the trait lives in tamako-core
+/// and the binary bridges it).
+struct AgentMergeConfirmer(EndpointMergeConfirmer);
+
+impl tamako_core::merge::MergeConfirmer for AgentMergeConfirmer {
+    fn confirm_merge<'a>(
+        &'a self,
+        a: &'a MergeNodeInfo,
+        b: &'a MergeNodeInfo,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<MergeConfirmation, MergeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let a = tamako_agent::merge_confirm::MergeNode {
+            name: a.name.clone(),
+            kind: a.kind.as_str().to_string(),
+            description: a.description.clone(),
+        };
+        let b = tamako_agent::merge_confirm::MergeNode {
+            name: b.name.clone(),
+            kind: b.kind.as_str().to_string(),
+            description: b.description.clone(),
+        };
+        Box::pin(async move {
+            let confirmation =
+                tamako_agent::merge_confirm::MergeConfirmer::confirm_merge(&self.0, &a, &b)
+                    .await
+                    .map_err(|error| MergeError::Confirmer(error.to_string()))?;
+            let verdict = match confirmation.verdict {
+                tamako_agent::merge_confirm::MergeVerdict::Same => MergeVerdict::Same,
+                tamako_agent::merge_confirm::MergeVerdict::Related => MergeVerdict::Related,
+                tamako_agent::merge_confirm::MergeVerdict::Different => MergeVerdict::Different,
+            };
+            Ok(MergeConfirmation {
+                verdict,
+                reason: confirmation.reason,
+            })
+        })
+    }
+}
+
+/// Opens the per-group store and graph backend of the merge modes
+/// (decision 74: an OFFLINE operator tool, one group per run — THE BOT
+/// MUST BE STOPPED, decision 47: an external process cannot share the
+/// per-group lbug mutex or the store's single WAL writer). The store
+/// opens ONLY the given group, matching the AmbiguousGroup constraint
+/// of the chat_id-less embedding/audit helpers. A group with no
+/// store.db is a loud error in the wording of --status: `open_group`
+/// would CREATE an empty store and mask a mistyped chat id.
+fn open_merge_group(data_root: &Path, chat_id: &str) -> Result<(Arc<Store>, LbugBackend)> {
+    if !data_root.join(chat_id).join("store.db").is_file() {
+        anyhow::bail!(
+            "no store.db for group {chat_id} under {} (the group has not been served yet)",
+            data_root.display()
+        );
+    }
+    let store = Arc::new(Store::new(data_root.to_path_buf()));
+    store
+        .open_group(chat_id)
+        .with_context(|| format!("failed to open the store of group {chat_id}"))?;
+    Ok((store, LbugBackend::new(data_root.to_path_buf())))
+}
+
+/// The `--merge-tool` run (decision 74, graph-spec Section 7.7).
+/// OFFLINE: the bot must be stopped. The threshold comes from the
+/// per-group `merge_candidate_threshold` of the resolved config
+/// (default 0.85); the confirmation budget from `--max-confirmations`.
+/// DRY RUN by default: without --apply the run prints the confirmed
+/// plan and writes NOTHING (the core plan path is write-free by
+/// construction — `tamako_core::merge::plan_merges` never mutates the
+/// graph or the store). The no-key degrade mirrors the per-purpose
+/// builders: a missing family API key (`AgentError::ProviderConfig`)
+/// prints the scan alone with a note; every other confirmer build
+/// error propagates.
+async fn run_merge_tool(cli: &Cli, chat_id: &str) -> Result<()> {
+    let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    let bot_config = load_bot_config(cli.config.as_deref())?;
+    let group_config = bot_config.for_group(chat_id);
+    let threshold = group_config.merge_candidate_threshold;
+    let endpoints = resolve_endpoints(&group_config)?;
+    let confirmer = match EndpointMergeConfirmer::from_endpoint(&endpoints.digest) {
+        Ok(confirmer) => confirmer,
+        Err(AgentError::ProviderConfig(error)) => {
+            warn!(%error, "merge tool: no provider configuration; confirmations skipped, printing the scan only");
+            let candidates = scan_merge_candidates(&store, &memory, chat_id, threshold).await?;
+            print!("{}", format_merge_scan(chat_id, threshold, &candidates));
+            println!(
+                "  note: no LLM key for the digest endpoint; the {n} candidate pair(s) were NOT \
+                 confirmed and nothing was planned or written. Set the family API key and re-run.",
+                n = candidates.len()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("failed to build the merge confirmer"),
+    };
+    let confirmer = AgentMergeConfirmer(confirmer);
+    let plan = plan_merges(
+        &store,
+        &memory,
+        chat_id,
+        threshold,
+        &confirmer,
+        cli.max_confirmations,
+    )
+    .await?;
+    if !cli.apply {
+        print!(
+            "{}",
+            format_merge_plan(chat_id, threshold, cli.max_confirmations, &plan)
+        );
+        println!("DRY RUN: nothing written; re-run with --apply to execute this plan.");
+        return Ok(());
+    }
+    let confirmed_by = format!("llm:{}", endpoints.digest.model);
+    let report = apply_merge_plan(&store, &memory, chat_id, &plan, &confirmed_by).await;
+    print!(
+        "{}",
+        format_apply_report(chat_id, &plan, &report, &confirmed_by)
+    );
+    if !report.failures.is_empty() {
+        // Loud exit: the applied actions stand (each carries its audit
+        // row), but the operator must see the failure in the exit code.
+        anyhow::bail!(
+            "{} merge action(s) failed; the successful actions above applied and carry audit rows",
+            report.failures.len()
+        );
+    }
+    Ok(())
+}
+
+/// The `--merge` run: the manual, LLM-free form of the merge tool
+/// (decision 74 / Section 7.7 step 3: the operator picks the pair AND
+/// the survivor, overriding the degree rule). Reuses the core apply
+/// path with a one-action 'same' plan so the merge, the sidecar
+/// tombstone, and the audit row follow the exact Section 7.7 step 3
+/// order. A missing node id (mistyped, or an already-merged loser —
+/// Section 7.7 step 5) is a loud error.
+async fn run_merge(cli: &Cli, chat_id: &str, loser_id: &str, survivor_id: &str) -> Result<()> {
+    if loser_id == survivor_id {
+        anyhow::bail!(
+            "--merge needs two different node ids (loser and survivor are both '{loser_id}')"
+        );
+    }
+    let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    // The stored content of both nodes feeds the audit row's loser
+    // name/description and the loud unknown-id error.
+    let content_of = |node_id: &str| {
+        let memory = &memory;
+        let node_id = node_id.to_string();
+        async move {
+            memory
+                .node_content(chat_id, &node_id)
+                .await
+                .with_context(|| format!("failed to read node {node_id} of group {chat_id}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no node {node_id} in group {chat_id} (a mistyped id, or an already-merged node)"
+                    )
+                })
+        }
+    };
+    let loser = content_of(loser_id).await?;
+    let survivor = content_of(survivor_id).await?;
+    let kinds = memory
+        .node_resolution_infos(chat_id, &[loser_id.to_string(), survivor_id.to_string()])
+        .await
+        .context("failed to read the node kinds")?;
+    let kind_of = |node_id: &str| {
+        kinds
+            .iter()
+            .find(|(id, _)| id == node_id)
+            .map(|(_, info)| info.kind)
+            .expect("the node content read above proves the node exists")
+    };
+    let loser_kind = kind_of(loser_id);
+    if loser_kind != kind_of(survivor_id) {
+        warn!(chat_id = %chat_id, loser_id = %loser_id, survivor_id = %survivor_id, "manual merge of kind-incompatible nodes; the audit row records the loser kind");
+    }
+    // MergeCandidate keeps a_id < b_id for a deterministic display
+    // order; the operator's loser/survivor choice rides the dedicated
+    // fields, not the pair order. The audit row takes the loser
+    // name/description from the matching endpoint, so both orders must
+    // carry the right content.
+    let (a_id, a_name, a_description, b_id, b_name, b_description) = if loser_id < survivor_id {
+        (
+            loser_id,
+            loser.name.clone(),
+            loser.description.clone(),
+            survivor_id,
+            survivor.name.clone(),
+            survivor.description.clone(),
+        )
+    } else {
+        (
+            survivor_id,
+            survivor.name.clone(),
+            survivor.description.clone(),
+            loser_id,
+            loser.name.clone(),
+            loser.description.clone(),
+        )
+    };
+    let action = MergePlanAction {
+        candidate: MergeCandidate {
+            a_id: a_id.to_string(),
+            b_id: b_id.to_string(),
+            a_name,
+            b_name,
+            a_description,
+            b_description,
+            // The audit row records the loser kind. For a
+            // kind-incompatible operator merge the loser's kind is the
+            // honest value.
+            kind: loser_kind,
+            // An operator-decided pair has no scan score; the field is
+            // display-only here and never persisted.
+            score: 1.0,
+        },
+        verdict: MergeVerdict::Same,
+        reason: "operator decision (--merge)".to_string(),
+        survivor_id: survivor_id.to_string(),
+        loser_id: loser_id.to_string(),
+    };
+    let plan = MergePlan {
+        actions: vec![action],
+        skipped: Vec::new(),
+    };
+    let report = apply_merge_plan(&store, &memory, chat_id, &plan, "operator").await;
+    if let Some(failure) = report.failures.first() {
+        anyhow::bail!(
+            "the merge of {loser_id} into {survivor_id} in group {chat_id} failed: {}",
+            failure.error
+        );
+    }
+    let audit_id = report.audit_ids[0];
+    println!("merged \"{}\" ({loser_id}) into \"{}\" ({survivor_id}) in group {chat_id}: audit id {audit_id}", loser.name, survivor.name);
+    println!("  roll back with: --merge-rollback {chat_id} {audit_id}");
+    Ok(())
+}
+
+/// The `--merge-rollback` run: restores one 'same' merge from its audit
+/// snapshot (graph-spec Section 7.7 step 4). Refusals (unknown audit
+/// id, non-'same' row, already rolled back, no snapshot, a tombstoned
+/// survivor) are LOUD: the error propagates and the process exits
+/// non-zero. The restored node's vec row is NOT recreated here — the
+/// merge deleted it with the done-journal rows, so the next startup
+/// reconciliation re-embeds the node automatically (decision 66/74).
+async fn run_merge_rollback(cli: &Cli, chat_id: &str, audit_id: i64) -> Result<()> {
+    let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    rollback_merge_action(&store, &memory, chat_id, audit_id).await?;
+    // Read the row back for the report. AGENT.md Section 6.2: the
+    // synchronous store call runs in spawn_blocking.
+    let row = {
+        let store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || store.list_merge_audit())
+            .await
+            .context("the blocking store task failed to join")?
+            .context("failed to read the merge audit")?
+            .into_iter()
+            .find(|row| row.id == audit_id)
+            .expect("the rolled-back audit row exists")
+    };
+    println!("rolled back merge audit {audit_id} of group {chat_id}:");
+    println!(
+        "  loser restored:  \"{}\" ({})",
+        row.loser_name, row.loser_id
+    );
+    println!("  survivor kept:   {}", row.survivor_id);
+    println!("  the audit row is marked rolled back");
+    println!("  the restored node's embedding is rebuilt by the next startup reconciliation");
+    Ok(())
+}
+
+/// The display name of one endpoint of a plan action's pair.
+fn endpoint_name<'a>(candidate: &'a MergeCandidate, node_id: &str) -> &'a str {
+    if candidate.a_id == node_id {
+        &candidate.a_name
+    } else {
+        &candidate.b_name
+    }
+}
+
+/// Renders one confirmed plan action: pair, score, verdict, effect, and
+/// the confirmer's reason. Pure.
+fn format_plan_action(action: &MergePlanAction) -> String {
+    let candidate = &action.candidate;
+    let mut out = String::new();
+    let effect = match action.verdict {
+        MergeVerdict::Same => format!(
+            "\"{}\" ({}) merges into \"{}\" ({})",
+            endpoint_name(candidate, &action.loser_id),
+            action.loser_id,
+            endpoint_name(candidate, &action.survivor_id),
+            action.survivor_id
+        ),
+        MergeVerdict::Related => format!(
+            "\"{}\" ({}) --also_known_as--> \"{}\" ({})",
+            endpoint_name(candidate, &action.survivor_id),
+            action.survivor_id,
+            endpoint_name(candidate, &action.loser_id),
+            action.loser_id
+        ),
+        MergeVerdict::Different => format!(
+            "\"{}\" ({}) / \"{}\" ({}) left as-is",
+            candidate.a_name, candidate.a_id, candidate.b_name, candidate.b_id
+        ),
+    };
+    let _ = writeln!(
+        out,
+        "    [{:<9}] score={:.3}  {}  {}",
+        action.verdict.as_str(),
+        candidate.score,
+        candidate.kind.as_str(),
+        effect
+    );
+    let _ = writeln!(out, "               reason: {}", action.reason);
+    out
+}
+
+/// Renders the `--merge-tool` dry-run plan table (decision 74 point 3):
+/// the confirmed actions first, then the skipped candidates with their
+/// reasons. Pure.
+fn format_merge_plan(
+    chat_id: &str,
+    threshold: f64,
+    max_confirmations: usize,
+    plan: &MergePlan,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Merge plan: {chat_id} (threshold {threshold}, confirmation budget {max_confirmations})"
+    );
+    let _ = writeln!(out, "  confirmed actions: {}", plan.actions.len());
+    for action in &plan.actions {
+        out.push_str(&format_plan_action(action));
+    }
+    let _ = writeln!(out, "  skipped: {}", plan.skipped.len());
+    for (candidate, reason) in &plan.skipped {
+        let note = match reason {
+            SkipReason::OverConfirmationBudget => {
+                "over the confirmation budget (not confirmed)".to_string()
+            }
+            SkipReason::ConfirmationFailed(error) => format!("confirmation failed: {error}"),
+        };
+        let _ = writeln!(
+            out,
+            "    score={:.3}  {} \"{}\" ({}) / \"{}\" ({}): {note}",
+            candidate.score,
+            candidate.kind.as_str(),
+            candidate.a_name,
+            candidate.a_id,
+            candidate.b_name,
+            candidate.b_id
+        );
+    }
+    out
+}
+
+/// Renders the no-LLM-key scan output of `--merge-tool`: the candidate
+/// pairs above the threshold, nothing confirmed, nothing written. Pure.
+fn format_merge_scan(chat_id: &str, threshold: f64, candidates: &[MergeCandidate]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Merge scan: {chat_id} (threshold {threshold})");
+    let _ = writeln!(out, "  candidate pairs: {}", candidates.len());
+    for candidate in candidates {
+        let _ = writeln!(
+            out,
+            "    score={:.3}  {} \"{}\" ({}) / \"{}\" ({})",
+            candidate.score,
+            candidate.kind.as_str(),
+            candidate.a_name,
+            candidate.a_id,
+            candidate.b_name,
+            candidate.b_id
+        );
+    }
+    out
+}
+
+/// Renders the `--apply` outcome: one line per action with its audit
+/// id, one per failure, and the summary line. Pure: `report.audit_ids`
+/// rides the insertion order of the successful actions
+/// ([`tamako_core::merge::ApplyReport`]).
+fn format_apply_report(
+    chat_id: &str,
+    plan: &MergePlan,
+    report: &tamako_core::merge::ApplyReport,
+    confirmed_by: &str,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Merge apply: {chat_id} (confirmed_by {confirmed_by})");
+    let mut audit_ids = report.audit_ids.iter();
+    for action in &plan.actions {
+        let failure = report.failures.iter().find(|failure| {
+            failure.loser_id == action.loser_id
+                && failure.survivor_id == action.survivor_id
+                && failure.verdict == action.verdict
+        });
+        match failure {
+            Some(failure) => {
+                let _ = writeln!(
+                    out,
+                    "    [{:<9}] FAILED  {} -> {}: {}",
+                    action.verdict.as_str(),
+                    failure.loser_id,
+                    failure.survivor_id,
+                    failure.error
+                );
+            }
+            None => {
+                let audit_id = audit_ids.next().expect("one audit id per applied action");
+                let _ = write!(out, "{}", format_plan_action(action));
+                let _ = writeln!(out, "               audit id: {audit_id}");
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  {} action(s): {} applied, {} failed",
+        plan.actions.len(),
+        report.audit_ids.len(),
+        report.failures.len()
+    );
+    out
 }
 
 /// Renders one group status snapshot as aligned text (specs.md Sections
@@ -1433,6 +2007,9 @@ mod tests {
             &["--live"][..],
             &["--status", "-1001"][..],
             &["--status-all"][..],
+            &["--merge-tool", "-1001"][..],
+            &["--merge", "-1001", "a", "b"][..],
+            &["--merge-rollback", "-1001", "7"][..],
         ] {
             let ParseOutcome::Run(cli) = parse(args).expect("a valid command line") else {
                 panic!("expected the Run outcome");
@@ -1540,6 +2117,169 @@ mod tests {
     fn status_needs_a_value() {
         let error = parse(&["--status"]).expect_err("a missing --status value must fail");
         assert!(error.contains("--status"));
+    }
+
+    #[test]
+    fn merge_tool_parses_with_the_dry_run_defaults() {
+        // Decision 74: --merge-tool is a DRY RUN without --apply; the
+        // confirmation budget defaults to 50.
+        let outcome = parse(&["--merge-tool", "-1001"]).expect("a valid merge-tool command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::MergeTool { chat_id } => assert_eq!(chat_id, "-1001"),
+            _ => panic!("expected the merge-tool mode"),
+        }
+        assert!(!cli.apply);
+        assert_eq!(cli.max_confirmations, DEFAULT_MAX_CONFIRMATIONS);
+        assert_eq!(cli.data_root, PathBuf::from("./data"));
+    }
+
+    #[test]
+    fn merge_tool_apply_and_max_confirmations_parse() {
+        let outcome = parse(&[
+            "--merge-tool",
+            "-1001",
+            "--apply",
+            "--max-confirmations",
+            "5",
+        ])
+        .expect("a valid merge-tool command line with --apply");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::MergeTool { .. }));
+        assert!(cli.apply);
+        assert_eq!(cli.max_confirmations, 5);
+    }
+
+    #[test]
+    fn merge_tool_needs_a_value() {
+        let error = parse(&["--merge-tool"]).expect_err("a missing --merge-tool value must fail");
+        assert!(error.contains("--merge-tool"));
+    }
+
+    #[test]
+    fn merge_parses_chat_loser_survivor() {
+        let outcome =
+            parse(&["--merge", "-1001", "loser-id", "survivor-id"]).expect("a valid --merge line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::Merge {
+                chat_id,
+                loser_id,
+                survivor_id,
+            } => {
+                assert_eq!(chat_id, "-1001");
+                assert_eq!(loser_id, "loser-id");
+                assert_eq!(survivor_id, "survivor-id");
+            }
+            _ => panic!("expected the merge mode"),
+        }
+    }
+
+    #[test]
+    fn merge_needs_three_values() {
+        for args in [
+            &["--merge"][..],
+            &["--merge", "-1001"][..],
+            &["--merge", "-1001", "loser-id"][..],
+        ] {
+            let error = parse(args).expect_err("an incomplete --merge must fail");
+            assert!(
+                error.contains("--merge"),
+                "args: {args:?}, message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_rollback_parses_chat_and_audit_id() {
+        let outcome =
+            parse(&["--merge-rollback", "-1001", "7"]).expect("a valid --merge-rollback line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::MergeRollback { chat_id, audit_id } => {
+                assert_eq!(chat_id, "-1001");
+                assert_eq!(audit_id, 7);
+            }
+            _ => panic!("expected the merge-rollback mode"),
+        }
+    }
+
+    #[test]
+    fn merge_rollback_needs_two_values() {
+        for args in [
+            &["--merge-rollback"][..],
+            &["--merge-rollback", "-1001"][..],
+        ] {
+            let error = parse(args).expect_err("an incomplete --merge-rollback must fail");
+            assert!(
+                error.contains("--merge-rollback"),
+                "args: {args:?}, message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_rollback_audit_id_must_be_an_integer() {
+        let error = parse(&["--merge-rollback", "-1001", "abc"])
+            .expect_err("a non-integer audit id must fail");
+        assert!(error.contains("audit id"), "message: {error}");
+        assert!(error.contains("abc"), "message: {error}");
+    }
+
+    #[test]
+    fn max_confirmations_must_be_a_non_negative_integer() {
+        let error = parse(&["--merge-tool", "-1001", "--max-confirmations", "many"])
+            .expect_err("a non-integer budget must fail");
+        assert!(error.contains("--max-confirmations"), "message: {error}");
+    }
+
+    #[test]
+    fn apply_and_max_confirmations_are_accepted_in_other_modes() {
+        // The same accepted-everywhere discipline as
+        // --allow-default-persona: the flags parse in any mode and only
+        // affect --merge-tool.
+        let outcome = parse(&["--status", "-1001", "--apply", "--max-confirmations", "3"])
+            .expect("the flags are accepted in the status mode");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::Status { .. }));
+        assert!(cli.apply);
+        assert_eq!(cli.max_confirmations, 3);
+    }
+
+    #[test]
+    fn merge_modes_are_mutually_exclusive_with_every_other_mode() {
+        let merge_tool = ["--merge-tool", "-1001", "", ""];
+        let merge = ["--merge", "-1001", "a", "b"];
+        let rollback = ["--merge-rollback", "-1001", "7", ""];
+        let live = ["--live", "", "", ""];
+        let status = ["--status", "-1001", "", ""];
+        for (first, second) in [
+            (merge_tool, merge),
+            (merge_tool, rollback),
+            (merge, rollback),
+            (merge_tool, live),
+            (merge, status),
+            (rollback, live),
+        ] {
+            let args: Vec<&str> = first
+                .iter()
+                .chain(second.iter())
+                .copied()
+                .filter(|arg| !arg.is_empty())
+                .collect();
+            let error = parse(&args).expect_err(&format!("the combination {args:?} must fail"));
+            assert!(error.contains("mutually exclusive"), "message: {error}");
+        }
     }
 
     #[test]
