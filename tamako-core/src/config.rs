@@ -167,6 +167,12 @@ pub struct TriggerConfig {
     /// batch; an exhausted budget treats middle-band entities as
     /// below-threshold. Default 5.
     pub resolution_confirm_budget: u32,
+    /// Decision 74 (proposed-graph-database-specs.md Section 7.7 step
+    /// 1): the cosine SIMILARITY at or above which an embedded
+    /// Person/Concept pair becomes a merge candidate of the offline
+    /// merge tool. Deliberately narrower than the write-path band
+    /// (decision 74 point 5). Default 0.85 (provisional).
+    pub merge_candidate_threshold: f64,
     /// The hard cap of injected memories per wake (Section 9.2
     /// conservative default). Default 5. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill (Phase 1 M5).
@@ -225,6 +231,7 @@ impl Default for TriggerConfig {
             vector_match_threshold: 0.92,
             vector_candidate_threshold: 0.80,
             resolution_confirm_budget: 5,
+            merge_candidate_threshold: 0.85,
             recall_injection_cap: 5,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
@@ -330,6 +337,9 @@ pub struct TriggerConfigToml {
     /// The per-batch confirmation budget. Refer to
     /// `TriggerConfig::resolution_confirm_budget`.
     pub resolution_confirm_budget: Option<u32>,
+    /// The merge-candidate similarity (decision 74). Refer to
+    /// `TriggerConfig::merge_candidate_threshold`.
+    pub merge_candidate_threshold: Option<f64>,
     /// The injection cap of one wake. Refer to
     /// `TriggerConfig::recall_injection_cap`.
     pub recall_injection_cap: Option<u32>,
@@ -462,6 +472,9 @@ impl TriggerConfigToml {
         if let Some(value) = self.resolution_confirm_budget {
             base.resolution_confirm_budget = value;
         }
+        if let Some(value) = self.merge_candidate_threshold {
+            base.merge_candidate_threshold = value;
+        }
         if let Some(value) = self.recall_injection_cap {
             base.recall_injection_cap = value;
         }
@@ -592,6 +605,10 @@ wake_floor_secs = 60
         assert_eq!(config.vector_match_threshold, 0.92);
         assert_eq!(config.vector_candidate_threshold, 0.80);
         assert_eq!(config.resolution_confirm_budget, 5);
+        // Decision 74 (proposed-graph-database-specs.md Section 7.7
+        // step 1): the merge-candidate threshold defaults to the
+        // provisional 0.85, narrower than the write-path band.
+        assert_eq!(config.merge_candidate_threshold, 0.85);
         // The structured-output mode keys (reported for spec backfill):
         // every Option is None by default; the agent layer resolves
         // the default mode.
@@ -718,6 +735,30 @@ vector_match_threshold = 0.90
         assert_eq!(plain.global.vector_match_threshold, 0.92);
         assert_eq!(plain.global.vector_candidate_threshold, 0.80);
         assert_eq!(plain.global.resolution_confirm_budget, 5);
+    }
+
+    #[test]
+    fn toml_override_sets_merge_candidate_threshold() {
+        // Decision 74 point 5: an independent threshold key, per-group
+        // overridable like every other trigger key (AGENT.md Section
+        // 6.3).
+        let text = r#"
+[global]
+merge_candidate_threshold = 0.90
+
+[groups."-100777"]
+merge_candidate_threshold = 0.88
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        // Global set.
+        assert_eq!(config.global.merge_candidate_threshold, 0.90);
+        // A group override wins over the global value.
+        assert_eq!(config.for_group("-100777").merge_candidate_threshold, 0.88);
+        // A group without an override inherits the global value.
+        assert_eq!(config.for_group("-100999").merge_candidate_threshold, 0.90);
+        // Keys the TOML does not set keep the decision-74 default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(plain.global.merge_candidate_threshold, 0.85);
     }
 
     #[test]
