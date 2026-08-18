@@ -1420,6 +1420,37 @@ v0.0.1 (alpha).
     automatically (the same mechanism, decision 66). Spec backfill:
     graph-spec Section 7.7, specs.md Sections 5.2 and 13.
 
+75. **Fact validity + manual invalidation (2026-08-17).** Roadmap
+    Phase 2 items 4–5. Rulings: (a) REGISTRY — the predicate
+    registry is the config key `single_value_predicates` (default
+    the spec's four: currently_playing, works_at, lives_in, dating;
+    per-group overridable); a predicate absent from the list is
+    multi-value — accumulate is the safe default; (b) WRITE PATH —
+    upsert_batch processes each new single-value edge in batch
+    order: invalidate every valid edge with the same (subject,
+    predicate), then write the new one — all inside the existing
+    single transaction, so exactly one valid edge per (subject,
+    predicate) exists at commit even when one batch carries a
+    change ("quit A, now at B": the last write wins); replayed
+    batches converge (the deterministic edge id MERGEs, valid_at
+    refreshes — convergent, noted); (c) MERGE-TOOL INVARIANT — the
+    design review caught a real hole: re-pointing can leave TWO
+    valid same-predicate edges on the survivor, so merge_nodes now
+    invalidates the older valid same-predicate edges after
+    re-pointing (the invariant holds globally, not just at the
+    digest path); (d) MANUAL COMMAND — offline CLI like the merge
+    tool (bot stopped, decision 47): `--facts <chat_id> <name>`
+    lists a node's edges with ids and validity (entry via exact
+    alias), `--invalidate <chat_id> <edge_id>` sets invalid_at,
+    `--revalidate <chat_id> <edge_id>` clears it (the typo safety
+    net); no audit table — invalidation is non-destructive and
+    self-recording (invalid_at + updated_at on the edge itself);
+    (e) OBSERVABILITY — `facts_invalidated_total` counter + DEBUG
+    lines; curated INFO lines frozen. The read side needed NO
+    change: neighbors() has filtered invalid edges since M5, and
+    history queries stay a Phase-3-class concern. Spec backfill:
+    graph-spec Section 7.5, specs.md Sections 13 and 14.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
