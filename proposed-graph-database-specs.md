@@ -205,10 +205,10 @@ NOTE: The vector pre-screen at write time is the primary defense against graph f
 
 ### 7.5 Fact validity
 
-The predicate registry has two classes. The registry is a configuration item:
+The predicate registry has two classes. The registry is the configuration key `single_value_predicates` (current-state.md decision 75); a predicate absent from the list is multi-value:
 
-- Single-value predicates: `currently_playing`, `works_at`, `lives_in`, `dating`. One valid edge is permitted for each pair of subject and predicate.
-- Multi-value predicates: `likes`, `knows`, `has_pet`. Edges accumulate.
+- Single-value predicates (default): `currently_playing`, `works_at`, `lives_in`, `dating`. One valid edge is permitted for each pair of subject and predicate.
+- Multi-value predicates: `likes`, `knows`, `has_pet`. Edges accumulate. This is the default class.
 
 For a new single-value fact, do these steps in one transaction:
 
@@ -223,7 +223,9 @@ SET r.invalid_at = $now, r.updated_at = $now
 2. Merge the new edge with `valid_at` set to the current time.
 3. Keep the old edges. They answer queries about the past.
 
-This version does not implement LLM negation detection. The interface is reserved. A message of the form "X does not like Y any more" can then invalidate the related edge and add a `supersedes` mark.
+The write path applies these steps per new single-value edge in batch order, so one batch carrying a change ("quit A, now at B") commits with exactly one valid edge — the last write wins. The merge tool enforces the same invariant on the survivor after re-pointing (Section 7.7): two valid same-predicate edges never coexist. A replayed batch converges: the deterministic edge identifier MERGEs and `valid_at` refreshes.
+
+This version does not implement LLM negation detection. The interface is reserved. A message of the form "X does not like Y any more" can then invalidate the related edge and add a `supersedes` mark. Until then the owner has the manual invalidation command (`--facts` / `--invalidate` / `--revalidate`, offline like the merge tool).
 
 ### 7.6 Storage
 

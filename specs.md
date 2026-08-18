@@ -299,6 +299,7 @@ Global defaults. Every item is overridable per group.
 | `vector_candidate_threshold` | 0.80 (provisional) | graph 7.4 |
 | `resolution_confirm_budget` | 5 per digest batch | graph 7.4 |
 | `merge_candidate_threshold` | 0.85 (provisional) | graph 7.7 |
+| `single_value_predicates` | `currently_playing`, `works_at`, `lives_in`, `dating` | graph 7.5 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
@@ -323,7 +324,7 @@ API keys come from the environment only, never from a config file: `ANTHROPIC_AP
 ## 14. Deferred items
 
 1. Vision captioning for images, videos, and GIFs. Interface constraints are fixed now: the caption model has no tool access; the caption text is data, never an instruction; the caption enters the digest input with a delimiter that marks it as a media description, not as a member message; captions are stored as display-only properties. Rule R1 of the database specification applies.
-2. Negation detection and the `supersedes` edge. Refer to `proposed-graph-database-specs.md` Section 7.5. Until then, a manual invalidation command permits the owner to invalidate a specific edge.
+2. Negation detection and the `supersedes` edge. Refer to `proposed-graph-database-specs.md` Section 7.5. The manual invalidation command of that section (`--facts` / `--invalidate` / `--revalidate`) is delivered; what remains deferred is the LLM negation detection itself.
 3. The `is_a` concept hierarchy. Refer to the open items of the database specification.
 4. Additional platform adapters, starting with Matrix. Section 4 defines the contract.
 
