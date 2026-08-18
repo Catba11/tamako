@@ -1368,6 +1368,51 @@ v0.0.1 (alpha).
     curated INFO lines stay frozen (decision 53). Spec backfill:
     graph-spec Section 7.4, specs.md Section 13.
 
+74. **Merge tool design (2026-08-17, operator-ruled).** Roadmap
+    Phase 2 item 3 — the graph's first destructive operation class.
+    The operator ruled on all six design points: (1) THREE-WAY
+    verdict — the confirmation schema is {verdict:
+    same|related|different, reason}; `same` merges, `related`
+    creates an `also_known_as` edge (the graph-spec CAUTION's
+    answer for cross-language synonyms), `different` skips; (2)
+    OFFLINE tool — CLI modes like `--status`, run with the bot
+    STOPPED (decision 47: an external process cannot share the
+    per-group lbug mutex); (3) DRY-RUN BY DEFAULT — `--merge-tool`
+    scans and prints the plan, writes nothing without `--apply`;
+    (4) HARD DELETE tombstone, but the audit row carries a full
+    rollback SNAPSHOT in SQLite (the operator's amendment): the
+    loser node's properties plus every original edge with
+    properties, plus the identifiers of the created re-pointed
+    edges — rollback deletes the created edges and restores the
+    loser node and its original edges from the snapshot
+    (`--merge-rollback <chat_id> <audit_id>`; refused when the
+    survivor was itself tombstoned by a later merge — chained-merge
+    rollback is out of scope); (5) INDEPENDENT threshold key —
+    `merge_candidate_threshold` (0.85 PROVISIONAL, per-group
+    overridable), deliberately narrower than the write-path band;
+    (6) candidate scope Person↔Person and Concept↔Concept only
+    (Alias fragmentation does not exist by construction — aliases
+    are natural keys; `known_as`-linked pairs are excluded as
+    legitimate surface-form links). Execution semantics of one
+    merge (`merge_nodes`): survivor = higher edge degree, tiebreak
+    older `created_at` (the manual `--merge` form overrides); edges
+    re-point by copy-properties-create-then-delete (lbug cannot
+    re-endpoint an edge), ALL edge types including `contains`
+    provenance and `known_as`; loser↔survivor edges become
+    self-loops and are dropped (audited); re-point dedups on
+    (predicate, other endpoint, description text) against the
+    survivor's existing edges; then DETACH DELETE the loser, delete
+    its vec row and queue rows, and append the audit row. Migration
+    v9 adds `merge_audit` (append-only; verdict, reason,
+    confirmed_by = `llm:<model>`|`operator`, edge counters,
+    snapshot, rolled_back flag). Re-merging an already-merged loser
+    is a loud error. The `injected_memories` dedup keys (edge ids)
+    go stale for re-pointed edges — a memory may re-inject once
+    after a merge; acceptable, noted in the audit remarks. Rebuild
+    note: the reconciliation pass re-embeds a rollback-restored node
+    automatically (the same mechanism, decision 66). Spec backfill:
+    graph-spec Section 7.7, specs.md Sections 5.2 and 13.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
