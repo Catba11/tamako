@@ -115,6 +115,7 @@ pub mod endpoint;
 pub mod extract;
 pub mod gate;
 pub mod graph;
+pub mod merge_confirm;
 pub mod pipeline;
 pub mod prompt;
 pub mod recall;
