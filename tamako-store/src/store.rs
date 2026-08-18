@@ -241,6 +241,56 @@ pub struct PendingEmbedding {
     pub attempts: u32,
 }
 
+/// A row of the `merge_audit` table (migration v9, decision 74,
+/// specs.md Section 5.2): one append-only record per merge-tool action.
+///
+/// All three verdicts are audited: 'same' (the pair merged), 'related'
+/// (the pair was linked via `also_known_as`), and 'different' (the pair
+/// was skipped). Only a 'same' merge carries a `snapshot` (JSON: the
+/// loser node and its original edges, plus the created edge
+/// identifiers) — the rollback source of graph-spec Section 7.7;
+/// non-merge verdicts store None.
+///
+/// On `insert_merge_audit` the `id`, `rolled_back`, and `created_at`
+/// fields are IGNORED: the id is the autoincrement rowid, rolled_back
+/// starts at the database default 0 (flip it with
+/// `mark_merge_rolled_back`), and created_at is stamped from the Rust
+/// side (the house RFC 3339 TEXT idiom).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeAuditRow {
+    pub id: i64,
+    /// Node id of the merged-away node. For non-merge verdicts: the
+    /// candidate that WOULD have been merged away.
+    pub loser_id: String,
+    /// Node id of the surviving node.
+    pub survivor_id: String,
+    /// Kind of the loser (Person, Concept, ...); kind-compatible pairs
+    /// only (graph-spec Section 7.7).
+    pub loser_kind: String,
+    pub loser_name: String,
+    pub loser_description: Option<String>,
+    /// The three-way confirmation verdict: 'same', 'related', or
+    /// 'different'. Enforced by a CHECK constraint.
+    pub verdict: String,
+    /// The LLM's or operator's justification of the verdict.
+    pub reason: String,
+    /// Who confirmed: `llm:<model>` or `operator` (decision 74).
+    pub confirmed_by: String,
+    /// Edges re-pointed from the loser to the survivor.
+    pub edges_moved: u32,
+    /// Loser↔survivor edges that became self-loops and were dropped.
+    pub self_loops_dropped: u32,
+    /// Re-points skipped because the survivor already had an equivalent
+    /// edge (same predicate, other endpoint, description text).
+    pub edges_deduped: u32,
+    /// The rollback snapshot. Some only for a 'same' merge.
+    pub snapshot: Option<String>,
+    /// Flipped to true by `mark_merge_rolled_back` when the merge was
+    /// rolled back.
+    pub rolled_back: bool,
+    pub created_at: OffsetDateTime,
+}
+
 /// Registers the sqlite-vec (vec0) extension on a connection. Migration
 /// v7's node_embeddings table and every vec0 query need it; registration
 /// is PER-CONNECTION and never persisted, so every open path
@@ -838,7 +888,7 @@ impl Store {
     /// inserts nothing; a changed hash for a known node inserts a new
     /// row.
     pub fn enqueue_embeddings(&self, items: &[(String, String)]) -> Result<usize> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let now = schema::now_rfc3339()?;
             let mut stmt = conn.prepare(
                 "INSERT OR IGNORE INTO pending_embeddings
@@ -860,7 +910,7 @@ impl Store {
     /// a crash simply re-claims the same rows (idempotent by content
     /// hash).
     pub fn claim_embedding_batch(&self, limit: usize) -> Result<Vec<PendingEmbedding>> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, node_id, content_hash, attempts
@@ -877,7 +927,7 @@ impl Store {
 
     /// Marks a claimed queue row done after its vector was written.
     pub fn mark_embedding_done(&self, id: i64) -> Result<()> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             conn.execute(
                 "UPDATE pending_embeddings
                  SET status = 'done', updated_at = ?2
@@ -893,7 +943,7 @@ impl Store {
     /// inspectable; below the cap it stays 'pending' and is re-claimed
     /// on a later pass.
     pub fn mark_embedding_attempt_failed(&self, id: i64) -> Result<()> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             conn.execute(
                 &format!(
                     "UPDATE pending_embeddings
@@ -918,7 +968,7 @@ impl Store {
     /// replacing), so the upsert is DELETE + INSERT in one transaction.
     pub fn upsert_node_embedding(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
         let blob = embedding_to_blob(embedding)?;
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM node_embeddings WHERE node_id = ?1", [node_id])?;
             tx.execute(
@@ -934,7 +984,7 @@ impl Store {
     /// trace of a merged-away node — its vec row AND all its queue rows
     /// — in one transaction.
     pub fn delete_node_embedding_rows(&self, node_id: &str) -> Result<()> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM node_embeddings WHERE node_id = ?1", [node_id])?;
             tx.execute(
@@ -961,7 +1011,7 @@ impl Store {
     /// distance = descending similarity, so the best match is first.
     pub fn knn_node_embeddings(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
         let blob = embedding_to_blob(query)?;
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let k = i64::try_from(k).unwrap_or(i64::MAX);
             let mut stmt = conn.prepare(
                 "SELECT node_id, distance FROM node_embeddings
@@ -982,7 +1032,7 @@ impl Store {
     /// A node may hold several done rows from successive contents; the
     /// row with the max id per node wins.
     pub fn done_embedding_hashes(&self) -> Result<Vec<(String, String)>> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT node_id, content_hash FROM pending_embeddings AS done
                  WHERE done.status = 'done'
@@ -1013,7 +1063,7 @@ impl Store {
     /// index: re-recording the same pair (or recording a pair whose row
     /// the worker just marked done) is a no-op.
     pub fn record_node_embedded(&self, node_id: &str, content_hash: &str) -> Result<()> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let now = schema::now_rfc3339()?;
             conn.execute(
                 "INSERT OR IGNORE INTO pending_embeddings
@@ -1030,7 +1080,7 @@ impl Store {
     /// to detect orphans (vec rows whose node was deleted without a
     /// tombstone cleanup).
     pub fn all_embedding_node_ids(&self) -> Result<Vec<String>> {
-        self.with_embedding_conn(|conn| {
+        self.with_single_group_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT node_id FROM node_embeddings
                  UNION
@@ -1044,13 +1094,129 @@ impl Store {
         })
     }
 
-    /// Runs `f` on the embedding sidecar's connection. The embedding
-    /// helpers take no chat_id (their interface is pinned by the
-    /// parallel subtasks), so they operate on the Store's single open
-    /// group: a Store used for embedding work must have exactly one
-    /// group open. Rule P5 still holds — the connection is the same
-    /// per-group store.db; the group was fixed at open_group time.
-    fn with_embedding_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    /// Every node id with a VEC TABLE row (decision 74): the merge-tool
+    /// candidate scan KNNs each embedded node with its own stored
+    /// vector, so it must seed from the vec table only — a queue-only
+    /// id has no vector yet, and the UNION of
+    /// [`Store::all_embedding_node_ids`] (the reconciliation orphan
+    /// detector) would mislead the scan.
+    pub fn embedded_node_ids(&self) -> Result<Vec<String>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT node_id FROM node_embeddings ORDER BY node_id")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// The stored vector of one node (decision 74): the merge-tool
+    /// candidate scan KNNs each embedded node with the node's OWN
+    /// stored vector, so it needs a per-node vector read (the KNN
+    /// helper takes the query vector as an argument and never reads
+    /// one back). `None` when the node has no vec row.
+    pub fn node_embedding(&self, node_id: &str) -> Result<Option<Vec<f32>>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT embedding FROM node_embeddings WHERE node_id = ?1")?;
+            let mut rows = stmt.query([node_id])?;
+            match rows.next()? {
+                Some(row) => {
+                    let blob: Vec<u8> = row.get(0)?;
+                    Ok(Some(blob_to_embedding(&blob)?))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Appends one merge-tool action to `merge_audit` (migration v9,
+    /// decision 74). The audit row is written for ALL three verdicts —
+    /// the snapshot is the rollback source of a 'same' merge and is
+    /// None for 'related'/'different'. The `id`, `rolled_back`, and
+    /// `created_at` fields of `row` are ignored (see MergeAuditRow).
+    /// Returns the new audit id.
+    ///
+    /// Takes no chat_id (the same single-group contract as the
+    /// embedding helpers): the merge tool is an offline operator tool
+    /// that opens exactly one group per run.
+    pub fn insert_merge_audit(&self, row: &MergeAuditRow) -> Result<i64> {
+        self.with_single_group_conn(|conn| {
+            conn.execute(
+                "INSERT INTO merge_audit (
+                    loser_id, survivor_id, loser_kind, loser_name,
+                    loser_description, verdict, reason, confirmed_by,
+                    edges_moved, self_loops_dropped, edges_deduped,
+                    snapshot, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    row.loser_id,
+                    row.survivor_id,
+                    row.loser_kind,
+                    row.loser_name,
+                    row.loser_description,
+                    row.verdict,
+                    row.reason,
+                    row.confirmed_by,
+                    row.edges_moved,
+                    row.self_loops_dropped,
+                    row.edges_deduped,
+                    row.snapshot,
+                    schema::now_rfc3339()?,
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// All merge_audit rows ordered by id. Used by tests and a possible
+    /// future inspect mode. Audit reads are rare; the table has no
+    /// indexes beyond the primary key, so this is a deliberate full
+    /// scan (migration v9 comment).
+    pub fn list_merge_audit(&self) -> Result<Vec<MergeAuditRow>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, loser_id, survivor_id, loser_kind, loser_name,
+                        loser_description, verdict, reason, confirmed_by,
+                        edges_moved, self_loops_dropped, edges_deduped,
+                        snapshot, rolled_back, created_at
+                 FROM merge_audit ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], merge_audit_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Flips the rolled_back flag of one audit row (the
+    /// `--merge-rollback` flow of graph-spec Section 7.7). A missing
+    /// audit id is a LOUD error — a rollback against a nonexistent
+    /// audit row must never pass silently.
+    pub fn mark_merge_rolled_back(&self, id: i64) -> Result<()> {
+        self.with_single_group_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE merge_audit SET rolled_back = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::InvalidValue {
+                    key: "merge_audit_id".to_string(),
+                    value: format!("no merge_audit row with id {id}"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    /// Runs `f` on the Store's single open group connection. The
+    /// single-group helpers (the embedding sidecar and merge_audit)
+    /// take no chat_id (their interface is pinned by the parallel
+    /// subtasks), so they operate on the Store's single open group: a
+    /// Store used through these helpers must have exactly one group
+    /// open. Rule P5 still holds — the connection is the same per-group
+    /// store.db; the group was fixed at open_group time.
+    fn with_single_group_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let mut guard = self.lock();
         if guard.len() != 1 {
             return Err(StoreError::AmbiguousGroup(guard.len()));
@@ -1110,6 +1276,23 @@ fn embedding_to_blob(embedding: &[f32]) -> Result<Vec<u8>> {
     Ok(embedding.iter().flat_map(|f| f.to_le_bytes()).collect())
 }
 
+/// Decodes the little-endian float32 blob vec0 returns for a
+/// `float[N]` column back into a vector (the inverse of
+/// [`embedding_to_blob`]). A length-mismatched blob is a store error,
+/// not a silent truncation.
+fn blob_to_embedding(blob: &[u8]) -> Result<Vec<f32>> {
+    if blob.len() != EMBEDDING_DIM * 4 {
+        return Err(StoreError::InvalidValue {
+            key: "embedding_blob".to_string(),
+            value: format!("expected {} bytes, got {}", EMBEDDING_DIM * 4, blob.len()),
+        });
+    }
+    Ok(blob
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
 /// Maps one row of a pending_embeddings SELECT to a `PendingEmbedding`.
 fn pending_embedding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEmbedding> {
     Ok(PendingEmbedding {
@@ -1117,6 +1300,28 @@ fn pending_embedding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEmb
         node_id: row.get("node_id")?,
         content_hash: row.get("content_hash")?,
         attempts: row.get("attempts")?,
+    })
+}
+
+/// Maps one row of a merge_audit SELECT to a `MergeAuditRow`.
+fn merge_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeAuditRow> {
+    let created_at: String = row.get("created_at")?;
+    Ok(MergeAuditRow {
+        id: row.get("id")?,
+        loser_id: row.get("loser_id")?,
+        survivor_id: row.get("survivor_id")?,
+        loser_kind: row.get("loser_kind")?,
+        loser_name: row.get("loser_name")?,
+        loser_description: row.get("loser_description")?,
+        verdict: row.get("verdict")?,
+        reason: row.get("reason")?,
+        confirmed_by: row.get("confirmed_by")?,
+        edges_moved: row.get("edges_moved")?,
+        self_loops_dropped: row.get("self_loops_dropped")?,
+        edges_deduped: row.get("edges_deduped")?,
+        snapshot: row.get("snapshot")?,
+        rolled_back: row.get("rolled_back")?,
+        created_at: schema::parse_rfc3339(&created_at)?,
     })
 }
 
@@ -1539,7 +1744,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1549,7 +1754,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -1601,8 +1806,9 @@ mod tests {
     fn migration_v6_upgrades_a_v5_database_in_place() {
         // A database created by the previous release carries migrations
         // v1-v5 and live data. Opening it with this build must apply only
-        // v6 (index-only: no data touched) and v7 (additive embedding
-        // sidecar), keep the data, and be a no-op on reopen.
+        // v6 (index-only: no data touched) plus the additive v7-v9
+        // (embedding sidecar, merge audit), keep the data, and be a
+        // no-op on reopen.
         let dir = tempfile::tempdir().expect("tempdir");
         let group_dir = dir.path().join("c1");
         std::fs::create_dir_all(&group_dir).expect("create group dir");
@@ -1656,7 +1862,7 @@ mod tests {
             .expect("insert v5 message");
         }
 
-        // The upgrade open applies v6 and v7. A reopen is a no-op.
+        // The upgrade open applies v6 through v9. A reopen is a no-op.
         let store = Store::new(dir.path().to_path_buf());
         store.open_group("c1").expect("upgrade open");
         let store2 = Store::new(dir.path().to_path_buf());
@@ -1681,7 +1887,7 @@ mod tests {
             ]
         );
 
-        // Migration bookkeeping: exactly three versions were added.
+        // Migration bookkeeping: exactly four versions were added.
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1691,7 +1897,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     /// The column names of one index, in key order, via PRAGMA index_info.
@@ -1775,7 +1981,7 @@ mod tests {
             .expect("insert summary");
         assert!(summary_id > 0);
 
-        // Migration bookkeeping: the upgrade applied v5 through v8.
+        // Migration bookkeeping: the upgrade applied v5 through v9.
         let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
         let versions: Vec<u32> = {
             let mut stmt = conn
@@ -1786,7 +1992,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -2946,6 +3152,46 @@ mod tests {
     }
 
     #[test]
+    fn node_embedding_round_trips_the_stored_vector() {
+        let (_dir, store) = embedding_store();
+        let vector = {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[0] = 1.0;
+            v[7] = 0.5;
+            v
+        };
+        store.upsert_node_embedding("n1", &vector).expect("upsert");
+
+        let stored = store.node_embedding("n1").expect("read").expect("row");
+        assert_eq!(stored, vector);
+        // A node without a vec row reads as None (the queue-only case).
+        assert_eq!(store.node_embedding("n-missing").expect("read"), None);
+    }
+
+    #[test]
+    fn embedded_node_ids_lists_vec_rows_only() {
+        let (_dir, store) = embedding_store();
+        let vector = vec![1.0f32; EMBEDDING_DIM];
+        store
+            .upsert_node_embedding("n-vec", &vector)
+            .expect("upsert");
+        // A queue-only id (no vec row yet) must NOT occur: the
+        // merge-tool scan has no stored vector to KNN it with.
+        store
+            .enqueue_embeddings(&[("n-queue".to_string(), "h1".to_string())])
+            .expect("enqueue");
+
+        assert_eq!(
+            store.embedded_node_ids().expect("ids"),
+            vec!["n-vec".to_string()]
+        );
+        // The UNION helper of the reconciliation still sees both.
+        let all = store.all_embedding_node_ids().expect("all");
+        assert!(all.contains(&"n-vec".to_string()));
+        assert!(all.contains(&"n-queue".to_string()));
+    }
+
+    #[test]
     fn enqueue_embeddings_dedups_and_requeues_on_a_new_hash() {
         let (_dir, store) = embedding_store();
         let pair = || ("n1".to_string(), "h1".to_string());
@@ -3196,5 +3442,186 @@ mod tests {
             .claim_embedding_batch(1)
             .expect_err("two open groups must fail");
         assert!(matches!(err, StoreError::AmbiguousGroup(2)));
+    }
+
+    // --- merge_audit (migration v9, decision 74) ---------------------
+
+    /// A full 'same'-verdict audit row, snapshot and counters included.
+    /// `id`, `rolled_back`, and `created_at` are placeholders — the
+    /// insert ignores them (see MergeAuditRow).
+    fn sample_merge_audit() -> MergeAuditRow {
+        MergeAuditRow {
+            id: 0,
+            loser_id: "n-loser".to_string(),
+            survivor_id: "n-survivor".to_string(),
+            loser_kind: "Person".to_string(),
+            loser_name: "yux".to_string(),
+            loser_description: Some("the other yux node".to_string()),
+            verdict: "same".to_string(),
+            reason: "same display name, same description".to_string(),
+            confirmed_by: "llm:k3-256k".to_string(),
+            edges_moved: 4,
+            self_loops_dropped: 1,
+            edges_deduped: 2,
+            snapshot: Some(
+                r#"{"node":{"id":"n-loser"},"edges":[{"id":"e1"}],"created_edge_ids":["e9"]}"#
+                    .to_string(),
+            ),
+            rolled_back: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn migration_v9_creates_merge_audit_and_is_idempotent_on_reopen() {
+        let (dir, store) = embedding_store();
+        store
+            .with_conn("c1", |conn| {
+                // The audit table exists after v9.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'merge_audit'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "merge_audit must exist");
+                // v9 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 9)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v9 must be recorded in schema_migrations");
+                Ok(())
+            })
+            .expect("v9 assertions");
+
+        // Reopen through a NEW Store instance: migrations are a no-op
+        // and v9 stays recorded exactly once.
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen");
+        store2
+            .with_conn("c1", |conn| {
+                let v9_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 9",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(v9_rows, 1, "v9 recorded exactly once");
+                Ok(())
+            })
+            .expect("reopen assertions");
+    }
+
+    #[test]
+    fn merge_audit_insert_and_list_round_trip() {
+        let (_dir, store) = embedding_store();
+        let before = OffsetDateTime::now_utc();
+
+        // A full 'same' merge row: snapshot JSON blob and all counters.
+        let merge = sample_merge_audit();
+        let merge_id = store.insert_merge_audit(&merge).expect("insert merge");
+        assert!(merge_id > 0);
+
+        // A 'different' verdict is audited too (specs.md Section 5.2:
+        // one row per merge-tool action), with a NULL snapshot and zero
+        // counters.
+        let different = MergeAuditRow {
+            loser_id: "n-a".to_string(),
+            survivor_id: "n-b".to_string(),
+            loser_kind: "Concept".to_string(),
+            loser_name: "tea".to_string(),
+            loser_description: None,
+            verdict: "different".to_string(),
+            reason: "same word, unrelated senses".to_string(),
+            confirmed_by: "operator".to_string(),
+            edges_moved: 0,
+            self_loops_dropped: 0,
+            edges_deduped: 0,
+            snapshot: None,
+            ..merge.clone()
+        };
+        let different_id = store
+            .insert_merge_audit(&different)
+            .expect("insert different");
+
+        // Ordered by id, both rows come back intact.
+        let rows = store.list_merge_audit().expect("list");
+        assert_eq!(rows.len(), 2);
+        let merged = &rows[0];
+        assert_eq!(merged.id, merge_id);
+        assert_eq!(merged.loser_id, merge.loser_id);
+        assert_eq!(merged.survivor_id, merge.survivor_id);
+        assert_eq!(merged.loser_kind, merge.loser_kind);
+        assert_eq!(merged.loser_name, merge.loser_name);
+        assert_eq!(merged.loser_description, merge.loser_description);
+        assert_eq!(merged.verdict, "same");
+        assert_eq!(merged.reason, merge.reason);
+        assert_eq!(merged.confirmed_by, merge.confirmed_by);
+        assert_eq!(merged.edges_moved, 4);
+        assert_eq!(merged.self_loops_dropped, 1);
+        assert_eq!(merged.edges_deduped, 2);
+        assert_eq!(merged.snapshot, merge.snapshot);
+        assert!(!merged.rolled_back, "rolled_back defaults to 0 on insert");
+        assert!(
+            merged.created_at >= before,
+            "created_at is stamped at insert time"
+        );
+
+        let skipped = &rows[1];
+        assert_eq!(skipped.id, different_id);
+        assert_eq!(skipped.verdict, "different");
+        assert_eq!(skipped.confirmed_by, "operator");
+        assert_eq!(skipped.snapshot, None);
+        assert_eq!(skipped.edges_moved, 0);
+        assert!(!skipped.rolled_back);
+    }
+
+    #[test]
+    fn mark_merge_rolled_back_sets_the_flag_and_errors_on_a_missing_id() {
+        let (_dir, store) = embedding_store();
+        let id = store
+            .insert_merge_audit(&sample_merge_audit())
+            .expect("insert");
+
+        store.mark_merge_rolled_back(id).expect("mark rolled back");
+        let rows = store.list_merge_audit().expect("list");
+        assert!(rows[0].rolled_back, "the flag is set");
+        // The snapshot survives the flag flip: rollback does not erase
+        // the audit trail.
+        assert!(rows[0].snapshot.is_some());
+
+        // A missing audit id is a loud error, never a silent no-op.
+        let err = store
+            .mark_merge_rolled_back(id + 1000)
+            .expect_err("missing id must fail");
+        assert!(
+            matches!(err, StoreError::InvalidValue { .. }),
+            "expected InvalidValue, got {err}"
+        );
+    }
+
+    #[test]
+    fn merge_audit_rejects_an_unknown_verdict() {
+        let (_dir, store) = embedding_store();
+        let bad = MergeAuditRow {
+            verdict: "maybe".to_string(),
+            ..sample_merge_audit()
+        };
+        let err = store
+            .insert_merge_audit(&bad)
+            .expect_err("a verdict outside the CHECK set must fail");
+        assert!(
+            matches!(
+                &err,
+                StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation
+            ),
+            "expected a CHECK constraint violation, got {err}"
+        );
+        // Nothing was written.
+        assert!(store.list_merge_audit().expect("list").is_empty());
     }
 }

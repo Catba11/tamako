@@ -13,7 +13,7 @@ pub enum StoreError {
     #[error("invalid stored value for key {key}: {value}")]
     InvalidValue { key: String, value: String },
     #[error(
-        "embedding helpers take no chat_id and need exactly one open group on this Store, found {0}"
+        "single-group helpers take no chat_id and need exactly one open group on this Store, found {0}"
     )]
     AmbiguousGroup(usize),
 }
