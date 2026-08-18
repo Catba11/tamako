@@ -23,6 +23,7 @@ pub mod context;
 pub mod digest;
 pub mod embedding;
 pub mod event;
+pub mod merge;
 pub mod session;
 pub mod summary;
 pub mod trigger;
