@@ -497,6 +497,12 @@ pub async fn plan_merges<M: MemoryBackend>(
 /// a 'same' merge carries the snapshot and the edge counters. The
 /// `id`/`rolled_back`/`created_at` fields are placeholders —
 /// `insert_merge_audit` ignores them.
+///
+/// Decision 75 audit remarks: the v9 schema stays FROZEN — the
+/// invariant-pass count rides the `reason` field instead of a new
+/// column. When the merge invalidated single-value duplicates, the
+/// confirmer's reason gets the note
+/// `"; single-value invariant: invalidated N edge(s)"` appended.
 fn audit_row(
     action: &MergePlanAction,
     confirmed_by: &str,
@@ -508,6 +514,15 @@ fn audit_row(
     } else {
         (&candidate.b_name, &candidate.b_description)
     };
+    let mut reason = action.reason.clone();
+    if let Some(outcome) = outcome {
+        if outcome.single_value_invalidated > 0 {
+            reason.push_str(&format!(
+                "; single-value invariant: invalidated {} edge(s)",
+                outcome.single_value_invalidated
+            ));
+        }
+    }
     MergeAuditRow {
         id: 0,
         loser_id: action.loser_id.clone(),
@@ -520,7 +535,7 @@ fn audit_row(
             Some(loser_description.clone())
         },
         verdict: action.verdict.as_str().to_string(),
-        reason: action.reason.clone(),
+        reason,
         confirmed_by: confirmed_by.to_string(),
         edges_moved: outcome.map_or(0, |outcome| outcome.edges_moved),
         self_loops_dropped: outcome.map_or(0, |outcome| outcome.self_loops_dropped),
@@ -533,18 +548,46 @@ fn audit_row(
 
 /// Applies one plan action: the graph mutation first, then the audit
 /// row (Section 7.7 step 3 order). Returns the new audit id.
+///
+/// Decision 75 (c): the 'same' merge rides the resolved single-value
+/// registry, so the invariant pass closes the re-point hole on the
+/// survivor (the invariant holds globally, not just at the digest
+/// path). An empty registry is the decision-74 behavior.
 async fn apply_one<M: MemoryBackend>(
     store: &Arc<Store>,
     memory: &M,
     chat_id: &str,
     action: &MergePlanAction,
     confirmed_by: &str,
+    single_value_predicates: &[String],
 ) -> Result<i64, MergeError> {
     let outcome = match action.verdict {
         MergeVerdict::Same => {
             let outcome = memory
-                .merge_nodes(chat_id, &action.loser_id, &action.survivor_id)
+                .merge_nodes_with_registry(
+                    chat_id,
+                    &action.loser_id,
+                    &action.survivor_id,
+                    single_value_predicates,
+                )
                 .await?;
+            // Decision 75 (e): the invariant-pass count feeds the same
+            // `facts_invalidated_total` counter as the digest write
+            // path. Best effort, like every counter: a failure is a
+            // WARN, never an action failure (the merge itself already
+            // committed). A zero count skips the store call entirely
+            // (the pipeline's `bump_counter_by` discipline).
+            if outcome.single_value_invalidated > 0 {
+                let count = i64::from(outcome.single_value_invalidated);
+                let chat_id_owned = chat_id.to_string();
+                if let Err(error) = store_call(store, move |store| {
+                    store.increment_counter(&chat_id_owned, "facts_invalidated_total", count)
+                })
+                .await
+                {
+                    warn!(chat_id, loser_id = %action.loser_id, survivor_id = %action.survivor_id, %error, "merge apply: failed to increment facts_invalidated_total");
+                }
+            }
             // Delete the loser's vec row and queue rows (Section 7.7
             // step 3). A failure here must NOT abort the audit write —
             // without the audit row the snapshot is lost and rollback
@@ -588,6 +631,15 @@ async fn apply_one<M: MemoryBackend>(
 /// its audit row (specs.md Section 5.2). `confirmed_by` is
 /// `llm:<model>` or `operator` (decision 74 / migration v9).
 ///
+/// Decision 75 (c): `single_value_predicates` is the resolved
+/// per-group registry; every 'same' merge runs the invariant pass on
+/// the survivor (the invariant holds globally, not just at the digest
+/// path). An EMPTY slice preserves the decision-74 behavior exactly.
+/// The registry rides a plain parameter (the same seam shape as
+/// `MemoryBackend::merge_nodes_with_registry`) rather than an options
+/// struct: one call site per CLI mode, no further apply-time options
+/// in sight.
+///
 /// Best-effort per action: one action's failure logs WARN, lands in
 /// [`ApplyReport::failures`], and the batch continues — it never
 /// aborts mid-way silently.
@@ -597,10 +649,20 @@ pub async fn apply_merge_plan<M: MemoryBackend>(
     chat_id: &str,
     plan: &MergePlan,
     confirmed_by: &str,
+    single_value_predicates: &[String],
 ) -> ApplyReport {
     let mut report = ApplyReport::default();
     for action in &plan.actions {
-        match apply_one(store, memory, chat_id, action, confirmed_by).await {
+        match apply_one(
+            store,
+            memory,
+            chat_id,
+            action,
+            confirmed_by,
+            single_value_predicates,
+        )
+        .await
+        {
             Ok(audit_id) => report.audit_ids.push(audit_id),
             Err(error) => {
                 warn!(chat_id, loser_id = %action.loser_id, survivor_id = %action.survivor_id, verdict = %action.verdict.as_str(), %error, "merge apply: action failed; continuing with the next action");
@@ -1278,7 +1340,7 @@ mod tests {
         let plan = plan_merges(&store, &memory, CHAT, 0.85, &confirmer, 10)
             .await
             .expect("plan");
-        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "llm:test-model").await;
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "llm:test-model", &[]).await;
         (dir, store, memory, fixture, report)
     }
 
@@ -1417,7 +1479,7 @@ mod tests {
                 action.survivor_id = identifiers::concept_id("gone");
             }
         }
-        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator").await;
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].loser_id, fixture.rustlang.id);
         assert_eq!(
@@ -1435,6 +1497,184 @@ mod tests {
             .await
             .expect("content")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_with_registry_invalidates_the_survivors_single_value_duplicate() {
+        // Decision 75 (c): two fragmented Concepts each carry ONE valid
+        // `works_at` edge; the re-point leaves TWO on the survivor, and
+        // the invariant pass of `merge_nodes_with_registry` invalidates
+        // the older one. The counter bumps, and the audit row's reason
+        // carries the invariant note (the v9 schema stays frozen).
+        let at = base();
+        let rust = node("Rust", NodeType::Concept, "the programming language", at);
+        let rustlang = node(
+            "Rust Language",
+            NodeType::Concept,
+            "the Rust programming language",
+            at + Duration::seconds(1),
+        );
+        let acme = node("AcmeCorp", NodeType::Concept, "the old employer", at);
+        let newcorp = node("NewCorp", NodeType::Concept, "the new employer", at);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        store.open_group(CHAT).expect("open group");
+        let memory = LbugBackend::new(dir.path());
+        memory
+            .upsert_batch(
+                CHAT,
+                &MemoryBatch {
+                    batch_id: identifiers::batch_id(1, 10),
+                    nodes: vec![
+                        rust.clone(),
+                        rustlang.clone(),
+                        acme.clone(),
+                        newcorp.clone(),
+                    ],
+                    edges: vec![
+                        // The loser's OLDER works_at edge.
+                        edge(
+                            &rustlang.id,
+                            &acme.id,
+                            "works_at",
+                            "Rust Language at AcmeCorp",
+                            None,
+                            1,
+                        ),
+                        // The survivor's NEWER works_at edge.
+                        edge(
+                            &rust.id,
+                            &newcorp.id,
+                            "works_at",
+                            "Rust at NewCorp",
+                            None,
+                            2,
+                        ),
+                        // Enough survivor-only edges that `rust` wins the
+                        // degree rule and survives.
+                        edge(
+                            &rust.id,
+                            &acme.id,
+                            "mentions",
+                            "Rust mentions AcmeCorp",
+                            None,
+                            3,
+                        ),
+                        edge(
+                            &rust.id,
+                            &newcorp.id,
+                            "mentions",
+                            "Rust mentions NewCorp",
+                            None,
+                            4,
+                        ),
+                    ],
+                },
+            )
+            .await
+            .expect("seed graph");
+        // Near-parallel vectors make the pair the only candidate.
+        store
+            .upsert_node_embedding(&rust.id, &vector(0, None))
+            .expect("vec");
+        store
+            .upsert_node_embedding(&rustlang.id, &vector(0, Some((1, 0.1))))
+            .expect("vec");
+
+        let confirmer = ScriptedConfirmer::default().with(
+            "Rust",
+            "Rust Language",
+            MergeVerdict::Same,
+            "identical concept",
+        );
+        let plan = plan_merges(&store, &memory, CHAT, 0.85, &confirmer, 10)
+            .await
+            .expect("plan");
+        assert_eq!(plan.actions.len(), 1);
+        let registry = vec!["works_at".to_string()];
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &registry).await;
+        assert!(report.failures.is_empty());
+        assert_eq!(report.audit_ids.len(), 1);
+
+        // Exactly one valid works_at edge on the survivor: the NEWER
+        // one (NewCorp); the re-pointed older one (AcmeCorp) is invalid.
+        let rows = memory
+            .query_rows(
+                CHAT,
+                &format!(
+                    "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(t:Node) \
+                     WHERE r.relationship_name = 'works_at' \
+                     RETURN t.name, r.invalid_at",
+                    rust.id
+                ),
+            )
+            .await
+            .expect("edges");
+        assert_eq!(rows.len(), 2, "both edges exist on the survivor");
+        let valid: Vec<_> = rows
+            .iter()
+            .filter(|row| row[1] == "NULL")
+            .map(|row| row[0].clone())
+            .collect();
+        assert_eq!(
+            valid,
+            vec!["NewCorp".to_string()],
+            "the newest valid_at wins"
+        );
+
+        // The counter bumped by the invariant count.
+        assert_eq!(
+            store
+                .get_state(CHAT, "facts_invalidated_total")
+                .expect("state"),
+            Some("1".to_string())
+        );
+
+        // The audit row: the edge counters keep the v9 shape, and the
+        // reason carries the invariant note verbatim.
+        let row = store
+            .list_merge_audit()
+            .expect("audit")
+            .into_iter()
+            .find(|row| row.verdict == "same")
+            .expect("same row");
+        assert_eq!(
+            row.reason,
+            "identical concept; single-value invariant: invalidated 1 edge(s)"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_with_an_empty_registry_keeps_the_decision_74_audit_reason() {
+        // The empty-registry apply path is the decision-74 behavior: no
+        // invariant pass, no counter row, no note in the reason.
+        let fixture = fixture();
+        let (_dir, store, memory) = seeded(&fixture).await;
+        let confirmer = ScriptedConfirmer::default().with(
+            "Rust",
+            "Rust Language",
+            MergeVerdict::Same,
+            "identical concept",
+        );
+        let plan = plan_merges(&store, &memory, CHAT, 0.85, &confirmer, 10)
+            .await
+            .expect("plan");
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
+        assert!(report.failures.is_empty());
+        let row = store
+            .list_merge_audit()
+            .expect("audit")
+            .into_iter()
+            .find(|row| row.verdict == "same")
+            .expect("same row");
+        assert_eq!(row.reason, "identical concept");
+        assert_eq!(
+            store
+                .get_state(CHAT, "facts_invalidated_total")
+                .expect("state"),
+            None,
+            "no counter row without an invariant pass"
+        );
     }
 
     #[tokio::test]
@@ -1538,7 +1778,7 @@ mod tests {
             .expect("plan");
         plan.actions
             .retain(|action| action.verdict == MergeVerdict::Same);
-        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator").await;
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
         assert!(report.failures.is_empty());
 
         // After the merge, reconciliation does NOTHING for the loser:

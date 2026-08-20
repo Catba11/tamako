@@ -80,6 +80,14 @@ pub struct AgentDigestPipeline<M: MemoryBackend> {
     /// the pipeline was built without the vector sidecar (replay mode,
     /// or a missing embedding provider key).
     vector: Option<VectorParts>,
+    /// The decision-75 single-value fact predicates of the resolved
+    /// group (graph-spec Section 7.5). They ride the graph commit so a
+    /// new edge with a registered predicate invalidates the older valid
+    /// (subject, predicate) siblings. EMPTY preserves the byte-identical
+    /// Phase 1 write behavior: a pipeline built without
+    /// [`Self::with_single_value_predicates`] never invalidates and
+    /// never touches the `facts_invalidated_total` counter.
+    single_value_predicates: Vec<String>,
     config: PipelineConfig,
 }
 
@@ -111,6 +119,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             memory,
             extractor,
             vector: None,
+            single_value_predicates: Vec::new(),
             config,
         }
     }
@@ -141,6 +150,17 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             confirmer,
             config,
         });
+        self
+    }
+
+    /// Wires the decision-75 single-value fact registry (Section 7.5).
+    /// Builder-style, like [`Self::with_embedding_store`]: the resolved
+    /// per-group `single_value_predicates` of the group this pipeline
+    /// serves. A pipeline built without it keeps the byte-identical
+    /// Phase 1 write behavior: the commit never invalidates and never
+    /// touches the `facts_invalidated_total` counter.
+    pub fn with_single_value_predicates(mut self, predicates: Vec<String>) -> Self {
+        self.single_value_predicates = predicates;
         self
     }
 
@@ -291,7 +311,24 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         let batch = resolved.batch;
         let node_count = batch.nodes.len();
         let edge_count = batch.edges.len();
-        self.memory.upsert_batch(chat_id, &batch).await?;
+        // Decision 75 (Section 7.5): the graph commit rides the resolved
+        // single-value registry, so a new edge with a registered
+        // predicate invalidates the older valid (subject, predicate)
+        // siblings inside the same transaction. An EMPTY registry is the
+        // byte-identical Phase 1 write path (no invalidation, zero
+        // returned). The count feeds the `facts_invalidated_total`
+        // counter of decision 75 (e), best effort like every counter of
+        // the pipeline (`bump_counter_by` skips zero).
+        let outcome = self
+            .memory
+            .upsert_batch_with_registry(chat_id, &batch, &self.single_value_predicates)
+            .await?;
+        self.bump_counter_by(
+            chat_id,
+            "facts_invalidated_total",
+            i64::from(outcome.invalidated),
+        )
+        .await;
         // Decision 66: immediately AFTER the graph commit, enqueue the
         // (node_id, content-hash) pairs into the per-group
         // pending_embeddings queue. The sidecar vector write of Section
@@ -1389,6 +1426,148 @@ mod tests {
                 .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
                 .expect("state"),
             None
+        );
+    }
+
+    // ---- Decision 75: the single-value registry rides the graph
+    // commit. Real tempdir Store + real LbugBackend, scripted extractor
+    // (the pattern of the decision-66/73 tests above). ----
+
+    /// One batch carrying a single-value CHANGE ("quit A, now at B"):
+    /// two `works_at` edges out of the same sender-bound person, in
+    /// batch order. The last write must win.
+    fn works_at_change_graph() -> KnowledgeGraph {
+        KnowledgeGraph {
+            nodes: vec![
+                ExtractedNode {
+                    name: "Alice".to_string(),
+                    node_type: ExtractedNodeType::Person,
+                    description: "A group member changing jobs.".to_string(),
+                },
+                ExtractedNode {
+                    name: "AcmeCorp".to_string(),
+                    node_type: ExtractedNodeType::Concept,
+                    description: "The old employer.".to_string(),
+                },
+                ExtractedNode {
+                    name: "NewCorp".to_string(),
+                    node_type: ExtractedNodeType::Concept,
+                    description: "The new employer.".to_string(),
+                },
+            ],
+            edges: vec![
+                ExtractedEdge {
+                    source: "Alice".to_string(),
+                    target: "AcmeCorp".to_string(),
+                    relationship_name: "works_at".to_string(),
+                    description: "Alice works at AcmeCorp.".to_string(),
+                },
+                ExtractedEdge {
+                    source: "Alice".to_string(),
+                    target: "NewCorp".to_string(),
+                    relationship_name: "works_at".to_string(),
+                    description: "Alice now works at NewCorp.".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// The valid/invalid `works_at` rows of the sender-bound Alice, as
+    /// (target name, invalid_at rendering) pairs.
+    async fn works_at_rows(memory: &LbugBackend) -> Vec<(String, String)> {
+        memory
+            .query_rows(
+                ENQUEUE_CHAT,
+                &format!(
+                    "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(t:Node) \
+                     WHERE r.relationship_name = 'works_at' \
+                     RETURN t.name, r.invalid_at",
+                    person_id("1001")
+                ),
+            )
+            .await
+            .expect("query")
+            .into_iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_registered_predicate_change_invalidates_the_old_edge_and_bumps_the_counter() {
+        // Decision 75 (b)/(e): one batch carries the change, the last
+        // write wins, the older valid sibling is invalidated inside the
+        // same transaction, and the count feeds facts_invalidated_total.
+        let (_dir, store, memory) = enqueue_fixtures();
+        al_messages(&store);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![works_at_change_graph()]),
+            None,
+        )
+        .with_single_value_predicates(vec!["works_at".to_string()]);
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // The counter moved by exactly the invalidated count.
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "facts_invalidated_total")
+                .expect("state"),
+            Some("1".to_string())
+        );
+        // Exactly one valid works_at edge on Alice (the last write);
+        // the older one carries an invalid_at.
+        let rows = works_at_rows(&memory).await;
+        assert_eq!(rows.len(), 2);
+        let valid: Vec<_> = rows
+            .iter()
+            .filter(|(_, invalid_at)| invalid_at == "NULL")
+            .collect();
+        assert_eq!(valid.len(), 1, "exactly one valid works_at edge");
+        assert_eq!(valid[0].0, "NewCorp", "the last write wins");
+    }
+
+    #[tokio::test]
+    async fn no_registry_keeps_the_byte_identical_phase_1_write_behavior() {
+        // A pipeline built WITHOUT with_single_value_predicates keeps
+        // the decision-74 write path: every predicate stays multi-value
+        // (both edges valid) and no facts_invalidated_total counter row
+        // appears (bump_counter_by skips a zero delta).
+        let (_dir, store, memory) = enqueue_fixtures();
+        al_messages(&store);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![works_at_change_graph()]),
+            None,
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // No counter row at all.
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "facts_invalidated_total")
+                .expect("state"),
+            None
+        );
+        // Both edges stay valid (multi-value Phase 1).
+        let rows = works_at_rows(&memory).await;
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|(_, invalid_at)| invalid_at == "NULL"),
+            "no invalidation without a registry"
         );
     }
 }
