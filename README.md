@@ -209,6 +209,27 @@ cargo run -- --merge-rollback -1001234567890 <audit_id> --data-root ./data
 
 Without a digest-endpoint LLM key `--merge-tool` prints only the scan (the candidate pairs above the threshold) with a note that the confirmations were skipped; it writes nothing either way. The candidate threshold is the per-group `merge_candidate_threshold` config key (default 0.85); `--max-confirmations N` caps the LLM confirmation calls of one run (default 50). Rollback does not re-embed the restored node itself: the next startup reconciliation of the embedding worker picks it up automatically (decision 66).
 
+The fact modes are the offline fact-validity tool (current-state.md decision 75, `proposed-graph-database-specs.md` Section 7.5): they list, invalidate, and re-validate the edges of one node. No LLM key is needed. Like the merge modes they WRITE the group's `store.db` and `memory.lbug`, so **stop the bot first** — a running bot holds the group's LadybugDB mutex and the store's single writer. The flow: `--facts` prints the edge ids that `--invalidate` / `--revalidate` take.
+
+```sh
+# List every edge of the node resolved from <name> (exact alias match),
+# both directions, valid AND invalid — with the edge id, the direction,
+# the predicate, the other endpoint, a description excerpt, and the
+# validity timestamps. An unknown name exits non-zero.
+cargo run -- --facts -1001234567890 <name> --data-root ./data
+
+# Set invalid_at on one edge. The edge id is the opaque string that
+# --facts prints; a malformed or unknown id exits non-zero. A successful
+# invalidation bumps facts_invalidated_total.
+cargo run -- --invalidate -1001234567890 <edge_id> --data-root ./data
+
+# Clear invalid_at on one edge (the typo safety net). Does NOT decrement
+# facts_invalidated_total: the counter counts invalidation events.
+cargo run -- --revalidate -1001234567890 <edge_id> --data-root ./data
+```
+
+Invalidation is non-destructive and self-recording: it sets `invalid_at` on the edge row itself (no audit table), and the recall path has filtered invalid edges since M5 — an invalidated fact stops entering wakes immediately. The `facts_invalidated_total` counter (visible in `--status`) counts invalidation events from all three write paths: the digest path, the merge apply path, and the manual `--invalidate` command.
+
 ## Verification commands
 
 ```sh

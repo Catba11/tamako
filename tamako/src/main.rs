@@ -8,8 +8,10 @@
 //! (M5) from the resolved LLM endpoints of Section 13; without the
 //! family API key the pipelines degrade to silence. The `--merge-tool` /
 //! `--merge` / `--merge-rollback` modes are the OFFLINE merge tool of
-//! current-state.md decision 74 (graph-spec Section 7.7): they run with
-//! the bot STOPPED and never start the event loop.
+//! current-state.md decision 74 (graph-spec Section 7.7), and the
+//! `--facts` / `--invalidate` / `--revalidate` modes the OFFLINE fact
+//! commands of decision 75 (graph-spec Section 7.5): they run with the
+//! bot STOPPED and never start the event loop.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -60,6 +62,9 @@ Usage:
   tamako --merge-tool <chat_id> [--apply] [--max-confirmations N] [--data-root <dir>] [--config <config.toml>]
   tamako --merge <chat_id> <loser_id> <survivor_id> [--data-root <dir>]
   tamako --merge-rollback <chat_id> <audit_id> [--data-root <dir>]
+  tamako --facts <chat_id> <name> [--data-root <dir>]
+  tamako --invalidate <chat_id> <edge_id> [--data-root <dir>]
+  tamako --revalidate <chat_id> <edge_id> [--data-root <dir>]
   tamako --help
 
 Options:
@@ -101,6 +106,36 @@ Options:
                            snapshot and marks the row rolled back. STOP
                            THE BOT FIRST. The restored node's embedding
                            is rebuilt by the next startup reconciliation.
+  --facts <chat_id> <name> The offline fact listing (decision 75,
+                           graph-spec Section 7.5): every edge of the
+                           node resolved from <name> (exact alias
+                           match), both directions, valid AND invalid —
+                           with the edge id, the direction, the
+                           predicate, the other endpoint, a description
+                           excerpt, and the validity timestamps. The
+                           printed edge ids are the values that
+                           --invalidate / --revalidate take. No LLM
+                           needed. STOP THE BOT FIRST: the command opens
+                           the group's store.db and memory.lbug as the
+                           single writer and cannot share them with a
+                           running bot. An unknown name exits non-zero.
+  --invalidate <chat_id> <edge_id>
+                           Sets invalid_at on one edge (decision 75,
+                           graph-spec Section 7.5): the manual
+                           invalidation. <edge_id> is the opaque id that
+                           --facts prints; a malformed or unknown id
+                           exits non-zero. A successful invalidation also
+                           bumps the facts_invalidated_total counter.
+                           No LLM needed. STOP THE BOT FIRST.
+  --revalidate <chat_id> <edge_id>
+                           Clears invalid_at on one edge (decision 75,
+                           graph-spec Section 7.5): the typo safety net
+                           that undoes an invalidation. <edge_id> is the
+                           opaque id that --facts prints; a malformed or
+                           unknown id exits non-zero. Does NOT decrement
+                           facts_invalidated_total: the counter counts
+                           invalidation events, not invalid edges. No
+                           LLM needed. STOP THE BOT FIRST.
   --apply                  Only affects --merge-tool: executes the printed
                            plan (merges, also_known_as links, audit rows)
                            instead of the dry run.
@@ -123,8 +158,8 @@ Options:
   --help                   Show this text.";
 
 /// The run mode. Exactly one of `--replay` / `--live` / `--status` /
-/// `--status-all` / `--merge-tool` / `--merge` / `--merge-rollback` is
-/// required.
+/// `--status-all` / `--merge-tool` / `--merge` / `--merge-rollback` /
+/// `--facts` / `--invalidate` / `--revalidate` is required.
 #[derive(Debug)]
 enum Mode {
     Replay {
@@ -146,6 +181,18 @@ enum Mode {
     MergeRollback {
         chat_id: String,
         audit_id: i64,
+    },
+    Facts {
+        chat_id: String,
+        name: String,
+    },
+    Invalidate {
+        chat_id: String,
+        edge_id: String,
+    },
+    Revalidate {
+        chat_id: String,
+        edge_id: String,
     },
 }
 
@@ -184,6 +231,9 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     let mut merge_tool = None;
     let mut merge = None;
     let mut merge_rollback = None;
+    let mut facts = None;
+    let mut invalidate = None;
+    let mut revalidate = None;
     let mut allow_default_persona = false;
     let mut verbose = false;
     let mut apply = false;
@@ -224,6 +274,26 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
                     format!("the --merge-rollback audit id must be an integer, got '{audit_id}'")
                 })?;
                 merge_rollback = Some((chat_id, audit_id));
+            }
+            "--facts" => {
+                let missing = "the --facts flag needs two values: <chat_id> <name>";
+                let chat_id = args.next().ok_or(missing)?;
+                let name = args.next().ok_or(missing)?;
+                facts = Some((chat_id, name));
+            }
+            "--invalidate" | "--revalidate" => {
+                // The edge id is an OPAQUE string (a compact JSON of the
+                // edge's natural key, decision 75): the parse accepts
+                // any value and the RUNTIME errors loudly on a malformed
+                // or unknown id (EdgeId::decode / the backend).
+                let missing = format!("the {arg} flag needs two values: <chat_id> <edge_id>");
+                let chat_id = args.next().ok_or(missing.clone())?;
+                let edge_id = args.next().ok_or(missing)?;
+                if arg == "--invalidate" {
+                    invalidate = Some((chat_id, edge_id));
+                } else {
+                    revalidate = Some((chat_id, edge_id));
+                }
             }
             "--apply" => apply = true,
             "--max-confirmations" => {
@@ -277,9 +347,19 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     if let Some((chat_id, audit_id)) = merge_rollback {
         modes.push(Mode::MergeRollback { chat_id, audit_id });
     }
+    if let Some((chat_id, name)) = facts {
+        modes.push(Mode::Facts { chat_id, name });
+    }
+    if let Some((chat_id, edge_id)) = invalidate {
+        modes.push(Mode::Invalidate { chat_id, edge_id });
+    }
+    if let Some((chat_id, edge_id)) = revalidate {
+        modes.push(Mode::Revalidate { chat_id, edge_id });
+    }
     const MODE_LIST: &str = "--replay <fixture.json>, --live, --status <chat_id>, \
          --status-all, --merge-tool <chat_id>, --merge <chat_id> <loser_id> <survivor_id>, \
-         or --merge-rollback <chat_id> <audit_id>";
+         --merge-rollback <chat_id> <audit_id>, --facts <chat_id> <name>, \
+         --invalidate <chat_id> <edge_id>, or --revalidate <chat_id> <edge_id>";
     let mode = match modes.len() {
         1 => modes.pop().expect("exactly one mode collected"),
         0 => return Err(format!("one of {MODE_LIST} is required")),
@@ -482,6 +562,11 @@ fn resolve_endpoints(config: &TriggerConfig) -> Result<LlmEndpoints> {
 /// `vector_match_threshold` / `vector_candidate_threshold` /
 /// `resolution_confirm_budget`) come from the resolved per-group
 /// `trigger_config` (specs.md Section 13).
+///
+/// Decision 75: the resolved per-group `single_value_predicates` ride
+/// the graph commit through `with_single_value_predicates` — the SAME
+/// wiring in replay and live mode (replay convergence is a write-path
+/// property).
 fn build_digest_pipeline(
     store: &Arc<Store>,
     memory: &Arc<LbugBackend>,
@@ -509,6 +594,13 @@ fn build_digest_pipeline(
                     pipeline
                 }
             };
+            // Decision 75: the resolved per-group single-value registry
+            // rides the graph commit. The replay path wires it too —
+            // replay convergence is a write-path property (a replayed
+            // batch converges state-wise), so live and replay must run
+            // the SAME invalidation behavior.
+            let pipeline = pipeline
+                .with_single_value_predicates(trigger_config.single_value_predicates.clone());
             // Decision 73: the vector pre-screen. Both the provider AND
             // the dedicated store must be wired for step 3 to activate
             // (the KNN read rides the one-group store).
@@ -774,11 +866,12 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
 /// Dispatches to the selected run mode. The status modes are offline
 /// inspection: no persona load, no TELOXIDE_TOKEN, no LLM endpoints, no
 /// actor spawn — status NEVER fails for a missing persona file. The
-/// merge modes are the offline operator tool of decision 74: they open
-/// one group's store and graph directly (the bot must be STOPPED) and
-/// never start the event loop. The run modes share one outbound channel
-/// for every actor (Rule A3): the actions carry their chat id, so one
-/// pump into the platform adapter is enough.
+/// merge modes are the offline operator tool of decision 74 and the fact
+/// modes the offline operator tool of decision 75: they open one group's
+/// store and graph directly (the bot must be STOPPED) and never start
+/// the event loop. The run modes share one outbound channel for every
+/// actor (Rule A3): the actions carry their chat id, so one pump into
+/// the platform adapter is enough.
 async fn run(cli: Cli) -> Result<()> {
     match &cli.mode {
         Mode::Status { chat_id } => return run_status(&cli, chat_id),
@@ -791,6 +884,13 @@ async fn run(cli: Cli) -> Result<()> {
         } => return run_merge(&cli, chat_id, loser_id, survivor_id).await,
         Mode::MergeRollback { chat_id, audit_id } => {
             return run_merge_rollback(&cli, chat_id, *audit_id).await
+        }
+        Mode::Facts { chat_id, name } => return run_facts(&cli, chat_id, name).await,
+        Mode::Invalidate { chat_id, edge_id } => {
+            return run_invalidate(&cli, chat_id, edge_id).await
+        }
+        Mode::Revalidate { chat_id, edge_id } => {
+            return run_revalidate(&cli, chat_id, edge_id).await
         }
         Mode::Replay { .. } | Mode::Live => {}
     }
@@ -806,7 +906,10 @@ async fn run(cli: Cli) -> Result<()> {
         | Mode::StatusAll
         | Mode::MergeTool { .. }
         | Mode::Merge { .. }
-        | Mode::MergeRollback { .. } => unreachable!(),
+        | Mode::MergeRollback { .. }
+        | Mode::Facts { .. }
+        | Mode::Invalidate { .. }
+        | Mode::Revalidate { .. } => unreachable!(),
     }
 }
 
@@ -1098,13 +1201,14 @@ impl tamako_core::merge::MergeConfirmer for AgentMergeConfirmer {
 }
 
 /// Opens the per-group store and graph backend of the merge modes
-/// (decision 74: an OFFLINE operator tool, one group per run — THE BOT
-/// MUST BE STOPPED, decision 47: an external process cannot share the
-/// per-group lbug mutex or the store's single WAL writer). The store
-/// opens ONLY the given group, matching the AmbiguousGroup constraint
-/// of the chat_id-less embedding/audit helpers. A group with no
-/// store.db is a loud error in the wording of --status: `open_group`
-/// would CREATE an empty store and mask a mistyped chat id.
+/// (decision 74) and the fact modes (decision 75): OFFLINE operator
+/// tools, one group per run — THE BOT MUST BE STOPPED (decision 47: an
+/// external process cannot share the per-group lbug mutex or the store's
+/// single WAL writer). The store opens ONLY the given group, matching
+/// the AmbiguousGroup constraint of the chat_id-less embedding/audit
+/// helpers. A group with no store.db is a loud error in the wording of
+/// --status: `open_group` would CREATE an empty store and mask a
+/// mistyped chat id.
 fn open_merge_group(data_root: &Path, chat_id: &str) -> Result<(Arc<Store>, LbugBackend)> {
     if !data_root.join(chat_id).join("store.db").is_file() {
         anyhow::bail!(
@@ -1170,7 +1274,17 @@ async fn run_merge_tool(cli: &Cli, chat_id: &str) -> Result<()> {
         return Ok(());
     }
     let confirmed_by = format!("llm:{}", endpoints.digest.model);
-    let report = apply_merge_plan(&store, &memory, chat_id, &plan, &confirmed_by).await;
+    // Decision 75 (c): the invariant must hold globally, so the tool
+    // path runs it with the resolved per-group registry.
+    let report = apply_merge_plan(
+        &store,
+        &memory,
+        chat_id,
+        &plan,
+        &confirmed_by,
+        &group_config.single_value_predicates,
+    )
+    .await;
     print!(
         "{}",
         format_apply_report(chat_id, &plan, &report, &confirmed_by)
@@ -1200,6 +1314,11 @@ async fn run_merge(cli: &Cli, chat_id: &str, loser_id: &str, survivor_id: &str) 
         );
     }
     let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    // Decision 75 (c): the invariant must hold globally, so the manual
+    // merge path runs it with the resolved per-group registry (the same
+    // resolution as --merge-tool).
+    let bot_config = load_bot_config(cli.config.as_deref())?;
+    let group_config = bot_config.for_group(chat_id);
     // The stored content of both nodes feeds the audit row's loser
     // name/description and the loud unknown-id error.
     let content_of = |node_id: &str| {
@@ -1283,7 +1402,15 @@ async fn run_merge(cli: &Cli, chat_id: &str, loser_id: &str, survivor_id: &str) 
         actions: vec![action],
         skipped: Vec::new(),
     };
-    let report = apply_merge_plan(&store, &memory, chat_id, &plan, "operator").await;
+    let report = apply_merge_plan(
+        &store,
+        &memory,
+        chat_id,
+        &plan,
+        "operator",
+        &group_config.single_value_predicates,
+    )
+    .await;
     if let Some(failure) = report.failures.first() {
         anyhow::bail!(
             "the merge of {loser_id} into {survivor_id} in group {chat_id} failed: {}",
@@ -1327,6 +1454,184 @@ async fn run_merge_rollback(cli: &Cli, chat_id: &str, audit_id: i64) -> Result<(
     println!("  the audit row is marked rolled back");
     println!("  the restored node's embedding is rebuilt by the next startup reconciliation");
     Ok(())
+}
+
+/// The character cap of one `--facts` description excerpt: longer edge
+/// texts are cut at a character boundary and marked with an ellipsis
+/// (the full text stays in the graph).
+const FACTS_EXCERPT_MAX_CHARS: usize = 60;
+
+/// The `--facts` run (decision 75, graph-spec Section 7.5): the fact
+/// listing of one node, resolved through the exact-alias machinery of
+/// Section 7.4 step 2. OFFLINE: the bot must be stopped. No LLM needed.
+/// Every edge prints with the opaque edge id that `--invalidate` /
+/// `--revalidate` take. An unknown name is a loud error (exit 1); a
+/// resolved node with zero edges prints an explicit note.
+async fn run_facts(cli: &Cli, chat_id: &str, name: &str) -> Result<()> {
+    let (_store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    let facts = memory
+        .node_facts(chat_id, name)
+        .await
+        .with_context(|| format!("failed to read the facts of \"{name}\" in group {chat_id}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no node named \"{name}\" in group {chat_id} (the entry is the exact alias \
+                 match; run --facts with a name the graph knows)"
+            )
+        })?;
+    print!("{}", format_node_facts(&facts));
+    Ok(())
+}
+
+/// Renders one timestamp of the fact modes as RFC 3339; an
+/// unrepresentable value degrades to a marker instead of failing the
+/// listing.
+fn format_fact_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "<invalid timestamp>".to_string())
+}
+
+/// Shortens a description excerpt at a character boundary: the first
+/// `FACTS_EXCERPT_MAX_CHARS` characters plus an ellipsis. Pure.
+fn excerpt_edge_text(text: &str) -> String {
+    let char_count = text.chars().count();
+    if char_count <= FACTS_EXCERPT_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut excerpt: String = text.chars().take(FACTS_EXCERPT_MAX_CHARS).collect();
+    excerpt.push('…');
+    excerpt
+}
+
+/// Renders the `--facts` listing: one block per edge — the opaque edge
+/// id first (the operator copies it), then direction, predicate, the
+/// other endpoint, the description excerpt, and the validity
+/// timestamps. An edge with `invalid_at` set is marked INVALID. Pure.
+fn format_node_facts(facts: &tamako_memory::NodeFacts) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Facts: \"{}\" ({}) in the group graph",
+        facts.node_name, facts.node_id
+    );
+    let _ = writeln!(out, "  edges: {}", facts.edges.len());
+    for edge in &facts.edges {
+        let direction = if edge.outgoing { "->" } else { "<-" };
+        let _ = writeln!(out, "  edge id: {}", edge.edge_id);
+        let _ = writeln!(
+            out,
+            "    {direction} {} \"{}\"",
+            edge.relationship_name, edge.other_node_name
+        );
+        let _ = writeln!(
+            out,
+            "      text:       {}",
+            excerpt_edge_text(&edge.edge_text)
+        );
+        let _ = writeln!(
+            out,
+            "      valid_at:   {}",
+            format_fact_timestamp(edge.valid_at)
+        );
+        match edge.invalid_at {
+            Some(invalid_at) => {
+                let _ = writeln!(
+                    out,
+                    "      invalid_at: {}  INVALID",
+                    format_fact_timestamp(invalid_at)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "      invalid_at: (valid)");
+            }
+        }
+    }
+    if facts.edges.is_empty() {
+        let _ = writeln!(out, "  (no edges: the node has no facts yet)");
+    }
+    out
+}
+
+/// Bumps `facts_invalidated_total` by 1 on the group's store after a
+/// SUCCESSFUL manual invalidation (decision 75 (e): the counter covers
+/// the digest path, the merge apply path, AND the manual command). Best
+/// effort, the same discipline as the pipeline's `bump_counter_by` and
+/// the merge apply path: a store failure is one WARN and never fails the
+/// command — the invalidation itself already committed. AGENT.md
+/// Section 6.2: the synchronous store call runs in spawn_blocking.
+async fn bump_facts_invalidated(store: &Arc<Store>, chat_id: &str) {
+    let store = Arc::clone(store);
+    let chat_id_owned = chat_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        store.increment_counter(&chat_id_owned, "facts_invalidated_total", 1)
+    })
+    .await;
+    match result {
+        Ok(Ok(new_value)) => {
+            info!(chat_id = %chat_id, new_value, "facts_invalidated_total incremented (manual invalidation)");
+        }
+        Ok(Err(error)) => {
+            warn!(chat_id = %chat_id, %error, "failed to increment facts_invalidated_total; the invalidation itself succeeded");
+        }
+        Err(error) => {
+            warn!(chat_id = %chat_id, %error, "the blocking store task failed to join; facts_invalidated_total not incremented");
+        }
+    }
+}
+
+/// The shared run of `--invalidate` and `--revalidate` (decision 75,
+/// graph-spec Section 7.5). OFFLINE: the bot must be stopped. No LLM
+/// needed. The edge id is the opaque string `--facts` prints; a
+/// malformed id (bad JSON, a missing field, an unparseable timestamp)
+/// or a well-formed id that matches no edge row is a LOUD error — the
+/// manual ops never silently target the wrong edge. The result words
+/// distinguish the actual mutation from the no-ops (already invalid /
+/// already valid).
+async fn run_edge_validity(
+    cli: &Cli,
+    chat_id: &str,
+    edge_id: &str,
+    invalidate: bool,
+) -> Result<()> {
+    let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    let now = OffsetDateTime::now_utc();
+    let changed = if invalidate {
+        memory
+            .invalidate_edge(chat_id, edge_id, now)
+            .await
+            .with_context(|| format!("failed to invalidate the edge in group {chat_id}"))?
+    } else {
+        memory
+            .revalidate_edge(chat_id, edge_id, now)
+            .await
+            .with_context(|| format!("failed to revalidate the edge in group {chat_id}"))?
+    };
+    // Decision 75 (e): a SUCCESSFUL manual invalidation feeds the same
+    // counter as the digest and merge paths. Revalidation never
+    // decrements: the counter counts invalidation events.
+    if invalidate && changed {
+        bump_facts_invalidated(&store, chat_id).await;
+    }
+    let verb = match (invalidate, changed) {
+        (true, true) => "invalidated",
+        (true, false) => "already invalid (no change)",
+        (false, true) => "revalidated",
+        (false, false) => "already valid (no change)",
+    };
+    println!("edge {verb}: {edge_id}");
+    Ok(())
+}
+
+/// The `--invalidate` run: sets `invalid_at` on one edge (decision 75).
+async fn run_invalidate(cli: &Cli, chat_id: &str, edge_id: &str) -> Result<()> {
+    run_edge_validity(cli, chat_id, edge_id, true).await
+}
+
+/// The `--revalidate` run: clears `invalid_at` on one edge — the typo
+/// safety net (decision 75).
+async fn run_revalidate(cli: &Cli, chat_id: &str, edge_id: &str) -> Result<()> {
+    run_edge_validity(cli, chat_id, edge_id, false).await
 }
 
 /// The display name of one endpoint of a plan action's pair.
@@ -1512,6 +1817,7 @@ fn format_group_status(
     let injection_wakes = counter("injection_wakes_total");
     let digest_failures = counter("digest_failures_total");
     let summaries_failed = counter("summaries_failed_total");
+    let facts_invalidated = counter("facts_invalidated_total");
     let dead_letters_counter = counter("dead_letters_total");
     let last_boundary = counter("last_digest_boundary_msg_id");
     let prev_boundary = counter("prev_digest_boundary_msg_id");
@@ -1530,6 +1836,11 @@ fn format_group_status(
         out,
         "    {:<27}{summaries_failed}",
         "summaries_failed_total:"
+    );
+    let _ = writeln!(
+        out,
+        "    {:<27}{facts_invalidated}",
+        "facts_invalidated_total:"
     );
     let _ = writeln!(
         out,
@@ -2010,6 +2321,9 @@ mod tests {
             &["--merge-tool", "-1001"][..],
             &["--merge", "-1001", "a", "b"][..],
             &["--merge-rollback", "-1001", "7"][..],
+            &["--facts", "-1001", "Tama"][..],
+            &["--invalidate", "-1001", "edge"][..],
+            &["--revalidate", "-1001", "edge"][..],
         ] {
             let ParseOutcome::Run(cli) = parse(args).expect("a valid command line") else {
                 panic!("expected the Run outcome");
@@ -2232,6 +2546,138 @@ mod tests {
             .expect_err("a non-integer audit id must fail");
         assert!(error.contains("audit id"), "message: {error}");
         assert!(error.contains("abc"), "message: {error}");
+    }
+
+    #[test]
+    fn facts_parses_chat_and_name() {
+        let outcome = parse(&["--facts", "-1001", "Tama"]).expect("a valid --facts command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::Facts { chat_id, name } => {
+                assert_eq!(chat_id, "-1001");
+                assert_eq!(name, "Tama");
+            }
+            _ => panic!("expected the facts mode"),
+        }
+        assert_eq!(cli.data_root, PathBuf::from("./data"));
+    }
+
+    #[test]
+    fn facts_needs_two_values() {
+        for args in [&["--facts"][..], &["--facts", "-1001"][..]] {
+            let error = parse(args).expect_err("an incomplete --facts must fail");
+            assert!(
+                error.contains("--facts"),
+                "args: {args:?}, message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalidate_parses_chat_and_edge_id() {
+        let outcome = parse(&["--invalidate", "-1001", "{\"source_id\":\"a\"}"])
+            .expect("a valid --invalidate command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::Invalidate { chat_id, edge_id } => {
+                assert_eq!(chat_id, "-1001");
+                assert_eq!(edge_id, "{\"source_id\":\"a\"}");
+            }
+            _ => panic!("expected the invalidate mode"),
+        }
+    }
+
+    #[test]
+    fn revalidate_parses_chat_and_edge_id() {
+        let outcome = parse(&["--revalidate", "-1001", "edge-key"])
+            .expect("a valid --revalidate command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::Revalidate { chat_id, edge_id } => {
+                assert_eq!(chat_id, "-1001");
+                assert_eq!(edge_id, "edge-key");
+            }
+            _ => panic!("expected the revalidate mode"),
+        }
+    }
+
+    #[test]
+    fn invalidate_and_revalidate_need_two_values() {
+        for args in [
+            &["--invalidate"][..],
+            &["--invalidate", "-1001"][..],
+            &["--revalidate"][..],
+            &["--revalidate", "-1001"][..],
+        ] {
+            let error = parse(args).expect_err("an incomplete edge command must fail");
+            assert!(
+                error.contains("--invalidate") || error.contains("--revalidate"),
+                "args: {args:?}, message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_id_is_opaque_at_parse_time() {
+        // Decision 75: the edge id is an opaque string (a compact JSON
+        // of the edge's natural key). The PARSE accepts any value —
+        // garbage included — and the RUNTIME errors loudly on a
+        // malformed or unknown id. So garbage parses fine here.
+        for flag in ["--invalidate", "--revalidate"] {
+            for edge_id in ["not-json", "{}", "12345", "{\"source_id\":\"a\"}"] {
+                let outcome =
+                    parse(&[flag, "-1001", edge_id]).expect("the parse accepts any edge-id string");
+                let ParseOutcome::Run(cli) = outcome else {
+                    panic!("expected the Run outcome");
+                };
+                match cli.mode {
+                    Mode::Invalidate {
+                        edge_id: parsed, ..
+                    }
+                    | Mode::Revalidate {
+                        edge_id: parsed, ..
+                    } => {
+                        assert_eq!(parsed, edge_id);
+                    }
+                    _ => panic!("expected an edge mode"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fact_modes_are_mutually_exclusive_with_every_other_mode() {
+        let facts = ["--facts", "-1001", "Tama"];
+        let invalidate = ["--invalidate", "-1001", "edge"];
+        let revalidate = ["--revalidate", "-1001", "edge"];
+        let live = ["--live", "", ""];
+        let status = ["--status", "-1001", ""];
+        let merge_tool = ["--merge-tool", "-1001", ""];
+        for (first, second) in [
+            (facts, invalidate),
+            (facts, revalidate),
+            (invalidate, revalidate),
+            (facts, live),
+            (facts, status),
+            (invalidate, merge_tool),
+            (revalidate, live),
+            (revalidate, status),
+        ] {
+            let args: Vec<&str> = first
+                .iter()
+                .chain(second.iter())
+                .copied()
+                .filter(|arg| !arg.is_empty())
+                .collect();
+            let error = parse(&args).expect_err(&format!("the combination {args:?} must fail"));
+            assert!(error.contains("mutually exclusive"), "message: {error}");
+        }
     }
 
     #[test]
@@ -2487,6 +2933,10 @@ mod tests {
             "text:\n{text}"
         );
         assert!(
+            text.contains("facts_invalidated_total:   0"),
+            "text:\n{text}"
+        );
+        assert!(
             text.contains("dead_letters_total:        0"),
             "text:\n{text}"
         );
@@ -2512,6 +2962,7 @@ mod tests {
                 ("injection_wakes_total", "6"),
                 ("digest_failures_total", "0"),
                 ("summaries_failed_total", "3"),
+                ("facts_invalidated_total", "4"),
                 ("dead_letters_total", "2"),
                 ("last_digest_boundary_msg_id", "91"),
                 ("prev_digest_boundary_msg_id", "82"),
@@ -2568,6 +3019,10 @@ mod tests {
             "text:\n{text}"
         );
         assert!(
+            text.contains("facts_invalidated_total:   4"),
+            "text:\n{text}"
+        );
+        assert!(
             text.contains("  dead letters: 2 total (most recent first)\n"),
             "text:\n{text}"
         );
@@ -2601,5 +3056,114 @@ mod tests {
         );
         assert!(text.contains("note:"), "text:\n{text}");
         assert!(text.contains("counter reads 5"), "text:\n{text}");
+    }
+
+    /// A fact edge fixture with fixed timestamps for the render tests.
+    fn fact_edge(
+        relationship_name: &str,
+        other_node_name: &str,
+        outgoing: bool,
+        edge_text: &str,
+        invalid_at: Option<OffsetDateTime>,
+    ) -> tamako_memory::NodeFactEdge {
+        tamako_memory::NodeFactEdge {
+            edge_id: format!(
+                "{{\"source_id\":\"s\",\"relationship_name\":\"{relationship_name}\",\
+                 \"target_id\":\"t\",\"valid_at\":\"2026-08-01T00:00:00Z\"}}"
+            ),
+            relationship_name: relationship_name.to_string(),
+            other_node_name: other_node_name.to_string(),
+            outgoing,
+            edge_text: edge_text.to_string(),
+            valid_at: time::macros::datetime!(2026-08-01 00:00:00 UTC),
+            invalid_at,
+        }
+    }
+
+    #[test]
+    fn format_node_facts_renders_edges_directions_and_validity() {
+        let facts = tamako_memory::NodeFacts {
+            node_id: "person:tama".to_string(),
+            node_name: "Tama".to_string(),
+            edges: vec![
+                fact_edge("works_at", "Studio A", true, "Tama works at Studio A", None),
+                fact_edge(
+                    "likes",
+                    "Tama",
+                    false,
+                    "a long edge text that runs well past the excerpt cap of sixty characters",
+                    Some(time::macros::datetime!(2026-08-02 00:00:00 UTC)),
+                ),
+            ],
+        };
+        let text = format_node_facts(&facts);
+        assert!(
+            text.starts_with("Facts: \"Tama\" (person:tama) in the group graph\n"),
+            "text:\n{text}"
+        );
+        assert!(text.contains("  edges: 2\n"), "text:\n{text}");
+        // The edge id line comes first: the operator copies it.
+        assert!(
+            text.contains("  edge id: {\"source_id\":\"s\","),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("    -> works_at \"Studio A\"\n"),
+            "text:\n{text}"
+        );
+        assert!(text.contains("    <- likes \"Tama\"\n"), "text:\n{text}");
+        assert!(
+            text.contains("      valid_at:   2026-08-01T00:00:00Z\n"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("      invalid_at: 2026-08-02T00:00:00Z  INVALID\n"),
+            "text:\n{text}"
+        );
+        // A valid edge prints the (valid) marker, never INVALID.
+        assert!(
+            text.contains("      invalid_at: (valid)\n"),
+            "text:\n{text}"
+        );
+        // The long description is excerpted at the character cap.
+        let excerpt_line = text
+            .lines()
+            .find(|line| line.starts_with("      text:       a long edge text"))
+            .expect("the excerpt line");
+        assert!(excerpt_line.ends_with('…'), "line: {excerpt_line}");
+    }
+
+    #[test]
+    fn format_node_facts_without_edges_prints_the_note() {
+        let facts = tamako_memory::NodeFacts {
+            node_id: "alias:mochi".to_string(),
+            node_name: "Mochi".to_string(),
+            edges: Vec::new(),
+        };
+        let text = format_node_facts(&facts);
+        assert!(text.contains("  edges: 0\n"), "text:\n{text}");
+        assert!(
+            text.contains("  (no edges: the node has no facts yet)\n"),
+            "text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn excerpt_edge_text_keeps_short_texts_and_cuts_long_ones() {
+        // Short texts pass through unchanged; the cap counts characters,
+        // not bytes, and the cut gets an ellipsis.
+        assert_eq!(excerpt_edge_text("short"), "short");
+        let exactly: String = "x".repeat(FACTS_EXCERPT_MAX_CHARS);
+        assert_eq!(excerpt_edge_text(&exactly), exactly);
+        let long: String = "y".repeat(FACTS_EXCERPT_MAX_CHARS + 1);
+        let excerpt = excerpt_edge_text(&long);
+        assert_eq!(excerpt.chars().count(), FACTS_EXCERPT_MAX_CHARS + 1);
+        assert!(excerpt.ends_with('…'));
+        // Character-boundary safety: a multibyte character at the cut
+        // point never splits.
+        let cjk: String = "あ".repeat(FACTS_EXCERPT_MAX_CHARS + 3);
+        let excerpt = excerpt_edge_text(&cjk);
+        assert_eq!(excerpt.chars().count(), FACTS_EXCERPT_MAX_CHARS + 1);
+        assert!(excerpt.ends_with('…'));
     }
 }
