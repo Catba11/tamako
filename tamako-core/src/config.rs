@@ -173,6 +173,13 @@ pub struct TriggerConfig {
     /// merge tool. Deliberately narrower than the write-path band
     /// (decision 74 point 5). Default 0.85 (provisional).
     pub merge_candidate_threshold: f64,
+    /// Decision 75 (proposed-graph-database-specs.md Section 7.5,
+    /// specs.md Section 13): the single-value fact predicates. When a
+    /// NEW edge with a registered predicate is written, the older
+    /// valid edges with the same (subject, predicate) are invalidated
+    /// — one valid fact per subject per predicate. A predicate absent
+    /// from the list is multi-value. Default the four of Section 13.
+    pub single_value_predicates: Vec<String>,
     /// The hard cap of injected memories per wake (Section 9.2
     /// conservative default). Default 5. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill (Phase 1 M5).
@@ -232,6 +239,12 @@ impl Default for TriggerConfig {
             vector_candidate_threshold: 0.80,
             resolution_confirm_budget: 5,
             merge_candidate_threshold: 0.85,
+            single_value_predicates: vec![
+                "currently_playing".to_string(),
+                "works_at".to_string(),
+                "lives_in".to_string(),
+                "dating".to_string(),
+            ],
             recall_injection_cap: 5,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
@@ -340,6 +353,11 @@ pub struct TriggerConfigToml {
     /// The merge-candidate similarity (decision 74). Refer to
     /// `TriggerConfig::merge_candidate_threshold`.
     pub merge_candidate_threshold: Option<f64>,
+    /// The single-value fact predicates (decision 75). Refer to
+    /// `TriggerConfig::single_value_predicates`. A SET overlay
+    /// REPLACES the whole list — a per-group override replaces
+    /// wholesale, no merging with the base list.
+    pub single_value_predicates: Option<Vec<String>>,
     /// The injection cap of one wake. Refer to
     /// `TriggerConfig::recall_injection_cap`.
     pub recall_injection_cap: Option<u32>,
@@ -475,6 +493,11 @@ impl TriggerConfigToml {
         if let Some(value) = self.merge_candidate_threshold {
             base.merge_candidate_threshold = value;
         }
+        if let Some(value) = &self.single_value_predicates {
+            // A set overlay REPLACES the whole list (no merging), so a
+            // group can also declare zero single-value predicates.
+            base.single_value_predicates = value.clone();
+        }
         if let Some(value) = self.recall_injection_cap {
             base.recall_injection_cap = value;
         }
@@ -609,6 +632,18 @@ wake_floor_secs = 60
         // step 1): the merge-candidate threshold defaults to the
         // provisional 0.85, narrower than the write-path band.
         assert_eq!(config.merge_candidate_threshold, 0.85);
+        // Decision 75 (proposed-graph-database-specs.md Section 7.5,
+        // specs.md Section 13): the single-value predicate registry
+        // defaults to the four predicates of Section 13.
+        assert_eq!(
+            config.single_value_predicates,
+            vec![
+                "currently_playing".to_string(),
+                "works_at".to_string(),
+                "lives_in".to_string(),
+                "dating".to_string(),
+            ]
+        );
         // The structured-output mode keys (reported for spec backfill):
         // every Option is None by default; the agent layer resolves
         // the default mode.
@@ -759,6 +794,60 @@ merge_candidate_threshold = 0.88
         // Keys the TOML does not set keep the decision-74 default.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert_eq!(plain.global.merge_candidate_threshold, 0.85);
+    }
+
+    #[test]
+    fn toml_override_sets_single_value_predicates() {
+        // Decision 75: the single-value predicate registry follows the
+        // per-key overlay pattern (AGENT.md Section 6.3), with one
+        // twist: a set overlay REPLACES the whole list — no merging,
+        // so a group override wins wholesale.
+        let text = r#"
+[global]
+single_value_predicates = ["works_at", "lives_in"]
+
+[groups."-100777"]
+single_value_predicates = ["favorite_food"]
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        // The global set parses (a TOML array of strings) and applies.
+        assert_eq!(
+            config.global.single_value_predicates,
+            vec!["works_at".to_string(), "lives_in".to_string()]
+        );
+        // A group override REPLACES the list wholesale: the global
+        // entries do NOT carry over into this group.
+        assert_eq!(
+            config.for_group("-100777").single_value_predicates,
+            vec!["favorite_food".to_string()]
+        );
+        // A group without an override inherits the global list.
+        assert_eq!(
+            config.for_group("-100999").single_value_predicates,
+            vec!["works_at".to_string(), "lives_in".to_string()]
+        );
+        // An EMPTY array parses: a group can declare zero single-value
+        // predicates (every predicate is then multi-value for it).
+        let empty_text = r#"
+[groups."-100888"]
+single_value_predicates = []
+"#;
+        let empty_config = BotConfig::from_toml_str(empty_text).expect("the TOML loads");
+        assert!(empty_config
+            .for_group("-100888")
+            .single_value_predicates
+            .is_empty());
+        // The key the TOML does not set keeps the Section 13 default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(
+            plain.global.single_value_predicates,
+            vec![
+                "currently_playing".to_string(),
+                "works_at".to_string(),
+                "lives_in".to_string(),
+                "dating".to_string(),
+            ]
+        );
     }
 
     #[test]
