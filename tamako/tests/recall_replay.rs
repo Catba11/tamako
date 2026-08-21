@@ -21,16 +21,28 @@
 //! - Section 10.2 step 4 / Rule C3: the second digest prunes the
 //!   injection rows at the one-chunk-lag boundary.
 //!
+//! Decision 76 (deep recall): the DEEP scenarios at the bottom of this
+//! file run the same real actor with `ShallowRecall::with_deep_recall`
+//! wired the way main.rs wires it — a DEDICATED one-group Store for the
+//! recall (the KNN / edge_texts single-open-group contract) and a
+//! scripted `EmbeddingProvider`, so the deep behavior stays
+//! deterministic and network-free. The scenarios ABOVE stay shallow
+//! (no DeepRecallConfig): their assertions are the byte-identical
+//! pre-76 behavior and are semantically unchanged.
+//!
 //! Timer note: same policy as wake_replay.rs — `wake_interval` is
 //! near-infinite and the wake floor is zero, so only the message count
 //! drives wakes and the built-in 1-second ticker stays inert.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tamako_adapter_mock::MockAdapter;
+use tamako_agent::endpoint::EMBEDDING_DIMS;
+use tamako_agent::recall::DeepRecallConfig;
 use tamako_agent::{
     AgentDigestPipeline, AgentError, ExtractedNode, ExtractedNodeType, KnowledgeGraph,
     PipelineConfig, RelevanceGate, RelevanceInput, ScriptedExtractor, ScriptedGate,
@@ -45,10 +57,15 @@ use tamako_core::context::{
     render_human_content, ContextItem, ContextItemKind, ContextRole, RangeTag, ReplyRender,
 };
 use tamako_core::digest::DigestPipeline;
+use tamako_core::embedding::{
+    reconcile_group, EmbeddingError, EmbeddingProvider, GroupEmbeddingTarget,
+};
 use tamako_core::event::{InboundEvent, NormalizedMessage, OutboundAction};
 use tamako_core::wake::{GateDecision, ParticipationGate, ReplyGenerator, WakeServices};
 use tamako_memory::identifiers::{alias_id, concept_id, person_id};
-use tamako_memory::{LbugBackend, MemoryBackend, MemoryBatch, MemoryEdge, MemoryNode, NodeType};
+use tamako_memory::{
+    EdgeId, LbugBackend, MemoryBackend, MemoryBatch, MemoryEdge, MemoryNode, NodeType,
+};
 use tamako_store::{InjectedMemoryRow, Store};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -113,6 +130,27 @@ struct Fixture {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
     memory: Arc<LbugBackend>,
+}
+
+impl Fixture {
+    /// The data root of the fixture (the `GroupEmbeddingTarget::open`
+    /// argument of the reconciliation scenario).
+    fn data_root(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+
+    /// A DEDICATED one-group Store over the same data root — the
+    /// deep-recall store shape of main.rs (`GroupEmbeddingTarget::open`
+    /// — the same per-group store.db file, so every write of the
+    /// fixture store and of the actor's shared store is visible here).
+    /// The decision-76 store sources (KNN over `node_embeddings`, LIKE
+    /// over `edge_texts`) are chat_id-less helpers that reject a Store
+    /// with 2+ open groups (`StoreError::AmbiguousGroup`).
+    fn dedicated_store(&self) -> Arc<Store> {
+        let store = Arc::new(Store::new(self._dir.path().to_path_buf()));
+        store.open_group(CHAT_ID).expect("open_group succeeds");
+        store
+    }
 }
 
 async fn make_fixture() -> Fixture {
@@ -1379,4 +1417,631 @@ async fn a_chinese_ngram_matching_an_alias_flows_end_to_end() {
 
     handle.shutdown().await.expect("the actor reports no error");
     shutdown_pump(pump).await;
+}
+
+// ---- Decision 76: the deep-recall scenarios. -------------------------
+//
+// The recall is wired the way main.rs wires a `deep_recall = true`
+// group with a provider: a DEDICATED one-group store (the
+// single-open-group contract of the KNN / edge_texts reads) plus a
+// scripted embedding provider, so the deep behavior stays deterministic
+// and network-free. The scenarios ABOVE keep the pre-76 shallow wiring
+// (no DeepRecallConfig) and are semantically unchanged.
+
+/// A scripted core embedding provider (the decision-76 vector-entry
+/// seam): pops one batch result per `embed_texts` call (FIFO) and
+/// records every call's texts — the same double shape as the recall.rs
+/// ScriptedEmbedder, kept local so the suite stays env-hermetic. An
+/// exhausted queue fails the call; the recall degrades the vector
+/// entry to empty on ANY provider error (decision 76), so a surprise
+/// call surfaces through the `call_count` / `calls` assertions.
+struct ScriptedEmbedder {
+    batches: Mutex<VecDeque<Vec<Vec<f32>>>>,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl ScriptedEmbedder {
+    /// Every `embed_texts` call answers with the next batch (in order).
+    fn with_batches(batches: Vec<Vec<Vec<f32>>>) -> Self {
+        ScriptedEmbedder {
+            batches: Mutex::new(batches.into()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl EmbeddingProvider for ScriptedEmbedder {
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, EmbeddingError>> + Send + 'a>> {
+        Box::pin(async move {
+            let texts = [text.to_string()];
+            let mut batches = self.embed_texts(&texts).await?;
+            Ok(batches.remove(0))
+        })
+    }
+
+    fn embed_texts<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, EmbeddingError>> + Send + 'a>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(texts.to_vec());
+        let result = self
+            .batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .ok_or_else(|| {
+                EmbeddingError::Provider("scripted embedder: exhausted queue".to_string())
+            });
+        Box::pin(async move { result })
+    }
+}
+
+/// The unit basis vector of one dimension (EMBEDDING_DIMS wide — the
+/// pinned sidecar dimension of decision 66).
+fn unit_vector(dim: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; EMBEDDING_DIMS];
+    vector[dim] = 1.0;
+    vector
+}
+
+/// A fact edge stamped at the wall clock (plus `offset_seconds`): the
+/// decision-76 two-hop expansion applies the 90-day recall window
+/// against the real `now_utc()`, so the deep scenarios cannot use the
+/// fixed t0() of the shallow scenarios above.
+fn recent_edge(
+    source_id: &str,
+    target_id: &str,
+    relationship: &str,
+    text: &str,
+    offset_seconds: i64,
+) -> MemoryEdge {
+    let at = OffsetDateTime::now_utc() + time::Duration::seconds(offset_seconds);
+    MemoryEdge {
+        source_id: source_id.to_string(),
+        target_id: target_id.to_string(),
+        relationship_name: relationship.to_string(),
+        valid_at: at,
+        invalid_at: None,
+        edge_text: text.to_string(),
+        created_at: at,
+        updated_at: at,
+        properties: None,
+    }
+}
+
+/// Seeds nodes and edges directly against the graph (the seeding style
+/// of `seed_person_facts`).
+async fn seed_graph(fixture: &Fixture, nodes: Vec<MemoryNode>, edges: Vec<MemoryEdge>) {
+    let batch = MemoryBatch {
+        batch_id: "seed".to_string(),
+        nodes,
+        edges,
+    };
+    fixture
+        .memory
+        .upsert_batch(CHAT_ID, &batch)
+        .await
+        .expect("the seed upsert");
+}
+
+/// The opaque `EdgeId` JSON of one seeded edge — the key shape the
+/// `edge_texts` sidecar stores (the store never parses it).
+fn edge_json_id(edge: &MemoryEdge) -> String {
+    EdgeId {
+        source_id: edge.source_id.clone(),
+        relationship_name: edge.relationship_name.clone(),
+        target_id: edge.target_id.clone(),
+        valid_at: edge.valid_at,
+    }
+    .encode()
+}
+
+/// Writes one `edge_texts` row on the fixture store (the post-commit
+/// digest harvest shape of decision 76c). Runs BEFORE the actor spawns.
+async fn seed_edge_text(fixture: &Fixture, edge_id: &str, edge_text: &str) {
+    let store = Arc::clone(&fixture.store);
+    let edge_id = edge_id.to_string();
+    let edge_text = edge_text.to_string();
+    tokio::task::spawn_blocking(move || {
+        store.open_group(CHAT_ID)?;
+        store.upsert_edge_text(&edge_id, &edge_text)
+    })
+    .await
+    .expect("the blocking task joins")
+    .expect("upsert_edge_text succeeds");
+}
+
+/// Spawns the real actor with the recall wired the way main.rs wires a
+/// `deep_recall = true` group with a provider (decision 76): a
+/// DEDICATED one-group store for the recall plus the scripted
+/// embedding provider and the group's thresholds. The actor itself
+/// keeps the fixture's shared store.
+fn spawn_with_deep_wake(
+    fixture: &Fixture,
+    config: TriggerConfig,
+    started_at: OffsetDateTime,
+    doubles: &WakeDoubles,
+    embedder: &Arc<ScriptedEmbedder>,
+) -> GroupActorHandle {
+    // Open the group store BEFORE the actor spawns (the WAL pragma race
+    // note of tamako/tests/wake_replay.rs).
+    fixture
+        .store
+        .open_group(CHAT_ID)
+        .expect("open_group succeeds");
+    let recall = ShallowRecall::new(
+        fixture.dedicated_store(),
+        Arc::clone(&fixture.memory),
+        SharedRelevanceGate(Arc::clone(&doubles.relevance)),
+        config.recall_injection_cap,
+    )
+    .with_deep_recall(DeepRecallConfig {
+        provider: Arc::clone(embedder) as Arc<dyn EmbeddingProvider>,
+        vector_candidate_threshold: config.vector_candidate_threshold,
+        candidate_cap: config.recall_candidate_cap,
+    });
+    spawn_group_actor(GroupActorParams {
+        chat_id: CHAT_ID.to_string(),
+        store: Arc::clone(&fixture.store),
+        memory: Arc::clone(&fixture.memory),
+        config,
+        started_at,
+        inbox_capacity: DEFAULT_INBOX_CAPACITY,
+        preamble: TEST_PREAMBLE.to_string(),
+        digest: None,
+        post_digest_hook: None,
+        wake: Some(WakeServices {
+            recall: Arc::new(recall),
+            gate: Arc::clone(&doubles.gate) as Arc<dyn ParticipationGate>,
+            reply: Arc::clone(&doubles.reply) as Arc<dyn ReplyGenerator>,
+        }),
+        summary_provider: None,
+        outbound: None,
+        bot_name: Some("Tamako".to_string()),
+    })
+}
+
+/// The scripted doubles of a deep scenario whose wake injects nothing:
+/// the relevance gate records its input and selects empty; the
+/// participation gate declines; the reply model is never reached.
+fn silent_doubles() -> WakeDoubles {
+    WakeDoubles {
+        relevance: Arc::new(ScriptedRelevanceGate::with_selections(vec![vec![]])),
+        gate: Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
+            participate: false,
+            target_row_id: None,
+            reason: None,
+        }])),
+        reply: Arc::new(ScriptedReplyGenerator::failing(
+            "a gate-no wake never reaches the reply model",
+        )),
+    }
+}
+
+/// The edge texts of the candidates the relevance gate recorded on its
+/// first (and only) call.
+fn presented_texts(doubles: &WakeDoubles) -> Vec<String> {
+    let inputs = doubles.relevance.inputs();
+    assert_eq!(inputs.len(), 1, "exactly one relevance-gate call");
+    inputs[0]
+        .candidates
+        .iter()
+        .map(|candidate| candidate.edge_text.clone())
+        .collect()
+}
+
+/// Deep scenario 1 (decision 76 (a)): a two-hop fact surfaces. The
+/// fact lives at Alice -> espresso -> cake; the wake's only entry is
+/// the sender's Person (stopword texts, so NO candidate terms and the
+/// embed provider is never called — decision 76 (f)). The hop-2 edge
+/// espresso -> cake appears among the candidates presented to the
+/// relevance gate, asserted through the gate's recorded input.
+#[tokio::test]
+async fn deep_recall_surfaces_a_two_hop_fact_end_to_end() {
+    let fixture = make_fixture().await;
+    let alice = person_node("u1", "Alice");
+    let espresso = concept_node("espresso");
+    let cake = concept_node("cake");
+    let hop_one = recent_edge(
+        &alice.id,
+        &espresso.id,
+        "related_to",
+        "Alice likes espresso.",
+        0,
+    );
+    let hop_two = recent_edge(
+        &espresso.id,
+        &cake.id,
+        "related_to",
+        "Espresso pairs with cake.",
+        0,
+    );
+    seed_graph(
+        &fixture,
+        vec![alice, espresso, cake],
+        vec![hop_one, hop_two],
+    )
+    .await;
+
+    let doubles = silent_doubles();
+    let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+    let handle = spawn_with_deep_wake(&fixture, wake_config(), t0(), &doubles, &embedder);
+
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u1", "Alice", STOPWORD_TEXT),
+        )
+        .await;
+    }
+    wait_for_relevance_calls(&doubles.relevance, 1).await;
+    handle.snapshot().await.expect("the snapshot succeeds");
+
+    // Decision 76 (f): stopword-only texts yield no candidate terms,
+    // so the vector entry never calls the provider.
+    assert_eq!(embedder.call_count(), 0);
+    // The hop-1 edge exactly once (the shallow source won the
+    // first-wins dedup), then the hop-2 edge of the expansion.
+    assert_eq!(
+        presented_texts(&doubles),
+        vec![
+            "Alice likes espresso.".to_string(),
+            "Espresso pairs with cake.".to_string(),
+        ]
+    );
+    // The empty scripted selection injects nothing (Section 9.2).
+    assert!(injected_rows(&fixture.store).await.is_empty());
+
+    handle.shutdown().await.expect("the actor reports no error");
+}
+
+/// Deep scenario 2 (decision 76 (c)): an FTS-only hit. The term
+/// appears ONLY in an edge DESCRIPTION — no entry node name carries it
+/// (the detached edge is unreachable from every shallow entry) — and
+/// the term is the two-character CJK word 咖啡 (the FTS5-trigram hole
+/// of decision 76 (c): the sidecar is a plain parameterized LIKE).
+#[tokio::test]
+async fn deep_recall_fts_surfaces_an_edge_description_only_cjk_term() {
+    let fixture = make_fixture().await;
+    let debate = concept_node("price debate");
+    let market = concept_node("market");
+    let edge = recent_edge(
+        &debate.id,
+        &market.id,
+        "related_to",
+        "The group debated 咖啡 prices.",
+        0,
+    );
+    seed_graph(&fixture, vec![debate, market], vec![edge.clone()]).await;
+    seed_edge_text(&fixture, &edge_json_id(&edge), &edge.edge_text).await;
+
+    let doubles = silent_doubles();
+    // One candidate term (咖啡): ONE batched embeddings call, answered
+    // with one query vector; the empty node_embeddings sidecar accepts
+    // nothing, so only the FTS source contributes.
+    let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+    let handle = spawn_with_deep_wake(&fixture, wake_config(), t0(), &doubles, &embedder);
+
+    // The sender is UNSEEDED and m2's text is exactly the 2-char term:
+    // no person entry, no alias entry — the sidecar hit is the ONLY
+    // path to the candidate.
+    let texts = ["ok ok thanks", "咖啡", "ok ok thanks"];
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u9", "阿杰", texts[index]),
+        )
+        .await;
+    }
+    wait_for_relevance_calls(&doubles.relevance, 1).await;
+    handle.snapshot().await.expect("the snapshot succeeds");
+
+    assert_eq!(embedder.call_count(), 1);
+    assert_eq!(embedder.calls(), vec![vec!["咖啡".to_string()]]);
+    assert_eq!(
+        presented_texts(&doubles),
+        vec!["The group debated 咖啡 prices.".to_string()]
+    );
+    assert!(injected_rows(&fixture.store).await.is_empty());
+
+    handle.shutdown().await.expect("the actor reports no error");
+}
+
+/// Deep scenario 3 (decision 76 (b)): the also_known_as bridge. The
+/// sender's Person node links to her English name twin through
+/// also_known_as — the cross-language bridge of decision 74 — and the
+/// TWIN carries the fact. The expansion TRAVERSES also_known_as (the
+/// whitelist drops only contains and known_as), so the twin's fact
+/// surfaces at hop 2.
+#[tokio::test]
+async fn deep_recall_bridges_a_cross_language_fact_through_also_known_as() {
+    let fixture = make_fixture().await;
+    let ming = person_node("u7", "小明");
+    let twin = person_node("u7en", "Xiao Ming");
+    let ceremony = concept_node("tea ceremony");
+    let bridge = recent_edge(
+        &ming.id,
+        &twin.id,
+        "also_known_as",
+        "小明 is also known as Xiao Ming.",
+        1,
+    );
+    let fact = recent_edge(
+        &twin.id,
+        &ceremony.id,
+        "related_to",
+        "Xiao Ming hosts the tea ceremony.",
+        0,
+    );
+    seed_graph(&fixture, vec![ming, twin, ceremony], vec![bridge, fact]).await;
+
+    let doubles = silent_doubles();
+    let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+    let handle = spawn_with_deep_wake(&fixture, wake_config(), t0(), &doubles, &embedder);
+
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u7", "小明", STOPWORD_TEXT),
+        )
+        .await;
+    }
+    wait_for_relevance_calls(&doubles.relevance, 1).await;
+    handle.snapshot().await.expect("the snapshot succeeds");
+
+    assert_eq!(embedder.call_count(), 0);
+    // The bridge edge itself (the shallow neighbor, one candidate after
+    // the first-wins dedup against the expansion's hop 1), then the
+    // twin's fact at hop 2.
+    assert_eq!(
+        presented_texts(&doubles),
+        vec![
+            "小明 is also known as Xiao Ming.".to_string(),
+            "Xiao Ming hosts the tea ceremony.".to_string(),
+        ]
+    );
+
+    handle.shutdown().await.expect("the actor reports no error");
+}
+
+/// Deep scenario 4 (decision 76 (b)): contains and known_as are never
+/// TRAVERSED. Decoy facts sit BEHIND a contains edge and a known_as
+/// edge of the entry node; the expansion's whitelist drops both
+/// relationships, so the decoys never reach the gate. The known_as
+/// edge of the ENTRY itself still appears as a shallow candidate (the
+/// pre-76 behavior scenario 6 pins above) — it is the traversal
+/// THROUGH it that adds nothing.
+#[tokio::test]
+async fn deep_recall_never_traverses_contains_or_known_as() {
+    let fixture = make_fixture().await;
+    let alice = person_node("u1", "Alice");
+    let tea = concept_node("tea");
+    let alias = alias_node("Al");
+    let sealed = concept_node("sealed");
+    let hidden_one = concept_node("hidden one");
+    let hidden_two = concept_node("hidden two");
+    let fact = recent_edge(&alice.id, &tea.id, "related_to", "Alice likes tea.", 3);
+    let known_as = recent_edge(
+        &alice.id,
+        &alias.id,
+        "known_as",
+        "Al is a surface form of Alice.",
+        2,
+    );
+    let contains = recent_edge(
+        &alice.id,
+        &sealed.id,
+        "contains",
+        "The contains decoy edge.",
+        1,
+    );
+    let behind_known_as = recent_edge(
+        &alias.id,
+        &hidden_one.id,
+        "related_to",
+        "The known_as decoy fact.",
+        0,
+    );
+    let behind_contains = recent_edge(
+        &sealed.id,
+        &hidden_two.id,
+        "related_to",
+        "The contains decoy fact.",
+        0,
+    );
+    seed_graph(
+        &fixture,
+        vec![alice, tea, alias, sealed, hidden_one, hidden_two],
+        vec![fact, known_as, contains, behind_known_as, behind_contains],
+    )
+    .await;
+
+    let doubles = silent_doubles();
+    let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+    let handle = spawn_with_deep_wake(&fixture, wake_config(), t0(), &doubles, &embedder);
+
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u1", "Alice", STOPWORD_TEXT),
+        )
+        .await;
+    }
+    wait_for_relevance_calls(&doubles.relevance, 1).await;
+    handle.snapshot().await.expect("the snapshot succeeds");
+
+    // Exactly the valid fact and the entry's own known_as edge (the
+    // shallow set); neither decoy surfaces through any source.
+    let texts = presented_texts(&doubles);
+    assert_eq!(texts.len(), 2, "no decoy reached the gate: {texts:?}");
+    assert!(texts.contains(&"Alice likes tea.".to_string()));
+    assert!(texts.contains(&"Al is a surface form of Alice.".to_string()));
+    assert!(!texts.contains(&"The contains decoy edge.".to_string()));
+    assert!(!texts.contains(&"The known_as decoy fact.".to_string()));
+    assert!(!texts.contains(&"The contains decoy fact.".to_string()));
+
+    handle.shutdown().await.expect("the actor reports no error");
+}
+
+/// Deep scenario 5 (decision 76, the Section 8.2 validity filter): an
+/// invalidated fact surfaces through NO source. The stale edge KEEPS
+/// its `edge_texts` sidecar row (the digest harvest ran before the
+/// invalidation — the sidecar lags until the next reconciliation), so
+/// the FTS source HITS the row; the hydration (`edges_by_ids`, valid
+/// only) drops it. The shallow neighbor fetch and the two-hop
+/// expansion filter `invalid_at` the same way.
+#[tokio::test]
+async fn deep_recall_never_surfaces_an_invalidated_fact() {
+    let fixture = make_fixture().await;
+    let alice = person_node("u1", "Alice");
+    let tea = concept_node("tea");
+    let boycott = concept_node("boycott");
+    let valid = recent_edge(&alice.id, &tea.id, "related_to", "Alice likes tea.", 0);
+    let stale = recent_edge(
+        &alice.id,
+        &boycott.id,
+        "related_to",
+        "Alice boycotts 龙井 after the scandal.",
+        0,
+    );
+    seed_graph(
+        &fixture,
+        vec![alice, tea, boycott],
+        vec![valid, stale.clone()],
+    )
+    .await;
+    // The sidecar row of the stale edge (harvested pre-invalidation),
+    // then the memory invalidate path (decision 75 (d)).
+    seed_edge_text(&fixture, &edge_json_id(&stale), &stale.edge_text).await;
+    let invalidated = fixture
+        .memory
+        .invalidate_edge(CHAT_ID, &edge_json_id(&stale), OffsetDateTime::now_utc())
+        .await
+        .expect("the invalidate succeeds");
+    assert!(
+        invalidated,
+        "the seeded edge was valid before the invalidation"
+    );
+
+    let doubles = silent_doubles();
+    // One candidate term (龙井): the FTS row of the INVALID edge is the
+    // only sidecar hit.
+    let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+    let handle = spawn_with_deep_wake(&fixture, wake_config(), t0(), &doubles, &embedder);
+
+    let texts = ["ok ok thanks", "龙井", "ok ok thanks"];
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u1", "Alice", texts[index]),
+        )
+        .await;
+    }
+    wait_for_relevance_calls(&doubles.relevance, 1).await;
+    handle.snapshot().await.expect("the snapshot succeeds");
+
+    assert_eq!(embedder.calls(), vec![vec!["龙井".to_string()]]);
+    // Only the valid fact is presented; the invalidated edge surfaced
+    // through neither the FTS hit nor the graph reads.
+    assert_eq!(
+        presented_texts(&doubles),
+        vec!["Alice likes tea.".to_string()]
+    );
+
+    handle.shutdown().await.expect("the actor reports no error");
+}
+
+/// Deep scenario 6 (decision 76 (c), Section 7.6 step 6): the startup
+/// reconciliation repairs a seeded FTS gap and drops an orphan, END TO
+/// END — a graph edge with NO sidecar row (the harvest loss) becomes
+/// searchable after `reconcile_group`, and a wake then surfaces it
+/// through the FTS source. The set-difference mechanics are covered at
+/// core level (embedding.rs `reconciliation_repairs_the_edge_texts_
+/// sidecar`); this test pins the repair-to-recall hand-off.
+#[tokio::test]
+async fn reconciliation_repairs_the_fts_gap_and_a_deep_wake_surfaces_the_edge() {
+    let fixture = make_fixture().await;
+    // A DETACHED fact: no shallow entry reaches it, so only the
+    // repaired sidecar row can surface it.
+    let deploy = concept_node("the deploy");
+    let fix = concept_node("the fix");
+    let edge = recent_edge(
+        &deploy.id,
+        &fix.id,
+        "related_to",
+        "Alice deploys the fix tonight.",
+        0,
+    );
+    seed_graph(&fixture, vec![deploy, fix], vec![edge.clone()]).await;
+    // An orphan row: its natural key matches no graph edge.
+    let orphan_id = EdgeId {
+        source_id: concept_id("gone"),
+        relationship_name: "related_to".to_string(),
+        target_id: concept_id("stale"),
+        valid_at: OffsetDateTime::now_utc(),
+    }
+    .encode();
+    seed_edge_text(&fixture, &orphan_id, "a tombstoned edge").await;
+
+    // The startup reconciliation of the group (the embedding worker's
+    // pass, decisions 66/76c) over a dedicated one-group target.
+    let target = GroupEmbeddingTarget::open(fixture.data_root(), CHAT_ID)
+        .expect("the reconciliation target opens");
+    let report = reconcile_group(fixture.memory.as_ref(), &target).await;
+    assert_eq!(
+        report.edge_texts_upserted, 1,
+        "the harvest-loss row is re-written"
+    );
+    assert_eq!(report.edge_texts_pruned, 1, "the orphan row is pruned");
+    // The sidecar now holds exactly the graph's edge.
+    let store = Arc::clone(&target.store);
+    let ids = tokio::task::spawn_blocking(move || store.list_edge_text_ids())
+        .await
+        .expect("the blocking task joins")
+        .expect("list_edge_text_ids succeeds");
+    assert_eq!(ids, vec![edge_json_id(&edge)]);
+
+    // ... and a deep wake surfaces the repaired row through FTS.
+    let doubles = silent_doubles();
+    let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+    let handle = spawn_with_deep_wake(&fixture, wake_config(), t0(), &doubles, &embedder);
+
+    let texts = ["ok ok thanks", "deploys", "ok ok thanks"];
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        send_message(
+            &handle,
+            message(id, index as i64 + 1, "u9", "阿杰", texts[index]),
+        )
+        .await;
+    }
+    wait_for_relevance_calls(&doubles.relevance, 1).await;
+    handle.snapshot().await.expect("the snapshot succeeds");
+
+    assert_eq!(embedder.calls(), vec![vec!["deploys".to_string()]]);
+    assert_eq!(
+        presented_texts(&doubles),
+        vec!["Alice deploys the fix tonight.".to_string()]
+    );
+
+    handle.shutdown().await.expect("the actor reports no error");
 }
