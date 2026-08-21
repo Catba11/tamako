@@ -46,7 +46,7 @@ use crate::backend::{
     AliasTarget, CandidateEdge, EdgeId, MemoryBackend, MemoryBatch, MemoryError, MergeOutcome,
     MergeSnapshot, MergeSnapshotEdge, MergeSnapshotEdgeKey, MergeSnapshotNode, NeighborEdge,
     NodeContent, NodeFactEdge, NodeFacts, NodeMergeStats, NodeResolutionInfo, NodeType, Result,
-    UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT, RECALL_TIME_WINDOW_DAYS,
+    TopicCandidate, UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT, RECALL_TIME_WINDOW_DAYS,
 };
 
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
@@ -261,6 +261,33 @@ WHERE s.id = $subject_id AND r.relationship_name = $rel AND r.invalid_at IS NULL
 SET r.invalid_at = $now, r.updated_at = $now
 RETURN count(r)";
 
+// Decision 78 (c) / specs.md Section 9.7 step 2: the warmup topic
+// sampling. A full Concept scan by design (the documented Rule R5
+// exception, mirroring LIST_NODE_CONTENTS — the warmup sampler has no
+// entry identifiers). The degree is the same measure as
+// NODE_MERGE_STATS: every EDGE row touching the node, both directions,
+// DISTINCT so a self-loop counts once. The OPTIONAL MATCH keeps bare
+// Concepts in the result (count 0, NULL maxima).
+//
+// Driver quirk (verified against lbug 0.18): mixing a DISTINCT
+// aggregate with a non-DISTINCT aggregate in the same RETURN makes the
+// NON-DISTINCT aggregates evaluate to NULL. max(DISTINCT x) is
+// semantically identical to max(x), so EVERY aggregate here is
+// DISTINCT — that keeps the degree measure identical to
+// NODE_MERGE_STATS AND the maxima correct. The newest activity arrives
+// as two separate aggregates (max() over two columns in one call is
+// unverified on this driver); the Rust side takes the max of
+// `latest_valid` and `latest_created`, NULLs as None. Aggregates carry
+// RETURN aliases so ORDER BY can name them; the order (degree DESC, id
+// ASC) is a deterministic total order, so the LIMIT truncation is
+// stable. `$limit` binds as a parameter (Section 5.2 rule 4).
+const SAMPLE_INTEREST_TOPICS: &str = "MATCH (n:Node)
+WHERE n.type = 'Concept'
+OPTIONAL MATCH (n)-[r:EDGE]-()
+RETURN n.id AS id, n.name AS name, count(DISTINCT r) AS degree, max(DISTINCT r.valid_at) AS latest_valid, max(DISTINCT r.created_at) AS latest_created
+ORDER BY degree DESC, id ASC
+LIMIT $limit";
+
 // Decision 75: set the `invalid_at` of one edge addressed by its natural
 // key (source, relationship_name, target, valid_at) — the EDGE table has no
 // id column (Section 6.1), so the natural key IS the address. `$invalid_at`
@@ -389,6 +416,20 @@ fn node_content_of(name: Option<Value>, properties: Option<Value>) -> Option<Nod
     };
     let description = description_of(properties);
     Some(NodeContent { name, description })
+}
+
+/// Decodes one nullable TIMESTAMP result column into an
+/// `Option<OffsetDateTime>`: `Value::Timestamp` is `Some`, NULL (or an
+/// absent column) is `None`. Any other shape is a LOUD error — the same
+/// policy as `find_edge_invalid_at`.
+fn opt_timestamp_column(value: Option<Value>) -> Result<Option<OffsetDateTime>> {
+    match value {
+        Some(Value::Timestamp(timestamp)) => Ok(Some(timestamp)),
+        Some(Value::Null(_)) | None => Ok(None),
+        other => Err(MemoryError::Backend(format!(
+            "unexpected nullable timestamp shape: {other:?}"
+        ))),
+    }
 }
 
 /// Renders one `lbug::Value` as a display string. Used by the read
@@ -1537,6 +1578,69 @@ impl MemoryBackend for LbugBackend {
                 }
             }
             Ok(contents)
+        })
+        .await
+    }
+
+    /// Decision 78 (c) / specs.md Section 9.7 step 2: the warmup topic
+    /// sampling. Serialized per group by `with_conn` (decision 47).
+    async fn sample_interest_topics(
+        &self,
+        chat_id: &str,
+        limit: u32,
+    ) -> Result<Vec<TopicCandidate>> {
+        // A zero limit short-circuits WITHOUT opening the database of
+        // the group (same policy as the empty-list short-circuits of
+        // node_resolution_infos / two_hop_edges).
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.with_conn(chat_id, move |conn| {
+            let mut statement = conn.prepare(SAMPLE_INTEREST_TOPICS).map_err(backend)?;
+            let result = conn
+                .execute(
+                    &mut statement,
+                    vec![("limit", Value::Int64(i64::from(limit)))],
+                )
+                .map_err(backend)?;
+            let mut topics = Vec::new();
+            for row in result {
+                let mut columns = row.into_iter();
+                let decoded = (
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                );
+                // A row of an unexpected shape is a LOUD error: the
+                // warmup sampler must not silently weigh a half-decoded
+                // topic (house policy, same as the merge snapshot reads).
+                let (
+                    Some(Value::String(node_id)),
+                    Some(Value::String(name)),
+                    Some(Value::Int64(degree)),
+                    latest_valid,
+                    latest_created,
+                ) = decoded
+                else {
+                    return Err(MemoryError::Backend(
+                        "sample_interest_topics: unexpected row shape".to_string(),
+                    ));
+                };
+                let latest_valid = opt_timestamp_column(latest_valid)?;
+                let latest_created = opt_timestamp_column(latest_created)?;
+                topics.push(TopicCandidate {
+                    node_id,
+                    name,
+                    edge_count: u64::try_from(degree).unwrap_or(0),
+                    // The newest activity over the node's edges: the max
+                    // of the two aggregate maxima (Option::max treats a
+                    // NULL side as absent).
+                    last_activity_at: latest_valid.max(latest_created),
+                });
+            }
+            Ok(topics)
         })
         .await
     }
@@ -5395,5 +5499,269 @@ mod tests {
 
         let candidates = backend.edges_by_ids("chat_d76i", &[]).await.unwrap();
         assert!(candidates.is_empty());
+    }
+
+    /// Decision 78 (c) test data: one edge with an explicit valid_at
+    /// distinct from its created_at (fact_edge sets them equal).
+    fn timed_edge(
+        source_id: &str,
+        target_id: &str,
+        relationship_name: &str,
+        valid_at: OffsetDateTime,
+        created_at: OffsetDateTime,
+    ) -> MemoryEdge {
+        MemoryEdge {
+            source_id: source_id.to_string(),
+            target_id: target_id.to_string(),
+            relationship_name: relationship_name.to_string(),
+            valid_at,
+            invalid_at: None,
+            edge_text: format!("{source_id} {relationship_name} {target_id}"),
+            created_at,
+            updated_at: created_at,
+            properties: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_of_an_empty_graph_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+
+        let topics = backend
+            .sample_interest_topics("chat_d78a", 100)
+            .await
+            .unwrap();
+        assert!(topics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_with_a_zero_limit_does_not_open_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+
+        let topics = backend
+            .sample_interest_topics("chat_d78b", 0)
+            .await
+            .unwrap();
+        assert!(topics.is_empty());
+        // The zero-limit short-circuit runs BEFORE with_conn: the group
+        // directory (and its database file) is never created.
+        assert!(!dir.path().join("chat_d78b").exists());
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_orders_by_degree_descending() {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let hot = concept_node("Hot", base);
+        let warm = concept_node("Warm", base);
+        let bare = concept_node("Bare", base);
+        let person = MemoryNode {
+            id: crate::identifiers::person_id("1001"),
+            name: "Tama".to_string(),
+            node_type: NodeType::Person,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        let batch_id = crate::identifiers::batch_id(12, 200);
+        // Degree is EVERY touching EDGE row, both directions, no
+        // whitelist — deliberately unlike `neighbors` / `two_hop_edges`:
+        // the `contains` provenance edge to the MessageBatch skeleton
+        // (created by write_batch under the batch id) COUNTS toward the
+        // degree. The weighting and exclusions are tamako-core's job;
+        // this read stays dumb.
+        let edges = vec![
+            fact_edge(
+                &hot.id,
+                &warm.id,
+                "related",
+                None,
+                base + Duration::seconds(1),
+            ),
+            fact_edge(
+                &person.id,
+                &hot.id,
+                "likes",
+                None,
+                base + Duration::seconds(2),
+            ),
+            // Provenance edge Hot -> MessageBatch: counts (see above).
+            fact_edge(
+                &hot.id,
+                &batch_id,
+                "contains",
+                None,
+                base + Duration::seconds(3),
+            ),
+            fact_edge(
+                &person.id,
+                &warm.id,
+                "dislikes",
+                None,
+                base + Duration::seconds(4),
+            ),
+        ];
+        let batch = MemoryBatch {
+            batch_id,
+            nodes: vec![hot.clone(), warm.clone(), bare.clone(), person],
+            edges,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        backend.upsert_batch("chat_d78c", &batch).await.unwrap();
+
+        let topics = backend
+            .sample_interest_topics("chat_d78c", 100)
+            .await
+            .unwrap();
+        // Hot: 3 (related + likes + contains), Warm: 2 (related +
+        // dislikes), Bare: 0. The Person is not a Concept (covered
+        // explicitly by sample_interest_topics_excludes_non_concepts).
+        let ids: Vec<&str> = topics.iter().map(|t| t.node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![hot.id.as_str(), warm.id.as_str(), bare.id.as_str()]
+        );
+        let degrees: Vec<u64> = topics.iter().map(|t| t.edge_count).collect();
+        assert_eq!(degrees, vec![3, 2, 0]);
+        assert_eq!(topics[0].name, "Hot");
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_last_activity_is_the_max_over_the_edges() {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let concept = concept_node("Alpha", base);
+        let other = concept_node("Beta", base);
+        let bare = concept_node("Gamma", base);
+        // Edge 1: valid_at OLD, created_at NEW. Edge 2: valid_at NEWEST
+        // of the valids, created_at older. The newest activity is the
+        // max across BOTH columns and BOTH edges: edge 1's created_at.
+        let newest = base + Duration::days(5);
+        let edges = vec![
+            timed_edge(
+                &concept.id,
+                &other.id,
+                "likes",
+                base + Duration::days(1),
+                newest,
+            ),
+            timed_edge(
+                &other.id,
+                &concept.id,
+                "dislikes",
+                base + Duration::days(3),
+                base + Duration::days(2),
+            ),
+        ];
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(12, 210),
+            nodes: vec![concept.clone(), other, bare.clone()],
+            edges,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        backend.upsert_batch("chat_d78d", &batch).await.unwrap();
+
+        let topics = backend
+            .sample_interest_topics("chat_d78d", 100)
+            .await
+            .unwrap();
+        let alpha = topics
+            .iter()
+            .find(|t| t.node_id == concept.id)
+            .expect("Alpha is a candidate");
+        assert_eq!(alpha.edge_count, 2);
+        assert_eq!(alpha.last_activity_at, Some(newest));
+        // A Concept with NO edges: degree 0 and no activity (the
+        // OPTIONAL MATCH miss yields count 0 and NULL maxima).
+        let gamma = topics
+            .iter()
+            .find(|t| t.node_id == bare.id)
+            .expect("Gamma is a candidate");
+        assert_eq!(gamma.edge_count, 0);
+        assert_eq!(gamma.last_activity_at, None);
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_limit_truncates_deterministically() {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let concepts: Vec<MemoryNode> = ["One", "Two", "Three"]
+            .into_iter()
+            .map(|name| concept_node(name, base))
+            .collect();
+        // A DEGREE TIE: each Concept carries exactly one edge (each to
+        // its own Person endpoint, so no Concept-Concept edge disturbs
+        // the tie). The truncation must break the tie by node id ASC.
+        let mut nodes: Vec<MemoryNode> = concepts.clone();
+        let mut edges = Vec::new();
+        for (index, concept) in concepts.iter().enumerate() {
+            let person = MemoryNode {
+                id: crate::identifiers::person_id(&format!("200{index}")),
+                name: format!("Person {index}"),
+                node_type: NodeType::Person,
+                created_at: base,
+                updated_at: base,
+                properties: None,
+            };
+            edges.push(fact_edge(&person.id, &concept.id, "likes", None, base));
+            nodes.push(person);
+        }
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(12, 220),
+            nodes,
+            edges,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        backend.upsert_batch("chat_d78e", &batch).await.unwrap();
+
+        let mut expected_ids: Vec<String> =
+            concepts.iter().map(|concept| concept.id.clone()).collect();
+        expected_ids.sort();
+        let topics = backend
+            .sample_interest_topics("chat_d78e", 2)
+            .await
+            .unwrap();
+        let ids: Vec<String> = topics.into_iter().map(|t| t.node_id).collect();
+        assert_eq!(ids, expected_ids[..2]);
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_excludes_non_concept_nodes() {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let person = MemoryNode {
+            id: crate::identifiers::person_id("1001"),
+            name: "Tama".to_string(),
+            node_type: NodeType::Person,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        let concept = concept_node("Alpha", base);
+        // The Person carries BOTH edges; the Concept is bare. Only the
+        // Concept is a warmup topic candidate.
+        let other = concept_node("Beta", base);
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(12, 230),
+            nodes: vec![person.clone(), concept.clone(), other.clone()],
+            edges: vec![
+                fact_edge(&person.id, &other.id, "likes", None, base),
+                fact_edge(&other.id, &person.id, "mentions", None, base),
+            ],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        backend.upsert_batch("chat_d78f", &batch).await.unwrap();
+
+        let topics = backend
+            .sample_interest_topics("chat_d78f", 100)
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = topics.into_iter().map(|t| t.node_id).collect();
+        ids.sort();
+        let mut expected = vec![concept.id, other.id];
+        expected.sort();
+        assert_eq!(ids, expected);
     }
 }

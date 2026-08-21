@@ -9,7 +9,7 @@ pub use backend::{
     AliasTarget, CandidateEdge, EdgeId, MemoryBackend, MemoryBatch, MemoryEdge, MemoryError,
     MemoryNode, MergeOutcome, MergeSnapshot, MergeSnapshotEdge, MergeSnapshotEdgeKey,
     MergeSnapshotNode, NeighborEdge, NodeContent, NodeFactEdge, NodeFacts, NodeMergeStats,
-    NodeResolutionInfo, NodeType, Result, UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT,
+    NodeResolutionInfo, NodeType, Result, TopicCandidate, UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT,
     RECALL_TIME_WINDOW_DAYS,
 };
 pub use lbug_backend::LbugBackend;
