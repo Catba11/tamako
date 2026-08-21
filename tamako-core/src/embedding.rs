@@ -5,18 +5,23 @@
 //!
 //! Two mechanisms, one task:
 //!
-//! - **Startup reconciliation** ([`reconcile_group`]): runs once per
-//!   group BEFORE the first drain tick. It diffs the graph's stored
-//!   node contents against the store-side done-journal: backfill (a
-//!   node never embedded), steady-state repair (the stored content
-//!   drifted from the journaled hash), and tombstone cleanup (vec/queue
-//!   rows whose node left the graph) are ONE pass. Decision 76 extends
-//!   the same pass to the `edge_texts` sidecar as a pure set
+//! - **Reconciliation** ([`reconcile_group`]): runs once per group
+//!   BEFORE the first drain tick, then periodically every
+//!   [`RECONCILE_EVERY_N_TICKS`] ticks (decision 77, M4). It diffs the
+//!   graph's stored node contents against the store-side done-journal:
+//!   backfill (a node never embedded), steady-state repair (the stored
+//!   content drifted from the journaled hash), and tombstone cleanup
+//!   (vec/queue rows whose node left the graph) are ONE pass. Decision
+//!   76 extends the same pass to the `edge_texts` sidecar as a pure set
 //!   difference against the graph's edges (no journal on that side).
+//!   Reconciliation needs NO provider — the edge_texts repair is a pure
+//!   store/graph diff — so it runs even when embeddings are disabled.
 //! - **The drain tick** ([`drain_group`]): every
 //!   [`EMBEDDING_WORKER_INTERVAL`], at most [`EMBEDDING_BATCH_PER_GROUP`]
-//!   rows per group, embedded SEQUENTIALLY (the rate limit at our
-//!   scale).
+//!   rows per group (or [`EMBEDDING_BURST_BATCH`] while the backlog
+//!   exceeds [`EMBEDDING_BURST_THRESHOLD`], decision 77 M13), embedded
+//!   SEQUENTIALLY (the rate limit at our scale). A `None` provider skips
+//!   the drain loop only; reconciliation still runs.
 //!
 //! Why not a post-digest hook: the hook runs inline on the actor loop
 //! and a 300-second endpoint timeout would stall the inbox (specs.md
@@ -36,10 +41,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tamako_memory::{MemoryBackend, NodeContent};
+use tamako_memory::{MemoryBackend, NodeType};
 use tamako_store::{Store, StoreError};
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::digest::embedding_content_hash;
 
@@ -51,6 +56,23 @@ pub const EMBEDDING_WORKER_INTERVAL: Duration = Duration::from_secs(30);
 /// calls run sequentially within the batch; the limit paces the
 /// endpoint.
 pub const EMBEDDING_BATCH_PER_GROUP: usize = 8;
+
+/// The periodic reconciliation cadence (decision 77, M4): every Nth
+/// tick re-runs [`reconcile_group`] — 40 × the 30 s
+/// [`EMBEDDING_WORKER_INTERVAL`] ≈ 20 min. The edge_texts sidecar
+/// repair is a pure store/graph diff, so this cadence runs even with
+/// NO provider (the drain loop alone is provider-gated).
+pub const RECONCILE_EVERY_N_TICKS: u32 = 40;
+
+/// The backlog-burst threshold (decision 77, M13): when a group's
+/// pending embedding queue EXCEEDS this many rows, a tick claims
+/// [`EMBEDDING_BURST_BATCH`] instead of [`EMBEDDING_BATCH_PER_GROUP`]
+/// until the backlog drains.
+pub const EMBEDDING_BURST_THRESHOLD: usize = 256;
+
+/// The per-group claim limit of a burst tick (decision 77, M13). Refer
+/// to [`EMBEDDING_BURST_THRESHOLD`].
+pub const EMBEDDING_BURST_BATCH: usize = 64;
 
 /// Errors of the embedding worker. Row-level and group-level failures
 /// are logged at WARN and skipped inside the pass functions; this type
@@ -119,17 +141,17 @@ pub fn embedded_text(name: &str, description: &str) -> String {
 }
 
 /// Decision 66 embeds only Person/Alias/Concept nodes; MessageBatch
-/// skeletons are never embedded. A node-id PREFIX filter cannot
-/// implement this: identifiers.rs makes every node id an opaque UUID5
-/// hash — the natural keys (`tg_user:…`, `alias:…`, `concept:…`,
-/// `batch:…`) are the hash INPUT, so no prefix survives on the stored
-/// id. The discriminator that DOES survive on the read path:
-/// MessageBatch nodes carry their own id as the display name
-/// (tamako-agent resolve.rs `message_batch_node` sets `name: batch_id`
-/// on both the skeleton and the full-resolution write), while
-/// Person/Alias/Concept names are human display names.
-fn is_embedded_kind(node_id: &str, content: &NodeContent) -> bool {
-    content.name != node_id
+/// skeletons are never embedded. Decision 77 (M10) discriminates on the
+/// STORED node `type` (the closed set of graph-spec Section 6.2, read
+/// batched through [`MemoryBackend::node_resolution_infos`]) — the old
+/// discriminator, the MessageBatch name-equals-id invariant, was only a
+/// PROXY and misclassified a real node whose display name collides with
+/// its id. A node MISSING from the resolution read (a stored type
+/// string outside the closed set — the read paths skip such rows) is
+/// embedded: the closed set carries exactly one non-embedded kind, and
+/// the drain re-reads the stored content anyway.
+fn is_embedded_kind(kind: Option<NodeType>) -> bool {
+    kind != Some(NodeType::MessageBatch)
 }
 
 /// One group's embedding sidecar: the chat id plus the group's OWN
@@ -202,13 +224,19 @@ where
         .map_err(EmbeddingError::from)
 }
 
-/// The startup reconciliation of one group (decision 66): backfill,
-/// steady-state repair, and tombstone cleanup in ONE pass.
+/// The reconciliation pass of one group (decision 66 startup, decision
+/// 77 M4 periodic): backfill, steady-state repair, and tombstone
+/// cleanup in ONE pass.
 ///
 /// - Every embedded-kind graph node whose current stored content hash
 ///   is not the node's latest journaled done hash is (re-)enqueued —
 ///   this covers the first-startup backfill AND the repair of a node
-///   whose stored content drifted (alias merge, manual edit).
+///   whose stored content drifted (alias merge, manual edit). The
+///   embedded-kind filter reads the stored TYPE column (decision 77,
+///   M10): one batched [`MemoryBackend::node_resolution_infos`] call
+///   over the listed ids. Without a provider the enqueued rows simply
+///   wait store-side for a later drain — the pass is harmless and runs
+///   anyway, so a provider appearing later finds the queue primed.
 /// - Every node id known to the sidecar (vec rows UNION queue rows)
 ///   that the graph no longer holds is tombstoned.
 /// - Decision 76 (Section 7.6 step 6): the `edge_texts` sidecar rides
@@ -222,8 +250,11 @@ where
 ///   and their rows reappear here regardless of any node journal.
 ///
 /// Failures are WARN + skip: a group whose memory read fails keeps its
-/// queue untouched and retries on the next process start. Logs one INFO
-/// summary line per group.
+/// queue untouched and retries on the next pass. Logs one DEBUG
+/// summary line per group (decision 77, S2: at the M4 periodic cadence
+/// the line is RECURRING, and the curated INFO surface of decision 53
+/// is frozen to the one-line-per-wake/digest set — a periodic line
+/// outside that set would extend it, so the summary is DEBUG).
 pub async fn reconcile_group<M: MemoryBackend>(
     memory: &M,
     target: &GroupEmbeddingTarget,
@@ -237,6 +268,22 @@ pub async fn reconcile_group<M: MemoryBackend>(
         }
     };
     let graph_ids: HashSet<&str> = contents.iter().map(|(id, _)| id.as_str()).collect();
+    // Decision 77 (M10): the embedded-kind filter reads the stored type
+    // column — ONE batched resolution-info call over the listed ids.
+    let node_ids: Vec<String> = contents.iter().map(|(id, _)| id.clone()).collect();
+    let kinds: HashMap<String, NodeType> = match memory
+        .node_resolution_infos(&target.chat_id, &node_ids)
+        .await
+    {
+        Ok(infos) => infos
+            .into_iter()
+            .map(|(id, info)| (id, info.kind))
+            .collect(),
+        Err(error) => {
+            warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: kind read failed; skipping the group");
+            return report;
+        }
+    };
     let done: HashMap<String, String> = match store_call(
         &target.store,
         Store::done_embedding_hashes,
@@ -251,7 +298,7 @@ pub async fn reconcile_group<M: MemoryBackend>(
     };
     let to_enqueue: Vec<(String, String)> = contents
         .iter()
-        .filter(|(node_id, content)| is_embedded_kind(node_id, content))
+        .filter(|(node_id, _)| is_embedded_kind(kinds.get(node_id).copied()))
         .map(|(node_id, content)| {
             (
                 node_id.clone(),
@@ -278,7 +325,7 @@ pub async fn reconcile_group<M: MemoryBackend>(
         Ok(known) => known,
         Err(error) => {
             warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: orphan scan failed; tombstones skipped");
-            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = 0, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
+            debug!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = 0, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
             return report;
         }
     };
@@ -306,17 +353,20 @@ pub async fn reconcile_group<M: MemoryBackend>(
         Ok(edges) => edges,
         Err(error) => {
             warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: graph edge listing failed; edge_texts repair skipped");
-            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
+            debug!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
             return report;
         }
     };
-    let sidecar_ids: HashSet<String> = match store_call(&target.store, Store::list_edge_text_ids)
-        .await
+    let sidecar_texts: HashMap<String, String> = match store_call(
+        &target.store,
+        Store::list_edge_texts,
+    )
+    .await
     {
-        Ok(ids) => ids.into_iter().collect(),
+        Ok(pairs) => pairs.into_iter().collect(),
         Err(error) => {
             warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: edge_texts scan failed; edge repair skipped");
-            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
+            debug!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
             return report;
         }
     };
@@ -325,12 +375,18 @@ pub async fn reconcile_group<M: MemoryBackend>(
         .map(|(edge_id, _)| edge_id.as_str())
         .collect();
     for (edge_id, edge_text) in &graph_edges {
-        // The digest harvest skips empty descriptions (nothing to
-        // search); the diff mirrors that skip so an empty-text edge
-        // never flaps between the two writers. A present row needs no
-        // rewrite: the upsert is idempotent and the digest refreshes
-        // the text on redigest.
-        if edge_text.is_empty() || sidecar_ids.contains(edge_id) {
+        // Decision 77 (S6-F6): the diff is BY CONTENT — upsert when the
+        // sidecar row is missing OR its text DRIFTED from the graph's
+        // edge_text (a re-extracted edge with a new description repairs
+        // the sidecar here; the id-presence-only diff could not). The
+        // digest harvest skips empty descriptions (nothing to search);
+        // the diff mirrors that skip so an empty-text edge never flaps
+        // between the two writers.
+        if edge_text.is_empty()
+            || sidecar_texts
+                .get(edge_id)
+                .is_some_and(|text| text == edge_text)
+        {
             continue;
         }
         let id = edge_id.clone();
@@ -346,8 +402,8 @@ pub async fn reconcile_group<M: MemoryBackend>(
             }
         }
     }
-    let orphans: Vec<String> = sidecar_ids
-        .into_iter()
+    let orphans: Vec<String> = sidecar_texts
+        .into_keys()
         .filter(|edge_id| !graph_edge_ids.contains(edge_id.as_str()))
         .collect();
     if !orphans.is_empty() {
@@ -363,12 +419,14 @@ pub async fn reconcile_group<M: MemoryBackend>(
             }
         }
     }
-    info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = report.edge_texts_upserted, edge_texts_pruned = report.edge_texts_pruned, "embedding reconciliation complete");
+    debug!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = report.edge_texts_upserted, edge_texts_pruned = report.edge_texts_pruned, "embedding reconciliation complete");
     report
 }
 
 /// One drain tick of one group (decision 66): claims the oldest pending
-/// rows (at most [`EMBEDDING_BATCH_PER_GROUP`]) and embeds them
+/// rows (at most [`EMBEDDING_BATCH_PER_GROUP`], or
+/// [`EMBEDDING_BURST_BATCH`] while the backlog exceeds
+/// [`EMBEDDING_BURST_THRESHOLD`] — decision 77, M13) and embeds them
 /// SEQUENTIALLY.
 ///
 /// Per row: the STORED node content is authoritative (pipeline-known
@@ -391,17 +449,30 @@ pub async fn drain_group<M: MemoryBackend>(
     target: &GroupEmbeddingTarget,
 ) -> DrainReport {
     let mut report = DrainReport::default();
-    let batch = match store_call(&target.store, |store| {
-        store.claim_embedding_batch(EMBEDDING_BATCH_PER_GROUP)
+    // Backlog-burst probe (decision 77, M13): `claim_embedding_batch`
+    // is a pure SELECT — the store keeps no claim state — so ONE probe
+    // claim of `EMBEDDING_BURST_THRESHOLD + 1` rows doubles as the
+    // pending-count read. A FULL probe means the pending backlog exceeds
+    // the threshold and the tick drains EMBEDDING_BURST_BATCH rows; a
+    // short probe drains the normal EMBEDDING_BATCH_PER_GROUP. The probe
+    // rows past the batch stay 'pending' and are re-read next tick.
+    let probe = match store_call(&target.store, |store| {
+        store.claim_embedding_batch(EMBEDDING_BURST_THRESHOLD + 1)
     })
     .await
     {
-        Ok(batch) => batch,
+        Ok(probe) => probe,
         Err(error) => {
             warn!(chat_id = %target.chat_id, %error, "embedding drain: claim failed; skipping the group this tick");
             return report;
         }
     };
+    let batch_size = if probe.len() > EMBEDDING_BURST_THRESHOLD {
+        EMBEDDING_BURST_BATCH
+    } else {
+        EMBEDDING_BATCH_PER_GROUP
+    };
+    let batch: Vec<_> = probe.into_iter().take(batch_size).collect();
     report.claimed = batch.len();
     for row in batch {
         let content = match memory.node_content(&target.chat_id, &row.node_id).await {
@@ -511,21 +582,27 @@ impl<M: MemoryBackend + 'static> EmbeddingWorker<M> {
         }
     }
 
-    /// Spawns the worker task. A `None` provider (the degrade path: no
-    /// API key) logs ONE info line and spawns NO task — a no-op task
-    /// ticking forever would only pretend the sidecar is alive. The
+    /// Spawns the worker task. The task ALWAYS spawns: a `None`
+    /// provider (the degrade path: no API key, or
+    /// `embedding_enabled = false`) logs ONE info line and skips only
+    /// the DRAIN loop — reconciliation needs no embeddings (the
+    /// edge_texts repair is a pure store/graph diff) and still runs at
+    /// startup and on the [`RECONCILE_EVERY_N_TICKS`] cadence
+    /// (decision 77, M4). The `Option` return is kept for the
+    /// decision-66 call-site shape; it is now always `Some`. The
     /// returned handle is detached: dropping it never cancels the task.
     ///
-    /// The task body runs the per-group startup reconciliation ONCE,
+    /// The task body runs the per-group reconciliation ONCE at startup,
     /// then ticks at [`EMBEDDING_WORKER_INTERVAL`] with
     /// `MissedTickBehavior::Delay` (a delayed tick loses at most
-    /// cadence, the house idiom). A panic kills only this task; there
-    /// is no supervisor machinery by design (module docs).
+    /// cadence, the house idiom). Every [`RECONCILE_EVERY_N_TICKS`]th
+    /// tick re-runs the reconciliation. A panic kills only this task;
+    /// there is no supervisor machinery by design (module docs).
     pub fn spawn(self) -> Option<tokio::task::JoinHandle<()>> {
-        let Some(provider) = self.provider else {
-            info!("embeddings disabled: no embedding provider; the embedding worker will not run");
-            return None;
-        };
+        let provider = self.provider;
+        if provider.is_none() {
+            info!("embeddings disabled: no embedding provider; the drain loop is off, but the reconciliation pass still runs (startup + periodic)");
+        }
         let memory = self.memory;
         let targets = self.targets;
         Some(tokio::spawn(async move {
@@ -541,10 +618,21 @@ impl<M: MemoryBackend + 'static> EmbeddingWorker<M> {
             // the first drain runs one full interval after the
             // reconciliation pass.
             ticker.tick().await;
+            // Ticks since the startup reconciliation; every Nth tick
+            // re-runs it (decision 77, M4).
+            let mut ticks: u32 = 0;
             loop {
                 ticker.tick().await;
-                for target in &targets {
-                    drain_group(&*provider, &*memory, target).await;
+                ticks += 1;
+                if let Some(provider) = &provider {
+                    for target in &targets {
+                        drain_group(&**provider, &*memory, target).await;
+                    }
+                }
+                if ticks.is_multiple_of(RECONCILE_EVERY_N_TICKS) {
+                    for target in &targets {
+                        reconcile_group(&*memory, target).await;
+                    }
                 }
             }
         }))
@@ -556,7 +644,10 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use tamako_memory::{AliasTarget, MemoryBatch, NeighborEdge, Result as MemoryResult};
+    use tamako_memory::{
+        AliasTarget, MemoryBatch, NeighborEdge, NodeContent, NodeResolutionInfo,
+        Result as MemoryResult,
+    };
     use tamako_store::EMBEDDING_DIM;
 
     use super::*;
@@ -625,6 +716,10 @@ mod tests {
     struct ScriptedMemory {
         /// chat_id -> node_id -> stored content.
         contents: Mutex<HashMap<String, HashMap<String, NodeContent>>>,
+        /// chat_id -> node_id -> stored kind — the type-column truth of
+        /// the decision-77 (M10) embedded-kind filter, served through
+        /// `node_resolution_infos`.
+        kinds: Mutex<HashMap<String, HashMap<String, NodeType>>>,
         /// chat_id -> (edge_id, edge_text) of the group's edges — the
         /// graph truth of the decision-76 edge_texts diff.
         edges: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -640,6 +735,36 @@ mod tests {
                 contents: Mutex::new(HashMap::from([(chat_id.to_string(), nodes)])),
                 ..ScriptedMemory::default()
             }
+        }
+
+        /// Seeds the group's stored kinds (decision 77, M10 tests).
+        fn with_kinds(self, chat_id: &str, kinds: &[(&str, NodeType)]) -> Self {
+            self.kinds.lock().expect("kinds lock").insert(
+                chat_id.to_string(),
+                kinds
+                    .iter()
+                    .map(|(id, kind)| ((*id).to_string(), *kind))
+                    .collect(),
+            );
+            self
+        }
+
+        /// Adds (or replaces) one node post-construction — the paused-
+        /// time periodic-reconciliation test seeds a node AFTER the
+        /// startup pass.
+        fn add_node(&self, chat_id: &str, node_id: &str, content: NodeContent, kind: NodeType) {
+            self.contents
+                .lock()
+                .expect("contents lock")
+                .entry(chat_id.to_string())
+                .or_default()
+                .insert(node_id.to_string(), content);
+            self.kinds
+                .lock()
+                .expect("kinds lock")
+                .entry(chat_id.to_string())
+                .or_default()
+                .insert(node_id.to_string(), kind);
         }
 
         /// Seeds the group's edge listing (decision 76 tests).
@@ -728,6 +853,32 @@ mod tests {
                 .unwrap_or_default())
         }
 
+        async fn node_resolution_infos(
+            &self,
+            chat_id: &str,
+            node_ids: &[String],
+        ) -> MemoryResult<Vec<(String, NodeResolutionInfo)>> {
+            let kinds = self.kinds.lock().expect("kinds lock");
+            let Some(group) = kinds.get(chat_id) else {
+                return Ok(Vec::new());
+            };
+            Ok(node_ids
+                .iter()
+                .filter_map(|id| {
+                    group.get(id).map(|kind| {
+                        (
+                            id.clone(),
+                            NodeResolutionInfo {
+                                kind: *kind,
+                                alias_target: None,
+                                alias_target_count: 0,
+                            },
+                        )
+                    })
+                })
+                .collect())
+        }
+
         async fn close(&self, _chat_id: &str) -> MemoryResult<()> {
             Ok(())
         }
@@ -759,15 +910,18 @@ mod tests {
     }
 
     #[test]
-    fn the_message_batch_filter_uses_the_name_equals_id_invariant() {
-        // resolve.rs `message_batch_node` writes name == id for
-        // MessageBatch nodes (on both write paths); Person/Alias/
-        // Concept names are human display names. The node ids are
-        // opaque UUID5 hashes, so no prefix filter can exist.
-        let batch = content("9b2f…", "");
-        assert!(!is_embedded_kind("9b2f…", &batch));
-        let person = content("Tama", "a cat");
-        assert!(is_embedded_kind("9b2f…", &person));
+    fn the_embedded_kind_filter_discriminates_on_the_stored_type() {
+        // Decision 77 (M10): the discriminator is the stored `type`
+        // column, not the name-equals-id proxy. Only MessageBatch is
+        // excluded.
+        assert!(!is_embedded_kind(Some(NodeType::MessageBatch)));
+        assert!(is_embedded_kind(Some(NodeType::Person)));
+        assert!(is_embedded_kind(Some(NodeType::Alias)));
+        assert!(is_embedded_kind(Some(NodeType::Concept)));
+        // A node missing from the resolution read (a stored type
+        // outside the closed set) is embedded: the closed set carries
+        // exactly one non-embedded kind.
+        assert!(is_embedded_kind(None));
     }
 
     #[tokio::test]
@@ -929,9 +1083,17 @@ mod tests {
             &[
                 ("p1", content("Tama", "a cat")),
                 ("c1", content("Rust", "a language")),
-                // The MessageBatch skeleton: name == id (the resolve.rs
-                // invariant the filter relies on).
+                // The MessageBatch skeleton: excluded by the stored
+                // type column (decision 77, M10).
                 ("b1", content("b1", "")),
+            ],
+        )
+        .with_kinds(
+            "chat_a",
+            &[
+                ("p1", NodeType::Person),
+                ("c1", NodeType::Concept),
+                ("b1", NodeType::MessageBatch),
             ],
         );
 
@@ -970,6 +1132,10 @@ mod tests {
                 ("p1", content("Tama", "a cat")),
                 ("c1", content("Rust", "a language")),
             ],
+        )
+        .with_kinds(
+            "chat_a",
+            &[("p1", NodeType::Person), ("c1", NodeType::Concept)],
         );
         // c1's journal is current; p1's journal holds a STALE hash
         // (the stored content drifted since the embed).
@@ -1001,6 +1167,10 @@ mod tests {
         let memory = ScriptedMemory::with_group(
             "chat_a",
             &[("p1", content("Tama", "a cat")), ("b1", content("b1", ""))],
+        )
+        .with_kinds(
+            "chat_a",
+            &[("p1", NodeType::Person), ("b1", NodeType::MessageBatch)],
         );
         // An orphan: vec + queue rows for a node the graph no longer
         // holds.
@@ -1031,12 +1201,12 @@ mod tests {
 
     #[tokio::test]
     async fn reconciliation_repairs_the_edge_texts_sidecar() {
-        // Decision 76: the reconcile pass diffs edge_texts against the
-        // graph's edges as a pure set difference — a graph edge missing
-        // from the sidecar is upserted (id + the graph's edge_text), a
-        // sidecar row the graph no longer holds (a merge tombstone) is
-        // pruned, and an empty-text edge is never written (the digest
-        // harvest skip, mirrored so the two writers never flap).
+        // Decision 76/77: the reconcile pass diffs edge_texts against
+        // the graph's edges BY CONTENT — a graph edge missing from the
+        // sidecar is upserted (id + the graph's edge_text), a sidecar
+        // row the graph no longer holds (a merge tombstone) is pruned,
+        // and an empty-text edge is never written (the digest harvest
+        // skip, mirrored so the two writers never flap).
         let (_dir, target) = test_target();
         let memory = ScriptedMemory::with_group("chat_a", &[]).with_edges(
             "chat_a",
@@ -1090,9 +1260,214 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_without_a_provider_logs_and_spawns_nothing() {
-        let worker: EmbeddingWorker<ScriptedMemory> =
-            EmbeddingWorker::new(None, Arc::new(ScriptedMemory::default()), Vec::new());
-        assert!(worker.spawn().is_none());
+    async fn reconciliation_repairs_a_drifted_edge_text_row() {
+        // Decision 77 (S6-F6): a sidecar row whose text DRIFTED from
+        // the graph's edge_text (the edge was re-extracted with a new
+        // description) is corrected by the content diff — the
+        // id-presence-only diff would have missed it, because the id
+        // was already present.
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::with_group("chat_a", &[])
+            .with_edges("chat_a", &[("e1", "Alice discussed tea with Bob")]);
+        target
+            .store
+            .upsert_edge_text("e1", "Alice discussed coffee with Bob")
+            .expect("seed stale row");
+
+        let report = reconcile_group(&memory, &target).await;
+
+        assert_eq!(report.edge_texts_upserted, 1);
+        assert_eq!(report.edge_texts_pruned, 0);
+        assert_eq!(
+            target.store.list_edge_texts().expect("pairs"),
+            vec![("e1".to_string(), "Alice discussed tea with Bob".to_string())],
+            "the stale text is replaced with the graph's edge_text"
+        );
+        assert!(
+            target
+                .store
+                .search_edge_texts("coffee")
+                .expect("search")
+                .is_empty(),
+            "the drifted text no longer matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_embeds_a_person_whose_name_equals_its_id() {
+        // Decision 77 (M10): the filter reads the stored TYPE, so a
+        // Person whose display name collides with its node id IS
+        // enqueued (the old name==id proxy would have dropped it),
+        // while a MessageBatch skeleton is still excluded.
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::with_group(
+            "chat_a",
+            &[
+                ("n1", content("n1", "a person named like its own id")),
+                ("b1", content("b1", "")),
+            ],
+        )
+        .with_kinds(
+            "chat_a",
+            &[("n1", NodeType::Person), ("b1", NodeType::MessageBatch)],
+        );
+
+        let report = reconcile_group(&memory, &target).await;
+
+        assert_eq!(report.enqueued, 1);
+        let claimed = target.store.claim_embedding_batch(100).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].node_id, "n1");
+        assert_eq!(
+            claimed[0].content_hash,
+            embedding_content_hash("n1", "a person named like its own id")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backlog_above_the_burst_threshold_drains_the_burst_batch() {
+        // Decision 77 (M13): 300 pending rows exceed
+        // EMBEDDING_BURST_THRESHOLD (256), so the tick claims
+        // EMBEDDING_BURST_BATCH (64) instead of EMBEDDING_BATCH_PER_GROUP.
+        let (_dir, target) = test_target();
+        // The graph holds none of the seeded nodes: every claimed row
+        // takes the gone-node tombstone path, so the test exercises the
+        // claim limit without any embed call.
+        let memory = ScriptedMemory::default();
+        let rows: Vec<(String, String)> = (0..300)
+            .map(|i| (format!("n{i}"), format!("h{i}")))
+            .collect();
+        target.store.enqueue_embeddings(&rows).expect("enqueue");
+        let provider = ScriptedProvider::succeeding();
+
+        let report = drain_group(&provider, &memory, &target).await;
+
+        assert_eq!(report.claimed, EMBEDDING_BURST_BATCH);
+        assert!(provider.texts().is_empty(), "gone nodes make no embed call");
+    }
+
+    #[tokio::test]
+    async fn a_backlog_below_the_burst_threshold_drains_the_normal_batch() {
+        // Decision 77 (M13): 10 pending rows stay under the threshold,
+        // so the tick claims the normal EMBEDDING_BATCH_PER_GROUP (8).
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::default();
+        let rows: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("n{i}"), format!("h{i}")))
+            .collect();
+        target.store.enqueue_embeddings(&rows).expect("enqueue");
+        let provider = ScriptedProvider::succeeding();
+
+        let report = drain_group(&provider, &memory, &target).await;
+
+        assert_eq!(report.claimed, EMBEDDING_BATCH_PER_GROUP);
+    }
+
+    #[tokio::test]
+    async fn spawn_without_a_provider_still_runs_the_startup_reconciliation() {
+        // Decision 77 (M4): the worker task spawns even with NO
+        // provider — reconciliation (the edge_texts repair is a pure
+        // store/graph diff) needs no embeddings; only the drain loop is
+        // skipped.
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::with_group("chat_a", &[("p1", content("Tama", "a cat"))])
+            .with_kinds("chat_a", &[("p1", NodeType::Person)]);
+        let store = Arc::clone(&target.store);
+        let worker = EmbeddingWorker::new(None, Arc::new(memory), vec![target]);
+
+        let handle = worker
+            .spawn()
+            .expect("the task spawns even without a provider");
+
+        // The startup reconciliation enqueues p1 without any provider.
+        let mut enqueued = false;
+        for _ in 0..200 {
+            if !store
+                .claim_embedding_batch(EMBEDDING_BATCH_PER_GROUP)
+                .expect("claim")
+                .is_empty()
+            {
+                enqueued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        assert!(enqueued, "the startup reconciliation ran provider-less");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_periodic_reconciliation_runs_every_n_ticks_without_a_provider() {
+        // Decision 77 (M4): every RECONCILE_EVERY_N_TICKSth tick re-runs
+        // the reconciliation, provider or not. Paused time drives the
+        // 30 s interval instantly.
+        let (_dir, target) = test_target();
+        // Two markers bracket the STARTUP pass: p0's enqueue is its
+        // first mutation, the prune of the seeded e-orphan sidecar row
+        // its LAST. Waiting for both guarantees the worker finished the
+        // pass and parks on the ticker BEFORE the test advances the
+        // clock — ticks of a not-yet-created ticker would be lost.
+        let memory = Arc::new(
+            ScriptedMemory::with_group("chat_a", &[("p0", content("Mochi", "a cat"))])
+                .with_kinds("chat_a", &[("p0", NodeType::Person)]),
+        );
+        let store = Arc::clone(&target.store);
+        store
+            .upsert_edge_text("e-orphan", "gone")
+            .expect("seed orphan");
+        let worker = EmbeddingWorker::new(None, Arc::clone(&memory), vec![target]);
+        let handle = worker.spawn().expect("spawn");
+        let claimed = || {
+            store
+                .claim_embedding_batch(100)
+                .expect("claim")
+                .into_iter()
+                .map(|row| row.node_id)
+                .collect::<HashSet<_>>()
+        };
+        for _ in 0..10_000 {
+            if claimed().contains("p0") && store.list_edge_text_ids().expect("ids").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            claimed().contains("p0") && store.list_edge_text_ids().expect("ids").is_empty(),
+            "the startup pass ran to completion"
+        );
+        // Let the worker consume the immediate first tick and park on
+        // the ticker (synchronous code only from here).
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+
+        // A node that appears AFTER the startup pass: only the periodic
+        // reconciliation can pick it up (no provider → no drain).
+        memory.add_node("chat_a", "p1", content("Tama", "a cat"), NodeType::Person);
+
+        // Ticks 1..N-1: no reconciliation.
+        for _ in 0..RECONCILE_EVERY_N_TICKS - 1 {
+            tokio::time::advance(EMBEDDING_WORKER_INTERVAL).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !claimed().contains("p1"),
+            "no periodic reconciliation before the Nth tick"
+        );
+
+        // The Nth tick reconciles and enqueues the new node.
+        tokio::time::advance(EMBEDDING_WORKER_INTERVAL).await;
+        for _ in 0..10_000 {
+            if claimed().contains("p1") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+        assert!(
+            claimed().contains("p1"),
+            "the Nth tick re-ran the reconciliation"
+        );
     }
 }
