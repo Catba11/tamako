@@ -40,6 +40,12 @@ llm_base_url = "https://opencode.ai/zen/go/v1"
 digest_model = "mimo-v2.5"      # extraction (Section 10)
 gate_model = "mimo-v2.5-pro"    # participation decision + recall gate (9.6)
 reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
+# summary_model = "mimo-v2.5"   # segmented C3 summarizer (7.3); default claude-haiku-4-5
+
+# Embeddings for the vector sidecar (global-only; decision 66). Keyed by
+# OPENAI_API_KEY; the default pair is OpenRouter + qwen3-embedding-8b (ZDR).
+# embedding_model = "qwen/qwen3-embedding-8b"
+# embedding_llm_base_url = "https://openrouter.ai/api/v1"
 
 # Per-purpose endpoint overrides for mixed deployments. Example:
 # reply_llm_api      = "anthropic-compatible"
@@ -69,6 +75,18 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # monologue_limit = 2
 # reply_staleness_threshold = 20
 # recall_injection_cap = 5
+# reply_quote_threshold = 10    # quote the reply target only beyond this (6.2)
+# gate_context = true           # the gates see the shared context view (9.6)
+
+# ------------------------------------------------------- Memory (P2) ----
+# vector_resolution = true          # step-3 vector pre-screen (graph 7.4)
+# vector_match_threshold = 0.92     # provisional; calibrate with live data
+# vector_candidate_threshold = 0.80 # provisional
+# resolution_confirm_budget = 5     # per digest batch
+# merge_candidate_threshold = 0.85  # provisional; merge-tool scan (graph 7.7)
+# single_value_predicates = ["currently_playing", "works_at", "lives_in", "dating"]
+# deep_recall = true                # false restores the Phase 1 shallow recall (9.1)
+# recall_candidate_cap = 40         # per wake, before the relevance gate
 
 # -------------------------------------------------------------- Groups ----
 # One table per group. An empty table registers the group with defaults.
