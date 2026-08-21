@@ -4,7 +4,7 @@
 //! The flow of one recall call:
 //!
 //! 1. Entry resolution (Section 8.1 of the database spec, steps 1 and 2
-//!    ONLY — no vector search, that is Phase 2): the Person identifiers
+//!    ONLY): the Person identifiers
 //!    of the senders and of the reply targets, plus exact alias matches
 //!    of the candidate terms. An unknown term yields no entry (step 4:
 //!    no fuzzy scans, Rule R5).
@@ -32,6 +32,47 @@
 //! neighbor fetch) logs a warning and skips that entry; the wake
 //! continues with the remaining entries. Store failures are unexpected
 //! internal failures and propagate as `CoreError`.
+//!
+//! ## The deep candidate pipeline (decision 76)
+//!
+//! With [`DeepRecallConfig`] wired ([`ShallowRecall::with_deep_recall`]
+//! — the `deep_recall` config key, default true), steps 1-2 widen
+//! behind the UNTOUCHED `RecallProvider` seam. The candidate pipeline
+//! of one wake is, IN ORDER:
+//!
+//! 1. SHALLOW: the sources above, unchanged (decision-58 tokenizer,
+//!    entry resolution, one-hop neighbors, budgets).
+//! 2. VECTOR ENTRY: ONE batched `embed_texts` call per wake (ONLY when
+//!    candidate terms exist — zero terms never call the provider,
+//!    decision 76 (f)), then KNN per term over the `node_embeddings`
+//!    sidecar (k = [`VECTOR_ENTRY_KNN_K`]). A node at or above
+//!    `vector_candidate_threshold` (cosine similarity; the sidecar
+//!    stores cosine DISTANCE, so `similarity = 1.0 - distance`,
+//!    decision 73) becomes an additional ENTRY node. NO confirmation
+//!    call on the read path — confirmation is write-path only.
+//! 3. TWO-HOP EXPANSION from ALL entry nodes found so far (shallow
+//!    entries plus vector entries): `MemoryBackend::two_hop_edges`
+//!    under the Section 8.2 rules (whitelist, validity, the 90-day
+//!    window, `NEIGHBOR_EXPANSION_LIMIT` per node).
+//! 4. FTS: `Store::search_edge_texts` per candidate term over the
+//!    `edge_texts` sidecar (decision 76 (c)), the hits hydrated
+//!    through `MemoryBackend::edges_by_ids` (valid only, stale ids
+//!    dropped).
+//!
+//! Then: dedup EVERYTHING by edge id — source order shallow, then
+//! expansion (which carries the vector entries' edges), then fts,
+//! FIRST occurrence wins — and cap the total at
+//! `recall_candidate_cap` (default 40) BEFORE the relevance gate. The
+//! downstream steps are unchanged: the decision-40 same-fact collapse,
+//! the Section 9.3 `injected_memories` dedup, the relevance gate, the
+//! injection cap. `MAX_PRESENTED_CANDIDATES` stays a hard prompt bound
+//! on top of the configured cap (the defaults are equal: 40).
+//!
+//! Every deep source degrades INDEPENDENTLY to empty: an embed or
+//! endpoint failure logs WARN, a store or memory read failure logs
+//! DEBUG; recall NEVER fails a wake on a deep source. With
+//! `deep_recall = false` (no [`DeepRecallConfig`] wired) the behavior
+//! is byte-identical to the pre-76 shallow path.
 //!
 //! ## The candidate-term tokenizer (Phase 1, decision 44)
 //!
@@ -90,6 +131,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
+use tamako_core::embedding::EmbeddingProvider;
 // The injection rendering is defined ONCE in tamako-core (next to
 // `PlannedInjection`, the type that documents the injection text
 // shape): the recall renderer below uses `render_injection_content`,
@@ -100,7 +142,7 @@ use tamako_core::wake::{
     render_injection_content, GateMessage, PlannedInjection, RecallOutcome, RecallProvider,
 };
 use tamako_memory::identifiers::{alias_id, normalize, person_id};
-use tamako_memory::MemoryBackend;
+use tamako_memory::{CandidateEdge, MemoryBackend, NEIGHBOR_EXPANSION_LIMIT};
 use tamako_persona::CONTEXT_FORMAT_GLOSS;
 use tamako_store::{Store, StoreError};
 use time::macros::format_description;
@@ -139,7 +181,18 @@ const MAX_NGRAM_N: usize = 5;
 /// candidates per entry order survive. Entry order is senders first,
 /// then reply targets, then alias terms — the persons of the wake rank
 /// above the term matches. A documented Phase 1 choice.
+///
+/// Decision 76: the configurable `recall_candidate_cap` truncates the
+/// merged deep candidate pool first; this constant stays a hard prompt
+/// bound on top of it (the defaults are equal: 40).
 pub const MAX_PRESENTED_CANDIDATES: usize = 40;
+
+/// Decision 76 (a): the KNN fan-out of the vector entry — per
+/// candidate term, the 5 nearest node embeddings of the sidecar are
+/// screened against `vector_candidate_threshold`. A modest k: the
+/// vector entry widens the entry set, it does not replace the alias
+/// entry; the two-hop expansion reaches the accepted nodes' edges.
+pub const VECTOR_ENTRY_KNN_K: usize = 5;
 
 /// The built-in English stopword list of the tokenizer. Phase 1:
 /// English only, a closed const set, no per-language lists.
@@ -724,6 +777,36 @@ pub struct ShallowRecall<M: MemoryBackend, G: RelevanceGate> {
     /// The Section 9.2 hard cap of injected memories per wake (the
     /// config key `recall_injection_cap`, default 5).
     injection_cap: u32,
+    /// The decision-76 deep candidate pipeline (module docs). `None`
+    /// is the pre-76 shallow form, byte-identical (the `deep_recall`
+    /// kill switch: the wiring layer simply never calls
+    /// [`ShallowRecall::with_deep_recall`]).
+    deep: Option<DeepRecallConfig>,
+}
+
+/// The decision-76 deep-recall knobs and seams (module docs). The
+/// wiring layer builds one per group from the resolved `TriggerConfig`
+/// and calls [`ShallowRecall::with_deep_recall`] ONLY when
+/// `config.deep_recall` is true.
+///
+/// The store half of the deep sources (KNN over `node_embeddings`,
+/// LIKE over `edge_texts`) rides the SAME single-open-group `Store`
+/// the recall worker already holds (the embedding-worker contract:
+/// exactly one group open).
+pub struct DeepRecallConfig {
+    /// The embedding seam of the vector entry (the core
+    /// [`EmbeddingProvider`], adapted from the rig provider by the
+    /// binary): ONE batched `embed_texts` call per wake that has
+    /// candidate terms (decision 76 (f)).
+    pub provider: Arc<dyn EmbeddingProvider>,
+    /// The cosine-similarity acceptance threshold of the vector entry:
+    /// the shared `TriggerConfig::vector_candidate_threshold` of
+    /// decision 73 (default 0.80), REUSED per decision 76 (a).
+    pub vector_candidate_threshold: f64,
+    /// The TOTAL candidate cap before the relevance gate
+    /// (`TriggerConfig::recall_candidate_cap`, default 40, decision
+    /// 76 (d)).
+    pub candidate_cap: u32,
 }
 
 impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
@@ -733,7 +816,16 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             memory,
             gate,
             injection_cap,
+            deep: None,
         }
+    }
+
+    /// Decision 76: enables the deep candidate pipeline (module docs).
+    /// Additive builder — a `ShallowRecall` without this call is the
+    /// pre-76 shallow form, byte-identical.
+    pub fn with_deep_recall(mut self, deep: DeepRecallConfig) -> Self {
+        self.deep = Some(deep);
+        self
     }
 
     /// Runs one store call inside `tokio::task::spawn_blocking`
@@ -752,14 +844,150 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             .map_err(CoreError::Store)
     }
 
+    /// Decision 76 (a): the vector entry. ONE batched `embed_texts`
+    /// call per wake (only when candidate terms exist — zero terms
+    /// never call the provider, decision 76 (f)), then KNN per term
+    /// over the `node_embeddings` sidecar (k = [`VECTOR_ENTRY_KNN_K`],
+    /// ONE blocking-store round trip for every term). A node at or
+    /// above `vector_candidate_threshold` (cosine similarity; the
+    /// sidecar stores cosine DISTANCE, so `similarity = 1.0 -
+    /// distance`, decision 73) becomes an additional entry node,
+    /// deduped in first-occurrence order (term order, then KNN
+    /// nearest-first). NO confirmation call on the read path —
+    /// confirmation is write-path only (decision 76 (a)).
+    ///
+    /// Never fails the wake: an embed failure or a row-count mismatch
+    /// degrades the whole source to empty with one WARN (the endpoint
+    /// class); a per-term KNN store failure skips the term with a
+    /// DEBUG line (the store-read class); a join failure degrades the
+    /// whole source with a DEBUG line.
+    async fn vector_entry_nodes(&self, terms: &[String], deep: &DeepRecallConfig) -> Vec<String> {
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let vectors = match deep.provider.embed_texts(terms).await {
+            Ok(vectors) if vectors.len() == terms.len() => vectors,
+            Ok(vectors) => {
+                tracing::warn!(
+                    expected = terms.len(),
+                    got = vectors.len(),
+                    "deep recall: the batched embeddings call returned a row-count mismatch; \
+                     the vector entry is skipped"
+                );
+                return Vec::new();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "deep recall: the batched embeddings call failed; the vector entry is skipped"
+                );
+                return Vec::new();
+            }
+        };
+        let store = self.store.clone();
+        let knn_results = match tokio::task::spawn_blocking(move || {
+            vectors
+                .iter()
+                .map(|query| store.knn_node_embeddings(query, VECTOR_ENTRY_KNN_K))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "deep recall: the KNN store task failed to join; the vector entry is skipped"
+                );
+                return Vec::new();
+            }
+        };
+        let mut accepted = Vec::new();
+        let mut seen = HashSet::new();
+        for (term, result) in terms.iter().zip(knn_results) {
+            match result {
+                Ok(hits) => {
+                    for (node_id, distance) in hits {
+                        let similarity = 1.0 - f64::from(distance);
+                        if similarity >= deep.vector_candidate_threshold {
+                            push_unique(&mut accepted, &mut seen, node_id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        term = %term,
+                        error = %error,
+                        "deep recall: the KNN lookup failed; skipping the term"
+                    );
+                }
+            }
+        }
+        accepted
+    }
+
+    /// Decision 76 (a)/(c): the full-text term lookups against the
+    /// `edge_texts` sidecar — ONE blocking-store round trip for every
+    /// candidate term, the hit edge ids deduped in first-occurrence
+    /// order (term order, then the sidecar's edge-id order). Never
+    /// fails the wake: a per-term store failure skips the term with a
+    /// DEBUG line; a join failure degrades the whole source to empty
+    /// with a DEBUG line. Zero terms yield zero lookups.
+    async fn search_edge_text_ids(&self, terms: &[String]) -> Vec<String> {
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let store = self.store.clone();
+        let terms = terms.to_vec();
+        let results = match tokio::task::spawn_blocking(move || {
+            terms
+                .iter()
+                .map(|term| (term.clone(), store.search_edge_texts(term)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "deep recall: the edge_texts store task failed to join; the fts source is skipped"
+                );
+                return Vec::new();
+            }
+        };
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for (term, result) in results {
+            match result {
+                Ok(hits) => {
+                    for id in hits {
+                        push_unique(&mut ids, &mut seen, id);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        term = %term,
+                        error = %error,
+                        "deep recall: the edge_texts lookup failed; skipping the term"
+                    );
+                }
+            }
+        }
+        ids
+    }
+
     /// Entry resolution, Section 8.1 steps 1 and 2 of the database
     /// spec. The entry order is senders first, then reply targets,
     /// then alias terms (see `MAX_PRESENTED_CANDIDATES`). Deduped,
-    /// first occurrence wins.
+    /// first occurrence wins. `terms` are the candidate terms of the
+    /// wake, computed ONCE by `recall_inner` (decision 76: the vector
+    /// entry and the fts source consume the same terms).
     async fn resolve_entries(
         &self,
         chat_id: &str,
         new_messages: &[GateMessage],
+        terms: &[String],
     ) -> Result<Vec<String>, CoreError> {
         let mut entry_ids = Vec::new();
         let mut seen = HashSet::new();
@@ -801,12 +1029,8 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         // Step 2: exact alias match per candidate term (Rule R5: enter
         // through the deterministic alias identifier). No fuzzy scans
         // (step 4).
-        let texts: Vec<&str> = new_messages
-            .iter()
-            .map(|message| message.text.as_str())
-            .collect();
-        for term in candidate_terms(&texts) {
-            let term_alias_id = alias_id(&term);
+        for term in terms {
+            let term_alias_id = alias_id(term);
             match self.memory.alias_targets(chat_id, &term_alias_id).await {
                 Ok(targets) => match targets.as_slice() {
                     // Exactly one target: the target node is the entry.
@@ -846,8 +1070,16 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         context_view: Option<&str>,
     ) -> Result<RecallOutcome, CoreError> {
         // Steps 1-2: entry resolution + neighbor fetch. Candidates are
-        // deduped by edge_id; the first occurrence wins.
-        let entry_ids = self.resolve_entries(chat_id, new_messages).await?;
+        // deduped by edge_id; the first occurrence wins. The candidate
+        // terms are computed ONCE per wake: the shallow alias entry,
+        // the vector entry, and the fts source share them (decision 76
+        // (a): candidate terms come from the new messages only).
+        let texts: Vec<&str> = new_messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        let terms = candidate_terms(&texts);
+        let mut entry_ids = self.resolve_entries(chat_id, new_messages, &terms).await?;
         let mut candidates: Vec<RecallCandidate> = Vec::new();
         let mut seen_edge_ids = HashSet::new();
         for entry_id in &entry_ids {
@@ -877,6 +1109,97 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                     );
                 }
             }
+        }
+        let shallow_count = candidates.len();
+
+        // Decision 76: the deep sources widen the candidate pool behind
+        // the untouched RecallProvider seam (module docs). Each source
+        // degrades INDEPENDENTLY to empty; none fails the wake.
+        if let Some(deep) = &self.deep {
+            // (2) VECTOR ENTRY: additional entry nodes at or above the
+            // threshold. Never fails (WARN on an embed failure, DEBUG
+            // on a store read failure).
+            let vector_entry_count;
+            {
+                let vector_entries = self.vector_entry_nodes(&terms, deep).await;
+                vector_entry_count = vector_entries.len();
+                let mut seen_entries: HashSet<String> = entry_ids.iter().cloned().collect();
+                for node_id in vector_entries {
+                    if seen_entries.insert(node_id.clone()) {
+                        entry_ids.push(node_id);
+                    }
+                }
+            }
+
+            // (3) TWO-HOP EXPANSION from ALL entry nodes found so far
+            // (shallow entries plus vector entries), under the Section
+            // 8.2 rules. The hop-1 edges overlap the shallow neighbors;
+            // the first-wins edge-id dedup keeps the shallow position.
+            let expansion_edges = match self
+                .memory
+                .two_hop_edges(
+                    chat_id,
+                    &entry_ids,
+                    time::OffsetDateTime::now_utc(),
+                    NEIGHBOR_EXPANSION_LIMIT,
+                )
+                .await
+            {
+                Ok(edges) => edges,
+                Err(error) => {
+                    tracing::debug!(
+                        chat_id = %chat_id,
+                        error = %error,
+                        "deep recall: the two-hop expansion failed; continuing without it"
+                    );
+                    Vec::new()
+                }
+            };
+            let expansion_count = expansion_edges.len();
+            for edge in expansion_edges {
+                push_deep_candidate(&mut candidates, &mut seen_edge_ids, edge);
+            }
+
+            // (4) FTS: the "who discussed X" pattern over the
+            // edge_texts sidecar (decision 76 (c)), hydrated valid-only
+            // through edges_by_ids.
+            let mut fts_count = 0;
+            let hit_ids = self.search_edge_text_ids(&terms).await;
+            if !hit_ids.is_empty() {
+                match self.memory.edges_by_ids(chat_id, &hit_ids).await {
+                    Ok(edges) => {
+                        fts_count = edges.len();
+                        for edge in edges {
+                            push_deep_candidate(&mut candidates, &mut seen_edge_ids, edge);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            chat_id = %chat_id,
+                            error = %error,
+                            "deep recall: the edge hydration failed; continuing without the fts source"
+                        );
+                    }
+                }
+            }
+
+            // Dedup + cap (decision 76 (d)): first-wins by edge id in
+            // source order shallow -> expansion -> fts, then truncate
+            // the total at recall_candidate_cap BEFORE the relevance
+            // gate. MAX_PRESENTED_CANDIDATES stays a hard prompt bound
+            // on top (step 5, unchanged).
+            let deduped_count = candidates.len();
+            candidates.truncate(deep.candidate_cap as usize);
+            tracing::debug!(
+                chat_id = %chat_id,
+                shallow_count = shallow_count,
+                vector_entry_count = vector_entry_count,
+                expansion_count = expansion_count,
+                fts_count = fts_count,
+                deduped_count = deduped_count,
+                capped_count = candidates.len(),
+                "deep recall candidate sources (source order shallow -> expansion -> fts, first-wins dedup)"
+            );
         }
 
         // Same-fact collapse (decision 40): the edge natural key
@@ -1016,6 +1339,48 @@ fn push_unique(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: String) {
     }
 }
 
+/// Decision 76: the Section 9.3 dedup key of a deep-source candidate,
+/// in the SAME pipe shape as `NeighborEdge::edge_id`
+/// (`{source_id}|{relationship_name}|{target_id}|{valid_at}`, RFC 3339).
+/// The `CandidateEdge.edge_id` carries the opaque `EdgeId` JSON
+/// encoding (decision 75, the manual-ops namespace); the recall
+/// pipeline and the `injected_memories` dedup table speak the pipe
+/// shape since M5, so deep-source candidates MUST convert here — one
+/// edge surfaced by two sources dedups to one candidate, and an
+/// injected deep candidate dedups against later wakes.
+fn deep_candidate_edge_id(edge: &CandidateEdge) -> String {
+    let valid_at = edge
+        .valid_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| format!("{:?}", edge.valid_at));
+    format!(
+        "{}|{}|{}|{}",
+        edge.source_id, edge.relationship_name, edge.target_id, valid_at
+    )
+}
+
+/// Converts one deep-source [`CandidateEdge`] into a
+/// [`RecallCandidate`] and appends it under the shared first-wins
+/// edge-id dedup of `recall_inner` (module docs: source order shallow,
+/// then expansion, then fts).
+fn push_deep_candidate(
+    candidates: &mut Vec<RecallCandidate>,
+    seen_edge_ids: &mut HashSet<String>,
+    edge: CandidateEdge,
+) {
+    let edge_id = deep_candidate_edge_id(&edge);
+    if seen_edge_ids.insert(edge_id.clone()) {
+        candidates.push(RecallCandidate {
+            edge_id,
+            edge_text: edge.edge_text,
+            valid_at: edge.valid_at,
+            source_id: edge.source_id,
+            relationship_name: edge.relationship_name,
+            target_id: edge.target_id,
+        });
+    }
+}
+
 /// Collapses the candidate set by fact key: one fact is the triple
 /// (source_id, relationship_name, target_id), IGNORING `valid_at`
 /// (decision 40: the edge natural key carries `valid_at`, so the same
@@ -1129,8 +1494,9 @@ impl<M: MemoryBackend, G: RelevanceGate> RecallProvider for ShallowRecall<M, G> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tamako_core::embedding::EmbeddingError;
     use tamako_memory::identifiers::concept_id;
-    use tamako_memory::{LbugBackend, MemoryBatch, MemoryEdge, MemoryNode, NodeType};
+    use tamako_memory::{EdgeId, LbugBackend, MemoryBatch, MemoryEdge, MemoryNode, NodeType};
     use time::macros::datetime;
     use time::OffsetDateTime;
 
@@ -2295,5 +2661,608 @@ The context section is read-only orientation; the selection names candidate numb
         // No candidate survived: the gate was never called
         // (Section 9.1).
         assert_eq!(recall.gate.call_count(), 0);
+    }
+
+    // --- Decision 76: the deep candidate pipeline. Scripted embedding
+    // provider + real tempdir Store (the vec0 node_embeddings sidecar
+    // and the plain edge_texts sidecar, one open group) + real
+    // LbugBackend (the decision-76 two_hop_edges / edges_by_ids reads)
+    // — the seeding style of the resolve.rs step-3 fixtures. ---
+
+    /// A scripted core embedding provider: pops one batch result per
+    /// `embed_texts` call (FIFO), records every call's texts (the same
+    /// double shape as the resolve.rs ScriptedEmbedder).
+    struct ScriptedEmbedder {
+        batches: Mutex<VecDeque<Result<Vec<Vec<f32>>, String>>>,
+        /// A permanent failure message: every call fails with it.
+        failure: Option<String>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedEmbedder {
+        /// Every `embed_texts` call answers with the next batch (in
+        /// order). An exhausted queue fails the call.
+        fn with_batches(batches: Vec<Vec<Vec<f32>>>) -> Self {
+            ScriptedEmbedder {
+                batches: Mutex::new(batches.into_iter().map(Ok).collect::<VecDeque<_>>()),
+                failure: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every `embed_texts` call fails.
+        fn failing(message: &str) -> Self {
+            ScriptedEmbedder {
+                batches: Mutex::new(VecDeque::new()),
+                failure: Some(message.to_string()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl EmbeddingProvider for ScriptedEmbedder {
+        fn embed<'a>(
+            &'a self,
+            text: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<f32>, EmbeddingError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let texts = [text.to_string()];
+                let mut batches = self.embed_texts(&texts).await?;
+                Ok(batches.remove(0))
+            })
+        }
+
+        fn embed_texts<'a>(
+            &'a self,
+            texts: &'a [String],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<Vec<f32>>, EmbeddingError>> + Send + 'a,
+            >,
+        > {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(texts.to_vec());
+            let result = match &self.failure {
+                Some(message) => Err(message.clone()),
+                None => self
+                    .batches
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .unwrap_or_else(|| Err("scripted embedder: exhausted queue".to_string())),
+            };
+            Box::pin(async move { result.map_err(EmbeddingError::Provider) })
+        }
+    }
+
+    /// The pinned sidecar dimension (decision 66).
+    const DIMS: usize = crate::endpoint::EMBEDDING_DIMS;
+
+    /// The unit basis vector of one dimension (DIMS wide).
+    fn unit_vector(dim: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; DIMS];
+        vector[dim] = 1.0;
+        vector
+    }
+
+    /// A unit vector whose cosine similarity with `unit_vector(0)` is
+    /// exactly `cosine` (up to f32 precision).
+    fn tilted_vector(cosine: f32, dim: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; DIMS];
+        vector[0] = cosine;
+        vector[dim] = (1.0 - cosine * cosine).sqrt();
+        vector
+    }
+
+    /// The deep knobs of one test: the decision-73 default threshold
+    /// (0.80) and the given candidate cap.
+    fn deep_config(provider: Arc<ScriptedEmbedder>, candidate_cap: u32) -> DeepRecallConfig {
+        DeepRecallConfig {
+            provider,
+            vector_candidate_threshold: 0.80,
+            candidate_cap,
+        }
+    }
+
+    /// A fact edge with RECENT timestamps: the decision-76 two-hop
+    /// expansion applies the 90-day window against the real
+    /// `now_utc()`, so expansion-test edges seed at the wall clock
+    /// (not the fixed `NOW` of the shallow tests).
+    fn recent_fact_edge(
+        source_id: &str,
+        target_id: &str,
+        relationship: &str,
+        text: &str,
+    ) -> MemoryEdge {
+        let now = OffsetDateTime::now_utc();
+        MemoryEdge {
+            valid_at: now,
+            created_at: now,
+            updated_at: now,
+            ..fact_edge(source_id, target_id, relationship, text)
+        }
+    }
+
+    /// The opaque `EdgeId` JSON of one seeded edge — the key shape the
+    /// edge_texts sidecar stores (the store never parses it).
+    fn edge_json_id(edge: &MemoryEdge) -> String {
+        EdgeId {
+            source_id: edge.source_id.clone(),
+            relationship_name: edge.relationship_name.clone(),
+            target_id: edge.target_id.clone(),
+            valid_at: edge.valid_at,
+        }
+        .encode()
+    }
+
+    /// Seeds one unconnected pair of concept nodes with one edge
+    /// between them (an fts/expansion fixture: no entry reaches the
+    /// pair through the shallow path).
+    async fn seed_detached_fact(
+        memory: &LbugBackend,
+        name_a: &str,
+        name_b: &str,
+        text: &str,
+    ) -> MemoryEdge {
+        let node_a = concept_node(name_a);
+        let node_b = concept_node(name_b);
+        let edge = recent_fact_edge(&node_a.id, &node_b.id, "related_to", text);
+        seed(memory, vec![node_a, node_b], vec![edge.clone()]).await;
+        edge
+    }
+
+    #[tokio::test]
+    async fn the_vector_entry_accepts_at_or_above_the_threshold_and_rejects_below() {
+        // Decision 76 (a): KNN per term, similarity = 1.0 - cosine
+        // distance, acceptance at or above vector_candidate_threshold
+        // (0.80). The accepted node becomes an entry; its edges surface
+        // through the two-hop expansion.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        // The accepted node (similarity 0.85) carries a fact; the
+        // rejected node (similarity 0.50) carries another.
+        let near = concept_node("near-topic");
+        let near_target = concept_node("near-target");
+        let near_edge = recent_fact_edge(
+            &near.id,
+            &near_target.id,
+            "related_to",
+            "Espresso pairs with cake.",
+        );
+        let far = concept_node("far-topic");
+        let far_target = concept_node("far-target");
+        let far_edge =
+            recent_fact_edge(&far.id, &far_target.id, "related_to", "Go is a board game.");
+        seed(
+            &memory,
+            vec![near.clone(), near_target, far.clone(), far_target],
+            vec![near_edge, far_edge],
+        )
+        .await;
+        store
+            .upsert_node_embedding(&near.id, &tilted_vector(0.85, 1))
+            .expect("seed near embedding");
+        store
+            .upsert_node_embedding(&far.id, &tilted_vector(0.5, 1))
+            .expect("seed far embedding");
+
+        // One candidate term ("espresso"); the batched call answers
+        // with the query vector unit_vector(0).
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5)
+            .with_deep_recall(deep_config(embedder.clone(), 40));
+        let messages = vec![gate_message(1, "u9999", "espresso")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        // ONE batched embeddings call for the wake, with the one term.
+        assert_eq!(embedder.call_count(), 1);
+        assert_eq!(embedder.calls(), vec![vec!["espresso".to_string()]]);
+        let texts = presented_texts(&recall.gate);
+        // The accepted node's edge surfaced through the expansion ...
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Espresso pairs with cake.")
+                .count(),
+            1
+        );
+        // ... the rejected node's edge did not.
+        assert!(!texts.contains(&"Go is a board game.".to_string()));
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn the_two_hop_expansion_surfaces_a_hop_two_edge() {
+        // Decision 76 (a): the hop-2 edge of a shallow entry's neighbor
+        // is a candidate; the hop-1 edge the shallow path already
+        // fetched dedups to one.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let pairing = concept_node("cake");
+        let hop_one =
+            recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        let hop_two = recent_fact_edge(
+            &topic.id,
+            &pairing.id,
+            "related_to",
+            "Espresso pairs with cake.",
+        );
+        seed(
+            &memory,
+            vec![person, topic, pairing],
+            vec![hop_one, hop_two],
+        )
+        .await;
+
+        // "ok" is a stopword: no candidate terms, so the embed
+        // provider is never called (decision 76 (f)); the expansion
+        // still runs from the shallow entries.
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5)
+            .with_deep_recall(deep_config(embedder.clone(), 40));
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        assert_eq!(embedder.call_count(), 0);
+        let texts = presented_texts(&recall.gate);
+        // The hop-1 edge exactly once (shallow source won the dedup) ...
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Alice likes espresso.")
+                .count(),
+            1
+        );
+        // ... and the hop-2 edge surfaced.
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Espresso pairs with cake.")
+                .count(),
+            1
+        );
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn the_fts_source_hits_and_hydrates_a_valid_edge() {
+        // Decision 76 (a)/(c): a candidate term matching an edge_texts
+        // row (the "who discussed X" pattern) hydrates through
+        // edges_by_ids — valid edges only; a stale sidecar row drops.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let edge = seed_detached_fact(
+            &memory,
+            "debate",
+            "coffee",
+            "The group debated 咖啡 prices.",
+        )
+        .await;
+        store
+            .upsert_edge_text(&edge_json_id(&edge), "The group debated 咖啡 prices.")
+            .expect("seed the edge text");
+        // A stale row: no graph edge carries this natural key, so the
+        // hydration drops it silently (Section 7.6 step 6).
+        let stale = EdgeId {
+            source_id: concept_id("gone"),
+            relationship_name: "related_to".to_string(),
+            target_id: concept_id("stale"),
+            valid_at: OffsetDateTime::now_utc(),
+        }
+        .encode();
+        store
+            .upsert_edge_text(&stale, "The 咖啡 stale row.")
+            .expect("seed the stale edge text");
+
+        // The two-character CJK term (the FTS5-trigram hole of
+        // decision 76 (c)) hits the plain LIKE sidecar. No embeddings
+        // are seeded, so the vector entry accepts nothing.
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(deep_config(embedder, 40));
+        let messages = vec![gate_message(1, "u9999", "咖啡")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        let candidates = &recall.gate.inputs()[0].candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].edge_text, "The group debated 咖啡 prices.");
+        // The hydrated candidate carries the Section 9.3 pipe-shaped
+        // dedup key (not the opaque JSON of the sidecar).
+        assert_eq!(
+            candidates[0].edge_id,
+            format!(
+                "{}|related_to|{}|{}",
+                concept_id("debate"),
+                concept_id("coffee"),
+                candidates[0]
+                    .valid_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .expect("rfc3339")
+            )
+        );
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn an_edge_surfaced_by_two_sources_is_one_candidate() {
+        // The cross-source dedup keys on the Section 9.3 pipe-shaped
+        // edge id: one edge reached by the shallow neighbor fetch AND
+        // the fts sidecar (AND the expansion hop 1) is ONE candidate.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let edge = recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        seed(&memory, vec![person, topic], vec![edge.clone()]).await;
+        store
+            .upsert_edge_text(&edge_json_id(&edge), "Alice likes espresso.")
+            .expect("seed the edge text");
+
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(deep_config(embedder, 40));
+        let messages = vec![gate_message(1, "u42", "espresso")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        let texts = presented_texts(&recall.gate);
+        assert_eq!(texts, vec!["Alice likes espresso.".to_string()]);
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn the_candidate_cap_truncates_in_source_order_before_the_gate() {
+        // Decision 76 (d): the merged pool caps at
+        // recall_candidate_cap BEFORE the relevance gate; the first
+        // candidates in source order (here: shallow fetch order,
+        // created_at descending) survive.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let now = OffsetDateTime::now_utc();
+        let mut nodes = vec![person.clone()];
+        let mut edges = Vec::new();
+        for (index, text) in [
+            "Alice likes espresso.",
+            "Alice plays go.",
+            "Alice reads books.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let concept = concept_node(&format!("hobby-{index}"));
+            // created_at descending: hobby-2 comes first in the
+            // neighbor fetch (Section 8.2).
+            let mut edge = recent_fact_edge(&person.id, &concept.id, "related_to", text);
+            edge.created_at = now + time::Duration::seconds(index as i64);
+            edges.push(edge);
+            nodes.push(concept);
+        }
+        seed(&memory, nodes, edges).await;
+
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(deep_config(embedder, 2));
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        let texts = presented_texts(&recall.gate);
+        assert_eq!(
+            texts,
+            vec![
+                "Alice reads books.".to_string(),
+                "Alice plays go.".to_string(),
+            ]
+        );
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn deep_recall_off_is_byte_identical_to_the_shallow_path() {
+        // The `deep_recall = false` form: no DeepRecallConfig wired.
+        // Deep-source artifacts that WOULD match (an edge_texts hit, an
+        // acceptable embedding, a hop-2 edge) add NOTHING — the
+        // candidate set is the pre-76 shallow set.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let pairing = concept_node("cake");
+        let hop_one =
+            recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        let hop_two = recent_fact_edge(
+            &topic.id,
+            &pairing.id,
+            "related_to",
+            "Espresso pairs with cake.",
+        );
+        seed(
+            &memory,
+            vec![person, topic.clone(), pairing],
+            vec![hop_one.clone(), hop_two],
+        )
+        .await;
+        store
+            .upsert_edge_text(&edge_json_id(&hop_one), "Alice likes espresso.")
+            .expect("seed the edge text");
+        store
+            .upsert_node_embedding(&topic.id, &unit_vector(0))
+            .expect("seed an embedding");
+
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5);
+        let messages = vec![gate_message(1, "u42", "espresso")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        // Exactly the shallow candidate: no hop-2 edge, no fts
+        // duplicate, no vector entry.
+        assert_eq!(
+            presented_texts(&recall.gate),
+            vec!["Alice likes espresso.".to_string()]
+        );
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn without_candidate_terms_the_embed_provider_is_never_called() {
+        // Decision 76 (f): zero candidate terms never call the model —
+        // not even the batched embeddings call.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        seed_person_fact(&memory, "u42", "Alice", "Alice likes espresso.").await;
+
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5)
+            .with_deep_recall(deep_config(embedder.clone(), 40));
+        // Stopword-only text: no terms at all.
+        let messages = vec![gate_message(1, "u42", "ok ok thanks")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        assert_eq!(embedder.call_count(), 0);
+        assert_eq!(
+            presented_texts(&recall.gate),
+            vec!["Alice likes espresso.".to_string()]
+        );
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn a_failing_embed_call_degrades_the_vector_entry_only() {
+        // Failure discipline (decision 76): an embeddings-endpoint
+        // failure degrades the vector entry to empty with one WARN; the
+        // shallow and expansion sources run, and the wake never fails.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let pairing = concept_node("cake");
+        let hop_one =
+            recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        let hop_two = recent_fact_edge(
+            &topic.id,
+            &pairing.id,
+            "related_to",
+            "Espresso pairs with cake.",
+        );
+        seed(
+            &memory,
+            vec![person, topic, pairing],
+            vec![hop_one, hop_two],
+        )
+        .await;
+        // An embedding that WOULD be accepted, had the call succeeded.
+        let detached =
+            seed_detached_fact(&memory, "vector-only", "target", "A vector-only fact.").await;
+        store
+            .upsert_node_embedding(&detached.source_id, &unit_vector(0))
+            .expect("seed an embedding");
+
+        let embedder = Arc::new(ScriptedEmbedder::failing("the endpoint is down"));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall = ShallowRecall::new(store, memory, gate, 5)
+            .with_deep_recall(deep_config(embedder.clone(), 40));
+        let messages = vec![gate_message(1, "u42", "espresso")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        // The call was attempted (a term exists) and failed; no error
+        // propagated.
+        assert_eq!(embedder.call_count(), 1);
+        let texts = presented_texts(&recall.gate);
+        assert!(texts.contains(&"Alice likes espresso.".to_string()));
+        assert!(texts.contains(&"Espresso pairs with cake.".to_string()));
+        // The vector-only fact stayed out: the vector entry degraded.
+        assert!(!texts.contains(&"A vector-only fact.".to_string()));
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_read_degrades_the_store_sources_only() {
+        // Failure discipline (decision 76): the store-backed deep
+        // sources (KNN and edge_texts, both single-open-group reads)
+        // degrade to empty with DEBUG lines when the store contract
+        // fails; the memory-backed expansion and the shallow path are
+        // unaffected, and the wake never fails.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let pairing = concept_node("cake");
+        let hop_one =
+            recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        let hop_two = recent_fact_edge(
+            &topic.id,
+            &pairing.id,
+            "related_to",
+            "Espresso pairs with cake.",
+        );
+        seed(
+            &memory,
+            vec![person, topic, pairing],
+            vec![hop_one.clone(), hop_two],
+        )
+        .await;
+        store
+            .upsert_edge_text(&edge_json_id(&hop_one), "Alice likes espresso.")
+            .expect("seed the edge text");
+        store
+            .upsert_node_embedding(&hop_one.target_id, &unit_vector(0))
+            .expect("seed an embedding");
+        // Break the single-open-group contract AFTER seeding: every
+        // with_single_group_conn read now fails (AmbiguousGroup). The
+        // chat-scoped reads (list_injected_memories) keep working.
+        store.open_group("recall_test_other").expect("second group");
+
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(deep_config(embedder, 40));
+        let messages = vec![gate_message(1, "u42", "espresso")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        let texts = presented_texts(&recall.gate);
+        // The shallow edge and the expansion hop-2 edge survived; the
+        // store-backed sources contributed nothing (the fts hit would
+        // have deduped to the same edge anyway — the count pins it).
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Alice likes espresso.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Espresso pairs with cake.")
+                .count(),
+            1
+        );
+        assert_eq!(texts.len(), 2);
+        assert_eq!(outcome, RecallOutcome::default());
     }
 }
