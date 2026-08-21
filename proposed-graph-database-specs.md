@@ -234,6 +234,7 @@ This version does not implement LLM negation detection. The interface is reserve
 3. If a new description is longer than 1 KB, append a new description edge. Do not rewrite the old value.
 4. Run `CHECKPOINT` at the end of the transaction.
 5. Write the embeddings of the name and the description of each Person, Alias, and Concept to the sidecar vector index. NOT in the graph transaction (current-state.md decision 66): after the commit, enqueue each new or changed node into the `pending_embeddings` queue of `specs.md` Section 5.2, best-effort. A background worker drains the queue, calls the embeddings endpoint, and writes the vector index. A startup reconciliation pass diffs graph nodes against embedded content hashes and enqueues the missing or stale ones, and drops vector and queue rows whose node no longer exists. Backfill, steady-state repair, and merge-tombstone cleanup all ride this one mechanism.
+6. Write the edge descriptions to the `edge_texts` full-text sidecar after the commit, best-effort (a local write, no queue). The reconciliation pass diffs graph edges against sidecar rows and repairs gaps — the same mechanism as step 5, extended to edges.
 
 ### 7.7 Node merge and tombstone
 
@@ -268,7 +269,8 @@ Do these steps in this sequence:
 - The `contains` edge must not occur in a reasoning traversal. Use it for provenance only.
 - The expansion limit for one node is 500 edges. Above this limit, truncate by `created_at` descending.
 - Mark each node with a degree above 1000 as `hub`. Truncation is mandatory for hub nodes.
-- For the query pattern "who discussed X in the group", use the sidecar full-text or vector index on `edge_text` first. Use the graph traversal as a supplement.
+- For the query pattern "who discussed X in the group", use the sidecar full-text or vector index on `edge_text` first. Use the graph traversal as a supplement. The sidecar is the plain `edge_texts` table of `specs.md` Section 5.2, scanned with parameterized LIKE — scale-appropriate at thousands of edges. The FTS5 upgrade path needs the trigram tokenizer for CJK coverage; note its limitation: trigram cannot match terms shorter than three characters, which excludes two-character Chinese words. Adopt FTS5 only when edge counts justify it.
+- Recall applies these rules with TWO hops. The relationship whitelist for recall excludes `contains` (provenance only) and `known_as` (surface forms, already resolved at entry); `also_known_as` is INCLUDED — it is the cross-language bridge (Section 7.1 CAUTION, decision 74). Entry resolution on the read path accepts vector candidates at or above `vector_candidate_threshold` without a confirmation call; confirmation is write-path only (Section 7.4).
 
 ### 8.3 Cache
 
