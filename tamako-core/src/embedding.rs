@@ -10,7 +10,9 @@
 //!   node contents against the store-side done-journal: backfill (a
 //!   node never embedded), steady-state repair (the stored content
 //!   drifted from the journaled hash), and tombstone cleanup (vec/queue
-//!   rows whose node left the graph) are ONE pass.
+//!   rows whose node left the graph) are ONE pass. Decision 76 extends
+//!   the same pass to the `edge_texts` sidecar as a pure set
+//!   difference against the graph's edges (no journal on that side).
 //! - **The drain tick** ([`drain_group`]): every
 //!   [`EMBEDDING_WORKER_INTERVAL`], at most [`EMBEDDING_BATCH_PER_GROUP`]
 //!   rows per group, embedded SEQUENTIALLY (the rate limit at our
@@ -160,6 +162,13 @@ pub struct ReconcileReport {
     pub enqueued: usize,
     /// Orphan node ids tombstoned (vec + queue rows deleted).
     pub pruned_orphans: usize,
+    /// edge_texts rows (re-)written for graph edges missing from the
+    /// sidecar (decision 76, Section 7.6 step 6).
+    pub edge_texts_upserted: usize,
+    /// Orphan edge_texts rows deleted (sidecar edge ids the graph no
+    /// longer holds — incl. merge-tombstoned nodes' edges and the
+    /// pre-repoint edge ids a merge leaves behind).
+    pub edge_texts_pruned: usize,
 }
 
 /// The outcome of one [`drain_group`] tick.
@@ -202,6 +211,15 @@ where
 ///   whose stored content drifted (alias merge, manual edit).
 /// - Every node id known to the sidecar (vec rows UNION queue rows)
 ///   that the graph no longer holds is tombstoned.
+/// - Decision 76 (Section 7.6 step 6): the `edge_texts` sidecar rides
+///   the same mechanism as a pure SET DIFFERENCE (no done-journal on
+///   this side): the graph truth is `list_all_edges` (ALL edges, valid
+///   and invalid); a graph edge missing from the sidecar is (re-)
+///   written, and a sidecar id the graph no longer holds is pruned
+///   (orphans, incl. merge-tombstoned nodes' edges). The journal-free
+///   diff is what restores a merge ROLLBACK's recreated edges
+///   automatically: the rollback re-creates the loser and its edges,
+///   and their rows reappear here regardless of any node journal.
 ///
 /// Failures are WARN + skip: a group whose memory read fails keeps its
 /// queue untouched and retries on the next process start. Logs one INFO
@@ -260,7 +278,7 @@ pub async fn reconcile_group<M: MemoryBackend>(
         Ok(known) => known,
         Err(error) => {
             warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: orphan scan failed; tombstones skipped");
-            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = 0, "embedding reconciliation complete");
+            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = 0, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
             return report;
         }
     };
@@ -280,7 +298,72 @@ pub async fn reconcile_group<M: MemoryBackend>(
             }
         }
     }
-    info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, "embedding reconciliation complete");
+    // Decision 76 (Section 7.6 step 6): the edge_texts sidecar diff —
+    // the same set-difference mechanism as the node pass above, minus
+    // the done-journal (see the doc comment). Every failure is WARN +
+    // skip, like the node passes.
+    let graph_edges = match memory.list_all_edges(&target.chat_id).await {
+        Ok(edges) => edges,
+        Err(error) => {
+            warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: graph edge listing failed; edge_texts repair skipped");
+            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
+            return report;
+        }
+    };
+    let sidecar_ids: HashSet<String> = match store_call(&target.store, Store::list_edge_text_ids)
+        .await
+    {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(error) => {
+            warn!(chat_id = %target.chat_id, %error, "embedding reconciliation: edge_texts scan failed; edge repair skipped");
+            info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = 0, edge_texts_pruned = 0, "embedding reconciliation complete");
+            return report;
+        }
+    };
+    let graph_edge_ids: HashSet<&str> = graph_edges
+        .iter()
+        .map(|(edge_id, _)| edge_id.as_str())
+        .collect();
+    for (edge_id, edge_text) in &graph_edges {
+        // The digest harvest skips empty descriptions (nothing to
+        // search); the diff mirrors that skip so an empty-text edge
+        // never flaps between the two writers. A present row needs no
+        // rewrite: the upsert is idempotent and the digest refreshes
+        // the text on redigest.
+        if edge_text.is_empty() || sidecar_ids.contains(edge_id) {
+            continue;
+        }
+        let id = edge_id.clone();
+        let text = edge_text.clone();
+        match store_call(&target.store, move |store| {
+            store.upsert_edge_text(&id, &text)
+        })
+        .await
+        {
+            Ok(()) => report.edge_texts_upserted += 1,
+            Err(error) => {
+                warn!(chat_id = %target.chat_id, edge_id = %edge_id, %error, "embedding reconciliation: edge_texts upsert failed")
+            }
+        }
+    }
+    let orphans: Vec<String> = sidecar_ids
+        .into_iter()
+        .filter(|edge_id| !graph_edge_ids.contains(edge_id.as_str()))
+        .collect();
+    if !orphans.is_empty() {
+        let count = orphans.len();
+        match store_call(&target.store, move |store| {
+            store.delete_edge_texts(&orphans)
+        })
+        .await
+        {
+            Ok(deleted) => report.edge_texts_pruned = deleted,
+            Err(error) => {
+                warn!(chat_id = %target.chat_id, %error, count, "embedding reconciliation: edge_texts orphan prune failed")
+            }
+        }
+    }
+    info!(chat_id = %target.chat_id, enqueued = report.enqueued, pruned_orphans = report.pruned_orphans, edge_texts_upserted = report.edge_texts_upserted, edge_texts_pruned = report.edge_texts_pruned, "embedding reconciliation complete");
     report
 }
 
@@ -542,6 +625,9 @@ mod tests {
     struct ScriptedMemory {
         /// chat_id -> node_id -> stored content.
         contents: Mutex<HashMap<String, HashMap<String, NodeContent>>>,
+        /// chat_id -> (edge_id, edge_text) of the group's edges — the
+        /// graph truth of the decision-76 edge_texts diff.
+        edges: Mutex<HashMap<String, Vec<(String, String)>>>,
     }
 
     impl ScriptedMemory {
@@ -552,7 +638,20 @@ mod tests {
                 .collect();
             ScriptedMemory {
                 contents: Mutex::new(HashMap::from([(chat_id.to_string(), nodes)])),
+                ..ScriptedMemory::default()
             }
+        }
+
+        /// Seeds the group's edge listing (decision 76 tests).
+        fn with_edges(self, chat_id: &str, edges: &[(&str, &str)]) -> Self {
+            self.edges.lock().expect("edges lock").insert(
+                chat_id.to_string(),
+                edges
+                    .iter()
+                    .map(|(id, text)| ((*id).to_string(), (*text).to_string()))
+                    .collect(),
+            );
+            self
         }
     }
 
@@ -617,6 +716,16 @@ mod tests {
                 .unwrap_or_default();
             contents.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(contents)
+        }
+
+        async fn list_all_edges(&self, chat_id: &str) -> MemoryResult<Vec<(String, String)>> {
+            Ok(self
+                .edges
+                .lock()
+                .expect("edges lock")
+                .get(chat_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn close(&self, _chat_id: &str) -> MemoryResult<()> {
@@ -830,6 +939,8 @@ mod tests {
 
         assert_eq!(report.enqueued, 2);
         assert_eq!(report.pruned_orphans, 0);
+        assert_eq!(report.edge_texts_upserted, 0);
+        assert_eq!(report.edge_texts_pruned, 0);
         let queued: HashSet<(String, String)> = target
             .store
             .claim_embedding_batch(100)
@@ -915,6 +1026,66 @@ mod tests {
             target.store.all_embedding_node_ids().expect("node ids"),
             vec!["p1".to_string()],
             "the orphan's vec and queue rows are gone; p1's journal row remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repairs_the_edge_texts_sidecar() {
+        // Decision 76: the reconcile pass diffs edge_texts against the
+        // graph's edges as a pure set difference — a graph edge missing
+        // from the sidecar is upserted (id + the graph's edge_text), a
+        // sidecar row the graph no longer holds (a merge tombstone) is
+        // pruned, and an empty-text edge is never written (the digest
+        // harvest skip, mirrored so the two writers never flap).
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::with_group("chat_a", &[]).with_edges(
+            "chat_a",
+            &[("e1", "Alice discussed coffee with Bob"), ("e2", "")],
+        );
+        // A stale orphan row: its edge left the graph.
+        target
+            .store
+            .upsert_edge_text("e-orphan", "a tombstoned edge")
+            .expect("seed orphan");
+
+        let report = reconcile_group(&memory, &target).await;
+
+        assert_eq!(report.edge_texts_upserted, 1);
+        assert_eq!(report.edge_texts_pruned, 1);
+        // The node side of the report is untouched by the edge pass.
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.pruned_orphans, 0);
+        assert_eq!(
+            target.store.list_edge_text_ids().expect("ids"),
+            vec!["e1".to_string()],
+            "e1 written, the orphan pruned; the empty-text edge e2 is never written"
+        );
+        assert_eq!(
+            target.store.search_edge_texts("coffee").expect("search"),
+            vec!["e1".to_string()],
+            "the upserted row carries the graph's edge_text"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_leaves_a_converged_edge_texts_sidecar_alone() {
+        // Steady state: sidecar == graph. A second pass writes and
+        // prunes nothing (the diff is empty both ways).
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::with_group("chat_a", &[])
+            .with_edges("chat_a", &[("e1", "Alice discussed coffee with Bob")]);
+        target
+            .store
+            .upsert_edge_text("e1", "Alice discussed coffee with Bob")
+            .expect("seed row");
+
+        let report = reconcile_group(&memory, &target).await;
+
+        assert_eq!(report.edge_texts_upserted, 0);
+        assert_eq!(report.edge_texts_pruned, 0);
+        assert_eq!(
+            target.store.list_edge_text_ids().expect("ids"),
+            vec!["e1".to_string()]
         );
     }
 

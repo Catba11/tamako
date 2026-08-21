@@ -22,7 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tamako_memory::{MemoryBackend, MemoryError, MergeOutcome, NodeMergeStats, NodeType};
+use tamako_memory::{EdgeId, MemoryBackend, MemoryError, MergeOutcome, NodeMergeStats, NodeType};
 use tamako_store::{MergeAuditRow, Store, StoreError};
 use time::OffsetDateTime;
 use tracing::warn;
@@ -602,6 +602,54 @@ async fn apply_one<M: MemoryBackend>(
             {
                 warn!(chat_id, loser_id = %action.loser_id, %error, "merge apply: sidecar tombstone failed; reconciliation will prune the orphan");
             }
+            // Decision 76: the loser-touching edge_texts rows die with
+            // the merge — the same sidecar-tombstone discipline as the
+            // vec/queue rows above (Section 7.7 step 3), one best-
+            // effort pass right after them. Derivation note: the
+            // natural-key set is the loser's pre-merge edge set (the
+            // MergeSnapshot's `edges` list), but tamako-core has no
+            // JSON parser in its dependency set and the subtask's
+            // three-file constraint forbids adding one — so the ids
+            // come from the sidecar itself: every edge_texts row whose
+            // encoded natural key (EdgeId::decode) names the loser as
+            // an endpoint. That is the same set the snapshot would
+            // give (the sidecar mirrors the graph pre-merge), plus any
+            // harvest-missed stale rows — strictly more convergent. A
+            // row whose id does not decode is left alone (the
+            // reconciliation orphan pass prunes by raw set
+            // difference). The re-pointed edges live on under NEW ids
+            // (the survivor endpoint); their rows are the next
+            // reconciliation's missing-from-sidecar upserts.
+            // REGRESSION NOTE: a rollback recreates the loser and its
+            // original edges, but these rows stay deleted — exactly
+            // like the vec rows above, the next startup reconciliation
+            // restores them (the edge diff is a journal-free set
+            // difference; see crate::embedding::reconcile_group).
+            // WARN, never fail: reconciliation prunes the orphans
+            // either way.
+            match store_call(store, Store::list_edge_text_ids).await {
+                Ok(ids) => {
+                    let tombstones: Vec<String> = ids
+                        .into_iter()
+                        .filter(|id| {
+                            EdgeId::decode(id).is_ok_and(|key| {
+                                key.source_id == action.loser_id || key.target_id == action.loser_id
+                            })
+                        })
+                        .collect();
+                    if !tombstones.is_empty() {
+                        if let Err(error) =
+                            store_call(store, move |store| store.delete_edge_texts(&tombstones))
+                                .await
+                        {
+                            warn!(chat_id, loser_id = %action.loser_id, %error, "merge apply: edge_texts tombstone failed; reconciliation will prune the orphans");
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(chat_id, loser_id = %action.loser_id, %error, "merge apply: edge_texts scan failed; reconciliation will prune the orphans");
+                }
+            }
             Some(outcome)
         }
         MergeVerdict::Related => {
@@ -692,7 +740,11 @@ pub async fn apply_merge_plan<M: MemoryBackend>(
 /// row AND its done-journal rows, so the next startup reconciliation
 /// (`crate::embedding::reconcile_group`, decision 66) diffs the
 /// recreated node against the empty journal and re-embeds it
-/// automatically (decision 74 rebuild note, Section 7.7 step 4).
+/// automatically (decision 74 rebuild note, Section 7.7 step 4). The
+/// same holds for the loser-touching edge_texts rows (decision 76):
+/// deleted at merge time, restored by the reconciliation's
+/// missing-from-sidecar upserts — the edge diff is a journal-free set
+/// difference, so the recreated edges reappear there unconditionally.
 pub async fn rollback_merge_action<M: MemoryBackend>(
     store: &Arc<Store>,
     memory: &M,
@@ -1675,6 +1727,124 @@ mod tests {
             None,
             "no counter row without an invariant pass"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_tombstones_the_losers_edge_text_rows() {
+        // Decision 76: a 'same' merge deletes the loser-touching
+        // edge_texts rows immediately (the vec-row tombstone
+        // discipline), while the rows of edges that never touched the
+        // loser survive.
+        let fixture = fixture();
+        let (_dir, store, memory) = seeded(&fixture).await;
+        // Seed the sidecar the way the decision-76 digest harvest does:
+        // one row per graph edge, keyed by the encoded natural key.
+        let graph_edges = memory.list_all_edges(CHAT).await.expect("edges");
+        for (edge_id, edge_text) in &graph_edges {
+            store.upsert_edge_text(edge_id, edge_text).expect("seed");
+        }
+        let confirmer = ScriptedConfirmer::default().with(
+            "Rust",
+            "Rust Language",
+            MergeVerdict::Same,
+            "identical concept",
+        );
+        let mut plan = plan_merges(&store, &memory, CHAT, 0.85, &confirmer, 10)
+            .await
+            .expect("plan");
+        plan.actions
+            .retain(|action| action.verdict == MergeVerdict::Same);
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
+        assert!(report.failures.is_empty());
+
+        let remaining = store.list_edge_text_ids().expect("ids");
+        // Every loser-touching row is gone (including the incoming
+        // related_to edge, dropped as a self-loop, and the deduped
+        // shared mentions edge — the survivor's equivalent row is keyed
+        // by a DIFFERENT natural key and survives).
+        assert!(remaining.iter().all(|id| {
+            let key = EdgeId::decode(id).expect("decode");
+            key.source_id != fixture.rustlang.id && key.target_id != fixture.rustlang.id
+        }));
+        // Exactly the three untouched edges keep their rows: the
+        // survivor's own mentions/is_a edges and ferris's incoming
+        // likes edge.
+        let edge_id = |source: &str, relationship: &str, target: &str, offset: i64| {
+            EdgeId {
+                source_id: source.to_string(),
+                relationship_name: relationship.to_string(),
+                target_id: target.to_string(),
+                valid_at: base() + Duration::seconds(offset),
+            }
+            .encode()
+        };
+        let mut expected = vec![
+            edge_id(&fixture.rust.id, "mentions", &fixture.cargo.id, 1),
+            edge_id(&fixture.ferris.id, "likes", &fixture.rust.id, 3),
+            edge_id(&fixture.rust.id, "is_a", &fixture.programming.id, 4),
+        ];
+        expected.sort();
+        assert_eq!(remaining, expected);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_restores_the_rolled_back_edge_text_rows() {
+        // Decision 76 regression: the merge deletes the loser-touching
+        // edge_texts rows; a rollback recreates the loser and its edges
+        // but NOT the rows — the next reconciliation restores them (the
+        // journal-free set difference), exactly like the vec rows.
+        let fixture = fixture();
+        let (dir, store, memory) = seeded(&fixture).await;
+        let graph_edges = memory.list_all_edges(CHAT).await.expect("edges");
+        for (edge_id, edge_text) in &graph_edges {
+            store.upsert_edge_text(edge_id, edge_text).expect("seed");
+        }
+        let confirmer = ScriptedConfirmer::default().with(
+            "Rust",
+            "Rust Language",
+            MergeVerdict::Same,
+            "identical concept",
+        );
+        let mut plan = plan_merges(&store, &memory, CHAT, 0.85, &confirmer, 10)
+            .await
+            .expect("plan");
+        plan.actions
+            .retain(|action| action.verdict == MergeVerdict::Same);
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
+        assert!(report.failures.is_empty());
+        let sidecar_after_merge = store.list_edge_text_ids().expect("ids").len();
+        assert!(sidecar_after_merge < graph_edges.len());
+
+        rollback_merge_action(&store, &memory, CHAT, report.audit_ids[0])
+            .await
+            .expect("rollback");
+        // The rollback itself writes no sidecar rows.
+        assert_eq!(
+            store.list_edge_text_ids().expect("ids").len(),
+            sidecar_after_merge
+        );
+
+        let target = GroupEmbeddingTarget::open(dir.path(), CHAT).expect("target");
+        let reconcile = reconcile_group(&memory, &target).await;
+        // The restored loser's edges are missing from the sidecar: the
+        // reconciliation rewrites them (plus the merge-created
+        // re-point, whose row the merge-time graph never had).
+        assert!(reconcile.edge_texts_upserted > 0);
+        // The merge-created re-pointed edges left the graph at
+        // rollback; any of their harvested rows would prune. None were
+        // ever written in this test, so nothing prunes.
+        assert_eq!(reconcile.edge_texts_pruned, 0);
+        // Convergence: the sidecar mirrors the post-rollback graph
+        // exactly.
+        let mut graph_ids: Vec<String> = memory
+            .list_all_edges(CHAT)
+            .await
+            .expect("edges")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        graph_ids.sort();
+        assert_eq!(store.list_edge_text_ids().expect("ids"), graph_ids);
     }
 
     #[tokio::test]
