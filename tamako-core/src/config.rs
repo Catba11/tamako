@@ -16,6 +16,64 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// The `warmup_active_hours` window of specs.md Section 8.4, parsed
+/// ("HH:MM-HH:MM", host-local; overnight ranges unsupported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveHours {
+    /// Minutes after host-local midnight, window start (inclusive).
+    pub start_minutes: u16,
+    /// Minutes after host-local midnight, window end (exclusive).
+    pub end_minutes: u16,
+}
+
+impl ActiveHours {
+    /// The default window of specs.md Section 13: "08:00-23:00" host-local.
+    pub const DEFAULT: ActiveHours = ActiveHours {
+        start_minutes: 8 * 60,
+        end_minutes: 23 * 60,
+    };
+
+    /// Parses "HH:MM-HH:MM". Err(reason) on: bad shape, HH > 23,
+    /// MM > 59, or `end <= start` (overnight and empty windows are
+    /// unsupported, specs.md Section 8.4 — a LOUD config error).
+    pub fn parse(text: &str) -> Result<ActiveHours, String> {
+        fn hm(part: &str) -> Result<u16, String> {
+            let (h, m) = part
+                .split_once(':')
+                .ok_or_else(|| format!("expected the shape HH:MM, got {part:?}"))?;
+            let hours: u16 = h
+                .parse()
+                .map_err(|_| format!("expected the shape HH:MM, got {part:?}"))?;
+            let minutes: u16 = m
+                .parse()
+                .map_err(|_| format!("expected the shape HH:MM, got {part:?}"))?;
+            if hours > 23 || minutes > 59 {
+                return Err(format!("time out of range in {part:?} (HH 0-23, MM 0-59)"));
+            }
+            Ok(hours * 60 + minutes)
+        }
+        let (start, end) = text
+            .split_once('-')
+            .ok_or_else(|| "expected the shape HH:MM-HH:MM".to_string())?;
+        let start_minutes = hm(start)?;
+        let end_minutes = hm(end)?;
+        if end_minutes <= start_minutes {
+            return Err(format!(
+                "end {end:?} is not after start {start:?} — same-day windows only, overnight and empty ranges are unsupported (specs.md Section 8.4)"
+            ));
+        }
+        Ok(ActiveHours {
+            start_minutes,
+            end_minutes,
+        })
+    }
+
+    /// The window length in seconds.
+    pub fn span_seconds(&self) -> u64 {
+        u64::from(self.end_minutes - self.start_minutes) * 60
+    }
+}
+
 /// Trigger and pipeline thresholds. Refer to specs.md Sections 8 and 10.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TriggerConfig {
@@ -202,12 +260,25 @@ pub struct TriggerConfig {
     /// vector entry, two-hop expansion, edge_texts full-text) merged
     /// and deduped by edge id, then truncated. Default 40.
     pub recall_candidate_cap: u32,
-    /// specs.md Section 8.4. Lower bound of the daily quota. Default 1.
-    pub warmup_quota_min: u32,
-    /// specs.md Section 8.4. Upper bound of the daily quota. Default 3.
-    pub warmup_quota_max: u32,
-    /// specs.md Section 8.4. Default 4 h.
+    /// specs.md Sections 8.4/13 (decision 78 (e)): the warmup master
+    /// switch. Default TRUE — the Phase 2 exit criterion needs live
+    /// measurement.
+    pub warmup: bool,
+    /// specs.md Sections 8.4/13 (decision 78 (e)): the daily warmup
+    /// quota. Default 1, valid range 1..=3 — a value outside is a LOUD
+    /// startup error, never a silent clamp.
+    pub warmup_quota: u32,
+    /// specs.md Sections 8.4/13 (decision 78 (e)): the host-local
+    /// window the quota spreads over. Default "08:00-23:00".
+    pub warmup_active_hours: ActiveHours,
+    /// specs.md Section 8.4 (decision 78 (e)). Default 4 h.
     pub warmup_silence: Duration,
+    /// specs.md Section 8.5 (decision 78 (e)): the engagement watch
+    /// window of a sent warmup. Default 30 min.
+    pub warmup_reaction_window: Duration,
+    /// specs.md Section 9.7 step 2 (decision 78 (e)): the per-topic
+    /// cooldown. Default 3 days.
+    pub warmup_topic_cooldown_days: u32,
     /// specs.md Section 8.5. Default 2.
     pub monologue_limit: u32,
 }
@@ -267,9 +338,12 @@ impl Default for TriggerConfig {
             recall_injection_cap: 5,
             deep_recall: true,
             recall_candidate_cap: 40,
-            warmup_quota_min: 1,
-            warmup_quota_max: 3,
+            warmup: true,
+            warmup_quota: 1,
+            warmup_active_hours: ActiveHours::DEFAULT,
             warmup_silence: Duration::from_secs(4 * 60 * 60),
+            warmup_reaction_window: Duration::from_secs(30 * 60),
+            warmup_topic_cooldown_days: 3,
             monologue_limit: 2,
         }
     }
@@ -391,9 +465,22 @@ pub struct TriggerConfigToml {
     /// The total candidate cap before the relevance gate (decision
     /// 76). Refer to `TriggerConfig::recall_candidate_cap`.
     pub recall_candidate_cap: Option<u32>,
-    pub warmup_quota_min: Option<u32>,
-    pub warmup_quota_max: Option<u32>,
+    /// The warmup master switch (decision 78 (e)). Refer to
+    /// `TriggerConfig::warmup`.
+    pub warmup: Option<bool>,
+    /// The daily warmup quota (decision 78 (e)). Refer to
+    /// `TriggerConfig::warmup_quota`.
+    pub warmup_quota: Option<u32>,
+    /// The active-hours window, "HH:MM-HH:MM" host-local (decision 78
+    /// (e)). Refer to `TriggerConfig::warmup_active_hours`.
+    pub warmup_active_hours: Option<String>,
     pub warmup_silence_secs: Option<u64>,
+    /// The engagement watch window (decision 78 (e)). Refer to
+    /// `TriggerConfig::warmup_reaction_window`.
+    pub warmup_reaction_window_secs: Option<u64>,
+    /// The per-topic cooldown in days (decision 78 (e)). Refer to
+    /// `TriggerConfig::warmup_topic_cooldown_days`.
+    pub warmup_topic_cooldown_days: Option<u32>,
     pub monologue_limit: Option<u32>,
 }
 
@@ -566,14 +653,29 @@ impl TriggerConfigToml {
         if let Some(value) = self.recall_candidate_cap {
             base.recall_candidate_cap = value;
         }
-        if let Some(value) = self.warmup_quota_min {
-            base.warmup_quota_min = value;
+        if let Some(value) = self.warmup {
+            base.warmup = value;
         }
-        if let Some(value) = self.warmup_quota_max {
-            base.warmup_quota_max = value;
+        if let Some(value) = self.warmup_quota {
+            base.warmup_quota = value;
+        }
+        if let Some(value) = &self.warmup_active_hours {
+            // `BotConfig::from_toml_str` validates the raw overlay
+            // string BEFORE apply runs (decision 78 (e): a loud error,
+            // never a silent skip), so a malformed value never reaches
+            // this branch.
+            if let Ok(hours) = ActiveHours::parse(value) {
+                base.warmup_active_hours = hours;
+            }
         }
         if let Some(value) = self.warmup_silence_secs {
             base.warmup_silence = Duration::from_secs(value);
+        }
+        if let Some(value) = self.warmup_reaction_window_secs {
+            base.warmup_reaction_window = Duration::from_secs(value);
+        }
+        if let Some(value) = self.warmup_topic_cooldown_days {
+            base.warmup_topic_cooldown_days = value;
         }
         if let Some(value) = self.monologue_limit {
             base.monologue_limit = value;
@@ -599,6 +701,52 @@ pub enum ConfigError {
         /// The group table the key appeared under.
         group: String,
     },
+    /// A warmup key carries an out-of-range or malformed value
+    /// (decision 78 (e)): loud at startup, never a silent clamp.
+    #[error("invalid value for '{key}'{group_context}: {value:?} — {reason}")]
+    InvalidValue {
+        /// The offending key name.
+        key: &'static str,
+        /// The group context: " under [groups.-1001]", or "" under
+        /// [global].
+        group_context: String,
+        /// The offending value.
+        value: String,
+        /// Why the value is invalid.
+        reason: String,
+    },
+}
+
+/// The decision-78 (e) warmup validation of one raw TOML overlay:
+/// `warmup_quota` in 1..=3 and `warmup_active_hours` well-formed and
+/// same-day. Runs on the raw overlay values BEFORE apply, so a bad
+/// value never applies silently. `group_context` is "" under [global]
+/// or " under [groups.<chat_id>]".
+fn validate_warmup_overlay(
+    overlay: &TriggerConfigToml,
+    group_context: &str,
+) -> Result<(), ConfigError> {
+    if let Some(value) = overlay.warmup_quota {
+        if !(1..=3).contains(&value) {
+            return Err(ConfigError::InvalidValue {
+                key: "warmup_quota",
+                group_context: group_context.to_string(),
+                value: value.to_string(),
+                reason: "the valid range is 1..=3 (specs.md Section 8.4)".to_string(),
+            });
+        }
+    }
+    if let Some(value) = &overlay.warmup_active_hours {
+        if let Err(reason) = ActiveHours::parse(value) {
+            return Err(ConfigError::InvalidValue {
+                key: "warmup_active_hours",
+                group_context: group_context.to_string(),
+                value: value.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The root configuration of the bot.
@@ -639,13 +787,25 @@ impl BotConfig {
         // Sorted group ids keep the reported error deterministic.
         let mut groups: Vec<&String> = parsed.groups.keys().collect();
         groups.sort();
-        for group in groups {
+        for &group in &groups {
             if let Some(key) = parsed.groups[group].global_only_key() {
                 return Err(ConfigError::GlobalOnlyKey {
                     key,
                     group: group.clone(),
                 });
             }
+        }
+        // Decision 78 (e): the warmup keys validate LOUDLY on the raw
+        // overlay values, BEFORE apply runs — a bad value never applies
+        // silently and never clamps. The effective values are covered
+        // by the same checks: the defaults are in range, and every
+        // overlay value that could replace them is checked here.
+        if let Some(overlay) = &parsed.global {
+            validate_warmup_overlay(overlay, "")?;
+        }
+        for &group in &groups {
+            let group_context = format!(" under [groups.{group}]");
+            validate_warmup_overlay(&parsed.groups[group], &group_context)?;
         }
         let mut global = TriggerConfig::default();
         if let Some(overlay) = &parsed.global {
@@ -686,9 +846,15 @@ wake_floor_secs = 60
         assert_eq!(config.digest_max_bytes, 20 * 1024);
         assert_eq!(config.digest_timeout, Duration::from_secs(6 * 60 * 60));
         assert_eq!(config.digest_max_retries, 5);
-        assert_eq!(config.warmup_quota_min, 1);
-        assert_eq!(config.warmup_quota_max, 3);
+        // Decision 78 (e) (specs.md Sections 8.4/8.5/9.7/13): the six
+        // warmup keys.
+        assert!(config.warmup);
+        assert_eq!(config.warmup_quota, 1);
+        assert_eq!(config.warmup_active_hours, ActiveHours::DEFAULT);
+        assert_eq!(config.warmup_active_hours.span_seconds(), 15 * 60 * 60);
         assert_eq!(config.warmup_silence, Duration::from_secs(4 * 60 * 60));
+        assert_eq!(config.warmup_reaction_window, Duration::from_secs(30 * 60));
+        assert_eq!(config.warmup_topic_cooldown_days, 3);
         assert_eq!(config.monologue_limit, 2);
         // The M4 keys: every Option is None by default; the staleness
         // threshold is 20 (M4 deviation, reported for spec backfill).
@@ -1168,6 +1334,172 @@ embedding_llm_base_url = "https://embeddings.example/v1"
             plain.global.embedding_llm_base_url,
             "https://openrouter.ai/api/v1"
         );
+    }
+
+    #[test]
+    fn active_hours_parses_the_shape_and_rejects_bad_windows() {
+        // specs.md Section 8.4: "HH:MM-HH:MM", host-local, same-day.
+        let hours = ActiveHours::parse("08:00-23:00").expect("the default window parses");
+        assert_eq!(hours, ActiveHours::DEFAULT);
+        assert_eq!(hours.span_seconds(), 15 * 60 * 60);
+        assert_eq!(
+            ActiveHours::parse("00:30-01:45").expect("a short window parses"),
+            ActiveHours {
+                start_minutes: 30,
+                end_minutes: 105,
+            }
+        );
+        // Bad shape, out-of-range times, and overnight/empty windows
+        // all error with a reason.
+        for text in ["8-23", "08:00/23:00", "25:00-26:00", "08:60-23:00"] {
+            assert!(ActiveHours::parse(text).is_err(), "{text} must fail");
+        }
+        let overnight = ActiveHours::parse("23:00-08:00").expect_err("overnight fails");
+        assert!(
+            overnight.contains("same-day"),
+            "the overnight reason names the same-day rule: {overnight}"
+        );
+        let empty = ActiveHours::parse("08:00-08:00").expect_err("an empty window fails");
+        assert!(empty.contains("same-day"), "{empty}");
+    }
+
+    #[test]
+    fn toml_override_sets_decision_78_warmup_keys() {
+        // Decision 78 (e): the six warmup keys follow the same per-key
+        // overlay pattern as every other trigger key (AGENT.md Section
+        // 6.3: overridable per group).
+        let text = r#"
+[global]
+warmup = false
+warmup_quota = 2
+warmup_active_hours = "09:30-22:00"
+warmup_silence_secs = 7200
+warmup_reaction_window_secs = 900
+warmup_topic_cooldown_days = 5
+
+[groups."-100777"]
+warmup = true
+warmup_quota = 3
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the warmup TOML loads");
+        let global = &config.global;
+        assert!(!global.warmup);
+        assert_eq!(global.warmup_quota, 2);
+        assert_eq!(
+            global.warmup_active_hours,
+            ActiveHours {
+                start_minutes: 9 * 60 + 30,
+                end_minutes: 22 * 60,
+            }
+        );
+        assert_eq!(global.warmup_silence, Duration::from_secs(7200));
+        assert_eq!(global.warmup_reaction_window, Duration::from_secs(900));
+        assert_eq!(global.warmup_topic_cooldown_days, 5);
+        // A group override wins over the global value; keys the group
+        // does not set inherit the global values.
+        let overridden = config.for_group("-100777");
+        assert!(overridden.warmup);
+        assert_eq!(overridden.warmup_quota, 3);
+        assert_eq!(overridden.warmup_active_hours, global.warmup_active_hours);
+        assert_eq!(overridden.warmup_silence, global.warmup_silence);
+        assert_eq!(
+            overridden.warmup_reaction_window,
+            global.warmup_reaction_window
+        );
+        assert_eq!(
+            overridden.warmup_topic_cooldown_days,
+            global.warmup_topic_cooldown_days
+        );
+        // A group without an override receives the global values.
+        assert!(!config.for_group("-100999").warmup);
+        assert_eq!(config.for_group("-100999").warmup_quota, 2);
+        // Keys the TOML does not set keep the decision-78 defaults.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert!(plain.global.warmup);
+        assert_eq!(plain.global.warmup_quota, 1);
+        assert_eq!(plain.global.warmup_active_hours, ActiveHours::DEFAULT);
+    }
+
+    #[test]
+    fn warmup_quota_out_of_range_is_a_loud_error() {
+        // Decision 78 (e): quota outside 1..=3 fails at startup naming
+        // the key and the value — never a silent clamp.
+        for value in [0, 4] {
+            let text = format!("[global]\nwarmup_quota = {value}\n");
+            let error = BotConfig::from_toml_str(&text)
+                .expect_err("an out-of-range quota must fail loudly");
+            let message = error.to_string();
+            assert!(
+                message.contains("warmup_quota"),
+                "the error names the key: {message}"
+            );
+            assert!(
+                message.contains(&value.to_string()),
+                "the error names the value {value}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_warmup_active_hours_is_a_loud_error() {
+        // Decision 78 (e): a malformed window string fails at startup
+        // naming the key and the value — apply never sees it.
+        for value in ["8-23", "08:00/23:00", "25:00-26:00"] {
+            let text = format!("[global]\nwarmup_active_hours = \"{value}\"\n");
+            let error =
+                BotConfig::from_toml_str(&text).expect_err("a malformed window must fail loudly");
+            let message = error.to_string();
+            assert!(
+                message.contains("warmup_active_hours"),
+                "the error names the key: {message}"
+            );
+            assert!(
+                message.contains(value),
+                "the error names the value {value}: {message}"
+            );
+        }
+        // An overnight window fails with a reason naming the same-day
+        // rule (specs.md Section 8.4).
+        let text = "[global]\nwarmup_active_hours = \"23:00-08:00\"\n";
+        let error = BotConfig::from_toml_str(text).expect_err("an overnight window must fail");
+        let message = error.to_string();
+        assert!(message.contains("warmup_active_hours"), "{message}");
+        assert!(message.contains("23:00-08:00"), "{message}");
+        assert!(
+            message.contains("same-day"),
+            "the reason names the same-day rule: {message}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_warmup_value_under_a_group_names_the_group() {
+        // Decision 78 (e): the validation runs on every group overlay
+        // too, and the error names the group.
+        let text = r#"
+[global]
+warmup_active_hours = "09:00-21:00"
+
+[groups."-1001"]
+warmup_quota = 4
+"#;
+        let error = BotConfig::from_toml_str(text).expect_err("the group quota must fail loudly");
+        let message = error.to_string();
+        assert!(message.contains("warmup_quota"), "{message}");
+        assert!(message.contains('4'), "{message}");
+        assert!(
+            message.contains("-1001"),
+            "the error names the group: {message}"
+        );
+        // A malformed window under a group also fails, naming the group
+        // — even though apply would have skipped it.
+        let text = r#"
+[groups."-1001"]
+warmup_active_hours = "8-23"
+"#;
+        let error = BotConfig::from_toml_str(text).expect_err("the group window must fail loudly");
+        let message = error.to_string();
+        assert!(message.contains("warmup_active_hours"), "{message}");
+        assert!(message.contains("-1001"), "{message}");
     }
 
     #[test]
