@@ -184,6 +184,17 @@ pub struct TriggerConfig {
     /// conservative default). Default 5. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill (Phase 1 M5).
     pub recall_injection_cap: u32,
+    /// specs.md Sections 9.1/13 (decision 76): the deep-recall switch.
+    /// `false` restores the Phase 1 shallow candidate form (direct
+    /// neighbors only, one hop, entry by mentions/replies and exact
+    /// alias match) byte-identically — no embeddings call, no two-hop
+    /// expansion, no edge_texts full-text source. Default true.
+    pub deep_recall: bool,
+    /// specs.md Sections 9.1/13 (decision 76 (d)): the TOTAL candidate
+    /// cap before the relevance gate — every candidate source (shallow,
+    /// vector entry, two-hop expansion, edge_texts full-text) merged
+    /// and deduped by edge id, then truncated. Default 40.
+    pub recall_candidate_cap: u32,
     /// specs.md Section 8.4. Lower bound of the daily quota. Default 1.
     pub warmup_quota_min: u32,
     /// specs.md Section 8.4. Upper bound of the daily quota. Default 3.
@@ -246,6 +257,8 @@ impl Default for TriggerConfig {
                 "dating".to_string(),
             ],
             recall_injection_cap: 5,
+            deep_recall: true,
+            recall_candidate_cap: 40,
             warmup_quota_min: 1,
             warmup_quota_max: 3,
             warmup_silence: Duration::from_secs(4 * 60 * 60),
@@ -361,6 +374,12 @@ pub struct TriggerConfigToml {
     /// The injection cap of one wake. Refer to
     /// `TriggerConfig::recall_injection_cap`.
     pub recall_injection_cap: Option<u32>,
+    /// The deep-recall switch (decision 76). Refer to
+    /// `TriggerConfig::deep_recall`.
+    pub deep_recall: Option<bool>,
+    /// The total candidate cap before the relevance gate (decision
+    /// 76). Refer to `TriggerConfig::recall_candidate_cap`.
+    pub recall_candidate_cap: Option<u32>,
     pub warmup_quota_min: Option<u32>,
     pub warmup_quota_max: Option<u32>,
     pub warmup_silence_secs: Option<u64>,
@@ -500,6 +519,12 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.recall_injection_cap {
             base.recall_injection_cap = value;
+        }
+        if let Some(value) = self.deep_recall {
+            base.deep_recall = value;
+        }
+        if let Some(value) = self.recall_candidate_cap {
+            base.recall_candidate_cap = value;
         }
         if let Some(value) = self.warmup_quota_min {
             base.warmup_quota_min = value;
@@ -661,6 +686,40 @@ wake_floor_secs = 60
         // The M5 key: the injection cap defaults to 5 (Section 9.2
         // conservative default; deviation reported for spec backfill).
         assert_eq!(config.recall_injection_cap, 5);
+        // Decision 76 (specs.md Sections 9.1/13): deep recall defaults
+        // ON; the total candidate cap defaults to 40.
+        assert!(config.deep_recall);
+        assert_eq!(config.recall_candidate_cap, 40);
+    }
+
+    #[test]
+    fn toml_override_sets_decision_76_keys() {
+        // Decision 76: the deep-recall keys follow the same per-key
+        // overlay pattern as every other trigger key (AGENT.md Section
+        // 6.3: overridable per group).
+        let text = r#"
+[global]
+deep_recall = false
+recall_candidate_cap = 60
+
+[groups."-100777"]
+deep_recall = true
+recall_candidate_cap = 10
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert!(!config.global.deep_recall);
+        assert_eq!(config.global.recall_candidate_cap, 60);
+        // A group override applies over the global value (true wins:
+        // deep recall returns for this group only).
+        assert!(config.for_group("-100777").deep_recall);
+        assert_eq!(config.for_group("-100777").recall_candidate_cap, 10);
+        // A group without an override receives the global value.
+        assert!(!config.for_group("-100999").deep_recall);
+        assert_eq!(config.for_group("-100999").recall_candidate_cap, 60);
+        // Keys the TOML does not set keep the decision-76 defaults.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert!(plain.global.deep_recall);
+        assert_eq!(plain.global.recall_candidate_cap, 40);
     }
 
     #[test]
