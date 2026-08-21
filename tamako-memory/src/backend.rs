@@ -116,6 +116,17 @@ pub struct MemoryBatch {
 /// on one fetch. The fetch truncates by `created_at` descending.
 pub const NEIGHBOR_EXPANSION_LIMIT: usize = 500;
 
+/// The time window of the Section 8.2 traversal rules, in days: an edge
+/// qualifies for a recall expansion when its `valid_at` OR its
+/// `created_at` falls inside the window (the edge is recent by either
+/// measure — a long-valid fact re-extracted yesterday still counts).
+/// Decision 76 (a) runs the two-hop expansion "under the Section 8.2
+/// rules", which MANDATE the window ("a time window on `valid_at` or
+/// `created_at`. The default window is 90 days.") — unlike the
+/// decision-58 shallow read (`neighbors`), which documented NOT
+/// applying it.
+pub const RECALL_TIME_WINDOW_DAYS: i64 = 90;
+
 /// Read path, Section 8.2: one valid edge of a resolved entry node with
 /// its endpoints. `contains` edges never occur here (provenance only,
 /// Section 6.3/8.2).
@@ -149,6 +160,32 @@ impl NeighborEdge {
             self.source_id, self.relationship_name, self.target_id, valid_at
         )
     }
+}
+
+/// Decision 76 / graph-spec Section 8.2: one recall-candidate edge of
+/// the deep read path, with BOTH endpoint names hydrated (the candidate
+/// render speaks names). The `edge_id` is the opaque [`EdgeId::encode`]
+/// of the natural key — the same dedup key shape as
+/// [`NeighborEdge::edge_id`] (specs.md Section 9.3).
+///
+/// The field set is a superset of the decision-58 recall candidate
+/// render: `tamako-agent`'s `RecallCandidate` consumes `edge_id`,
+/// `edge_text`, `valid_at`, `source_id`, `relationship_name`, and
+/// `target_id` verbatim from here; the names feed the deep-recall
+/// candidate text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateEdge {
+    /// The opaque edge id: [`EdgeId::encode`] of the natural key.
+    pub edge_id: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub target_id: String,
+    pub target_name: String,
+    /// System name or open-vocabulary snake_case name. Section 6.3.
+    pub relationship_name: String,
+    /// The stored `edge_text` (the description).
+    pub edge_text: String,
+    pub valid_at: OffsetDateTime,
 }
 
 /// Decision 75: the opaque edge identifier of the manual fact ops
@@ -514,6 +551,98 @@ pub trait MemoryBackend: Send + Sync {
         chat_id: &'a str,
         node_id: &'a str,
     ) -> impl Future<Output = Result<Vec<NeighborEdge>>> + Send + 'a;
+
+    /// Decision 76 / graph-spec Section 8.2: the two-hop recall
+    /// expansion. Hop 1 fetches the valid whitelist edges of every entry
+    /// node (entered through the node identifiers, Rule R5); hop 2
+    /// fetches the valid whitelist edges of every hop-1 neighbor node.
+    /// The result is the deduped union: hop-1 edges first (entry order,
+    /// per node newest first), then hop-2 edges (frontier order, per
+    /// node newest first).
+    ///
+    /// The Section 8.2 rules applied, per decision 76:
+    /// - WHITELIST: every relationship EXCEPT `contains` (provenance)
+    ///   and `known_as` (surface forms, resolved at entry);
+    ///   `also_known_as` IS traversed (the cross-language bridge,
+    ///   decision 76 (b)).
+    /// - VALID ONLY: `invalid_at IS NULL`.
+    /// - TIME WINDOW: [`RECALL_TIME_WINDOW_DAYS`] on `valid_at` OR
+    ///   `created_at`, relative to `now`. Decision 76 (a) runs the
+    ///   expansion "under the Section 8.2 rules", which mandate the
+    ///   window — unlike the decision-58 shallow read (`neighbors`).
+    /// - PER-NODE LIMIT: `per_node_limit` edges per queried node at BOTH
+    ///   hops (entry-side at hop 1, neighbor-side at hop 2), truncated
+    ///   by `created_at` descending (decision 76 (d)); the call site
+    ///   passes [`NEIGHBOR_EXPANSION_LIMIT`]. Hub marking (degree above
+    ///   1000) is SKIPPED — the unconditional truncation is strictly
+    ///   stronger than the hub rule requires (the decision-58
+    ///   simplification, kept: decision 76 is silent on hub marking).
+    ///
+    /// `now` is a parameter (the house pattern of `invalidate_edge`) so
+    /// the window is deterministic under test. An empty entry list
+    /// yields an empty vec without opening the database of the group.
+    ///
+    /// The default returns an empty vec so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn two_hop_edges<'a>(
+        &'a self,
+        chat_id: &'a str,
+        entry_node_ids: &'a [String],
+        now: OffsetDateTime,
+        per_node_limit: usize,
+    ) -> impl Future<Output = Result<Vec<CandidateEdge>>> + Send + 'a {
+        let _ = (chat_id, entry_node_ids, now, per_node_limit);
+        async { Ok(Vec::new()) }
+    }
+
+    /// Decision 76 (c): hydrates sidecar `edge_texts` hits into full
+    /// recall candidates. Each id is the opaque [`EdgeId`] string the
+    /// sidecar stores; the edge is fetched by its natural key (Rule R5 —
+    /// entry through the endpoint identifiers) with the endpoint names
+    /// hydrated. Only VALID edges hydrate (`invalid_at IS NULL`): a
+    /// candidate the relevance gate sees must be a currently-valid fact,
+    /// the same policy as every other candidate-producing read.
+    ///
+    /// A stale id (a sidecar row whose graph edge was deleted or
+    /// invalidated between reconciliations, Section 7.6 step 6) and a
+    /// malformed id simply do not occur in the result — the read path
+    /// skips, it does not fail. An empty id list yields an empty vec
+    /// without opening the database of the group.
+    ///
+    /// The default returns an empty vec so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn edges_by_ids<'a>(
+        &'a self,
+        chat_id: &'a str,
+        edge_ids: &'a [String],
+    ) -> impl Future<Output = Result<Vec<CandidateEdge>>> + Send + 'a {
+        let _ = (chat_id, edge_ids);
+        async { Ok(Vec::new()) }
+    }
+
+    /// Decision 76 (c) / Section 7.6 step 6: EVERY edge of the group —
+    /// valid AND invalid, every relationship name including `contains`
+    /// — as (opaque edge id, `edge_text`) pairs. Backs the startup
+    /// reconciliation diff of the `edge_texts` sidecar: the diff needs
+    /// the full edge set to catch sidecar orphans, so the
+    /// valid-only filter of Section 8.2 deliberately does NOT apply
+    /// here. Edge counts are in the thousands, so the full listing
+    /// carries no paging.
+    ///
+    /// RULE R5 EXCEPTION: this is a full-graph scan by design — the
+    /// reconciliation pass has no entry identifiers. It is the
+    /// documented exception, mirroring `list_node_contents`
+    /// (decision 66).
+    ///
+    /// The default returns an empty vec so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn list_all_edges<'a>(
+        &'a self,
+        chat_id: &'a str,
+    ) -> impl Future<Output = Result<Vec<(String, String)>>> + Send + 'a {
+        let _ = chat_id;
+        async { Ok(Vec::new()) }
+    }
 
     /// Phase 2 (current-state.md decision 66): the stored name and
     /// description of one node, entered through the node identifier

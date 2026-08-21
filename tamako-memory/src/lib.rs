@@ -6,9 +6,10 @@ pub mod identifiers;
 mod lbug_backend;
 
 pub use backend::{
-    AliasTarget, EdgeId, MemoryBackend, MemoryBatch, MemoryEdge, MemoryError, MemoryNode,
-    MergeOutcome, MergeSnapshot, MergeSnapshotEdge, MergeSnapshotEdgeKey, MergeSnapshotNode,
-    NeighborEdge, NodeContent, NodeFactEdge, NodeFacts, NodeMergeStats, NodeResolutionInfo,
-    NodeType, Result, UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT,
+    AliasTarget, CandidateEdge, EdgeId, MemoryBackend, MemoryBatch, MemoryEdge, MemoryError,
+    MemoryNode, MergeOutcome, MergeSnapshot, MergeSnapshotEdge, MergeSnapshotEdgeKey,
+    MergeSnapshotNode, NeighborEdge, NodeContent, NodeFactEdge, NodeFacts, NodeMergeStats,
+    NodeResolutionInfo, NodeType, Result, UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT,
+    RECALL_TIME_WINDOW_DAYS,
 };
 pub use lbug_backend::LbugBackend;
