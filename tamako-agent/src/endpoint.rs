@@ -545,9 +545,13 @@ impl LlmConfigValues {
     }
 }
 
-/// Reads an env var. An empty value counts as unset.
+/// Reads an env var. The value is ASCII-trimmed; an empty or
+/// whitespace-only value counts as unset (decision 77, S5-L3).
 fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim_ascii().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// The resolved endpoints of the four purposes.
@@ -1731,6 +1735,26 @@ mod tests {
             Some("http://localhost:8000/v1")
         );
         assert_eq!(endpoints.digest.model, "config-model");
+    }
+
+    #[test]
+    fn whitespace_env_values_are_trimmed_and_whitespace_only_is_unset() {
+        // Decision 77 (S5-L3): env_value trims ASCII whitespace; a
+        // whitespace-only value counts as unset and the config value
+        // wins.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(LLM_API_ENV_VAR, " \t ");
+        env.set(DIGEST_MODEL_ENV_VAR, " env-model ");
+        let values = LlmConfigValues {
+            llm_api: Some("openai-compatible".to_string()),
+            digest_model: Some("config-model".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoints = LlmEndpoints::resolve(&values).unwrap();
+        // Whitespace-only: unset, the config value wins.
+        assert_eq!(endpoints.digest.api, LlmApi::OpenAiCompatible);
+        // Padded: trimmed, the env value wins.
+        assert_eq!(endpoints.digest.model, "env-model");
     }
 
     #[test]
