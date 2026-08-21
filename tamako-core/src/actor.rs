@@ -53,6 +53,30 @@
 //!    records the bot message for the monologue lock.
 //! 5. Done at start (refer to step 3).
 //!
+//! The warmup trigger (specs.md Sections 8.4/8.5/9.7, decision 78) is
+//! live since Phase 2. It is evaluated ONLY on the timer tick, AFTER the
+//! wake evaluation (the tick order is Digest → Wake → Warmup); intake
+//! never evaluates it. The steps of Section 9.7: resolve the engagement
+//! watch of the previous warmup first (a reply or reaction inside
+//! `warmup_reaction_window` resets the Section 8.5 soft backoff; an
+//! expired silent watch increments it), roll the quota-day counter over
+//! on a new host-local day, then — when the persisted `warmup_next_at`
+//! is due — run the step-1 gates (muted, effective quota, group
+//! silence, an open watch, a warmup in flight; any failure consumes the
+//! slot quietly at DEBUG and reschedules), pick a topic (step 2; no
+//! eligible topic means no warmup — forced small talk is worse than
+//! silence), and fire: the slot is consumed and persisted BEFORE the
+//! generation task spawns (the Section 6.1 rule-3 analog — the FIFO
+//! never blocks on an LLM call), so a generation failure needs no
+//! reschedule (the next slot is the natural retry). The send path
+//! mirrors the wake's: the parrot filter (decisions 59/64), the
+//! outbound raw-log row FIRST (Rule B1), a plain standalone
+//! `SendText` (proactive speech never quotes a target), the Rule C1
+//! context append, and the monologue lock. The counters `warmups_total`
+//! and `warmup_engaged_total` (Section 12) are best effort. Decision 78
+//! adds ONE new curated line kind: exactly one INFO `warmup` line per
+//! sent warmup; gate skips stay DEBUG.
+//!
 //! The timer driver (M4, known gap 2): a tokio interval inside the
 //! actor task evaluates the triggers on cadence ticks (`timer_cadence`;
 //! `MissedTickBehavior::Delay` — a delayed tick loses at most cadence
@@ -92,7 +116,7 @@ use tamako_store::{
     Direction, EventType, InsertOutcome, MessageRow, NewMessage, NewReaction, ReplyTargetRow,
     Store, StoreError,
 };
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -111,6 +135,10 @@ use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeSchedule
 use crate::wake::{
     filter_reply_parrot_lines, GateDecision, GateInput, GateMessage, ParticipationGate,
     PlannedInjection, RecallProvider, ReplyGenerator, ReplyRequest, WakeServices,
+};
+use crate::warmup::{
+    effective_quota, local_date_string, pick_topic, prune_cooldowns, schedule_next, WarmupServices,
+    TAIL_EXCLUSION_ROWS, TOPIC_SAMPLE_LIMIT,
 };
 
 /// Errors of tamako-core.
@@ -132,6 +160,11 @@ pub enum CoreError {
     /// this wake; the next wake is the natural retry.
     #[error("wake error: {0}")]
     Wake(String),
+    /// A failure of the warmup generation (specs.md Section 9.7 step 3,
+    /// decision 78). Log and skip this warmup; the next scheduled slot is
+    /// the natural retry.
+    #[error("warmup error: {0}")]
+    Warmup(String),
 }
 
 /// The default inbox capacity when the caller has no preference.
@@ -267,6 +300,20 @@ pub enum ActorCommand {
         /// Its `retried` mark bounds the requeue-once rule.
         forced: Option<ForcedWakeEntry>,
     },
+    /// The spawned warmup generation task reports its result through
+    /// this command (internal plumbing, the same pattern as
+    /// `WakeCompleted`; specs.md Section 9.7 step 3, decision 78). The
+    /// slot was already consumed at fire time, so the handler never
+    /// reschedules.
+    WarmupCompleted {
+        /// The generated warmup text, or the generation failure.
+        /// Boxed: a `Result<String, CoreError>` payload must not widen
+        /// the inbox enum (clippy::large_enum_variant).
+        result: Box<std::result::Result<String, CoreError>>,
+        /// The display name of the topic sampled at fire time (the
+        /// curated warmup line and the cooldown entry name it).
+        topic: String,
+    },
     Shutdown,
 }
 
@@ -353,6 +400,12 @@ pub struct GroupActorParams<M: MemoryBackend> {
     /// EXACTLY: an unforced fire logs and resets, a forced wake logs
     /// only. `Some` runs the wake procedure of specs.md Section 9.
     pub wake: Option<WakeServices>,
+    /// The warmup-trigger services (Phase 2, decision 78). `None`
+    /// disables the trigger entirely (replay mode, or no provider key —
+    /// the same discipline as `wake: Option<WakeServices>`). `Some`
+    /// runs the warmup procedure of specs.md Section 9.7 on the timer
+    /// tick.
+    pub warmup: Option<WarmupServices>,
     /// The Rule C3 chunk summarizer (segmented summarization, keep-two
     /// retention). `None` keeps the old C3 behavior EXACTLY: the removed
     /// chunk drops without a summary. The tamako binary wires the live
@@ -869,12 +922,32 @@ async fn run_actor<M: MemoryBackend>(
         digest,
         post_digest_hook,
         wake: wake_services,
+        warmup: warmup_services,
         summary_provider,
         outbound,
         bot_name,
         ..
     } = params;
     let bot_name = bot_name.unwrap_or_else(|| "Tamako".to_string());
+
+    // Decision 78 (specs.md Section 8.4): the host-local offset of the
+    // warmup active-hours window and the quota-day boundary, resolved
+    // ONCE at startup. The process never setenvs at runtime, so the
+    // offset cannot change under the actor (the `local-offset`
+    // soundness note of the time crate); tests pass explicit times and
+    // use TZ-proof configs. A resolution failure is a startup-class
+    // operator anomaly: one WARN naming the chat, then UTC.
+    let local_offset = match UtcOffset::current_local_offset() {
+        Ok(offset) => offset,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = %chat_id,
+                %error,
+                "the host-local UTC offset is unavailable; the warmup active-hours window falls back to UTC"
+            );
+            UtcOffset::UTC
+        }
+    };
 
     // --- Startup (see the docstring of spawn_group_actor) ---
     let startup_chat_id = chat_id.clone();
@@ -977,6 +1050,11 @@ async fn run_actor<M: MemoryBackend>(
     // requeue-once mark of decision 65.
     let mut wake_in_flight = false;
     let mut forced_pending: Option<ForcedWakeEntry> = None;
+    // One warmup generation at a time per group (decision 78, the
+    // Section 6.1 rule-3 analog): the flag lives in memory next to
+    // `wake_in_flight`; the spawned task's `WarmupCompleted` report
+    // ALWAYS resets it.
+    let mut warmup_in_flight = false;
 
     // --- The M4 timer driver (known gap 2) ---
     // `MissedTickBehavior::Delay`: a delayed tick loses at most cadence
@@ -1123,14 +1201,18 @@ async fn run_actor<M: MemoryBackend>(
                     &mut session,
                     &mut wake,
                     &mut rng,
+                    &memory,
                     &context,
                     digest.as_ref(),
                     &mut digest_in_flight,
                     summary_pending,
                     wake_services.as_ref(),
                     &mut wake_in_flight,
+                    warmup_services.as_ref(),
+                    &mut warmup_in_flight,
                     &inbox_sender,
                     now,
+                    local_offset,
                 )
                 .await?;
             }
@@ -1229,6 +1311,35 @@ async fn run_actor<M: MemoryBackend>(
                             Some(entry),
                             forced_at,
                             "forced",
+                        )
+                        .await?;
+                    }
+                }
+            }
+            ActorCommand::WarmupCompleted { result, topic } => {
+                // The flag resets ALWAYS (the H4a containment guarantee:
+                // every spawned task reports back, even a panicking
+                // one).
+                warmup_in_flight = false;
+                match *result {
+                    Err(error) => {
+                        // The slot was consumed at fire time, so there is
+                        // nothing to reschedule: the next slot is the
+                        // natural retry. Nothing sent, nothing persisted.
+                        tracing::error!(chat_id = %chat_id, %error, "warmup generation failed; the slot is consumed — the next slot is the natural retry");
+                    }
+                    Ok(raw_text) => {
+                        handle_warmup_report(
+                            &store,
+                            &chat_id,
+                            &config,
+                            &mut session,
+                            &mut context,
+                            outbound.as_ref(),
+                            &bot_name,
+                            raw_text,
+                            &topic,
+                            local_offset,
                         )
                         .await?;
                     }
@@ -1827,25 +1938,31 @@ async fn handle_message(
 
 /// The shared tick handling of the explicit `ActorCommand::Tick` and the
 /// M4 timer driver, so the two paths cannot diverge. specs.md Section
-/// 6.2: Digest runs BEFORE Wake. A tick never forces a wake (forcing
-/// needs a mention/reply, Section 8.1), so there is no `forced_pending`
+/// 6.2: Digest runs BEFORE Wake. Decision 78: the warmup trigger
+/// (specs.md Section 9.7) evaluates LAST, so the tick order is Digest →
+/// Wake → Warmup. A tick never forces a wake (forcing needs a
+/// mention/reply, Section 8.1), so there is no `forced_pending`
 /// parameter here.
 #[allow(clippy::too_many_arguments)]
-async fn handle_tick(
+async fn handle_tick<M: MemoryBackend>(
     store: &Arc<Store>,
     chat_id: &str,
     config: &TriggerConfig,
     session: &mut SessionState,
     wake: &mut WakeScheduler,
     rng: &mut StdRng,
+    memory: &Arc<M>,
     context: &LiveContext,
     digest: Option<&Arc<dyn DigestPipeline>>,
     digest_in_flight: &mut bool,
     summary_pending: bool,
     wake_services: Option<&WakeServices>,
     wake_in_flight: &mut bool,
+    warmup_services: Option<&WarmupServices>,
+    warmup_in_flight: &mut bool,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     now: OffsetDateTime,
+    local_offset: UtcOffset,
 ) -> Result<(), CoreError> {
     maybe_launch_digest(
         store,
@@ -1859,7 +1976,44 @@ async fn handle_tick(
         now,
     )
     .await?;
-    let Some(services) = wake_services else {
+    // Decision 78: NO early return on the disabled-wake path — the
+    // warmup evaluation below runs on every tick regardless of the
+    // wake wiring (the triggers are independent).
+    if let Some(services) = wake_services {
+        if let Some(reason) = wake.fire_reason(now, config) {
+            if *wake_in_flight {
+                // Same rule as the intake path: the counts already go toward
+                // the next wake (reset-at-start), so this fire is a no-op;
+                // the curated line reports the skip.
+                log_wake_line(
+                    chat_id,
+                    reason.as_str(),
+                    0,
+                    "in_flight_skipped",
+                    None,
+                    "nothing",
+                    None,
+                );
+            } else {
+                start_wake(
+                    store,
+                    chat_id,
+                    config,
+                    session,
+                    wake,
+                    rng,
+                    context,
+                    services,
+                    wake_in_flight,
+                    inbox_sender,
+                    None,
+                    now,
+                    reason.as_str(),
+                )
+                .await?;
+            }
+        }
+    } else {
         // The wake services are disabled (no LLM key wired); the
         // behavior matches the intake path exactly, marker advance
         // included (decision 65).
@@ -1869,41 +2023,484 @@ async fn handle_tick(
             reset_wake(config, session, wake, rng, now);
             persist_session(store, chat_id, session).await?;
         }
+    }
+    // Decision 78: the warmup trigger evaluates LAST (Digest → Wake →
+    // Warmup) and ONLY here — intake never evaluates it.
+    handle_warmup_tick(
+        store,
+        chat_id,
+        config,
+        session,
+        memory,
+        rng,
+        context,
+        warmup_services,
+        warmup_in_flight,
+        inbox_sender,
+        now,
+        local_offset,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The Section 9.7 step-1 failure path (decision 78): CONSUME the due
+/// slot — `warmup_next_at` reschedules from the spent slot (`prev =
+/// Some(due)`, so the Section 8.5 backoff spacing applies), never a
+/// same-slot retry — and persist. The caller logs the one DEBUG line
+/// naming the failed gate first. A `None` schedule (an effective quota
+/// of 0, or the pathological-multiplier bound) is retried on a later
+/// tick, costing nothing.
+#[allow(clippy::too_many_arguments)]
+async fn consume_warmup_slot(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &mut SessionState,
+    rng: &mut StdRng,
+    due: OffsetDateTime,
+    now: OffsetDateTime,
+    local_offset: UtcOffset,
+) -> Result<(), CoreError> {
+    session.warmup_next_at = schedule_next(
+        config,
+        session.warmup_backoff_factor,
+        Some(due),
+        now,
+        local_offset,
+        rng,
+    );
+    persist_session(store, chat_id, session).await
+}
+
+/// The warmup trigger of specs.md Section 9.7 (decision 78), evaluated
+/// on the actor's timer tick ONLY, after the wake evaluation. Runs
+/// inside the actor loop; only the LLM call leaves it (a spawned task
+/// reports `WarmupCompleted` back through the FIFO inbox).
+#[allow(clippy::too_many_arguments)]
+async fn handle_warmup_tick<M: MemoryBackend>(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &mut SessionState,
+    memory: &Arc<M>,
+    rng: &mut StdRng,
+    context: &LiveContext,
+    services: Option<&WarmupServices>,
+    warmup_in_flight: &mut bool,
+    inbox_sender: &mpsc::Sender<ActorCommand>,
+    now: OffsetDateTime,
+    local_offset: UtcOffset,
+) -> Result<(), CoreError> {
+    // Unwired services (replay mode, or no provider key) disable the
+    // trigger entirely; the startup WARN of the binary covers the
+    // unwired state, so this stays silent. The `warmup` master switch
+    // (Section 8.4) is silent too. Neither path consumes or touches
+    // state.
+    let Some(services) = services else {
         return Ok(());
     };
-    if let Some(reason) = wake.fire_reason(now, config) {
-        if *wake_in_flight {
-            // Same rule as the intake path: the counts already go toward
-            // the next wake (reset-at-start), so this fire is a no-op;
-            // the curated line reports the skip.
-            log_wake_line(
-                chat_id,
-                reason.as_str(),
-                0,
-                "in_flight_skipped",
-                None,
-                "nothing",
-                None,
-            );
-        } else {
-            start_wake(
+    if !config.warmup {
+        return Ok(());
+    }
+
+    // The engagement watch of the previous warmup resolves FIRST
+    // (Section 8.5, decision 78 (d)): at window expiry, engagement
+    // resets the soft backoff and silence increments it. A missing
+    // expiry self-heals as expired.
+    if session.warmup_watch_pending {
+        let expires = session.warmup_watch_expires_at.unwrap_or(now);
+        if now >= expires {
+            resolve_warmup_watch(store, chat_id, session, expires).await?;
+        }
+    }
+
+    // The quota-day rollover (decision 78 (b)): the counter belongs to
+    // one host-local day. Persists only when the day changed.
+    let today = local_date_string(now, local_offset);
+    if session.warmup_quota_day.as_deref() != Some(today.as_str()) {
+        session.warmup_quota_day = Some(today.clone());
+        session.warmup_quota_used_today = 0;
+        persist_session(store, chat_id, session).await?;
+    }
+
+    // Scheduling (Section 8.4, Rule P1): a fresh group draws its first
+    // slot once and persists it; a restart never reshuffles. The fresh
+    // slot is in the future by construction, so this tick is done
+    // either way; an effective-quota-0 `None` is retried on a later
+    // tick, costing nothing.
+    if session.warmup_next_at.is_none() {
+        session.warmup_next_at = schedule_next(
+            config,
+            session.warmup_backoff_factor,
+            None,
+            now,
+            local_offset,
+            rng,
+        );
+        if session.warmup_next_at.is_some() {
+            persist_session(store, chat_id, session).await?;
+        }
+        return Ok(());
+    }
+    let due = session
+        .warmup_next_at
+        .expect("the scheduling branch above guarantees Some");
+    // Not due: the normal state — NO log.
+    if due > now {
+        return Ok(());
+    }
+
+    // The Section 9.7 step-1 gates, in order. On ANY failure: one DEBUG
+    // line naming the failed gate, then consume the slot and return.
+    if session.muted {
+        debug!(chat_id = %chat_id, gate = "muted", "warmup slot skipped; the slot is consumed and the next slot is scheduled");
+        return consume_warmup_slot(store, chat_id, config, session, rng, due, now, local_offset)
+            .await;
+    }
+    if session.warmup_quota_used_today
+        >= effective_quota(config.warmup_quota, session.warmup_backoff_factor)
+    {
+        debug!(chat_id = %chat_id, gate = "quota", "warmup slot skipped; the slot is consumed and the next slot is scheduled");
+        return consume_warmup_slot(store, chat_id, config, session, rng, due, now, local_offset)
+            .await;
+    }
+    // The silence gate (Section 8.4): the newest raw-log row of ANY
+    // direction must be at least `warmup_silence` old — the bot's own
+    // speech also breaks group silence. An EMPTY log passes the gate:
+    // the topic pick below suppresses a topicless group anyway.
+    let tail_chat_id = chat_id.to_string();
+    let newest = blocking_store(store, move |store| {
+        store.list_latest_messages(&tail_chat_id, 1)
+    })
+    .await?;
+    let silence = time::Duration::try_from(config.warmup_silence).unwrap_or(time::Duration::MAX);
+    let silent = match newest.last() {
+        Some(row) => now - row.timestamp >= silence,
+        None => true,
+    };
+    if !silent {
+        debug!(chat_id = %chat_id, gate = "silence", "warmup slot skipped; the slot is consumed and the next slot is scheduled");
+        return consume_warmup_slot(store, chat_id, config, session, rng, due, now, local_offset)
+            .await;
+    }
+    if session.warmup_watch_pending {
+        // A warmup is already out (the watch has not expired yet).
+        debug!(chat_id = %chat_id, gate = "watch", "warmup slot skipped; the slot is consumed and the next slot is scheduled");
+        return consume_warmup_slot(store, chat_id, config, session, rng, due, now, local_offset)
+            .await;
+    }
+    if *warmup_in_flight {
+        debug!(chat_id = %chat_id, gate = "in_flight", "warmup slot skipped; the slot is consumed and the next slot is scheduled");
+        return consume_warmup_slot(store, chat_id, config, session, rng, due, now, local_offset)
+            .await;
+    }
+
+    // Step 2: the topic pick. A sampling failure is one ERROR, never
+    // propagated — the actor must not die over a warmup.
+    let candidates = match memory
+        .sample_interest_topics(chat_id, TOPIC_SAMPLE_LIMIT)
+        .await
+    {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::error!(chat_id = %chat_id, %error, "warmup topic sampling failed; the slot is consumed — the next slot is the natural retry");
+            return consume_warmup_slot(
                 store,
                 chat_id,
                 config,
                 session,
-                wake,
                 rng,
-                context,
-                services,
-                wake_in_flight,
-                inbox_sender,
-                None,
+                due,
                 now,
-                reason.as_str(),
+                local_offset,
             )
-            .await?;
+            .await;
         }
+    };
+    let tail_chat_id = chat_id.to_string();
+    let tail = blocking_store(store, move |store| {
+        store.list_latest_messages(&tail_chat_id, TAIL_EXCLUSION_ROWS)
+    })
+    .await?;
+    let tail_texts: Vec<String> = tail.into_iter().map(|row| row.text).collect();
+    prune_cooldowns(
+        &mut session.warmup_topic_cooldowns,
+        &today,
+        config.warmup_topic_cooldown_days,
+    );
+    let Some(topic) = pick_topic(
+        &candidates,
+        &session.warmup_topic_cooldowns,
+        &tail_texts,
+        &today,
+        config.warmup_topic_cooldown_days,
+        now,
+        rng,
+    ) else {
+        // Section 9.7 step 2: no eligible topic means no warmup —
+        // forced small talk is worse than silence.
+        debug!(chat_id = %chat_id, "warmup slot skipped: no eligible topic; the slot is consumed and the next slot is scheduled");
+        return consume_warmup_slot(store, chat_id, config, session, rng, due, now, local_offset)
+            .await;
+    };
+
+    // FIRE. FIRST consume the slot and persist (this also persists the
+    // pruned cooldowns and the rolled-over quota day): a generation
+    // failure below then needs no reschedule — the slot is spent and
+    // the next slot is the natural retry. Then the generation runs in a
+    // spawned task (the Section 6.1 rule-3 analog): the FIFO never
+    // blocks on an LLM call. The task gets a SNAPSHOT of the live
+    // context taken NOW; it touches NO actor state.
+    session.warmup_next_at = schedule_next(
+        config,
+        session.warmup_backoff_factor,
+        Some(due),
+        now,
+        local_offset,
+        rng,
+    );
+    persist_session(store, chat_id, session).await?;
+    let request = crate::warmup::WarmupRequest {
+        messages: context.messages_for_llm(),
+        topic: topic.name.clone(),
+    };
+    *warmup_in_flight = true;
+    let generator = Arc::clone(&services.generator);
+    let topic_name = topic.name;
+    let sender = inbox_sender.clone();
+    tokio::spawn(async move {
+        // H4a panic containment (the wake-task pattern): a panicking
+        // generator reports a synthetic `CoreError::Warmup` failure, so
+        // the completion handler runs and `warmup_in_flight` ALWAYS
+        // resets.
+        let result = contain_task_panic(async move { generator.generate_warmup(&request).await })
+            .await
+            .unwrap_or_else(|message| Err(CoreError::Warmup(message)));
+        // A failed send means the actor is shutting down; the result is
+        // dropped (same rule as the wake task).
+        let _ = sender
+            .send(ActorCommand::WarmupCompleted {
+                result: Box::new(result),
+                topic: topic_name,
+            })
+            .await;
+    });
+    Ok(())
+}
+
+/// Resolves the engagement watch of the last sent warmup at window
+/// expiry (specs.md Section 8.5, decision 78 (d)). Engagement resets the
+/// soft backoff to zero; silence increments it (saturating). One DEBUG
+/// line carries the verdict and the channel (`reply` / `reaction` /
+/// `none`; when both a reply and a reaction qualify, `reply` wins). The
+/// watch then closes — the row id, sent, and expiry timestamps stay
+/// persisted for forensics — and the session persists.
+async fn resolve_warmup_watch(
+    store: &Arc<Store>,
+    chat_id: &str,
+    session: &mut SessionState,
+    expires: OffsetDateTime,
+) -> Result<(), CoreError> {
+    // Engaged-by-reply: any INBOUND row above the watched warmup row
+    // (id > watch row implies it arrived after the warmup row) whose
+    // timestamp is at or before the expiry — the timestamp bound keeps
+    // the window honest when the cadence evaluates late.
+    let watch_row_id = session.warmup_watch_row_id.unwrap_or(0);
+    let replies_chat_id = chat_id.to_string();
+    let rows = blocking_store(store, move |store| {
+        store.list_messages_after(&replies_chat_id, watch_row_id)
+    })
+    .await?;
+    let engaged_by_reply = rows
+        .iter()
+        .any(|row| row.direction == Direction::Inbound && row.timestamp <= expires);
+
+    // Engaged-by-reaction: a bounded recent window of reaction rows
+    // whose timestamp lies in (sent_at, expires]. A candidate counts IFF
+    // its platform_msg_id is ABSENT from the messages table — the
+    // documented approximation of Section 8.5 "a reaction arrives within
+    // the window": outbound rows carry synthetic `bot-out:{nanos}` ids
+    // and the adapter returns no real sent id (Rule A3), so a reaction
+    // to an UNLOGGED message inside the window is treated as a reaction
+    // to the warmup, while a reaction to a LOGGED human message never
+    // counts. Reactions reach administrator groups only (Section 4.2).
+    // A missing `sent_at` yields an empty candidate window (only
+    // replies can engage); the state self-heals at the next fire.
+    let sent_at = session.warmup_watch_sent_at.unwrap_or(expires);
+    let reactions_chat_id = chat_id.to_string();
+    let reactions = blocking_store(store, move |store| {
+        store.list_latest_reactions(&reactions_chat_id, 100)
+    })
+    .await?;
+    let candidates: HashSet<String> = reactions
+        .iter()
+        .filter(|reaction| sent_at < reaction.timestamp && reaction.timestamp <= expires)
+        .map(|reaction| reaction.platform_msg_id.clone())
+        .collect();
+    let mut engaged_by_reaction = false;
+    if !candidates.is_empty() {
+        // The distinct target ids resolve in ONE blocking pass (the
+        // `resolve_reply_targets` pattern).
+        let lookup = candidates.clone();
+        let lookup_chat_id = chat_id.to_string();
+        let logged: HashSet<String> = blocking_store(store, move |store| {
+            let mut logged = HashSet::new();
+            for pid in &lookup {
+                if store
+                    .find_latest_message_by_platform_msg_id(&lookup_chat_id, pid)?
+                    .is_some()
+                {
+                    logged.insert(pid.clone());
+                }
+            }
+            Ok(logged)
+        })
+        .await?;
+        engaged_by_reaction = candidates.iter().any(|pid| !logged.contains(pid));
     }
+
+    let channel = if engaged_by_reply {
+        "reply"
+    } else if engaged_by_reaction {
+        "reaction"
+    } else {
+        "none"
+    };
+    let engaged = engaged_by_reply || engaged_by_reaction;
+    if engaged {
+        bump_counter(store, chat_id, "warmup_engaged_total").await;
+        session.warmup_backoff_factor = 0;
+    } else {
+        session.warmup_backoff_factor = session.warmup_backoff_factor.saturating_add(1);
+    }
+    debug!(chat_id = %chat_id, channel, engaged, "warmup engagement watch resolved");
+    session.warmup_watch_pending = false;
+    persist_session(store, chat_id, session).await
+}
+
+/// The completion side of the warmup trigger (specs.md Section 9.7
+/// steps 3-5, decision 78). Runs inside the actor loop on
+/// `WarmupCompleted(Ok(..))`. The send path mirrors the wake's: the
+/// parrot filter, the outbound raw-log row FIRST (Rule B1), a plain
+/// standalone send, the Rule C1 context append, the monologue lock —
+/// then the quota/cooldown/watch session state and the ONE curated
+/// INFO line of decision 78.
+#[allow(clippy::too_many_arguments)]
+async fn handle_warmup_report(
+    store: &Arc<Store>,
+    chat_id: &str,
+    config: &TriggerConfig,
+    session: &mut SessionState,
+    context: &mut LiveContext,
+    outbound: Option<&mpsc::Sender<OutboundAction>>,
+    bot_name: &str,
+    raw_text: String,
+    topic: &str,
+    local_offset: UtcOffset,
+) -> Result<(), CoreError> {
+    // The parrot filter (Section 9.7 step 3): decisions 59/64 apply to
+    // the warmup text like every reply.
+    let filtered = filter_reply_parrot_lines(&raw_text);
+    if filtered.stripped_parrot {
+        tracing::warn!(chat_id = %chat_id, "the warmup text parrots context structure: the parrot filter stripped the imitated lines");
+    }
+    if filtered.text.is_empty() {
+        // The wake empty-reply analog: nothing persisted, nothing sent.
+        tracing::error!(chat_id = %chat_id, topic = %topic, "the warmup text is empty after the parrot filter; nothing is sent");
+        return Ok(());
+    }
+    let text = filtered.text;
+
+    // Rule B1 FIRST (the wake send path's exact pattern): the outbound
+    // raw-log row persists BEFORE the send — the log is the source of
+    // truth; never speak without logging. The synthetic id: the adapter
+    // contract (Rule A3) returns no platform id for a sent message, so
+    // the row carries a local synthetic id; nanosecond time keeps the
+    // idempotency key unique.
+    let now_utc = OffsetDateTime::now_utc();
+    let row = NewMessage {
+        platform_msg_id: format!("bot-out:{}", now_utc.unix_timestamp_nanos()),
+        direction: Direction::Outbound,
+        event_type: EventType::Message,
+        timestamp: now_utc,
+        sender_id: "bot".to_string(),
+        sender_display_name: bot_name.to_string(),
+        sender_username: None,
+        text: text.clone(),
+        // Section 9.7 step 4: proactive speech never quotes a target.
+        reply_to_platform_msg_id: None,
+        mentions_bot: false,
+        is_reply_to_bot: false,
+    };
+    let insert_chat_id = chat_id.to_string();
+    let outcome = blocking_store(store, move |store| {
+        store.insert_message(&insert_chat_id, &row)
+    })
+    .await;
+    let row_id = match outcome {
+        Ok(InsertOutcome::Inserted(row_id)) => row_id,
+        // An insert failure (or an impossible duplicate of the synthetic
+        // id) aborts this warmup's send path with an error log. The
+        // error is NOT propagated: the actor must not die over one
+        // warmup.
+        Ok(InsertOutcome::Duplicate) => {
+            tracing::error!(chat_id = %chat_id, "outbound raw-log insert returned Duplicate; the warmup is not sent");
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::error!(chat_id = %chat_id, %error, "failed to persist the outbound raw-log row; the warmup is not sent");
+            return Ok(());
+        }
+    };
+    // The outbound action (Section 4.2: outbound failures are
+    // tolerated). `try_send`: the actor never blocks on the sink; a
+    // full or closed channel degrades to a logged drop — the raw-log
+    // row above is already the source of truth. A PLAIN standalone
+    // message: a warmup has no target to quote.
+    let action = OutboundAction::SendText {
+        chat_id: chat_id.to_string(),
+        text: text.clone(),
+        reply_to_platform_msg_id: None,
+    };
+    match outbound {
+        Some(sink) => {
+            if let Err(error) = sink.try_send(action) {
+                tracing::error!(chat_id = %chat_id, %error, "outbound action dropped (channel full or closed); the raw-log row is persisted");
+            }
+        }
+        None => debug!(chat_id = %chat_id, "outbound action dropped: no outbound sink wired"),
+    }
+    // Rule C1: the live context gets the same item. The Section 8.5
+    // monologue lock covers warmup speech. The counter is best effort
+    // (Section 12).
+    context.append_bot_speech(row_id, now_utc, &text);
+    session.record_bot_message(config);
+    bump_counter(store, chat_id, "warmups_total").await;
+
+    // The Section 9.7 step-5 session state. The quota counts on the
+    // COMPLETION-time host-local day (a midnight straddle between fire
+    // and completion counts on the completion day — immaterial). The
+    // cooldown entry keys on the NORMALIZED topic name (the pick's
+    // exclusion key). The engagement watch opens for
+    // `warmup_reaction_window` (Section 8.5).
+    session.warmup_quota_used_today = session.warmup_quota_used_today.saturating_add(1);
+    let today = local_date_string(now_utc, local_offset);
+    session.warmup_quota_day = Some(today.clone());
+    session
+        .warmup_topic_cooldowns
+        .insert(tamako_memory::identifiers::normalize(topic), today);
+    session.warmup_watch_row_id = Some(row_id);
+    session.warmup_watch_sent_at = Some(now_utc);
+    session.warmup_watch_expires_at = Some(now_utc + config.warmup_reaction_window);
+    session.warmup_watch_pending = true;
+    persist_session(store, chat_id, session).await?;
+
+    // The curated line (decision 53 discipline; decision 78 adds this
+    // ONE new curated line kind): exactly one INFO `warmup` line per
+    // sent warmup. Gate skips stay DEBUG; there are no other INFO-level
+    // warmup lines.
+    info!(chat_id = %chat_id, topic = %topic, action = "sent", "warmup");
     Ok(())
 }
 
@@ -2454,22 +3051,28 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use tamako_memory::MemoryBatch;
+    use tamako_memory::{MemoryBatch, TopicCandidate};
     use tempfile::TempDir;
 
+    use crate::config::ActiveHours;
     use crate::context::{render_bot_content, ContextItemKind, ContextRole, RangeTag};
     use crate::summary::ScriptedSummary;
+    use crate::warmup::{WarmupGenerator, WarmupRequest};
 
     /// A memory backend double. All calls succeed; `ensure_schema` records
-    /// the chat_id values it receives.
+    /// the chat_id values it receives. `topics` backs the decision-78
+    /// `sample_interest_topics` override of the warmup tests (the trait
+    /// default returns empty; this double returns the scripted set).
     struct NoopMemory {
         ensured: Mutex<Vec<String>>,
+        topics: Mutex<Vec<TopicCandidate>>,
     }
 
     impl NoopMemory {
         fn new() -> Self {
             Self {
                 ensured: Mutex::new(Vec::new()),
+                topics: Mutex::new(Vec::new()),
             }
         }
 
@@ -2478,6 +3081,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
+        }
+
+        /// Scripts the warmup topic sampling (decision 78).
+        fn set_topics(&self, topics: Vec<TopicCandidate>) {
+            *self
+                .topics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = topics;
         }
     }
 
@@ -2522,6 +3133,18 @@ mod tests {
 
         async fn close(&self, _chat_id: &str) -> tamako_memory::Result<()> {
             Ok(())
+        }
+
+        async fn sample_interest_topics(
+            &self,
+            _chat_id: &str,
+            _limit: u32,
+        ) -> tamako_memory::Result<Vec<TopicCandidate>> {
+            Ok(self
+                .topics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone())
         }
     }
 
@@ -2642,6 +3265,7 @@ mod tests {
             digest: Some(digest),
             post_digest_hook: None,
             wake: None,
+            warmup: None,
             summary_provider: None,
             outbound: None,
             bot_name: None,
@@ -2699,6 +3323,20 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
                 .any(|event| event.contains(needle))
+        }
+
+        /// Counts the captured events containing EVERY needle (the
+        /// one-curated-line assertions match on the field set: the
+        /// event message renders FIRST and unquoted, and `%`-fields
+        /// render unquoted, so the curated warmup line matches
+        /// `["message=warmup ", "action=\"sent\"", "topic=Tea"]`).
+        fn count_matching(&self, needles: &[&str]) -> usize {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|event| needles.iter().all(|needle| event.contains(needle)))
+                .count()
         }
     }
 
@@ -2857,6 +3495,7 @@ mod tests {
             digest: None,
             post_digest_hook: None,
             wake: None,
+            warmup: None,
             summary_provider: None,
             outbound: None,
             bot_name: None,
@@ -2880,6 +3519,7 @@ mod tests {
             digest: Some(digest),
             post_digest_hook: None,
             wake: None,
+            warmup: None,
             summary_provider: None,
             outbound: None,
             bot_name: None,
@@ -3010,6 +3650,7 @@ mod tests {
             digest: None,
             post_digest_hook: None,
             wake: None,
+            warmup: None,
             summary_provider: None,
             outbound: None,
             bot_name: None,
@@ -3638,6 +4279,7 @@ mod tests {
             digest: Some(digest),
             post_digest_hook: None,
             wake: None,
+            warmup: None,
             summary_provider: Some(summary),
             outbound: None,
             bot_name: None,
@@ -5066,6 +5708,7 @@ mod tests {
             digest: None,
             post_digest_hook: None,
             wake: Some(services),
+            warmup: None,
             summary_provider: None,
             outbound: Some(outbound_tx),
             bot_name: None,
@@ -5100,6 +5743,7 @@ mod tests {
                 gate,
                 reply,
             }),
+            warmup: None,
             summary_provider: None,
             outbound: Some(outbound_tx),
             bot_name: None,
@@ -5528,6 +6172,7 @@ mod tests {
                 gate: gate.clone(),
                 reply: reply.clone(),
             }),
+            warmup: None,
             summary_provider: None,
             outbound: Some(outbound_tx),
             bot_name: None,
@@ -6687,6 +7332,1009 @@ mod tests {
             .await
             .expect("context snapshot succeeds");
         assert_eq!(items[2].content, requests[0].target.content);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- Warmup-trigger tests (specs.md Section 9.7, decision 78) ---
+
+    /// A scripted warmup generator (the `ScriptedReply` shape): a FIFO
+    /// reply queue (the last queued reply repeats), every request
+    /// recorded, and a failing mode. Arc-shareable across actor
+    /// restarts — the P1 test respawns on the same doubles.
+    struct ScriptedWarmup {
+        replies: Mutex<std::collections::VecDeque<String>>,
+        failure: Option<String>,
+        calls: Mutex<usize>,
+        requests: Mutex<Vec<WarmupRequest>>,
+    }
+
+    impl ScriptedWarmup {
+        fn new(text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(std::collections::VecDeque::from([text.to_string()])),
+                failure: None,
+                calls: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Every call fails with a warmup error (the generation-failure
+        /// path: the slot is consumed, the actor lives).
+        fn failing(message: &str) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(std::collections::VecDeque::new()),
+                failure: Some(message.to_string()),
+                calls: Mutex::new(0),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn requests(&self) -> Vec<WarmupRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl WarmupGenerator for ScriptedWarmup {
+        fn generate_warmup<'a>(
+            &'a self,
+            request: &'a WarmupRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            let reply = {
+                let mut replies = self
+                    .replies
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if replies.len() > 1 {
+                    replies.pop_front().expect("len > 1 has a front")
+                } else {
+                    replies.front().cloned().unwrap_or_default()
+                }
+            };
+            let failure = self.failure.clone();
+            Box::pin(async move {
+                match failure {
+                    Some(message) => Err(CoreError::Warmup(message)),
+                    None => Ok(reply),
+                }
+            })
+        }
+    }
+
+    /// The trigger config of the warmup tests (decision 78), TZ-PROOF:
+    /// the active-hours window "00:00-23:59" schedules inside any
+    /// host-local day regardless of the dev/CI machine's offset, so a
+    /// scheduling tick always produces a slot. Tests that need a
+    /// specific due time SEED `warmup_next_at` directly (see
+    /// `seed_state`); the host offset never appears in an assertion.
+    fn warmup_config() -> TriggerConfig {
+        TriggerConfig {
+            warmup: true,
+            warmup_quota: 1,
+            warmup_active_hours: ActiveHours::parse("00:00-23:59").expect("the test window parses"),
+            ..TriggerConfig::default()
+        }
+    }
+
+    /// Spawns an actor with the warmup services wired over a scripted
+    /// generator (the `spawn_with_wake` pattern). Returns the outbound
+    /// receiver.
+    fn spawn_with_warmup(
+        fixture: &Fixture,
+        config: TriggerConfig,
+        generator: Arc<ScriptedWarmup>,
+    ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(64);
+        let handle = spawn_group_actor(GroupActorParams {
+            chat_id: CHAT_ID.to_string(),
+            store: Arc::clone(&fixture.store),
+            memory: Arc::clone(&fixture.memory),
+            config,
+            started_at: t0(),
+            inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            preamble: TEST_PREAMBLE.to_string(),
+            digest: None,
+            post_digest_hook: None,
+            wake: None,
+            warmup: Some(WarmupServices { generator }),
+            summary_provider: None,
+            outbound: Some(outbound_tx),
+            bot_name: None,
+        });
+        (handle, outbound_rx)
+    }
+
+    /// Writes state-table rows directly BEFORE the actor spawns (the
+    /// `set_state_directly` pattern, batched): the actor decodes the
+    /// persisted state at startup, so a test SEEDS the warmup schedule
+    /// (`warmup_next_at`, backoff, cooldowns, …) instead of reaching
+    /// into a live actor.
+    async fn seed_state(fixture: &Fixture, pairs: &[(&str, String)]) {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect();
+        blocking_store_call(&fixture.store, move |store| {
+            store.open_group(CHAT_ID)?;
+            store.set_state_many(CHAT_ID, &pairs)
+        })
+        .await;
+    }
+
+    /// The RFC 3339 encoding of a seeded instant (the session encoding
+    /// of `warmup_next_at` and the watch timestamps).
+    fn rfc3339(at: OffsetDateTime) -> String {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .expect("a test timestamp formats")
+    }
+
+    /// Seeds a DUE `warmup_next_at` slot.
+    async fn seed_warmup_due(fixture: &Fixture, due: OffsetDateTime) {
+        seed_state(fixture, &[("warmup_next_at", rfc3339(due))]).await;
+    }
+
+    /// A scripted warmup topic. `last_activity_at: None` decays as the
+    /// documented 30-day default (warmup.rs `STALE_TOPIC_DAYS`), so the
+    /// weight is a positive CONSTANT at every tick time these tests use
+    /// — t0-based and far-future ticks alike.
+    fn topic(name: &str) -> TopicCandidate {
+        TopicCandidate {
+            node_id: format!("id-{name}"),
+            name: name.to_string(),
+            edge_count: 10,
+            last_activity_at: None,
+        }
+    }
+
+    /// A human message with an explicit timestamp and text (the
+    /// engagement-watch and tail-exclusion tests place rows relative
+    /// to the REAL send time of the warmup, which
+    /// `OffsetDateTime::now_utc()` owns).
+    fn message_at(id: &str, at: OffsetDateTime, text: &str) -> NormalizedMessage {
+        NormalizedMessage {
+            platform_msg_id: id.to_string(),
+            timestamp: at,
+            sender_id: "u1".to_string(),
+            sender_display_name: "Alice".to_string(),
+            username: None,
+            text: text.to_string(),
+            reply_to_platform_msg_id: None,
+            mentions_bot: false,
+            is_reply_to_bot: false,
+        }
+    }
+
+    /// A named reaction event with an explicit timestamp (the
+    /// engagement-watch window is wall-clock).
+    fn reaction_at(platform_msg_id: &str, at: OffsetDateTime) -> ReactionEvent {
+        ReactionEvent {
+            platform_msg_id: platform_msg_id.to_string(),
+            timestamp: at,
+            reactor_id: Some("u1".to_string()),
+            anonymous: false,
+            aggregated: false,
+            old_emojis: vec![],
+            new_emojis: vec!["👍".to_string()],
+        }
+    }
+
+    /// Polls until the warmup double records `want` calls (bounded; the
+    /// `wait_for_reply_calls` pattern).
+    async fn wait_for_warmup_calls(generator: &ScriptedWarmup, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if generator.call_count() >= want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {want} warmup calls"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Fires one warmup over the scripted topic: seed a due slot, tick
+    /// at it, wait for the generation and the send path. Returns the
+    /// handle and the outbound receiver. The snapshot after
+    /// `warmups_total` proves the completion handler ran (the counter
+    /// bumps inside it).
+    async fn fire_one_warmup(
+        fixture: &Fixture,
+        config: TriggerConfig,
+        generator: Arc<ScriptedWarmup>,
+        due: OffsetDateTime,
+    ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
+        seed_warmup_due(fixture, due).await;
+        let (handle, outbound) = spawn_with_warmup(fixture, config, generator);
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        wait_for_counter(&fixture.store, "warmups_total", 1).await;
+        (handle, outbound)
+    }
+
+    #[tokio::test]
+    async fn p1_restart_keeps_the_persisted_schedule_and_fires_exactly_once() {
+        // Rule P1 (specs.md Section 8.4): the scheduled `warmup_next_at`
+        // persists; a restart never reshuffles it.
+        let fixture = make_fixture();
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let config = warmup_config();
+        let (handle, _outbound) =
+            spawn_with_warmup(&fixture, config.clone(), Arc::clone(&generator));
+
+        // Tick inside active hours ("00:00-23:59" is TZ-proof): the
+        // first slot is scheduled and persisted.
+        let t1 = t0() + time::Duration::hours(1);
+        handle
+            .send(ActorCommand::Tick(t1))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        let next_at = session.warmup_next_at.expect("the first slot is scheduled");
+        assert!(next_at >= t1, "the slot lies at or after the tick");
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // The restart on the SAME store with the SAME scripted doubles:
+        // the persisted schedule comes back byte-identically (no
+        // reshuffle).
+        let (restarted, mut outbound) =
+            spawn_with_warmup(&fixture, config.clone(), Arc::clone(&generator));
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.warmup_next_at, Some(next_at), "no reshuffle");
+
+        // A tick at exactly the persisted slot fires exactly once.
+        restarted
+            .send(ActorCommand::Tick(next_at))
+            .await
+            .expect("send succeeds");
+        wait_for_warmup_calls(&generator, 1).await;
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "warmup hello");
+        assert_eq!(reply_to, None);
+        wait_for_counter(&fixture.store, "warmups_total", 1).await;
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direction, Direction::Outbound);
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        let advanced = session
+            .warmup_next_at
+            .expect("the next slot is scheduled at fire time");
+        assert!(
+            advanced > next_at,
+            "the schedule advanced past the fired slot"
+        );
+        restarted.shutdown().await.expect("shutdown succeeds");
+
+        // A second restart: no double-fire. A tick at the fired slot is
+        // not due (the schedule advanced past it).
+        let (third, _outbound) = spawn_with_warmup(&fixture, config, generator.clone());
+        third
+            .send(ActorCommand::Tick(next_at))
+            .await
+            .expect("send succeeds");
+        let session = third.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.warmup_next_at, Some(advanced));
+        assert_eq!(generator.call_count(), 1);
+        third.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_due_slot_is_skipped_while_muted() {
+        // Section 9.7 step 1, the muted gate: the slot is consumed and
+        // rescheduled, the skip logs at DEBUG, nothing is generated.
+        let fixture = make_fixture();
+        let due = t0() + time::Duration::hours(1);
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(due)),
+                ("muted_flag", "1".to_string()),
+            ],
+        )
+        .await;
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let generator = ScriptedWarmup::new("never used");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_ne!(session.warmup_next_at, Some(due), "the slot was consumed");
+        assert!(
+            session.warmup_next_at.is_some(),
+            "the next slot is scheduled"
+        );
+        assert!(capture.contains("gate=\"muted\""));
+        assert_eq!(generator.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert!(list_messages(&fixture.store).await.is_empty());
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_due_slot_is_skipped_when_the_effective_quota_is_zero() {
+        // Section 8.5: quota 1 with backoff factor 1 has effective
+        // quota 0. TZ-safe: the consume reschedule draws nothing
+        // (schedule_next returns None at effective quota 0).
+        let fixture = make_fixture();
+        let due = t0() + time::Duration::hours(1);
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(due)),
+                ("warmup_backoff_factor", "1".to_string()),
+            ],
+        )
+        .await;
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let generator = ScriptedWarmup::new("never used");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.warmup_next_at, None, "the slot was consumed");
+        assert!(capture.contains("gate=\"quota\""));
+        assert_eq!(generator.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert!(list_messages(&fixture.store).await.is_empty());
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_due_slot_is_skipped_until_the_silence_window_passes() {
+        // Section 8.4: the newest raw-log row of ANY direction must be
+        // at least `warmup_silence` old. One message at t; a slot due
+        // 60 s short of the window is skipped; a slot due exactly at
+        // the window boundary fires (the gate is `>=`).
+        let fixture = make_fixture();
+        let config = warmup_config();
+        let silence = config.warmup_silence;
+        let spoke_at = t0();
+        let due = spoke_at + silence - time::Duration::seconds(60);
+        seed_warmup_due(&fixture, due).await;
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) = spawn_with_warmup(&fixture, config.clone(), generator.clone());
+        handle
+            .send_event(InboundEvent::Message(message("m1", 0, false)))
+            .await
+            .expect("send succeeds");
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_ne!(session.warmup_next_at, Some(due), "the slot was consumed");
+        assert!(capture.contains("gate=\"silence\""));
+        assert_eq!(generator.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // The second due slot at the boundary fires (the reseed keeps
+        // the due time deterministic; the doubles are the same Arcs).
+        let due2 = spoke_at + silence;
+        seed_warmup_due(&fixture, due2).await;
+        let (restarted, mut outbound) = spawn_with_warmup(&fixture, config, generator.clone());
+        restarted
+            .send(ActorCommand::Tick(due2))
+            .await
+            .expect("send succeeds");
+        wait_for_warmup_calls(&generator, 1).await;
+        let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "warmup hello");
+        wait_for_counter(&fixture.store, "warmups_total", 1).await;
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].direction, Direction::Outbound);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn warmup_disabled_never_evaluates() {
+        // Section 8.4: the `warmup` master switch disables the trigger
+        // ENTIRELY — a due slot is not even consumed (no state touch).
+        let fixture = make_fixture();
+        let due = t0() + time::Duration::hours(1);
+        seed_warmup_due(&fixture, due).await;
+        let generator = ScriptedWarmup::new("never used");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let mut config = warmup_config();
+        config.warmup = false;
+        let (handle, mut outbound) = spawn_with_warmup(&fixture, config, generator.clone());
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        // Untouched: the schedule, the quota-day rollover, everything.
+        assert_eq!(session.warmup_next_at, Some(due));
+        assert_eq!(session.warmup_quota_day, None);
+        assert_eq!(session.warmup_quota_used_today, 0);
+        assert_eq!(generator.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert!(list_messages(&fixture.store).await.is_empty());
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn unwired_warmup_services_are_fully_inert() {
+        // `warmup: None` disables the trigger entirely (decision 78).
+        // This doubles as the replay-discipline coverage: replay mode
+        // wires None, and a replayed tick must not touch the warmup
+        // state.
+        let fixture = make_fixture();
+        let due = t0() + time::Duration::hours(1);
+        seed_warmup_due(&fixture, due).await;
+        let handle = spawn_on(&fixture, warmup_config());
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.warmup_next_at, Some(due));
+        assert_eq!(session.warmup_quota_day, None);
+        assert_eq!(session.warmup_quota_used_today, 0);
+        assert_eq!(session.warmup_backoff_factor, 0);
+        assert!(!session.warmup_watch_pending);
+        assert!(list_messages(&fixture.store).await.is_empty());
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_topic_on_cooldown_or_in_the_tail_stays_silent() {
+        // Section 9.7 step 2 (the actor wiring; the pure pick rules are
+        // warmup.rs's): one candidate is named in the 50-row raw-log
+        // tail (never restart the conversation that just went quiet),
+        // the other is inside its per-topic cooldown. No eligible topic
+        // means no warmup — the slot is consumed at DEBUG.
+        let fixture = make_fixture();
+        // The tail message is old enough to pass the silence gate.
+        insert_messages_without_session(
+            &fixture,
+            &[message_at(
+                "tail1",
+                t0() - time::Duration::hours(100),
+                "we discussed Graph Database all evening",
+            )],
+        )
+        .await;
+        // The cooldown date uses the SAME local-offset logic the actor
+        // uses (TZ-proof: seeded at spawn time, the tick lands in the
+        // same local day).
+        let due = t0();
+        let today = local_date_string(
+            due,
+            UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+        );
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(due)),
+                ("warmup_topic_cooldowns", format!("{{\"tea\":\"{today}\"}}")),
+            ],
+        )
+        .await;
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let generator = ScriptedWarmup::new("never used");
+        fixture
+            .memory
+            .set_topics(vec![topic("Tea"), topic("Graph Database")]);
+        let (handle, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_ne!(session.warmup_next_at, Some(due), "the slot was consumed");
+        assert!(capture.contains("no eligible topic"));
+        assert_eq!(generator.call_count(), 0);
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        // Only the seeded human row exists; nothing was sent.
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direction, Direction::Inbound);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_warmup_request_carries_the_preamble_and_the_topic() {
+        // Section 9.7 step 3: the generation input is the live context
+        // as LLM-facing messages (Rule C4: item 0 is the preamble) plus
+        // the sampled topic's display name.
+        let fixture = make_fixture();
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let due = t0() + time::Duration::hours(1);
+        let (handle, _outbound) =
+            fire_one_warmup(&fixture, warmup_config(), generator.clone(), due).await;
+
+        let requests = generator.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].topic, "Tea");
+        assert_eq!(
+            requests[0].messages.len(),
+            1,
+            "an empty group: preamble only"
+        );
+        assert_eq!(requests[0].messages[0].role, ContextRole::System);
+        assert_eq!(requests[0].messages[0].content, TEST_PREAMBLE);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_parrot_filter_applies_to_warmup_text() {
+        // Section 9.7 step 3: decisions 59/64 guard the warmup text
+        // like every reply; a stripped warmup emits the decision-59
+        // WARN.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let generator = ScriptedWarmup::new("I remember: Alice likes tea.\nreal text");
+        fixture.memory.set_topics(vec![topic("Coffee")]);
+        let due = t0() + time::Duration::hours(1);
+        let (handle, mut outbound) =
+            fire_one_warmup(&fixture, warmup_config(), generator.clone(), due).await;
+
+        assert!(capture.contains("the warmup text parrots context structure"));
+        let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "real text");
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "real text");
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_outbound_row_precedes_the_send_and_never_quotes() {
+        // Section 9.7 step 4: a PLAIN standalone message (proactive
+        // speech never quotes a target); Rule B1 — the raw-log row
+        // exists (and carries the synthetic `bot-out:` id) by the time
+        // the outbound action leaves.
+        let fixture = make_fixture();
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let due = t0() + time::Duration::hours(1);
+        let (handle, mut outbound) =
+            fire_one_warmup(&fixture, warmup_config(), generator.clone(), due).await;
+
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "warmup hello");
+        assert_eq!(reply_to, None);
+        // The row was persisted BEFORE the send: by the time the action
+        // arrived, the log already held it.
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        let bot_row = &rows[0];
+        assert_eq!(bot_row.direction, Direction::Outbound);
+        assert_eq!(bot_row.reply_to_platform_msg_id, None);
+        assert!(bot_row.platform_msg_id.starts_with("bot-out:"));
+        assert_eq!(bot_row.sender_display_name, "Tamako");
+
+        // Rule C1: the context snapshot ends with the bot speech.
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(items.len(), 2);
+        let last = items.last().expect("items exist");
+        assert_eq!(last.kind, ContextItemKind::BotSpeech);
+        assert_eq!(
+            last.content,
+            render_bot_content(bot_row.id, bot_row.timestamp, "warmup hello")
+        );
+        assert_eq!(last.range_tag, Some(RangeTag::single(bot_row.id)));
+
+        // The Section 8.5 monologue lock covers the warmup speech.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.consecutive_bot_msgs, 1);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_human_reply_inside_the_window_engages_and_resets_the_backoff() {
+        // Section 8.5 (decision 78 (d)): a human reply inside
+        // `warmup_reaction_window` engages the warmup and resets the
+        // soft backoff to zero. Quota 2 with the factor seeded at 1:
+        // the effective quota 1 lets the fire happen AND the reset to 0
+        // is observable.
+        let fixture = make_fixture();
+        let mut config = warmup_config();
+        config.warmup_quota = 2;
+        let due = t0() + time::Duration::hours(1);
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(due)),
+                ("warmup_backoff_factor", "1".to_string()),
+            ],
+        )
+        .await;
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) = spawn_with_warmup(&fixture, config, generator.clone());
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        wait_for_counter(&fixture.store, "warmups_total", 1).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+
+        // The watch is open (the timestamps are REAL: the send path
+        // stamps them with OffsetDateTime::now_utc()).
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert!(session.warmup_watch_pending);
+        assert_eq!(session.warmup_backoff_factor, 1);
+        let sent_at = session
+            .warmup_watch_sent_at
+            .expect("the watch has a send time");
+        let expires = session
+            .warmup_watch_expires_at
+            .expect("the watch has an expiry");
+
+        // The reply lands inside the window; the tick at expiry
+        // resolves the watch.
+        handle
+            .send_event(InboundEvent::Message(message_at(
+                "r1",
+                sent_at + time::Duration::minutes(5),
+                "nice one",
+            )))
+            .await
+            .expect("send succeeds");
+        handle
+            .send(ActorCommand::Tick(expires))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(
+            session.warmup_backoff_factor, 0,
+            "engagement resets the backoff"
+        );
+        assert!(!session.warmup_watch_pending);
+        // The watch fields stay persisted for forensics.
+        assert_eq!(session.warmup_watch_sent_at, Some(sent_at));
+        assert!(session.warmup_watch_row_id.is_some());
+        assert_eq!(
+            counter_value(&fixture.store, "warmup_engaged_total").await,
+            Some(1)
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_reply_after_the_window_does_not_count() {
+        // Section 8.5: a reply past `warmup_reaction_window` (the
+        // timestamp bound keeps the window honest) does not engage; the
+        // backoff increments.
+        let fixture = make_fixture();
+        let due = t0() + time::Duration::hours(1);
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            fire_one_warmup(&fixture, warmup_config(), generator, due).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        let sent_at = session
+            .warmup_watch_sent_at
+            .expect("the watch has a send time");
+        let expires = session
+            .warmup_watch_expires_at
+            .expect("the watch has an expiry");
+
+        // The default window is 30 min: the reply at sent+31 min is out.
+        handle
+            .send_event(InboundEvent::Message(message_at(
+                "r1",
+                sent_at + time::Duration::minutes(31),
+                "too late",
+            )))
+            .await
+            .expect("send succeeds");
+        handle
+            .send(ActorCommand::Tick(sent_at + time::Duration::minutes(32)))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert!(expires <= sent_at + time::Duration::minutes(32));
+        assert_eq!(session.warmup_backoff_factor, 1);
+        assert!(!session.warmup_watch_pending);
+        assert_eq!(
+            counter_value(&fixture.store, "warmup_engaged_total").await,
+            None
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_reaction_on_an_unlogged_message_inside_the_window_engages() {
+        // Section 8.5 (decision 78 (d)), the documented approximation:
+        // outbound rows carry synthetic `bot-out:{nanos}` ids (Rule
+        // A3), so a reaction whose platform id is ABSENT from the log
+        // is treated as a reaction to the warmup.
+        let fixture = make_fixture();
+        let due = t0() + time::Duration::hours(1);
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            fire_one_warmup(&fixture, warmup_config(), generator, due).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        let sent_at = session
+            .warmup_watch_sent_at
+            .expect("the watch has a send time");
+        let expires = session
+            .warmup_watch_expires_at
+            .expect("the watch has an expiry");
+
+        handle
+            .send_event(InboundEvent::Reaction(reaction_at(
+                "unlogged-1",
+                sent_at + time::Duration::minutes(5),
+            )))
+            .await
+            .expect("send succeeds");
+        handle
+            .send(ActorCommand::Tick(expires))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert!(!session.warmup_watch_pending);
+        assert_eq!(session.warmup_backoff_factor, 0);
+        assert_eq!(
+            counter_value(&fixture.store, "warmup_engaged_total").await,
+            Some(1)
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_reaction_on_a_logged_human_message_does_not_count() {
+        // The absence heuristic, the other half: a reaction targeting
+        // a LOGGED human message is not a reaction to the warmup.
+        let fixture = make_fixture();
+        // The logged human message predates the warmup (old enough to
+        // pass the silence gate).
+        insert_messages_without_session(
+            &fixture,
+            &[message_at(
+                "m1",
+                t0() - time::Duration::hours(100),
+                "hello group",
+            )],
+        )
+        .await;
+        let due = t0();
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            fire_one_warmup(&fixture, warmup_config(), generator, due).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        let sent_at = session
+            .warmup_watch_sent_at
+            .expect("the watch has a send time");
+        let expires = session
+            .warmup_watch_expires_at
+            .expect("the watch has an expiry");
+
+        handle
+            .send_event(InboundEvent::Reaction(reaction_at(
+                "m1",
+                sent_at + time::Duration::minutes(5),
+            )))
+            .await
+            .expect("send succeeds");
+        handle
+            .send(ActorCommand::Tick(expires))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert!(!session.warmup_watch_pending);
+        assert_eq!(
+            session.warmup_backoff_factor, 1,
+            "unengaged: the backoff increments"
+        );
+        assert_eq!(
+            counter_value(&fixture.store, "warmup_engaged_total").await,
+            None
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn one_curated_info_line_per_sent_warmup() {
+        // Decision 53 discipline / decision 78: exactly one INFO
+        // `warmup` line per SENT warmup; a gate-skipped slot emits no
+        // such line.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+
+        // Phase 1: a gate-skipped slot (effective quota 0) — no line.
+        let due = t0();
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(due)),
+                ("warmup_backoff_factor", "1".to_string()),
+            ],
+        )
+        .await;
+        let (handle, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(
+            session.warmup_next_at, None,
+            "the skipped slot was consumed"
+        );
+        // No curated line: it is the only event kind that carries
+        // action="sent" together with the `warmup` message.
+        assert_eq!(
+            capture.count_matching(&["message=warmup ", "action=\"sent\""]),
+            0
+        );
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // Phase 2: a real fire — exactly ONE curated line, naming the
+        // topic, on the same capture.
+        let due2 = t0() + time::Duration::hours(2);
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(due2)),
+                ("warmup_backoff_factor", "0".to_string()),
+            ],
+        )
+        .await;
+        let (restarted, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+        restarted
+            .send(ActorCommand::Tick(due2))
+            .await
+            .expect("send succeeds");
+        wait_for_counter(&fixture.store, "warmups_total", 1).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        // Exactly ONE curated line: exactly one event carries the
+        // `warmup` message with action="sent", and it names the topic
+        // (a `%`-field renders UNQUOTED in the capture: `topic=Tea`).
+        assert_eq!(
+            capture.count_matching(&["message=warmup ", "action=\"sent\"", "topic=Tea"]),
+            1
+        );
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_quota_counter_rolls_over_on_a_new_local_day() {
+        // Section 8.4 (decision 78 (b)): the quota counter belongs to
+        // one host-local day. Quota 2: the day-2 watch resolution (no
+        // engagement) increments the factor to 1, and the effective
+        // quota 1 still lets the day-2 slot fire. The ≥ 25 h tick gap
+        // crosses a date boundary in every local TZ.
+        let fixture = make_fixture();
+        let mut config = warmup_config();
+        config.warmup_quota = 2;
+        let due = t0() + time::Duration::hours(1);
+        let generator = ScriptedWarmup::new("warmup hello");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            fire_one_warmup(&fixture, config.clone(), generator.clone(), due).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        // The quota accounting of one sent warmup (TZ-safe: the day
+        // string is whatever the actor's host-local day is).
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.warmup_quota_used_today, 1);
+        assert!(session.warmup_quota_day.is_some());
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // Day 2 (≥ 25 h later): the counter rolls back to a usable
+        // state and the reseeded slot fires again. The cooldowns are
+        // reseeded empty: fire 1 put "tea" on its 3-day cooldown, which
+        // day 2 has not outlived.
+        let day2 = OffsetDateTime::now_utc() + time::Duration::hours(25);
+        seed_state(
+            &fixture,
+            &[
+                ("warmup_next_at", rfc3339(day2)),
+                ("warmup_topic_cooldowns", "{}".to_string()),
+            ],
+        )
+        .await;
+        let (restarted, mut outbound) = spawn_with_warmup(&fixture, config, generator.clone());
+        restarted
+            .send(ActorCommand::Tick(day2))
+            .await
+            .expect("send succeeds");
+        wait_for_counter(&fixture.store, "warmups_total", 2).await;
+        let _ = expect_send_text(next_action(&mut outbound).await);
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.warmup_quota_used_today, 1);
+        assert!(session.warmup_quota_day.is_some());
+        assert_eq!(generator.call_count(), 2);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_failed_warmup_generation_consumes_the_slot_and_the_actor_lives() {
+        // The failure doctrine of `CoreError::Warmup` (the Wake
+        // analog): one ERROR, the slot stays consumed (it was spent at
+        // fire time — the next slot is the natural retry), nothing is
+        // sent, and the actor keeps serving.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let due = t0() + time::Duration::hours(1);
+        seed_warmup_due(&fixture, due).await;
+        let generator = ScriptedWarmup::failing("the reply endpoint is down");
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let (handle, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        wait_for_warmup_calls(&generator, 1).await;
+        // The failure line proves the completion handler ran (the
+        // in-flight flag resets there).
+        wait_for_event(&capture, "warmup generation failed").await;
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert!(list_messages(&fixture.store).await.is_empty());
+        assert_eq!(counter_value(&fixture.store, "warmups_total").await, None);
+
+        // The slot was consumed at fire time; the actor still serves.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_ne!(session.warmup_next_at, Some(due), "the slot was consumed");
+        assert!(!session.warmup_watch_pending);
         handle.shutdown().await.expect("shutdown succeeds");
     }
 }

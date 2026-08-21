@@ -54,8 +54,10 @@ fd-lock = "4"
 # Wake-trigger jitter. Refer to specs.md Section 8.3.
 rand = "0.9"
 
-# Timestamps. The project uses the time crate, not chrono.
-time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+# Timestamps. The project uses the time crate, not chrono. The
+# `local-offset` feature backs the warmup trigger's host-local
+# active-hours window (specs.md Section 8.4, decision 78).
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
 
 # LLM client for the digest extraction (tamako-agent only). rig entered in
 # Phase 1 (AGENT.md Section 3). rig-core 0.41 has no Extractor type:
