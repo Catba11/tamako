@@ -309,6 +309,25 @@ pub struct NodeContent {
     pub description: String,
 }
 
+/// Decision 78 (c) / specs.md Section 9.7 step 2: one warmup topic
+/// candidate — a Concept node with its edge degree and latest edge
+/// activity. The weighting (edge count × recency decay) and the
+/// exclusions (per-topic cooldown, raw-log tail) live in tamako-core;
+/// this crate stays dumb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicCandidate {
+    /// The deterministic node id (Rule R5).
+    pub node_id: String,
+    /// The stored display name (the warmup instruction names it).
+    pub name: String,
+    /// Every EDGE row touching the node, both directions (the same
+    /// degree measure as [`NodeMergeStats`]).
+    pub edge_count: u64,
+    /// The newest activity over the node's edges: the max of `valid_at`
+    /// and `created_at` across them. `None` when the node has no edges.
+    pub last_activity_at: Option<OffsetDateTime>,
+}
+
 /// Decision 73: the per-candidate resolution info of the vector
 /// pre-screen of entity resolution. The kind comes from the stored
 /// `type` column (the closed set of Section 6.2). `alias_target` is the
@@ -693,6 +712,32 @@ pub trait MemoryBackend: Send + Sync {
         async { Ok(Vec::new()) }
     }
 
+    /// Decision 78 (c) / specs.md Section 9.7 step 2: the warmup topic
+    /// sampling. Returns the Concept nodes of the group with their edge
+    /// degree and latest edge activity, ordered by edge count
+    /// descending with ties broken by node id ascending (deterministic),
+    /// truncated to `limit`. The weighting and the exclusions live in
+    /// tamako-core; this read stays dumb.
+    ///
+    /// RULE R5 EXCEPTION: this is a full Concept scan by design — the
+    /// warmup sampler has no entry identifiers. It is the documented
+    /// exception, mirroring `list_node_contents` (decision 66).
+    ///
+    /// `limit = 0` yields an empty vec WITHOUT opening the database of
+    /// the group (the short-circuit policy of `node_resolution_infos`);
+    /// an empty graph yields an empty vec.
+    ///
+    /// The default returns an empty vec so that noop test doubles stay
+    /// source-compatible with the extended trait.
+    fn sample_interest_topics<'a>(
+        &'a self,
+        chat_id: &'a str,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<TopicCandidate>>> + Send + 'a {
+        let _ = (chat_id, limit);
+        async { Ok(Vec::new()) }
+    }
+
     /// Decision 73: the kind and, for Alias nodes, the alias-bound
     /// target of each given node id, entered through the node
     /// identifiers (Rule R5). Backs the vector pre-screen of entity
@@ -968,4 +1013,52 @@ pub trait MemoryBackend: Send + Sync {
 
     /// Closes the cached handle of the group. Later calls reopen it.
     fn close<'a>(&'a self, chat_id: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The minimal noop double: only the methods without a default.
+    /// Stays source-compatible with the extended trait.
+    struct NoopBackend;
+
+    impl MemoryBackend for NoopBackend {
+        async fn ensure_schema(&self, _chat_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn upsert_batch(&self, _chat_id: &str, _batch: &MemoryBatch) -> Result<()> {
+            Ok(())
+        }
+
+        async fn checkpoint(&self, _chat_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn alias_targets(
+            &self,
+            _chat_id: &str,
+            _alias_node_id: &str,
+        ) -> Result<Vec<AliasTarget>> {
+            Ok(Vec::new())
+        }
+
+        async fn neighbors(&self, _chat_id: &str, _node_id: &str) -> Result<Vec<NeighborEdge>> {
+            Ok(Vec::new())
+        }
+
+        async fn close(&self, _chat_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sample_interest_topics_default_returns_empty() {
+        let topics = NoopBackend
+            .sample_interest_topics("chat", 100)
+            .await
+            .unwrap();
+        assert!(topics.is_empty());
+    }
 }
