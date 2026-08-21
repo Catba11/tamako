@@ -1209,6 +1209,81 @@ impl Store {
         })
     }
 
+    /// Writes (or overwrites) the description text of one graph edge in
+    /// the deep-recall sidecar (migration v10, decision 76c). INSERT OR
+    /// REPLACE: a re-digest of an edge with changed text replaces the
+    /// row in place. The edge id is tamako-memory's opaque EdgeId JSON
+    /// encoding; the store never parses it.
+    ///
+    /// Takes no chat_id (the same single-group contract as the
+    /// embedding and merge_audit helpers): the digest writer has
+    /// exactly one group open.
+    pub fn upsert_edge_text(&self, edge_id: &str, edge_text: &str) -> Result<()> {
+        self.with_single_group_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO edge_texts (edge_id, edge_text)
+                 VALUES (?1, ?2)",
+                rusqlite::params![edge_id, edge_text],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Removes edge_texts rows by edge id (merge/rollback cleanup and
+    /// the reconciliation pass of decision 76c). Ids without a row are
+    /// skipped silently; returns the number of rows actually deleted.
+    pub fn delete_edge_texts(&self, edge_ids: &[String]) -> Result<usize> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare("DELETE FROM edge_texts WHERE edge_id = ?1")?;
+            let mut deleted = 0;
+            for edge_id in edge_ids {
+                deleted += stmt.execute([edge_id])?;
+            }
+            Ok(deleted)
+        })
+    }
+
+    /// Full-text candidate match on edge descriptions (decision 76a:
+    /// the "who discussed X" recall pattern). Parameterized LIKE over
+    /// the plain edge_texts table — NOT FTS5, whose trigram tokenizer
+    /// cannot match CJK terms shorter than three characters (76c).
+    ///
+    /// LIKE metacharacters in `term` are escaped: the escape character
+    /// '\' first, then '%' and '_', and the query declares ESCAPE '\',
+    /// so a term matches only its LITERAL occurrences. An empty or
+    /// whitespace-only term returns an empty vec without querying.
+    /// Returns the matching edge ids ordered by edge_id.
+    pub fn search_edge_texts(&self, term: &str) -> Result<Vec<String>> {
+        if term.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", escape_like(term));
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT edge_id FROM edge_texts
+                 WHERE edge_text LIKE ?1 ESCAPE '\\'
+                 ORDER BY edge_id",
+            )?;
+            let rows = stmt
+                .query_map([pattern], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Every edge id with an edge_texts row: the reconciliation diff of
+    /// decision 76c compares this set against the graph's edge ids to
+    /// find rows to write or delete. Ordered by edge_id.
+    pub fn list_edge_text_ids(&self) -> Result<Vec<String>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT edge_id FROM edge_texts ORDER BY edge_id")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// Runs `f` on the Store's single open group connection. The
     /// single-group helpers (the embedding sidecar and merge_audit)
     /// take no chat_id (their interface is pinned by the parallel
@@ -1301,6 +1376,20 @@ fn pending_embedding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEmb
         content_hash: row.get("content_hash")?,
         attempts: row.get("attempts")?,
     })
+}
+
+/// Escapes the LIKE pattern metacharacters of a search term for
+/// [`Store::search_edge_texts`]: the escape character '\' itself first,
+/// then '%' and '_'. The paired query declares ESCAPE '\'.
+fn escape_like(term: &str) -> String {
+    let mut out = String::with_capacity(term.len());
+    for c in term.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Maps one row of a merge_audit SELECT to a `MergeAuditRow`.
@@ -1744,7 +1833,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 9);
+        assert_eq!(count, 10);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1754,7 +1843,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -1806,9 +1895,9 @@ mod tests {
     fn migration_v6_upgrades_a_v5_database_in_place() {
         // A database created by the previous release carries migrations
         // v1-v5 and live data. Opening it with this build must apply only
-        // v6 (index-only: no data touched) plus the additive v7-v9
-        // (embedding sidecar, merge audit), keep the data, and be a
-        // no-op on reopen.
+        // v6 (index-only: no data touched) plus the additive v7-v10
+        // (embedding sidecar, merge audit, edge texts), keep the data,
+        // and be a no-op on reopen.
         let dir = tempfile::tempdir().expect("tempdir");
         let group_dir = dir.path().join("c1");
         std::fs::create_dir_all(&group_dir).expect("create group dir");
@@ -1862,7 +1951,7 @@ mod tests {
             .expect("insert v5 message");
         }
 
-        // The upgrade open applies v6 through v9. A reopen is a no-op.
+        // The upgrade open applies v6 through v10. A reopen is a no-op.
         let store = Store::new(dir.path().to_path_buf());
         store.open_group("c1").expect("upgrade open");
         let store2 = Store::new(dir.path().to_path_buf());
@@ -1887,7 +1976,7 @@ mod tests {
             ]
         );
 
-        // Migration bookkeeping: exactly four versions were added.
+        // Migration bookkeeping: exactly five versions were added.
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -1897,7 +1986,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     /// The column names of one index, in key order, via PRAGMA index_info.
@@ -1981,7 +2070,7 @@ mod tests {
             .expect("insert summary");
         assert!(summary_id > 0);
 
-        // Migration bookkeeping: the upgrade applied v5 through v9.
+        // Migration bookkeeping: the upgrade applied v5 through v10.
         let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
         let versions: Vec<u32> = {
             let mut stmt = conn
@@ -1992,7 +2081,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
@@ -3623,5 +3712,225 @@ mod tests {
         );
         // Nothing was written.
         assert!(store.list_merge_audit().expect("list").is_empty());
+    }
+
+    // --- edge_texts (migration v10, decision 76) ---------------------
+
+    #[test]
+    fn migration_v10_creates_edge_texts_and_is_idempotent_on_reopen() {
+        let (dir, store) = embedding_store();
+        store
+            .with_conn("c1", |conn| {
+                // The sidecar table exists after v10.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'edge_texts'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "edge_texts must exist");
+                // v10 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 10)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v10 must be recorded in schema_migrations");
+                Ok(())
+            })
+            .expect("v10 assertions");
+
+        // Reopen through a NEW Store instance: migrations are a no-op,
+        // v10 stays recorded exactly once, and the helpers keep working.
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen");
+        store2
+            .with_conn("c1", |conn| {
+                let v10_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 10",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(v10_rows, 1, "v10 recorded exactly once");
+                Ok(())
+            })
+            .expect("reopen assertions");
+        store2
+            .upsert_edge_text("e1", "post-reopen write")
+            .expect("upsert after reopen");
+        assert_eq!(
+            store2.list_edge_text_ids().expect("list after reopen"),
+            vec!["e1".to_string()]
+        );
+    }
+
+    #[test]
+    fn edge_text_upsert_and_delete_round_trip() {
+        let (_dir, store) = embedding_store();
+
+        store
+            .upsert_edge_text("e1", "Alice discussed coffee with Bob")
+            .expect("upsert e1");
+        store
+            .upsert_edge_text("e2", "Carol joined the tea club")
+            .expect("upsert e2");
+        store
+            .upsert_edge_text("e3", "Dave bikes to work")
+            .expect("upsert e3");
+
+        // INSERT OR REPLACE: re-writing e1 changes the text in place.
+        store
+            .upsert_edge_text("e1", "Alice discussed espresso with Bob")
+            .expect("re-upsert e1");
+        assert_eq!(
+            store.search_edge_texts("coffee").expect("search old text"),
+            Vec::<String>::new(),
+            "the replaced text is gone"
+        );
+        assert_eq!(
+            store
+                .search_edge_texts("espresso")
+                .expect("search new text"),
+            vec!["e1".to_string()]
+        );
+
+        // Deleting a mix of present and absent ids deletes the present
+        // rows and reports the true count.
+        let deleted = store
+            .delete_edge_texts(&["e2".to_string(), "e3".to_string(), "e-gone".to_string()])
+            .expect("delete");
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            store.list_edge_text_ids().expect("list after delete"),
+            vec!["e1".to_string()]
+        );
+        // Deleting the same ids again is a silent no-op (count 0).
+        let deleted = store
+            .delete_edge_texts(&["e2".to_string(), "e3".to_string()])
+            .expect("re-delete");
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn search_edge_texts_escapes_like_metacharacters() {
+        let (_dir, store) = embedding_store();
+        // Texts that LITERALLY contain the LIKE metacharacters, each
+        // paired with a row a wildcard would false-positive on.
+        store
+            .upsert_edge_text("e-pct", "reached 100% coverage")
+            .expect("upsert pct");
+        store
+            .upsert_edge_text("e-pct-decoy", "reached 1000 percent")
+            .expect("upsert pct decoy");
+        store
+            .upsert_edge_text("e-us", "file_name.txt")
+            .expect("upsert underscore");
+        store
+            .upsert_edge_text("e-us-decoy", "fileXname.txt")
+            .expect("upsert underscore decoy");
+        store
+            .upsert_edge_text("e-bs", "path C:\\temp")
+            .expect("upsert backslash");
+        store
+            .upsert_edge_text("e-bs-decoy", "path C:temp")
+            .expect("upsert backslash decoy");
+
+        // A term with '%' matches only the literal percent row.
+        assert_eq!(
+            store.search_edge_texts("100%").expect("search percent"),
+            vec!["e-pct".to_string()]
+        );
+        // A term with '_' matches only the literal underscore row.
+        assert_eq!(
+            store
+                .search_edge_texts("file_name")
+                .expect("search underscore"),
+            vec!["e-us".to_string()]
+        );
+        // The escape character itself is escaped: a term with '\' matches
+        // only the literal backslash row.
+        assert_eq!(
+            store
+                .search_edge_texts("C:\\temp")
+                .expect("search backslash"),
+            vec!["e-bs".to_string()]
+        );
+    }
+
+    #[test]
+    fn search_edge_texts_matches_two_character_cjk_terms() {
+        // The 76c pin: the FTS5 trigram tokenizer cannot match CJK terms
+        // under three characters, so this case is exactly why the
+        // sidecar is a PLAIN table with LIKE. 咖啡 (two characters) MUST
+        // match.
+        let (_dir, store) = embedding_store();
+        store
+            .upsert_edge_text("e-pour", "小明讨论了手冲咖啡机的选择")
+            .expect("upsert pour-over");
+        store
+            .upsert_edge_text("e-machine", "小红想买了一台咖啡机")
+            .expect("upsert machine");
+        store
+            .upsert_edge_text("e-tea", "大家一起去喝茶")
+            .expect("upsert tea");
+
+        // The two-character term 咖啡 matches every row containing it,
+        // including inside the longer word 咖啡机.
+        assert_eq!(
+            store.search_edge_texts("咖啡").expect("search 咖啡"),
+            vec!["e-machine".to_string(), "e-pour".to_string()]
+        );
+        // A mixed-length term matches its literal occurrences.
+        assert_eq!(
+            store.search_edge_texts("咖啡机").expect("search 咖啡机"),
+            vec!["e-machine".to_string(), "e-pour".to_string()]
+        );
+        // A term absent from every row matches nothing.
+        assert_eq!(
+            store.search_edge_texts("可乐").expect("search absent term"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn search_edge_texts_rejects_an_empty_or_whitespace_term() {
+        let (_dir, store) = embedding_store();
+        store
+            .upsert_edge_text("e1", "anything at all")
+            .expect("upsert");
+
+        // The guard returns an empty vec without querying: even a
+        // one-row table must not match an empty term (an unescaped
+        // LIKE '%%' would match every row).
+        assert_eq!(
+            store.search_edge_texts("").expect("empty term"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            store
+                .search_edge_texts("   \t\n ")
+                .expect("whitespace term"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn list_edge_text_ids_returns_every_edge_id() {
+        let (_dir, store) = embedding_store();
+        assert_eq!(
+            store.list_edge_text_ids().expect("empty list"),
+            Vec::<String>::new()
+        );
+
+        for id in ["e-c", "e-a", "e-b"] {
+            store.upsert_edge_text(id, "text").expect("upsert");
+        }
+        // Ordered by edge_id, regardless of insert order.
+        assert_eq!(
+            store.list_edge_text_ids().expect("list"),
+            vec!["e-a".to_string(), "e-b".to_string(), "e-c".to_string()]
+        );
     }
 }
