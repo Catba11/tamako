@@ -16,6 +16,12 @@ pub enum StoreError {
         "single-group helpers take no chat_id and need exactly one open group on this Store, found {0}"
     )]
     AmbiguousGroup(usize),
+    #[error(
+        "database schema version {found} exceeds this binary's known maximum {known}: \
+         the store.db was written by a NEWER tamako; run that binary (or upgrade) instead \
+         of opening it with an older one"
+    )]
+    SchemaFromTheFuture { found: u32, known: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
