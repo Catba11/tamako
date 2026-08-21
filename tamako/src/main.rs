@@ -10,8 +10,15 @@
 //! `--merge` / `--merge-rollback` modes are the OFFLINE merge tool of
 //! current-state.md decision 74 (graph-spec Section 7.7), and the
 //! `--facts` / `--invalidate` / `--revalidate` modes the OFFLINE fact
-//! commands of decision 75 (graph-spec Section 7.5): they run with the
-//! bot STOPPED and never start the event loop.
+//! commands of decision 75 (graph-spec Section 7.5): they never start
+//! the event loop. Decision 77 (H5): the MUTATING offline commands
+//! (--merge-tool --apply, --merge, --merge-rollback, --invalidate,
+//! --revalidate) take the per-group advisory lock
+//! ({data_root}/{chat_id}/.tamako.lock) and refuse loudly when another
+//! process holds it; --live holds the same per-group locks for its whole
+//! lifetime, so a mutating tool against a served group fails immediately
+//! instead of deep inside the lbug open. The read-only paths
+//! (--merge-tool dry run, --facts, --status) take no lock.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -21,9 +28,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
-use tamako_agent::endpoint::{EmbeddingEndpoint, RigEmbeddingProvider};
+use tamako_agent::endpoint::{
+    EmbeddingEndpoint, LlmApi, RigEmbeddingProvider, DEFAULT_EMBEDDING_BASE_URL,
+};
 use tamako_agent::merge_confirm::EndpointMergeConfirmer;
 use tamako_agent::recall::DeepRecallConfig;
 use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
@@ -40,13 +50,13 @@ use tamako_core::digest::DigestPipeline;
 use tamako_core::embedding::{EmbeddingError, EmbeddingWorker, GroupEmbeddingTarget};
 use tamako_core::event::OutboundAction;
 use tamako_core::merge::{
-    apply_merge_plan, plan_merges, rollback_merge_action, scan_merge_candidates, MergeCandidate,
-    MergeConfirmation, MergeError, MergeNodeInfo, MergePlan, MergePlanAction, MergeVerdict,
-    SkipReason,
+    apply_merge_plan, merge_candidate_set_hash, plan_merges, rollback_merge_action,
+    scan_merge_candidates, MergeCandidate, MergeConfirmation, MergeError, MergeNodeInfo, MergePlan,
+    MergePlanAction, MergeVerdict, SkipReason,
 };
 use tamako_core::summary::SummaryProvider;
 use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
-use tamako_memory::{LbugBackend, MemoryBackend};
+use tamako_memory::{LbugBackend, MemoryBackend, NodeType};
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
 use tamako_store::{read_group_status, GroupStatus, Store, StoreError};
 use time::format_description::well_known::Rfc3339;
@@ -61,7 +71,7 @@ Usage:
   tamako --status <chat_id> [--data-root <dir>] [--config <config.toml>]
   tamako --status-all [--data-root <dir>] [--config <config.toml>]
   tamako --merge-tool <chat_id> [--apply] [--max-confirmations N] [--data-root <dir>] [--config <config.toml>]
-  tamako --merge <chat_id> <loser_id> <survivor_id> [--data-root <dir>]
+  tamako --merge <chat_id> <loser_id> <survivor_id> [--force] [--data-root <dir>]
   tamako --merge-rollback <chat_id> <audit_id> [--data-root <dir>]
   tamako --facts <chat_id> <name> [--data-root <dir>]
   tamako --invalidate <chat_id> <edge_id> [--data-root <dir>]
@@ -89,24 +99,40 @@ Options:
                            duplicate Person/Concept pairs, confirms each
                            candidate once on the digest endpoint (three-way
                            verdict: same merges, related links
-                           also_known_as, different skips), and prints the
-                           plan. DRY RUN by default: nothing is written
-                           without --apply. STOP THE BOT FIRST: the tool
-                           opens the group's store.db and memory.lbug as
-                           the single writer and cannot share them with a
-                           running bot. Without a digest-endpoint LLM key
-                           the confirmations are skipped and only the scan
-                           prints; nothing is written either way.
+                           also_known_as, different skips), prints the
+                           plan, and writes it to
+                           <data-root>/<chat_id>/merge_plan.json. DRY RUN
+                           by default: the group's store.db opens
+                           READ-ONLY and nothing else is written without
+                           --apply. --apply executes the PLAN FILE of a
+                           previous dry run (decision 77): it re-scans the
+                           candidates (cheap, no LLM) and refuses loudly
+                           when the candidate set changed since the dry
+                           run (\"plan is stale; re-run the dry run\").
+                           --apply takes the per-group lock
+                           (<data-root>/<chat_id>/.tamako.lock) for the
+                           whole run and refuses when another process
+                           holds it (is the bot running?). Without a
+                           digest-endpoint LLM key the confirmations are
+                           skipped and only the scan prints; no plan file
+                           is written either way.
   --merge <chat_id> <loser_id> <survivor_id>
                            Manual merge without an LLM: merges loser_id
                            into survivor_id as an operator-decided 'same'
                            action (confirmed_by \"operator\") and appends
-                           the audit row. STOP THE BOT FIRST.
+                           the audit row. A kind-incompatible pair (a
+                           Person into a Concept, say) is a hard error
+                           unless --force is given; the audit row records
+                           the loser kind either way. Takes the per-group
+                           lock and refuses when another process holds it
+                           (is the bot running?).
   --merge-rollback <chat_id> <audit_id>
                            Rolls one 'same' merge back from its audit
-                           snapshot and marks the row rolled back. STOP
-                           THE BOT FIRST. The restored node's embedding
-                           is rebuilt by the next startup reconciliation.
+                           snapshot and marks the row rolled back. The
+                           restored node's embedding is rebuilt by the next
+                           startup reconciliation. Takes the per-group
+                           lock and refuses when another process holds it
+                           (is the bot running?).
   --facts <chat_id> <name> The offline fact listing (decision 75,
                            graph-spec Section 7.5): every edge of the
                            node resolved from <name> (exact alias
@@ -116,10 +142,13 @@ Options:
                            excerpt, and the validity timestamps. The
                            printed edge ids are the values that
                            --invalidate / --revalidate take. No LLM
-                           needed. STOP THE BOT FIRST: the command opens
-                           the group's store.db and memory.lbug as the
-                           single writer and cannot share them with a
-                           running bot. An unknown name exits non-zero.
+                           needed. The store.db opens READ-ONLY
+                           (decision 77, M7). The graph open
+                           (memory.lbug) still conflicts with a running
+                           bot: LadybugDB holds an exclusive OS file
+                           lock, so against a running bot the command
+                           fails loudly with a lock error — stop the bot
+                           first. An unknown name exits non-zero.
   --invalidate <chat_id> <edge_id>
                            Sets invalid_at on one edge (decision 75,
                            graph-spec Section 7.5): the manual
@@ -127,7 +156,16 @@ Options:
                            --facts prints; a malformed or unknown id
                            exits non-zero. A successful invalidation also
                            bumps the facts_invalidated_total counter.
-                           No LLM needed. STOP THE BOT FIRST.
+                           Takes the per-group lock and refuses when
+                           another process holds it (is the bot
+                           running?). No LLM needed. Replay note
+                           (decision 77): a replayed batch never
+                           re-validates an invalidated edge (the stored
+                           invalid_at survives the replay), but an
+                           out-of-order FULL replay can still rewind a
+                           fact's other columns (edge text, properties)
+                           to the replayed batch's values — in-order
+                           replay converges.
   --revalidate <chat_id> <edge_id>
                            Clears invalid_at on one edge (decision 75,
                            graph-spec Section 7.5): the typo safety net
@@ -135,11 +173,16 @@ Options:
                            opaque id that --facts prints; a malformed or
                            unknown id exits non-zero. Does NOT decrement
                            facts_invalidated_total: the counter counts
-                           invalidation events, not invalid edges. No
-                           LLM needed. STOP THE BOT FIRST.
-  --apply                  Only affects --merge-tool: executes the printed
-                           plan (merges, also_known_as links, audit rows)
-                           instead of the dry run.
+                           invalidation events, not invalid edges. Takes
+                           the per-group lock and refuses when another
+                           process holds it (is the bot running?). No
+                           LLM needed.
+  --apply                  Only affects --merge-tool: executes the plan
+                           file (merge_plan.json) of a previous dry run
+                           instead of running a fresh dry run.
+  --force                  Only affects --merge: allows a kind-incompatible
+                           pair (a Person into a Concept, say); without it
+                           such a merge is a hard error.
   --max-confirmations N    Only affects --merge-tool: caps the LLM
                            confirmation calls of one run. Default: 50.
   --allow-default-persona  Only affects --live: restores the lenient
@@ -208,6 +251,9 @@ struct Cli {
     /// The `--apply` flag. Only affects --merge-tool (the same
     /// accepted-everywhere discipline as --allow-default-persona).
     apply: bool,
+    /// The `--force` flag. Only affects --merge (decision 77, M9):
+    /// allows a kind-incompatible pair.
+    force: bool,
     /// The `--max-confirmations` value of --merge-tool.
     max_confirmations: usize,
 }
@@ -238,6 +284,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     let mut allow_default_persona = false;
     let mut verbose = false;
     let mut apply = false;
+    let mut force = false;
     let mut max_confirmations = None;
     let mut data_root = None;
     let mut config = None;
@@ -297,6 +344,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
                 }
             }
             "--apply" => apply = true,
+            "--force" => force = true,
             "--max-confirmations" => {
                 let value = args
                     .next()
@@ -377,6 +425,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
         allow_default_persona,
         verbose,
         apply,
+        force,
         max_confirmations: max_confirmations.unwrap_or(DEFAULT_MAX_CONFIRMATIONS),
     }))
 }
@@ -860,7 +909,36 @@ impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
 fn build_embedding_provider(
     setup: &SharedSetup,
 ) -> Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>> {
-    let endpoint = EmbeddingEndpoint::resolve(&llm_config_values(&setup.bot_config.global));
+    let values = llm_config_values(&setup.bot_config.global);
+    let endpoint = EmbeddingEndpoint::resolve(&values);
+    // Decision 77 (M6b): the OPENAI_API_KEY dual-use conflation
+    // detector. Embeddings ALWAYS read OPENAI_API_KEY (the
+    // openai-compatible family key), and openai-compatible COMPLETION
+    // endpoints read the same variable. When the embeddings resolve to
+    // the DEFAULT OpenRouter base URL while the completions resolve
+    // elsewhere (the typical Opencode Go deployment), the operator
+    // likely set OPENAI_API_KEY for the completions provider only —
+    // embeddings then fail with auth errors against OpenRouter. One
+    // WARN at startup; the remedy is embedding_llm_base_url /
+    // TAMAKO_EMBEDDING_BASE_URL. The digest endpoint stands in for the
+    // completions side (the per-purpose base URLs rarely diverge).
+    if endpoint.base_url == DEFAULT_EMBEDDING_BASE_URL {
+        if let Ok(endpoints) = LlmEndpoints::resolve(&values) {
+            let digest = &endpoints.digest;
+            if digest.api == LlmApi::OpenAiCompatible
+                && digest.base_url.as_deref() != Some(endpoint.base_url.as_str())
+            {
+                warn!(
+                    embedding_base_url = %endpoint.base_url,
+                    completions_base_url = ?digest.base_url,
+                    "embeddings resolve to the default OpenRouter base URL but the completions \
+                     endpoint resolves to a different base URL; both read OPENAI_API_KEY, so the \
+                     key must be valid for the embedding endpoint too — set embedding_llm_base_url \
+                     (or TAMAKO_EMBEDDING_BASE_URL) if they should share one provider"
+                );
+            }
+        }
+    }
     RigEmbeddingProvider::build(&endpoint).map(|provider| {
         Arc::new(AgentEmbeddingProvider(provider))
             as Arc<dyn tamako_core::embedding::EmbeddingProvider>
@@ -1040,6 +1118,9 @@ async fn run_replay(
     // Decision 66: NO embedding worker in replay. Replay runs the mock
     // adapter and must stay deterministic and network-free; embeddings
     // are a live-mode sidecar (spawn_embedding_worker in run_live).
+    // Decision 77 (S1-F7): one startup INFO per group logs the resolved
+    // single-value registry.
+    info!(chat_id = %chat_id, single_value_registry = %format_single_value_registry(&group_config.single_value_predicates), "single-value registry resolved");
     let handle = spawn_group_actor(GroupActorParams {
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
@@ -1282,22 +1363,77 @@ impl tamako_core::merge::MergeConfirmer for AgentMergeConfirmer {
     }
 }
 
+/// The per-group cross-process lock file name (decision 77, H5): one
+/// advisory lock file per group, next to the group's store.db and
+/// memory.lbug.
+const GROUP_LOCK_FILE_NAME: &str = ".tamako.lock";
+
+/// The held per-group cross-process lock (decision 77, H5). The guard
+/// releases the OS lock on drop; the CLI modes hold it in their run
+/// function for the whole operation, --live holds one guard per served
+/// group in a map alongside the actors.
+///
+/// WHY AN ADVISORY FILE LOCK: the per-group lbug database is NOT
+/// cross-process safe. The H5 runtime experiment
+/// (tamako/tests/lbug_cross_process.rs, ignored; run it with
+/// `cargo test -p tamako --test lbug_cross_process -- --ignored`)
+/// opened one group's memory.lbug from a SECOND process while the
+/// first process held it: the second process's `Database::new`
+/// FAILED LOUDLY with a lock error ("Could not set lock on file ...
+/// Resource temporarily unavailable"), so a concurrent --merge against
+/// a running bot errors out deep inside the lbug open rather than
+/// corrupting the graph — but the failure is late, low-context, and
+/// lbug-version-specific. The fd-lock guard turns the same contention
+/// into an immediate, deliberate refusal at the CLI boundary (and lets
+/// --live declare its groups up front). The store.db side never needed
+/// this: it is WAL-mode SQLite with a 2 s busy timeout.
+struct GroupLock {
+    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+}
+
+/// Takes the per-group lock (`{data_root}/{chat_id}/.tamako.lock`) in
+/// exclusive (write) mode, non-blocking. Contention is a LOUD refusal
+/// that names the possibility. The fd-lock guard borrows its lock
+/// handle, so the handle is deliberately leaked ('static): the guard
+/// lives as long as the operation and the process releases the OS lock
+/// on exit anyway.
+fn acquire_group_lock(data_root: &Path, chat_id: &str) -> Result<GroupLock> {
+    let path = data_root.join(chat_id).join(GROUP_LOCK_FILE_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open the group lock file {}", path.display()))?;
+    let lock: &'static mut fd_lock::RwLock<std::fs::File> =
+        Box::leak(Box::new(fd_lock::RwLock::new(file)));
+    match lock.try_write() {
+        Ok(guard) => Ok(GroupLock { _guard: guard }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!(
+                "the group {chat_id} is locked by another tamako process — is the bot running? \
+                 lock held: {}. Stop the bot (or wait for the other tool) and retry.",
+                path.display()
+            )
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to lock the group file {}", path.display()))
+        }
+    }
+}
+
 /// Opens the per-group store and graph backend of the merge modes
 /// (decision 74) and the fact modes (decision 75): OFFLINE operator
-/// tools, one group per run — THE BOT MUST BE STOPPED (decision 47: an
-/// external process cannot share the per-group lbug mutex or the store's
-/// single WAL writer). The store opens ONLY the given group, matching
+/// tools, one group per run. The mutating modes hold the per-group
+/// lock ([`acquire_group_lock`], decision 77 H5) BEFORE this open — a
+/// running --live holds the group's lock for its whole lifetime. The
+/// store opens ONLY the given group, matching
 /// the AmbiguousGroup constraint of the chat_id-less embedding/audit
-/// helpers. A group with no store.db is a loud error in the wording of
-/// --status: `open_group` would CREATE an empty store and mask a
-/// mistyped chat id.
+/// helpers. A group with no store.db OR no memory.lbug is a loud error
+/// in the wording of --status (decision 77, S1-F8): `open_group` would
+/// CREATE an empty store and mask a mistyped chat id.
 fn open_merge_group(data_root: &Path, chat_id: &str) -> Result<(Arc<Store>, LbugBackend)> {
-    if !data_root.join(chat_id).join("store.db").is_file() {
-        anyhow::bail!(
-            "no store.db for group {chat_id} under {} (the group has not been served yet)",
-            data_root.display()
-        );
-    }
+    check_merge_group_exists(data_root, chat_id)?;
     let store = Arc::new(Store::new(data_root.to_path_buf()));
     store
         .open_group(chat_id)
@@ -1305,22 +1441,267 @@ fn open_merge_group(data_root: &Path, chat_id: &str) -> Result<(Arc<Store>, Lbug
     Ok((store, LbugBackend::new(data_root.to_path_buf())))
 }
 
+/// The READ-ONLY variant of [`open_merge_group`] (decision 77, M7) for
+/// the inspection paths (--merge-tool dry run, --facts): the store
+/// opens through SQLITE_OPEN_READ_ONLY with NO migrations (a read-only
+/// connection must never migrate) and the vec0 registration kept
+/// (decision 66 rule). A write through this store fails with
+/// SQLITE_READONLY — mutating modes use [`open_merge_group`].
+fn open_merge_group_read_only(
+    data_root: &Path,
+    chat_id: &str,
+) -> Result<(Arc<Store>, LbugBackend)> {
+    check_merge_group_exists(data_root, chat_id)?;
+    let store = Arc::new(Store::new(data_root.to_path_buf()));
+    store
+        .open_group_read_only(chat_id)
+        .with_context(|| format!("failed to open the store of group {chat_id} read-only"))?;
+    Ok((store, LbugBackend::new(data_root.to_path_buf())))
+}
+
+/// The shared existence check of the merge/fact group opens (decision
+/// 77, S1-F8): both store.db AND memory.lbug must be present, or the
+/// group has not been served yet (a mistyped chat id must never create
+/// empty stores or silently read an empty graph).
+fn check_merge_group_exists(data_root: &Path, chat_id: &str) -> Result<()> {
+    let group_dir = data_root.join(chat_id);
+    if !group_dir.join("store.db").is_file() {
+        anyhow::bail!(
+            "no store.db for group {chat_id} under {} (the group has not been served yet)",
+            data_root.display()
+        );
+    }
+    if !group_dir.join("memory.lbug").is_file() {
+        anyhow::bail!(
+            "no memory.lbug for group {chat_id} under {} (the group has not been served yet; \
+             the store exists but the graph was never written)",
+            data_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// The plan file name of the two-step apply (decision 77, H6a), one
+/// per group next to store.db.
+const MERGE_PLAN_FILE_NAME: &str = "merge_plan.json";
+
+/// The plan-file format version. A mismatch is a loud refusal.
+const MERGE_PLAN_FILE_VERSION: u32 = 1;
+
+/// Decision 77 (H6a): the on-disk shape of the two-step apply. The
+/// `--merge-tool` dry run writes the confirmed plan to
+/// `{data_root}/{chat_id}/merge_plan.json`; `--apply` REQUIRES the file,
+/// re-runs the candidate SCAN (cheap, no LLM — re-running the LLM
+/// confirmations to verify staleness would double their cost), and
+/// compares [`merge_candidate_set_hash`] of the fresh scan against the
+/// stored hash. The hash covers the CANDIDATE SET only (ids + scores,
+/// verdict-independent), so the stored actions — verdicts, reasons,
+/// survivor/loser choices — are exactly what a matching `--apply`
+/// executes: a matching hash certifies the scan the verdicts were
+/// confirmed against, and the file's actions are executed rather than a
+/// fresh plan. The skipped candidates of the dry run are NOT stored
+/// (they carry no action); they ride the hash only.
+#[derive(Debug, Serialize, Deserialize)]
+struct MergePlanFile {
+    version: u32,
+    chat_id: String,
+    threshold: f64,
+    confirmed_by: String,
+    candidate_set_hash: String,
+    actions: Vec<MergePlanFileAction>,
+}
+
+/// One action of [`MergePlanFile`]: the candidate fields plus the
+/// verdict, the reason, and the survivor/loser choice. `kind` and
+/// `verdict` are the wire strings (NodeType::as_str /
+/// MergeVerdict::as_str); unknown values are a loud error at load.
+#[derive(Debug, Serialize, Deserialize)]
+struct MergePlanFileAction {
+    a_id: String,
+    b_id: String,
+    a_name: String,
+    b_name: String,
+    a_description: String,
+    b_description: String,
+    kind: String,
+    score: f64,
+    verdict: String,
+    reason: String,
+    survivor_id: String,
+    loser_id: String,
+}
+
+impl MergePlanFile {
+    /// Builds the file of one dry-run plan. The candidate-set hash
+    /// covers EVERY scanned candidate (actions and skipped alike).
+    fn from_plan(chat_id: &str, threshold: f64, confirmed_by: &str, plan: &MergePlan) -> Self {
+        let candidate_set_hash = merge_candidate_set_hash(
+            plan.actions
+                .iter()
+                .map(|action| &action.candidate)
+                .chain(plan.skipped.iter().map(|(candidate, _)| candidate)),
+        );
+        MergePlanFile {
+            version: MERGE_PLAN_FILE_VERSION,
+            chat_id: chat_id.to_string(),
+            threshold,
+            confirmed_by: confirmed_by.to_string(),
+            candidate_set_hash,
+            actions: plan
+                .actions
+                .iter()
+                .map(|action| {
+                    let candidate = &action.candidate;
+                    MergePlanFileAction {
+                        a_id: candidate.a_id.clone(),
+                        b_id: candidate.b_id.clone(),
+                        a_name: candidate.a_name.clone(),
+                        b_name: candidate.b_name.clone(),
+                        a_description: candidate.a_description.clone(),
+                        b_description: candidate.b_description.clone(),
+                        kind: candidate.kind.as_str().to_string(),
+                        score: candidate.score,
+                        verdict: action.verdict.as_str().to_string(),
+                        reason: action.reason.clone(),
+                        survivor_id: action.survivor_id.clone(),
+                        loser_id: action.loser_id.clone(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Parses the file back into a plan. An unknown verdict or kind
+    /// string is a loud error (a hand-edited or corrupt file must not
+    /// silently become a different plan).
+    fn into_plan(self) -> Result<MergePlan> {
+        let mut actions = Vec::with_capacity(self.actions.len());
+        for action in self.actions {
+            let verdict = MergeVerdict::from_str(&action.verdict).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the merge plan file carries an unknown verdict {:?}; re-run the dry run",
+                    action.verdict
+                )
+            })?;
+            let kind = NodeType::from_str(&action.kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the merge plan file carries an unknown node kind {:?}; re-run the dry run",
+                    action.kind
+                )
+            })?;
+            actions.push(MergePlanAction {
+                candidate: MergeCandidate {
+                    a_id: action.a_id,
+                    b_id: action.b_id,
+                    a_name: action.a_name,
+                    b_name: action.b_name,
+                    a_description: action.a_description,
+                    b_description: action.b_description,
+                    kind,
+                    score: action.score,
+                },
+                verdict,
+                reason: action.reason,
+                survivor_id: action.survivor_id,
+                loser_id: action.loser_id,
+            });
+        }
+        Ok(MergePlan {
+            actions,
+            skipped: Vec::new(),
+        })
+    }
+}
+
+/// The path of the group's merge plan file.
+fn merge_plan_file_path(data_root: &Path, chat_id: &str) -> PathBuf {
+    data_root.join(chat_id).join(MERGE_PLAN_FILE_NAME)
+}
+
+/// Writes the plan file of a dry run (decision 77, H6a). A write
+/// failure propagates: without the file the printed plan is not
+/// executable by --apply, so the dry run must not pretend otherwise.
+fn write_merge_plan_file(
+    data_root: &Path,
+    chat_id: &str,
+    threshold: f64,
+    confirmed_by: &str,
+    plan: &MergePlan,
+) -> Result<PathBuf> {
+    let file = MergePlanFile::from_plan(chat_id, threshold, confirmed_by, plan);
+    let json = serde_json::to_string_pretty(&file).expect("the plan file struct serializes");
+    let path = merge_plan_file_path(data_root, chat_id);
+    std::fs::write(&path, format!("{json}\n"))
+        .with_context(|| format!("failed to write the merge plan file {}", path.display()))?;
+    Ok(path)
+}
+
+/// Reads and validates the plan file of a previous dry run (decision
+/// 77, H6a). A missing file, an unparseable file, a version mismatch,
+/// or a chat-id mismatch is a loud refusal that names the remedy.
+fn read_merge_plan_file(data_root: &Path, chat_id: &str) -> Result<MergePlanFile> {
+    let path = merge_plan_file_path(data_root, chat_id);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "--apply needs the plan file of a previous dry run; none exists at {} \
+             — run --merge-tool {chat_id} (the dry run) first",
+            path.display()
+        )
+    })?;
+    let file: MergePlanFile = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "the merge plan file {} is unparseable; re-run the dry run",
+            path.display()
+        )
+    })?;
+    if file.version != MERGE_PLAN_FILE_VERSION {
+        anyhow::bail!(
+            "the merge plan file {} has version {} (this binary writes {}); re-run the dry run",
+            path.display(),
+            file.version,
+            MERGE_PLAN_FILE_VERSION
+        );
+    }
+    if file.chat_id != chat_id {
+        anyhow::bail!(
+            "the merge plan file {} is for group {}, not {chat_id}; re-run the dry run",
+            path.display(),
+            file.chat_id
+        );
+    }
+    Ok(file)
+}
+
 /// The `--merge-tool` run (decision 74, graph-spec Section 7.7).
-/// OFFLINE: the bot must be stopped. The threshold comes from the
-/// per-group `merge_candidate_threshold` of the resolved config
-/// (default 0.85); the confirmation budget from `--max-confirmations`.
-/// DRY RUN by default: without --apply the run prints the confirmed
-/// plan and writes NOTHING (the core plan path is write-free by
-/// construction — `tamako_core::merge::plan_merges` never mutates the
-/// graph or the store). The no-key degrade mirrors the per-purpose
-/// builders: a missing family API key (`AgentError::ProviderConfig`)
-/// prints the scan alone with a note; every other confirmer build
+/// OFFLINE. The threshold comes from the per-group
+/// `merge_candidate_threshold` of the resolved config (default 0.85);
+/// the confirmation budget from `--max-confirmations`.
+///
+/// Decision 77 (H6a), the two-step apply: the DRY RUN (default) opens
+/// the group's store READ-ONLY (M7, no lock, no migrations), confirms
+/// the plan, prints it, and writes `{chat_id}/merge_plan.json`.
+/// `--apply` takes the per-group lock (H5), REQUIRES the plan file,
+/// re-scans the candidates (no LLM), and refuses loudly when the
+/// candidate-set hash changed since the dry run ("plan is stale;
+/// re-run the dry run"); a matching hash executes the FILE's actions.
+/// The no-key degrade mirrors the per-purpose builders: a missing
+/// family API key (`AgentError::ProviderConfig`) prints the scan alone
+/// with a note and writes NO plan file; every other confirmer build
 /// error propagates.
 async fn run_merge_tool(cli: &Cli, chat_id: &str) -> Result<()> {
-    let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
     let bot_config = load_bot_config(cli.config.as_deref())?;
     let group_config = bot_config.for_group(chat_id);
     let threshold = group_config.merge_candidate_threshold;
+    // Decision 77 (S1-F7): the resolved single-value registry is
+    // printed once per merge-tool invocation.
+    println!(
+        "single-value registry: {}",
+        format_single_value_registry(&group_config.single_value_predicates)
+    );
+    if cli.apply {
+        return run_merge_tool_apply(cli, chat_id, threshold, &group_config).await;
+    }
+    let (store, memory) = open_merge_group_read_only(&cli.data_root, chat_id)?;
     let endpoints = resolve_endpoints(&group_config)?;
     let confirmer = match EndpointMergeConfirmer::from_endpoint(&endpoints.digest) {
         Ok(confirmer) => confirmer,
@@ -1347,15 +1728,33 @@ async fn run_merge_tool(cli: &Cli, chat_id: &str) -> Result<()> {
         cli.max_confirmations,
     )
     .await?;
-    if !cli.apply {
-        print!(
-            "{}",
-            format_merge_plan(chat_id, threshold, cli.max_confirmations, &plan)
-        );
-        println!("DRY RUN: nothing written; re-run with --apply to execute this plan.");
-        return Ok(());
-    }
     let confirmed_by = format!("llm:{}", endpoints.digest.model);
+    let plan_path =
+        write_merge_plan_file(&cli.data_root, chat_id, threshold, &confirmed_by, &plan)?;
+    print!(
+        "{}",
+        format_merge_plan(chat_id, threshold, cli.max_confirmations, &plan)
+    );
+    println!(
+        "DRY RUN: the plan is written to {}; re-run with --apply to execute it.",
+        plan_path.display()
+    );
+    Ok(())
+}
+
+/// The `--merge-tool --apply` run (decision 77, H6a): executes the plan
+/// file of a previous dry run after the staleness check. Holds the
+/// per-group lock (H5) for the whole run.
+async fn run_merge_tool_apply(
+    cli: &Cli,
+    chat_id: &str,
+    threshold: f64,
+    group_config: &TriggerConfig,
+) -> Result<()> {
+    let _lock = acquire_group_lock(&cli.data_root, chat_id)?;
+    let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    let (plan, confirmed_by) =
+        load_applicable_merge_plan(&store, &memory, &cli.data_root, chat_id, threshold).await?;
     // Decision 75 (c): the invariant must hold globally, so the tool
     // path runs it with the resolved per-group registry.
     let report = apply_merge_plan(
@@ -1374,12 +1773,61 @@ async fn run_merge_tool(cli: &Cli, chat_id: &str) -> Result<()> {
     if !report.failures.is_empty() {
         // Loud exit: the applied actions stand (each carries its audit
         // row), but the operator must see the failure in the exit code.
+        // The plan file stays in place so the operator can roll back
+        // and re-apply.
         anyhow::bail!(
             "{} merge action(s) failed; the successful actions above applied and carry audit rows",
             report.failures.len()
         );
     }
+    // A fully applied plan retires its file: a second --apply of the
+    // same file would fail action-by-action (the losers are gone) with
+    // a confusing report, so the executed plan is removed.
+    std::fs::remove_file(merge_plan_file_path(&cli.data_root, chat_id))
+        .context("failed to remove the executed merge plan file")?;
     Ok(())
+}
+
+/// Decision 77 (H6a): loads the plan file of a previous dry run and
+/// certifies it against a FRESH candidate scan (cheap, no LLM —
+/// re-running the LLM confirmations to verify staleness would double
+/// their cost). A candidate-set hash mismatch is a loud refusal; the
+/// remedy is a fresh dry run (which re-confirms with the LLM). On a
+/// match the file's actions are returned verbatim — the apply executes
+/// the FILE's plan, not a fresh one. The returned `confirmed_by` is the
+/// dry run's attribution (`llm:<model>`), the honest value for an apply
+/// that makes no LLM calls.
+async fn load_applicable_merge_plan<M: MemoryBackend>(
+    store: &Arc<Store>,
+    memory: &M,
+    data_root: &Path,
+    chat_id: &str,
+    threshold: f64,
+) -> Result<(MergePlan, String)> {
+    let plan_file = read_merge_plan_file(data_root, chat_id)?;
+    let confirmed_by = plan_file.confirmed_by.clone();
+    let current = scan_merge_candidates(store, memory, chat_id, threshold).await?;
+    let current_hash = merge_candidate_set_hash(&current);
+    if current_hash != plan_file.candidate_set_hash {
+        anyhow::bail!(
+            "the merge plan is stale; re-run the dry run ({}: the candidate set changed since \
+             the dry run — plan hash {}, current scan hash {})",
+            merge_plan_file_path(data_root, chat_id).display(),
+            plan_file.candidate_set_hash,
+            current_hash
+        );
+    }
+    Ok((plan_file.into_plan()?, confirmed_by))
+}
+
+/// Renders the resolved single-value registry for the merge-tool
+/// output and the startup log (decision 77, S1-F7).
+fn format_single_value_registry(registry: &[String]) -> String {
+    if registry.is_empty() {
+        "(empty)".to_string()
+    } else {
+        format!("[{}]", registry.join(", "))
+    }
 }
 
 /// The `--merge` run: the manual, LLM-free form of the merge tool
@@ -1395,6 +1843,10 @@ async fn run_merge(cli: &Cli, chat_id: &str, loser_id: &str, survivor_id: &str) 
             "--merge needs two different node ids (loser and survivor are both '{loser_id}')"
         );
     }
+    // Decision 77 (H5): the mutating CLI holds the per-group lock for
+    // its whole lifetime; a running bot (or another tool) makes this a
+    // loud refusal, not a deep lbug lock error.
+    let _lock = acquire_group_lock(&cli.data_root, chat_id)?;
     let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
     // Decision 75 (c): the invariant must hold globally, so the manual
     // merge path runs it with the resolved per-group registry (the same
@@ -1432,8 +1884,20 @@ async fn run_merge(cli: &Cli, chat_id: &str, loser_id: &str, survivor_id: &str) 
             .expect("the node content read above proves the node exists")
     };
     let loser_kind = kind_of(loser_id);
-    if loser_kind != kind_of(survivor_id) {
-        warn!(chat_id = %chat_id, loser_id = %loser_id, survivor_id = %survivor_id, "manual merge of kind-incompatible nodes; the audit row records the loser kind");
+    let survivor_kind = kind_of(survivor_id);
+    if loser_kind != survivor_kind {
+        // Decision 77 (M9): a kind-incompatible pair is a hard error
+        // unless the operator forces it; the audit row records the
+        // loser kind either way.
+        if !cli.force {
+            anyhow::bail!(
+                "--merge refuses the kind-incompatible pair: {loser_id} is a {} but \
+                 {survivor_id} is a {} — pass --force to merge anyway",
+                loser_kind.as_str(),
+                survivor_kind.as_str()
+            );
+        }
+        warn!(chat_id = %chat_id, loser_id = %loser_id, survivor_id = %survivor_id, "forced manual merge of kind-incompatible nodes; the audit row records the loser kind");
     }
     // MergeCandidate keeps a_id < b_id for a deterministic display
     // order; the operator's loser/survivor choice rides the dedicated
@@ -1513,18 +1977,18 @@ async fn run_merge(cli: &Cli, chat_id: &str, loser_id: &str, survivor_id: &str) 
 /// merge deleted it with the done-journal rows, so the next startup
 /// reconciliation re-embeds the node automatically (decision 66/74).
 async fn run_merge_rollback(cli: &Cli, chat_id: &str, audit_id: i64) -> Result<()> {
+    let _lock = acquire_group_lock(&cli.data_root, chat_id)?;
     let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
     rollback_merge_action(&store, &memory, chat_id, audit_id).await?;
-    // Read the row back for the report. AGENT.md Section 6.2: the
-    // synchronous store call runs in spawn_blocking.
+    // Read the row back for the report (decision 77: the point lookup,
+    // not a full audit scan). AGENT.md Section 6.2: the synchronous
+    // store call runs in spawn_blocking.
     let row = {
         let store = Arc::clone(&store);
-        tokio::task::spawn_blocking(move || store.list_merge_audit())
+        tokio::task::spawn_blocking(move || store.get_merge_audit(audit_id))
             .await
             .context("the blocking store task failed to join")?
             .context("failed to read the merge audit")?
-            .into_iter()
-            .find(|row| row.id == audit_id)
             .expect("the rolled-back audit row exists")
     };
     println!("rolled back merge audit {audit_id} of group {chat_id}:");
@@ -1550,7 +2014,8 @@ const FACTS_EXCERPT_MAX_CHARS: usize = 60;
 /// `--revalidate` take. An unknown name is a loud error (exit 1); a
 /// resolved node with zero edges prints an explicit note.
 async fn run_facts(cli: &Cli, chat_id: &str, name: &str) -> Result<()> {
-    let (_store, memory) = open_merge_group(&cli.data_root, chat_id)?;
+    // Decision 77 (M7): the read-only open — no lock, no migrations.
+    let (_store, memory) = open_merge_group_read_only(&cli.data_root, chat_id)?;
     let facts = memory
         .node_facts(chat_id, name)
         .await
@@ -1676,6 +2141,7 @@ async fn run_edge_validity(
     edge_id: &str,
     invalidate: bool,
 ) -> Result<()> {
+    let _lock = acquire_group_lock(&cli.data_root, chat_id)?;
     let (store, memory) = open_merge_group(&cli.data_root, chat_id)?;
     let now = OffsetDateTime::now_utc();
     let changed = if invalidate {
@@ -2112,6 +2578,9 @@ async fn run_live(
     }
 
     let mut actors: HashMap<String, GroupActorHandle> = HashMap::new();
+    // Decision 77 (H5): one held group lock per served group, dropped
+    // (releasing the OS locks) at the end of the run.
+    let mut group_locks: HashMap<String, GroupLock> = HashMap::new();
     // Chat ids already logged as non-configured; the message logs once each.
     let mut logged_skips: HashSet<String> = HashSet::new();
     let mut events_routed = 0_usize;
@@ -2147,6 +2616,25 @@ async fn run_live(
                     let handle = match actors.entry(chat_id.clone()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
+                            // Decision 77 (H5): take the per-group lock
+                            // BEFORE the group is served; the guard is
+                            // held in `group_locks` for the process
+                            // lifetime. Contention means another tamako
+                            // process serves or edits this group. The
+                            // house-consistent choice (the same as every
+                            // other spawn-time failure in this branch —
+                            // and H4c's split-brain paranoia): fail the
+                            // RUN loudly; the supervisor restarts the
+                            // process.
+                            let lock = match acquire_group_lock(setup.store.data_root(), &chat_id) {
+                                Ok(lock) => lock,
+                                Err(error) => {
+                                    error!(chat_id = %chat_id, %error, "the group lock is held by another process; this group cannot be served");
+                                    fatal = Some(error);
+                                    break;
+                                }
+                            };
+                            group_locks.insert(chat_id.clone(), lock);
                             // Spawn-time re-check: a missing or unknown
                             // cached status (example: the bot joined the
                             // group after startup) is re-queried now.
@@ -2204,6 +2692,10 @@ async fn run_live(
                                     }
                                 };
                             info!(chat_id = %chat_id, "first event of a configured group; spawning the actor");
+                            // Decision 77 (S1-F7): one startup INFO per
+                            // group logs the resolved single-value
+                            // registry.
+                            info!(chat_id = %chat_id, single_value_registry = %format_single_value_registry(&group_config.single_value_predicates), "single-value registry resolved");
                             entry.insert(spawn_group_actor(GroupActorParams {
                                 chat_id: chat_id.clone(),
                                 store: Arc::clone(&setup.store),
@@ -3280,5 +3772,290 @@ mod tests {
         let excerpt = excerpt_edge_text(&cjk);
         assert_eq!(excerpt.chars().count(), FACTS_EXCERPT_MAX_CHARS + 1);
         assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn merge_force_flag_parses_and_defaults_to_false() {
+        // Decision 77 (M9): --force gates the kind-incompatible --merge.
+        let ParseOutcome::Run(cli) =
+            parse(&["--merge", "-1001", "a", "b"]).expect("a valid --merge line")
+        else {
+            panic!("expected the Run outcome");
+        };
+        assert!(!cli.force);
+        let ParseOutcome::Run(cli) = parse(&["--merge", "-1001", "a", "b", "--force"])
+            .expect("a valid --merge line with --force")
+        else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::Merge { .. }));
+        assert!(cli.force);
+    }
+
+    #[test]
+    fn force_is_accepted_in_other_modes_but_only_affects_merge() {
+        // The same accepted-everywhere discipline as --apply.
+        let ParseOutcome::Run(cli) =
+            parse(&["--status", "-1001", "--force"]).expect("the flag parses in the status mode")
+        else {
+            panic!("expected the Run outcome");
+        };
+        assert!(matches!(cli.mode, Mode::Status { .. }));
+        assert!(cli.force);
+    }
+
+    /// Decision 77 (H6a) test fixture: a two-node fragmented Concept
+    /// pair with near-parallel stored vectors (the merge.rs fixture
+    /// discipline), so the scan finds exactly one candidate. Returns
+    /// the store, the backend, and the scanned candidate.
+    async fn seeded_merge_group(dir: &Path) -> (Arc<Store>, LbugBackend, MergeCandidate) {
+        let store = Arc::new(Store::new(dir.to_path_buf()));
+        store.open_group("g1").expect("open group");
+        let memory = LbugBackend::new(dir.to_path_buf());
+        let at = time::macros::datetime!(2026-08-17 10:00 UTC);
+        let node = |name: &str, description: &str| tamako_memory::MemoryNode {
+            id: tamako_memory::identifiers::concept_id(name),
+            name: name.to_string(),
+            node_type: NodeType::Concept,
+            created_at: at,
+            updated_at: at,
+            properties: Some(format!(r#"{{"description":"{description}"}}"#)),
+        };
+        let rust = node("Rust", "the programming language");
+        let rustlang = node("Rust Language", "the Rust programming language");
+        memory
+            .upsert_batch(
+                "g1",
+                &tamako_memory::MemoryBatch {
+                    batch_id: tamako_memory::identifiers::batch_id(1, 10),
+                    nodes: vec![rust.clone(), rustlang.clone()],
+                    edges: vec![],
+                },
+            )
+            .await
+            .expect("seed graph");
+        // Near-parallel sparse vectors: cosine ~0.995 (see the merge.rs
+        // test fixture note).
+        let vector = |jitter: Option<f32>| {
+            let mut vector = vec![0.0f32; tamako_store::EMBEDDING_DIM];
+            vector[0] = 1.0;
+            if let Some(jitter) = jitter {
+                vector[1] = jitter;
+            }
+            vector
+        };
+        store
+            .upsert_node_embedding(&rust.id, &vector(None))
+            .expect("vec");
+        store
+            .upsert_node_embedding(&rustlang.id, &vector(Some(0.1)))
+            .expect("vec");
+        let candidates = scan_merge_candidates(&store, &memory, "g1", 0.85)
+            .await
+            .expect("scan");
+        assert_eq!(candidates.len(), 1);
+        (
+            store,
+            memory,
+            candidates.into_iter().next().expect("one candidate"),
+        )
+    }
+
+    /// A one-action 'same' plan of the seeded pair (hand-built
+    /// verdicts: the tests never call an LLM).
+    fn same_plan(candidate: &MergeCandidate) -> MergePlan {
+        MergePlan {
+            actions: vec![MergePlanAction {
+                candidate: candidate.clone(),
+                verdict: MergeVerdict::Same,
+                reason: "identical concept".to_string(),
+                survivor_id: candidate.a_id.clone(),
+                loser_id: candidate.b_id.clone(),
+            }],
+            skipped: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_tool_dry_run_writes_the_plan_file_and_apply_executes_it() {
+        // Decision 77 (H6a) happy path: the dry run writes
+        // merge_plan.json; the apply certifies it against a fresh scan
+        // and executes the FILE's actions.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, memory, candidate) = seeded_merge_group(dir.path()).await;
+        let plan = same_plan(&candidate);
+        let path = write_merge_plan_file(dir.path(), "g1", 0.85, "llm:test-model", &plan)
+            .expect("write the plan file");
+        assert!(path.is_file(), "the dry run wrote merge_plan.json");
+        assert_eq!(path, dir.path().join("g1").join("merge_plan.json"));
+        // The stored hash is the hash of the dry run's candidate set.
+        let file = read_merge_plan_file(dir.path(), "g1").expect("read back");
+        assert_eq!(
+            file.candidate_set_hash,
+            merge_candidate_set_hash([&candidate])
+        );
+
+        let (loaded, confirmed_by) =
+            load_applicable_merge_plan(&store, &memory, dir.path(), "g1", 0.85)
+                .await
+                .expect("a fresh plan file is applicable");
+        assert_eq!(confirmed_by, "llm:test-model");
+        assert_eq!(loaded, plan, "the file's actions load verbatim");
+        let report = apply_merge_plan(&store, &memory, "g1", &loaded, &confirmed_by, &[]).await;
+        assert!(report.failures.is_empty());
+        assert_eq!(report.audit_ids.len(), 1);
+        assert!(
+            memory
+                .node_content("g1", &candidate.b_id)
+                .await
+                .expect("content")
+                .is_none(),
+            "the loser merged away"
+        );
+        let row = store
+            .get_merge_audit(report.audit_ids[0])
+            .expect("get")
+            .expect("the audit row");
+        assert_eq!(row.verdict, "same");
+        assert!(row.snapshot.is_some(), "the rollback source landed");
+    }
+
+    #[tokio::test]
+    async fn merge_tool_apply_refuses_a_missing_plan_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, memory, _candidate) = seeded_merge_group(dir.path()).await;
+        let error = load_applicable_merge_plan(&store, &memory, dir.path(), "g1", 0.85)
+            .await
+            .expect_err("no plan file was written");
+        let text = format!("{error:#}");
+        assert!(text.contains("merge_plan.json"), "message: {text}");
+        assert!(text.contains("dry run"), "message: {text}");
+    }
+
+    #[tokio::test]
+    async fn merge_tool_apply_refuses_a_stale_plan_file() {
+        // Decision 77 (H6a): the graph changed between the dry run and
+        // the apply (the pair got linked, so the scan excludes it) —
+        // the candidate-set hash mismatches and the apply refuses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, memory, candidate) = seeded_merge_group(dir.path()).await;
+        write_merge_plan_file(
+            dir.path(),
+            "g1",
+            0.85,
+            "llm:test-model",
+            &same_plan(&candidate),
+        )
+        .expect("write the plan file");
+        memory
+            .link_also_known_as("g1", &candidate.a_id, &candidate.b_id)
+            .await
+            .expect("link the pair");
+        let error = load_applicable_merge_plan(&store, &memory, dir.path(), "g1", 0.85)
+            .await
+            .expect_err("the candidate set changed");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("the merge plan is stale; re-run the dry run"),
+            "message: {text}"
+        );
+        // A hand-edited file (the hash field tampered) refuses the same way.
+        let path = merge_plan_file_path(dir.path(), "g1");
+        let mut file = read_merge_plan_file(dir.path(), "g1").expect("read");
+        file.candidate_set_hash = "0000000000000000".to_string();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&file).expect("serialize"),
+        )
+        .expect("rewrite");
+        let error = load_applicable_merge_plan(&store, &memory, dir.path(), "g1", 0.85)
+            .await
+            .expect_err("a tampered hash mismatches");
+        assert!(format!("{error:#}").contains("stale"));
+    }
+
+    #[test]
+    fn merge_plan_file_refuses_version_chat_and_verdict_mismatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("g1")).expect("group dir");
+        let candidate = MergeCandidate {
+            a_id: "a".to_string(),
+            b_id: "b".to_string(),
+            a_name: "A".to_string(),
+            b_name: "B".to_string(),
+            a_description: String::new(),
+            b_description: String::new(),
+            kind: NodeType::Concept,
+            score: 0.9,
+        };
+        let plan = same_plan(&candidate);
+        write_merge_plan_file(dir.path(), "g1", 0.85, "llm:test-model", &plan).expect("write");
+
+        // A chat-id mismatch is a loud refusal.
+        let error =
+            read_merge_plan_file(dir.path(), "g2").expect_err("a missing file for another group");
+        assert!(format!("{error:#}").contains("dry run"));
+        // A version mismatch is a loud refusal.
+        let mut file = read_merge_plan_file(dir.path(), "g1").expect("read");
+        file.version = MERGE_PLAN_FILE_VERSION + 1;
+        std::fs::write(
+            merge_plan_file_path(dir.path(), "g1"),
+            serde_json::to_string_pretty(&file).expect("serialize"),
+        )
+        .expect("rewrite");
+        let error = read_merge_plan_file(dir.path(), "g1").expect_err("a version mismatch");
+        assert!(format!("{error:#}").contains("version"));
+        // An unknown verdict string never silently becomes a plan.
+        let mut file = MergePlanFile::from_plan("g1", 0.85, "llm:test-model", &plan);
+        file.actions[0].verdict = "maybe".to_string();
+        let error = file.into_plan().expect_err("an unknown verdict");
+        assert!(format!("{error:#}").contains("unknown verdict"));
+    }
+
+    #[test]
+    fn group_lock_refuses_a_second_holder_and_is_reacquirable_after_drop() {
+        // Decision 77 (H5): the contention refusal names the
+        // possibility and the lock path; a dropped guard frees the
+        // group again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("g1")).expect("group dir");
+        let guard = acquire_group_lock(dir.path(), "g1").expect("the first lock");
+        let error = acquire_group_lock(dir.path(), "g1")
+            .err()
+            .expect("contention must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("is the bot running?"), "message: {text}");
+        assert!(text.contains(".tamako.lock"), "message: {text}");
+        assert!(text.contains("g1"), "message: {text}");
+        drop(guard);
+        acquire_group_lock(dir.path(), "g1").expect("the lock is free after the drop");
+    }
+
+    #[tokio::test]
+    async fn open_merge_group_requires_store_db_and_memory_lbug() {
+        // Decision 77 (S1-F8): both files must exist; a store-only
+        // group (the graph never written) bails with the same
+        // not-served-yet family.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = open_merge_group(dir.path(), "g1")
+            .err()
+            .expect("neither file exists");
+        let text = format!("{error:#}");
+        assert!(text.contains("no store.db"), "message: {text}");
+        assert!(text.contains("has not been served yet"), "message: {text}");
+
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("g1").expect("create the store only");
+        let error = open_merge_group(dir.path(), "g1")
+            .err()
+            .expect("no graph yet");
+        let text = format!("{error:#}");
+        assert!(text.contains("no memory.lbug"), "message: {text}");
+        assert!(text.contains("has not been served yet"), "message: {text}");
+        // The read-only variant checks the same.
+        let error = open_merge_group_read_only(dir.path(), "g1")
+            .err()
+            .expect("no graph yet");
+        assert!(format!("{error:#}").contains("no memory.lbug"));
     }
 }

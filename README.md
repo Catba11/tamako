@@ -118,7 +118,7 @@ Environment variables:
 
 Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`, `summary`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_`, `reply_`, and `summary_`). The summary purpose alone also has per-purpose env overrides `TAMAKO_SUMMARY_LLM_API` / `TAMAKO_SUMMARY_LLM_BASE_URL`, which beat the global env overrides. The same pattern applies to the structured-output mode: `structured_output` globally and `digest_structured_output` / `gate_structured_output` / `reply_structured_output` / `summary_structured_output` per purpose (values `schema`, `json_object`, `prompt_only`; default `schema`; an unknown value is a hard startup error). Structured-output precedence: purpose env → global env → purpose config → global config → default `schema`. API keys come from the environment only, never from the config file.
 
-Embeddings (specs.md Section 13, schema v7): the vector sidecar embeds Person/Alias/Concept names and descriptions through an openai-compatible `/v1/embeddings` endpoint — the default pair is OpenRouter + `qwen/qwen3-embedding-8b` (zero data retention), keyed by `OPENAI_API_KEY`. The digest pipeline enqueues changed nodes after the graph commit; a background worker (30 s cadence, live mode only) drains the queue, and a startup reconciliation pass backfills or repairs the index, so the sidecar is always rebuildable derived data. A missing key degrades embeddings to a startup warning; the digest pipeline is unaffected.
+Embeddings (specs.md Section 13, schema v7): the vector sidecar embeds Person/Alias/Concept names and descriptions through an openai-compatible `/v1/embeddings` endpoint — the default pair is OpenRouter + `qwen/qwen3-embedding-8b` (zero data retention), keyed by `OPENAI_API_KEY`. The digest pipeline enqueues changed nodes after the graph commit; a background worker (30 s cadence, live mode only) drains the queue, and a startup reconciliation pass backfills or repairs the index, so the sidecar is always rebuildable derived data. A missing key degrades embeddings to a startup warning; the digest pipeline is unaffected. Note the dual-use: embeddings read the SAME `OPENAI_API_KEY` as openai-compatible completions, so when the completions endpoint points elsewhere (e.g. Opencode Go) while embeddings keep the default OpenRouter base URL, the key must be valid for OpenRouter — startup logs one WARN in that configuration (decision 77); point `embedding_llm_base_url` (or `TAMAKO_EMBEDDING_BASE_URL`) at your provider to co-locate them.
 
 ### Recipe: Opencode Go
 
@@ -184,21 +184,27 @@ cargo run -- --status-all --data-root ./data
 
 `--status` exits with an error when the group has no `store.db` yet. `--status-all` with no group stores prints a note and exits successfully. Caveat: after a CLEAN shutdown the bot removes the WAL files; a read-only status run then still opens the database, but the first query can fail when the directory is not writable — the error message carries a hint. Make the data-root directory writable, or start the bot once and stop it.
 
-The merge modes are the offline graph-repair tool (current-state.md decision 74, `proposed-graph-database-specs.md` Section 7.7): they deduplicate fragmented Person/Concept nodes. Unlike the status modes they WRITE the group's `store.db` and `memory.lbug`, so **stop the bot first** — a running bot holds the group's LadybugDB mutex and the store's single writer.
+The merge modes are the offline graph-repair tool (current-state.md decision 74, `proposed-graph-database-specs.md` Section 7.7): they deduplicate fragmented Person/Concept nodes. The mutating commands (`--merge-tool --apply`, `--merge`, `--merge-rollback`) take a per-group advisory lock, `{data-root}/{chat_id}/.tamako.lock`, and refuse loudly when another process holds it (`is the bot running? lock held: <path>`); `--live` holds the same lock per served group for its whole lifetime. The `--merge-tool` dry run opens the group's `store.db` READ-ONLY and writes only the plan file. Behind the lock, LadybugDB itself also holds an exclusive OS file lock on `memory.lbug`: a second process that somehow gets that far fails loudly at the open (`Could not set lock on file … Resource temporarily unavailable`) instead of corrupting the graph.
 
 ```sh
 # Scan the vector index for duplicate candidates, confirm each pair once
 # on the digest endpoint (verdicts: same merges, related links
-# also_known_as, different skips), print the plan. DRY RUN: without
-# --apply nothing is written.
+# also_known_as, different skips), print the plan, and write it to
+# {data-root}/{chat_id}/merge_plan.json. DRY RUN (read-only store).
 cargo run -- --merge-tool -1001234567890 --data-root ./data --config tamako.toml
 
-# Execute the printed plan. Every action appends a merge_audit row
-# (specs.md Section 5.2); confirmed_by is llm:<digest model>.
+# Execute the PLAN FILE of a previous dry run (decision 77, two-step
+# apply): the apply re-scans the candidates (cheap, no LLM) and refuses
+# loudly when the candidate set changed since the dry run ("plan is
+# stale; re-run the dry run"). A matching plan executes the file's
+# actions; every action appends a merge_audit row (specs.md Section 5.2)
+# and a fully applied plan retires its file.
 cargo run -- --merge-tool -1001234567890 --apply --data-root ./data --config tamako.toml
 
 # Manual merge, no LLM: merge loser into survivor as an operator-decided
-# 'same' action (confirmed_by "operator"). Prints the audit id.
+# 'same' action (confirmed_by "operator"). Prints the audit id. A
+# kind-incompatible pair (Person vs Concept) is a hard error unless
+# --force is given.
 cargo run -- --merge -1001234567890 <loser_id> <survivor_id> --data-root ./data
 
 # Roll one 'same' merge back from its audit snapshot; the row is marked
@@ -207,9 +213,9 @@ cargo run -- --merge -1001234567890 <loser_id> <survivor_id> --data-root ./data
 cargo run -- --merge-rollback -1001234567890 <audit_id> --data-root ./data
 ```
 
-Without a digest-endpoint LLM key `--merge-tool` prints only the scan (the candidate pairs above the threshold) with a note that the confirmations were skipped; it writes nothing either way. The candidate threshold is the per-group `merge_candidate_threshold` config key (default 0.85); `--max-confirmations N` caps the LLM confirmation calls of one run (default 50). Rollback does not re-embed the restored node itself: the next startup reconciliation of the embedding worker picks it up automatically (decision 66).
+Without a digest-endpoint LLM key `--merge-tool` prints only the scan (the candidate pairs above the threshold) with a note that the confirmations were skipped; it writes no plan file. The candidate threshold is the per-group `merge_candidate_threshold` config key (default 0.85); `--max-confirmations N` caps the LLM confirmation calls of one run (default 50). Rollback does not re-embed the restored node itself: the next startup reconciliation of the embedding worker picks it up automatically (decision 66).
 
-The fact modes are the offline fact-validity tool (current-state.md decision 75, `proposed-graph-database-specs.md` Section 7.5): they list, invalidate, and re-validate the edges of one node. No LLM key is needed. Like the merge modes they WRITE the group's `store.db` and `memory.lbug`, so **stop the bot first** — a running bot holds the group's LadybugDB mutex and the store's single writer. The flow: `--facts` prints the edge ids that `--invalidate` / `--revalidate` take.
+The fact modes are the offline fact-validity tool (current-state.md decision 75, `proposed-graph-database-specs.md` Section 7.5): they list, invalidate, and re-validate the edges of one node. No LLM key is needed. `--invalidate` / `--revalidate` WRITE the graph and take the same per-group lock as the merge modes, so they refuse loudly while the bot runs. `--facts` is read-only on the store side, but its graph open still conflicts with a running bot (the LadybugDB file lock), so stop the bot first for all three. The flow: `--facts` prints the edge ids that `--invalidate` / `--revalidate` take.
 
 ```sh
 # List every edge of the node resolved from <name> (exact alias match),
@@ -228,7 +234,7 @@ cargo run -- --invalidate -1001234567890 <edge_id> --data-root ./data
 cargo run -- --revalidate -1001234567890 <edge_id> --data-root ./data
 ```
 
-Invalidation is non-destructive and self-recording: it sets `invalid_at` on the edge row itself (no audit table), and the recall path has filtered invalid edges since M5 — an invalidated fact stops entering wakes immediately. The `facts_invalidated_total` counter (visible in `--status`) counts invalidation events from all three write paths: the digest path, the merge apply path, and the manual `--invalidate` command.
+Invalidation is non-destructive and self-recording: it sets `invalid_at` on the edge row itself (no audit table), and the recall path has filtered invalid edges since M5 — an invalidated fact stops entering wakes immediately. The `facts_invalidated_total` counter (visible in `--status`) counts invalidation events from all three write paths: the digest path, the merge apply path, and the manual `--invalidate` command. Replay note (decision 77): a replayed batch never re-validates an invalidated edge — the stored `invalid_at` survives — but an out-of-order FULL replay can still rewind a fact's other columns (edge text, properties) to the replayed batch's values; in-order replay converges.
 
 ## Verification commands
 
