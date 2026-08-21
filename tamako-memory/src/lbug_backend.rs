@@ -33,20 +33,20 @@
 //! reads and CHECKPOINT included, as a binding-level requirement
 //! (proposed-graph-database-specs.md Section 6.1 rule 3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use lbug::{Connection, Database, LogicalType, PreparedStatement, SystemConfig, Value};
 use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 
 use crate::backend::{
-    AliasTarget, EdgeId, MemoryBackend, MemoryBatch, MemoryError, MergeOutcome, MergeSnapshot,
-    MergeSnapshotEdge, MergeSnapshotEdgeKey, MergeSnapshotNode, NeighborEdge, NodeContent,
-    NodeFactEdge, NodeFacts, NodeMergeStats, NodeResolutionInfo, NodeType, Result, UpsertOutcome,
-    NEIGHBOR_EXPANSION_LIMIT,
+    AliasTarget, CandidateEdge, EdgeId, MemoryBackend, MemoryBatch, MemoryError, MergeOutcome,
+    MergeSnapshot, MergeSnapshotEdge, MergeSnapshotEdgeKey, MergeSnapshotNode, NeighborEdge,
+    NodeContent, NodeFactEdge, NodeFacts, NodeMergeStats, NodeResolutionInfo, NodeType, Result,
+    UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT, RECALL_TIME_WINDOW_DAYS,
 };
 
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
@@ -277,6 +277,48 @@ const NODE_FACTS_EDGES: &str = "MATCH (s:Node)-[r:EDGE]->(t:Node)
 WHERE s.id = $node_id OR t.id = $node_id
 RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at, r.invalid_at
 ORDER BY r.valid_at DESC, r.relationship_name, t.id";
+
+// Decision 76 / Section 8.2: one per-node expansion query of the two-hop
+// recall read. The SAME query serves hop 1 (the entry nodes) and hop 2
+// (the hop-1 neighbor nodes); the caller loops over the node ids and
+// dedupes the union by edge id. The whitelist drops `contains`
+// (provenance) and `known_as` (surface forms, resolved at entry) and
+// KEEPS `also_known_as` (the cross-language bridge, decision 76 (b)).
+// Valid edges only; the Section 8.2 window (RECALL_TIME_WINDOW_DAYS)
+// qualifies an edge recent by EITHER measure (`valid_at` or
+// `created_at`). The query enters the graph through the node identifier
+// (Rule R5); the node id and the cutoff are $params (Section 5.2 rule
+// 4). The LIMIT is interpolated at the call site from the trusted
+// per_node_limit argument, the same "trusted values only" policy as
+// `query_rows` and NEIGHBORS.
+const TWO_HOP_EDGES: &str = "MATCH (s:Node)-[r:EDGE]->(t:Node)
+WHERE (s.id = $node_id OR t.id = $node_id)
+  AND r.invalid_at IS NULL
+  AND r.relationship_name <> 'contains'
+  AND r.relationship_name <> 'known_as'
+  AND (r.valid_at >= $cutoff OR r.created_at >= $cutoff)
+RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at
+ORDER BY r.created_at DESC
+LIMIT ";
+
+// Decision 76 (c): hydrate one sidecar `edge_texts` hit by the natural
+// key of its edge (the decoded EdgeId), with both endpoint names. Valid
+// edges only: a recall candidate must be a currently-valid fact, the
+// same policy as every other candidate-producing read. Rule R5: entry
+// through the endpoint identifiers; every value is a $param (Section
+// 5.2 rule 4).
+const EDGE_BY_KEY_HYDRATE: &str =
+    "MATCH (s:Node {id: $source_id})-[r:EDGE]->(t:Node {id: $target_id})
+WHERE r.relationship_name = $rel AND r.valid_at = $valid_at
+  AND r.invalid_at IS NULL
+RETURN s.name, t.name, r.edge_text";
+
+// Decision 76 (c) / Section 7.6 step 6: EVERY edge of the group, valid
+// and invalid, for the reconciliation diff of the `edge_texts` sidecar.
+// Documented Rule R5 exception (the diff has no entry identifiers),
+// mirroring LIST_NODE_CONTENTS.
+const LIST_ALL_EDGES: &str = "MATCH (s:Node)-[r:EDGE]->(t:Node)
+RETURN s.id, r.relationship_name, t.id, r.valid_at, r.edge_text";
 
 // Decision 75 (c) / Section 7.7: the merge single-value invariant pass
 // reads the survivor's currently VALID outgoing edges of one predicate.
@@ -767,6 +809,94 @@ fn read_alias_targets(conn: &Connection, alias_node_id: &str) -> Result<Vec<Alia
     Ok(targets)
 }
 
+/// Decision 76: builds the [`CandidateEdge`] of one edge from its
+/// natural key, the endpoint names, and the stored `edge_text`. The
+/// `edge_id` is the [`EdgeId::encode`] of the natural key — the same
+/// dedup key shape as `NeighborEdge::edge_id` (specs.md Section 9.3).
+fn candidate_edge(
+    source_id: String,
+    source_name: String,
+    target_id: String,
+    target_name: String,
+    relationship_name: String,
+    edge_text: String,
+    valid_at: OffsetDateTime,
+) -> CandidateEdge {
+    let edge_id = EdgeId {
+        source_id: source_id.clone(),
+        relationship_name: relationship_name.clone(),
+        target_id: target_id.clone(),
+        valid_at,
+    }
+    .encode();
+    CandidateEdge {
+        edge_id,
+        source_id,
+        source_name,
+        target_id,
+        target_name,
+        relationship_name,
+        edge_text,
+        valid_at,
+    }
+}
+
+/// Decision 76 / Section 8.2: runs one per-node expansion query of the
+/// two-hop read and decodes the rows. Shared by hop 1 (the entry nodes)
+/// and hop 2 (the hop-1 neighbor nodes). A row of an unexpected shape is
+/// skipped, it does not fail the query (same policy as `neighbors`).
+fn read_expansion_edges(
+    conn: &Connection,
+    statement: &mut PreparedStatement,
+    node_id: &str,
+    cutoff: OffsetDateTime,
+) -> Result<Vec<CandidateEdge>> {
+    let result = conn
+        .execute(
+            statement,
+            vec![
+                ("node_id", Value::String(node_id.to_string())),
+                ("cutoff", Value::Timestamp(cutoff)),
+            ],
+        )
+        .map_err(backend)?;
+    let mut edges = Vec::new();
+    for row in result {
+        let mut columns = row.into_iter();
+        let decoded = (
+            columns.next(),
+            columns.next(),
+            columns.next(),
+            columns.next(),
+            columns.next(),
+            columns.next(),
+            columns.next(),
+        );
+        let (
+            Some(Value::String(source_id)),
+            Some(Value::String(source_name)),
+            Some(Value::String(target_id)),
+            Some(Value::String(target_name)),
+            Some(Value::String(relationship_name)),
+            Some(Value::String(edge_text)),
+            Some(Value::Timestamp(valid_at)),
+        ) = decoded
+        else {
+            continue;
+        };
+        edges.push(candidate_edge(
+            source_id,
+            source_name,
+            target_id,
+            target_name,
+            relationship_name,
+            edge_text,
+            valid_at,
+        ));
+    }
+    Ok(edges)
+}
+
 /// Decision 75 (c) / Section 7.7: the merge single-value invariant pass.
 /// Runs at the END of the merge transaction, so the MATCH sees the edges
 /// CREATEd by the re-point earlier in the SAME transaction
@@ -1141,6 +1271,188 @@ impl MemoryBackend for LbugBackend {
                     other_node_id,
                     other_node_name,
                 });
+            }
+            Ok(edges)
+        })
+        .await
+    }
+
+    /// Decision 76 / Section 8.2: the two-hop recall expansion. See the
+    /// trait doc for the rules. Fan-out shape: ONE `with_conn`
+    /// acquisition (decision 47) holds the per-group lock for the whole
+    /// read; inside it, hop 1 runs the TWO_HOP_EDGES query once per
+    /// entry node (per-node LIMIT interpolated), then hop 2 runs the
+    /// SAME query once per hop-1 neighbor node (per-node LIMIT
+    /// interpolated again). The union is deduped by edge id: an edge
+    /// between two queried nodes surfaces exactly once.
+    async fn two_hop_edges(
+        &self,
+        chat_id: &str,
+        entry_node_ids: &[String],
+        now: OffsetDateTime,
+        per_node_limit: usize,
+    ) -> Result<Vec<CandidateEdge>> {
+        // An empty entry list short-circuits without opening the
+        // database of the group (same policy as node_resolution_infos).
+        if entry_node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entry_node_ids = entry_node_ids.to_vec();
+        let cypher = format!("{TWO_HOP_EDGES}{per_node_limit}");
+        self.with_conn(chat_id, move |conn| {
+            let cutoff = now - Duration::days(RECALL_TIME_WINDOW_DAYS);
+            let mut statement = conn.prepare(&cypher).map_err(backend)?;
+            let mut candidates = Vec::new();
+            // Dedup sets: `seen_nodes` guards against re-querying a node
+            // (an entry id that is also a hop-1 neighbor, a duplicate
+            // entry id); `seen_edges` dedupes the union by edge id.
+            let mut seen_nodes: HashSet<String> = entry_node_ids.iter().cloned().collect();
+            let mut seen_edges: HashSet<String> = HashSet::new();
+            // Hop 1: the entry nodes. The frontier collects the hop-1
+            // neighbor nodes in first-seen order.
+            let mut frontier: Vec<String> = Vec::new();
+            for node_id in &entry_node_ids {
+                for edge in read_expansion_edges(conn, &mut statement, node_id, cutoff)? {
+                    let other = if edge.source_id == *node_id {
+                        edge.target_id.clone()
+                    } else {
+                        edge.source_id.clone()
+                    };
+                    if seen_nodes.insert(other.clone()) {
+                        frontier.push(other);
+                    }
+                    if seen_edges.insert(edge.edge_id.clone()) {
+                        candidates.push(edge);
+                    }
+                }
+            }
+            // Hop 2: the hop-1 neighbor nodes, same query, same per-node
+            // limit. Every frontier node is unqueried by construction.
+            for node_id in &frontier {
+                for edge in read_expansion_edges(conn, &mut statement, node_id, cutoff)? {
+                    if seen_edges.insert(edge.edge_id.clone()) {
+                        candidates.push(edge);
+                    }
+                }
+            }
+            Ok(candidates)
+        })
+        .await
+    }
+
+    /// Decision 76 (c): hydrate sidecar `edge_texts` hits into full
+    /// candidates. Serialized per group by `with_conn` (decision 47).
+    async fn edges_by_ids(&self, chat_id: &str, edge_ids: &[String]) -> Result<Vec<CandidateEdge>> {
+        if edge_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Decode BEFORE opening the database. A malformed id is skipped
+        // with a DEBUG note — the read path skips, it does not fail (a
+        // corrupt sidecar row must not break the recall read); the loud
+        // decode contract of EdgeId applies to the manual ops.
+        let mut keys = Vec::new();
+        for edge_id in edge_ids {
+            match EdgeId::decode(edge_id) {
+                Ok(key) => keys.push(key),
+                Err(error) => {
+                    tracing::debug!(edge_id = %edge_id, %error, "edges_by_ids: skipping a malformed edge id");
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(chat_id, move |conn| {
+            let mut statement = conn.prepare(EDGE_BY_KEY_HYDRATE).map_err(backend)?;
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut candidates = Vec::new();
+            for key in &keys {
+                // Duplicate ids collapse to one candidate.
+                if !seen.insert(key.encode()) {
+                    continue;
+                }
+                let mut result = conn
+                    .execute(
+                        &mut statement,
+                        vec![
+                            ("source_id", Value::String(key.source_id.clone())),
+                            ("target_id", Value::String(key.target_id.clone())),
+                            ("rel", Value::String(key.relationship_name.clone())),
+                            ("valid_at", Value::Timestamp(key.valid_at)),
+                        ],
+                    )
+                    .map_err(backend)?;
+                // The natural key addresses at most one edge row. Zero
+                // rows: a stale id whose graph edge is gone (deleted or
+                // invalidated between reconciliations, Section 7.6 step
+                // 6) — it simply does not occur in the result.
+                let Some(row) = result.next() else {
+                    continue;
+                };
+                let mut columns = row.into_iter();
+                let decoded = (columns.next(), columns.next(), columns.next());
+                // A row of an unexpected shape is skipped, it does not
+                // fail the query (same policy as `neighbors`).
+                let (
+                    Some(Value::String(source_name)),
+                    Some(Value::String(target_name)),
+                    Some(Value::String(edge_text)),
+                ) = decoded
+                else {
+                    continue;
+                };
+                candidates.push(candidate_edge(
+                    key.source_id.clone(),
+                    source_name,
+                    key.target_id.clone(),
+                    target_name,
+                    key.relationship_name.clone(),
+                    edge_text,
+                    key.valid_at,
+                ));
+            }
+            Ok(candidates)
+        })
+        .await
+    }
+
+    /// Decision 76 (c) / Section 7.6 step 6: EVERY edge of the group,
+    /// valid and invalid, for the reconciliation diff (the documented
+    /// Rule R5 exception, mirroring `list_node_contents`). Serialized
+    /// per group by `with_conn` (decision 47).
+    async fn list_all_edges(&self, chat_id: &str) -> Result<Vec<(String, String)>> {
+        self.with_conn(chat_id, |conn| {
+            let result = conn.query(LIST_ALL_EDGES).map_err(backend)?;
+            let mut edges = Vec::new();
+            for row in result {
+                let mut columns = row.into_iter();
+                let decoded = (
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                    columns.next(),
+                );
+                // A row of an unexpected shape is skipped, it does not
+                // fail the listing (same policy as `neighbors`).
+                let (
+                    Some(Value::String(source_id)),
+                    Some(Value::String(relationship_name)),
+                    Some(Value::String(target_id)),
+                    Some(Value::Timestamp(valid_at)),
+                    Some(Value::String(edge_text)),
+                ) = decoded
+                else {
+                    continue;
+                };
+                let edge_id = EdgeId {
+                    source_id,
+                    relationship_name,
+                    target_id,
+                    valid_at,
+                }
+                .encode();
+                edges.push((edge_id, edge_text));
             }
             Ok(edges)
         })
@@ -4064,5 +4376,420 @@ mod tests {
         .encode();
         let expected = if id_a < id_z { org_a_id } else { org_z_id };
         assert_eq!(kept_first, expected);
+    }
+
+    /// Decision 76 test graph: A -likes-> B -likes-> C, all valid.
+    fn two_hop_batch() -> (MemoryBatch, [MemoryNode; 3]) {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let a = concept_node("Alpha", base);
+        let b = concept_node("Beta", base);
+        let c = concept_node("Gamma", base);
+        let edges = vec![
+            fact_edge(&a.id, &b.id, "likes", None, base + Duration::seconds(1)),
+            fact_edge(&b.id, &c.id, "likes", None, base + Duration::seconds(2)),
+        ];
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(6, 100),
+            nodes: vec![a.clone(), b.clone(), c.clone()],
+            edges,
+        };
+        (batch, [a, b, c])
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_surfaces_the_hop_two_edges_with_names_hydrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [a, b, c]) = two_hop_batch();
+        backend.upsert_batch("chat_d76a", &batch).await.unwrap();
+
+        let now = datetime!(2026-08-08 10:00 UTC);
+        let candidates = backend
+            .two_hop_edges(
+                "chat_d76a",
+                std::slice::from_ref(&a.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        // Hop 1 surfaces A -> B; hop 2 surfaces B -> C, both with the
+        // endpoint names hydrated.
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].source_id, a.id);
+        assert_eq!(candidates[0].source_name, "Alpha");
+        assert_eq!(candidates[0].target_id, b.id);
+        assert_eq!(candidates[0].target_name, "Beta");
+        assert_eq!(candidates[1].source_id, b.id);
+        assert_eq!(candidates[1].source_name, "Beta");
+        assert_eq!(candidates[1].target_id, c.id);
+        assert_eq!(candidates[1].target_name, "Gamma");
+        assert_eq!(candidates[1].relationship_name, "likes");
+        // The opaque edge id is the EdgeId of the natural key and
+        // round-trips (specs.md Section 9.3 dedup key shape).
+        let key = EdgeId::decode(&candidates[1].edge_id).unwrap();
+        assert_eq!(key.source_id, b.id);
+        assert_eq!(key.target_id, c.id);
+        assert_eq!(key.valid_at, candidates[1].valid_at);
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_whitelist_excludes_contains_and_known_as_but_traverses_also_known_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let a = concept_node("Alpha", base);
+        let n = concept_node("Nick", base);
+        let x = concept_node("Xray", base);
+        let b = concept_node("Beta", base);
+        let y = concept_node("Yankee", base);
+        let k = concept_node("Kilo", base);
+        let z = concept_node("Zulu", base);
+        let edges = vec![
+            // known_as: never traversed (surface forms, resolved at
+            // entry) — and the edge BEHIND it never surfaces either.
+            fact_edge(&a.id, &n.id, "known_as", None, base + Duration::seconds(1)),
+            fact_edge(&n.id, &x.id, "likes", None, base + Duration::seconds(2)),
+            // contains: never traversed (provenance only) — and no
+            // expansion through it.
+            fact_edge(&a.id, &b.id, "contains", None, base + Duration::seconds(3)),
+            fact_edge(&b.id, &y.id, "likes", None, base + Duration::seconds(4)),
+            // also_known_as: INCLUDED (the cross-language bridge,
+            // decision 76 (b)) — the edge itself and the hop-2 edge
+            // behind it both surface.
+            fact_edge(
+                &a.id,
+                &k.id,
+                "also_known_as",
+                None,
+                base + Duration::seconds(5),
+            ),
+            fact_edge(&k.id, &z.id, "likes", None, base + Duration::seconds(6)),
+        ];
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(7, 110),
+            nodes: vec![
+                a.clone(),
+                n.clone(),
+                x.clone(),
+                b.clone(),
+                y.clone(),
+                k.clone(),
+                z.clone(),
+            ],
+            edges,
+        };
+        backend.upsert_batch("chat_d76b", &batch).await.unwrap();
+
+        let now = datetime!(2026-08-08 10:00 UTC);
+        let candidates = backend
+            .two_hop_edges(
+                "chat_d76b",
+                std::slice::from_ref(&a.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        let relationships: Vec<&str> = candidates
+            .iter()
+            .map(|edge| edge.relationship_name.as_str())
+            .collect();
+        assert_eq!(relationships, vec!["also_known_as", "likes"]);
+        assert_eq!(candidates[0].target_id, k.id);
+        assert_eq!(candidates[1].source_id, k.id);
+        assert_eq!(candidates[1].target_id, z.id);
+    }
+
+    /// Decision 76 test graph with invalid edges: A -likes-> B valid,
+    /// B -likes-> C INVALID, A -likes-> D INVALID, D -likes-> E valid.
+    fn two_hop_invalid_batch() -> (MemoryBatch, [MemoryNode; 5]) {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let nodes: Vec<MemoryNode> = ["Alpha", "Beta", "Gamma", "Delta", "Echo"]
+            .iter()
+            .map(|name| concept_node(name, base))
+            .collect();
+        let [a, b, c, d, e]: [MemoryNode; 5] = nodes.try_into().unwrap();
+        let edges = vec![
+            fact_edge(&a.id, &b.id, "likes", None, base + Duration::seconds(1)),
+            // Invalid hop-2 edge: excluded by `invalid_at IS NULL`.
+            fact_edge(
+                &b.id,
+                &c.id,
+                "likes",
+                Some(base + Duration::seconds(10)),
+                base + Duration::seconds(2),
+            ),
+            // Invalid hop-1 edge: excluded, and D never enters the
+            // frontier, so the valid D -> E edge behind it stays out.
+            fact_edge(
+                &a.id,
+                &d.id,
+                "likes",
+                Some(base + Duration::seconds(10)),
+                base + Duration::seconds(3),
+            ),
+            fact_edge(&d.id, &e.id, "likes", None, base + Duration::seconds(4)),
+        ];
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(8, 120),
+            nodes: vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()],
+            edges,
+        };
+        (batch, [a, b, c, d, e])
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_excludes_invalid_edges_and_never_expands_through_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [a, b, _c, _d, _e]) = two_hop_invalid_batch();
+        backend.upsert_batch("chat_d76c", &batch).await.unwrap();
+
+        let now = datetime!(2026-08-08 10:00 UTC);
+        let candidates = backend
+            .two_hop_edges(
+                "chat_d76c",
+                std::slice::from_ref(&a.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        // Only the valid hop-1 edge A -> B survives.
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_id, a.id);
+        assert_eq!(candidates[0].target_id, b.id);
+    }
+
+    #[tokio::test]
+    async fn list_all_edges_returns_every_edge_valid_and_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, nodes) = two_hop_invalid_batch();
+        let [a, b, c, d, e] = nodes;
+        backend.upsert_batch("chat_d76d", &batch).await.unwrap();
+
+        let listed = backend.list_all_edges("chat_d76d").await.unwrap();
+        // The reconciliation diff needs the FULL edge set: all four
+        // edges, the two invalid ones included.
+        assert_eq!(listed.len(), 4);
+        let mut keys: Vec<(String, String, String)> = listed
+            .iter()
+            .map(|(edge_id, edge_text)| {
+                // Every listed id round-trips through EdgeId::decode —
+                // the same id shape the sidecar diff reconciles against.
+                let key = EdgeId::decode(edge_id).unwrap();
+                assert!(edge_text.contains("likes"));
+                (key.source_id, key.relationship_name, key.target_id)
+            })
+            .collect();
+        keys.sort();
+        let mut expected: Vec<(String, String, String)> = vec![
+            (a.id.clone(), "likes".to_string(), b.id.clone()),
+            (b.id.clone(), "likes".to_string(), c.id.clone()),
+            (a.id.clone(), "likes".to_string(), d.id.clone()),
+            (d.id.clone(), "likes".to_string(), e.id.clone()),
+        ];
+        expected.sort();
+        assert_eq!(keys, expected);
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_truncates_per_node_at_both_hops() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let hub = concept_node("Hub", base);
+        let mut nodes = vec![hub.clone()];
+        let mut edges = Vec::new();
+        // Three hop-1 edges on the entry node, increasing created_at.
+        for i in 0..3 {
+            let target = concept_node(&format!("Hop1{i}"), base);
+            edges.push(fact_edge(
+                &hub.id,
+                &target.id,
+                "mentions",
+                None,
+                base + Duration::seconds(i + 1),
+            ));
+            nodes.push(target);
+        }
+        // Three hop-2 edges on the NEWEST hop-1 neighbor (Hop12),
+        // newer than every hop-1 edge.
+        let hop12 = crate::identifiers::concept_id("Hop12");
+        for j in 0..3 {
+            let target = concept_node(&format!("Hop2{j}"), base);
+            edges.push(fact_edge(
+                &hop12,
+                &target.id,
+                "mentions",
+                None,
+                base + Duration::seconds(10 + j),
+            ));
+            nodes.push(target);
+        }
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(9, 130),
+            nodes,
+            edges,
+        };
+        backend.upsert_batch("chat_d76e", &batch).await.unwrap();
+
+        // The test passes a SMALL per-node limit of 2; the call site
+        // passes NEIGHBOR_EXPANSION_LIMIT.
+        let now = datetime!(2026-08-08 10:00 UTC);
+        let candidates = backend
+            .two_hop_edges("chat_d76e", std::slice::from_ref(&hub.id), now, 2)
+            .await
+            .unwrap();
+        let targets: Vec<&str> = candidates
+            .iter()
+            .map(|edge| edge.target_name.as_str())
+            .collect();
+        // Hop 1 keeps the 2 NEWEST edges of Hub (Section 8.2 truncation
+        // by created_at descending); hop 2 then queries Hop12 and Hop11
+        // and keeps the 2 newest edges of Hop12. Hop11 carries only the
+        // already-collected hub edge, so it adds nothing.
+        assert_eq!(targets, vec!["Hop12", "Hop11", "Hop22", "Hop21"]);
+        // The hop-2 expansion of Hop12 was itself truncated: Hop20
+        // never surfaces.
+        assert!(!candidates.iter().any(|edge| edge.target_name == "Hop20"));
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_applies_the_ninety_day_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let old = datetime!(2026-01-01 10:00 UTC);
+        let recent = datetime!(2026-08-20 10:00 UTC);
+        let a = concept_node("Alpha", recent);
+        let b = concept_node("Beta", recent);
+        let c = concept_node("Gamma", recent);
+        let d = concept_node("Delta", recent);
+        // valid_at = created_at = old: outside the 90-day window by
+        // BOTH measures (decision 76 (a) keeps the Section 8.2 window,
+        // unlike the decision-58 shallow read).
+        let old_edge = fact_edge(&a.id, &b.id, "likes", None, old);
+        // A recent edge BEHIND the windowed-out edge: B never enters
+        // the frontier, so B -> C must not surface either.
+        let behind = fact_edge(&b.id, &c.id, "likes", None, recent);
+        // Old valid_at but recent created_at: inside the window — the
+        // Section 8.2 window qualifies an edge recent by EITHER measure.
+        let revalidated = MemoryEdge {
+            valid_at: old,
+            ..fact_edge(&a.id, &d.id, "likes", None, recent)
+        };
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(10, 140),
+            nodes: vec![a.clone(), b.clone(), c.clone(), d.clone()],
+            edges: vec![old_edge, behind, revalidated],
+        };
+        backend.upsert_batch("chat_d76f", &batch).await.unwrap();
+
+        let now = datetime!(2026-08-21 10:00 UTC);
+        let candidates = backend
+            .two_hop_edges(
+                "chat_d76f",
+                std::slice::from_ref(&a.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_id, a.id);
+        assert_eq!(candidates[0].target_id, d.id);
+        assert_eq!(candidates[0].valid_at, old);
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_with_an_empty_entry_list_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [_a, _b, _c]) = two_hop_batch();
+        backend.upsert_batch("chat_d76g", &batch).await.unwrap();
+
+        let now = datetime!(2026-08-08 10:00 UTC);
+        let candidates = backend
+            .two_hop_edges("chat_d76g", &[], now, NEIGHBOR_EXPANSION_LIMIT)
+            .await
+            .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn edges_by_ids_hydrates_and_drops_stale_malformed_and_invalid_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let a = concept_node("Alpha", base);
+        let b = concept_node("Beta", base);
+        let c = concept_node("Gamma", base);
+        let valid_edge = fact_edge(&a.id, &b.id, "likes", None, base);
+        let invalid_edge = fact_edge(
+            &a.id,
+            &c.id,
+            "likes",
+            Some(base + Duration::seconds(10)),
+            base + Duration::seconds(1),
+        );
+        let valid_id = EdgeId {
+            source_id: a.id.clone(),
+            relationship_name: "likes".to_string(),
+            target_id: b.id.clone(),
+            valid_at: valid_edge.valid_at,
+        }
+        .encode();
+        let invalid_id = EdgeId {
+            source_id: a.id.clone(),
+            relationship_name: "likes".to_string(),
+            target_id: c.id.clone(),
+            valid_at: invalid_edge.valid_at,
+        }
+        .encode();
+        // A well-formed id whose natural key matches no edge row: the
+        // sidecar row outlived its graph edge (normal between
+        // reconciliations, Section 7.6 step 6).
+        let stale_id = EdgeId {
+            source_id: a.id.clone(),
+            relationship_name: "likes".to_string(),
+            target_id: crate::identifiers::concept_id("Nobody"),
+            valid_at: base,
+        }
+        .encode();
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(11, 150),
+            nodes: vec![a.clone(), b.clone(), c.clone()],
+            edges: vec![valid_edge, invalid_edge],
+        };
+        backend.upsert_batch("chat_d76h", &batch).await.unwrap();
+
+        let ids = vec![
+            valid_id.clone(),
+            invalid_id,
+            stale_id,
+            "this is not an edge id".to_string(),
+        ];
+        let candidates = backend.edges_by_ids("chat_d76h", &ids).await.unwrap();
+        // Exactly the one valid, existing edge hydrates, with the
+        // endpoint names. The invalid edge (valid-only hydration), the
+        // stale id, and the malformed id are silently dropped.
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].edge_id, valid_id);
+        assert_eq!(candidates[0].source_name, "Alpha");
+        assert_eq!(candidates[0].target_name, "Beta");
+        assert_eq!(candidates[0].edge_text, format!("{} likes {}", a.id, b.id));
+    }
+
+    #[tokio::test]
+    async fn edges_by_ids_with_an_empty_id_list_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [_a, _b, _c]) = two_hop_batch();
+        backend.upsert_batch("chat_d76i", &batch).await.unwrap();
+
+        let candidates = backend.edges_by_ids("chat_d76i", &[]).await.unwrap();
+        assert!(candidates.is_empty());
     }
 }
