@@ -100,6 +100,20 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # deep_recall = true                # false restores the Phase 1 shallow recall (9.1)
 # recall_candidate_cap = 40         # per wake, before the relevance gate
 
+# -------------------------------------------- Warmup (P2, 8.4/8.5) ----
+# All optional, all per-group overridable like the trigger keys.
+# The pet starts conversations on its own: topics come from the group's
+# own graph (a Concept node sampled with weight edge-count x
+# recency-decay); a group with no eligible topic stays silent. Ignored
+# warmups back off (effective quota -1 and 2x spacing each, resetting on
+# engagement).
+# warmup = true                       # master switch (8.4); false disables proactive warmups entirely
+# warmup_quota = 1                    # 1-3 per host-local day; outside 1..=3 is a startup error
+# warmup_active_hours = "08:00-23:00" # host-local "HH:MM-HH:MM"; overnight ranges rejected
+# warmup_silence_secs = 14400         # the group must be silent this long (8.4)
+# warmup_reaction_window_secs = 1800  # engagement window (8.5); reactions reach administrator groups only (4.2)
+# warmup_topic_cooldown_days = 3      # per-topic cooldown (9.7)
+
 # -------------------------------------------------------------- Groups ----
 # One table per group. An empty table registers the group with defaults.
 # Telegram supergroup ids are negative and start with -100. Quote them.
