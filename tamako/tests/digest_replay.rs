@@ -19,7 +19,7 @@ use tamako_core::config::TriggerConfig;
 use tamako_core::digest::{DigestOutcome, DigestPipeline};
 use tamako_core::event::{InboundEvent, NormalizedMessage};
 use tamako_memory::identifiers::{concept_id, person_id};
-use tamako_memory::LbugBackend;
+use tamako_memory::{EdgeId, LbugBackend, MemoryBackend};
 use tamako_store::{DeadLetterRow, Direction, EventType, NewMessage, Store, StoreError};
 use time::OffsetDateTime;
 
@@ -606,4 +606,138 @@ async fn restart_keeps_the_digest_boundary() {
         .shutdown()
         .await
         .expect("the actor reports no error");
+}
+
+/// Decision 76 (Section 7.6 step 6): the edge_texts harvest end to
+/// end. The pipeline (wired with the dedicated one-group embedding
+/// store, the main.rs shape) writes one (edge_id, edge_text) row per
+/// batch edge with a non-empty description AFTER the graph commit, and
+/// an identical replayed digest leaves the rows converged — INSERT OR
+/// REPLACE keyed by the deterministic edge id: same rows, no dupes.
+/// The harvest mechanics are covered at pipeline level
+/// (tamako-agent::pipeline); this test pins the group-store visibility:
+/// the rows land in the group's store.db, readable through the shared
+/// store of the harness.
+#[tokio::test]
+async fn digest_harvests_edge_texts_and_an_identical_replay_converges() {
+    let fixture = make_fixture();
+    insert_messages(
+        &fixture,
+        0,
+        &[
+            ("u1", "Alice", "morning all"),
+            ("u1", "Alice", "GRPO looks unstable"),
+            ("u2", "Bob", "really? ours converged fine"),
+        ],
+    )
+    .await;
+
+    // The dedicated one-group embedding store of decision 66 (the same
+    // shape main.rs wires through `GroupEmbeddingTarget::open`): the
+    // chat_id-less sidecar helpers reject a multi-group Store.
+    let embedding_store = Arc::new(Store::new(fixture._dir.path().to_path_buf()));
+    embedding_store
+        .open_group(CHAT_ID)
+        .expect("open_group succeeds");
+    let pipeline = || {
+        Arc::new(
+            AgentDigestPipeline::new(
+                Arc::clone(&fixture.store),
+                Arc::clone(&fixture.memory),
+                Arc::new(ScriptedExtractor::with_graphs(vec![alice_grpo_graph()])),
+                PipelineConfig::default(),
+            )
+            .with_embedding_store(Arc::clone(&embedding_store)),
+        )
+    };
+
+    let outcome = pipeline()
+        .run_digest(CHAT_ID, 0)
+        .await
+        .expect("the run succeeds")
+        .expect("the tail is non-empty");
+    assert!(
+        matches!(
+            outcome,
+            DigestOutcome::Extracted {
+                new_boundary: 3,
+                ..
+            }
+        ),
+        "the batch extracts, got {outcome:?}"
+    );
+
+    // The sorted edge ids of the graph (the reconciliation truth of
+    // decision 76c). Every edge kind carries a non-empty generated or
+    // extracted description (resolve.rs), so the sidecar mirrors the
+    // graph whole.
+    let graph_edge_ids = {
+        let mut ids: Vec<String> = fixture
+            .memory
+            .list_all_edges(CHAT_ID)
+            .await
+            .expect("list_all_edges succeeds")
+            .into_iter()
+            .map(|(edge_id, _)| edge_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert!(!graph_edge_ids.is_empty());
+    let sidecar_ids = |store: &Arc<Store>| {
+        let store = Arc::clone(store);
+        async move {
+            tokio::task::spawn_blocking(move || store.list_edge_text_ids())
+                .await
+                .expect("the blocking task joins")
+                .expect("list_edge_text_ids succeeds")
+        }
+    };
+    // The rows exist in the GROUP's store: the harness's shared store
+    // (one group open) reads the same store.db the dedicated store
+    // wrote.
+    assert_eq!(sidecar_ids(&fixture.store).await, graph_edge_ids);
+    assert_eq!(sidecar_ids(&embedding_store).await, graph_edge_ids);
+    // The fact edge's row carries the extracted description under the
+    // resolved natural-key id (valid_at = the batch end = the last
+    // message's timestamp, resolve.rs Section 7.5).
+    let likes_edge_id = EdgeId {
+        source_id: person_id("u1"),
+        relationship_name: "likes".to_string(),
+        target_id: concept_id("GRPO"),
+        valid_at: t0() + time::Duration::seconds(2),
+    }
+    .encode();
+    let hits = {
+        let store = Arc::clone(&fixture.store);
+        tokio::task::spawn_blocking(move || store.search_edge_texts("despite its instability"))
+            .await
+            .expect("the blocking task joins")
+            .expect("search_edge_texts succeeds")
+    };
+    assert_eq!(hits, vec![likes_edge_id]);
+
+    // An identical replayed digest (the same range (0, 3] through a
+    // fresh pipeline over the same store and backend — the retry shape
+    // of `digest_is_idempotent_under_retry`) leaves the rows converged.
+    let outcome = pipeline()
+        .run_digest(CHAT_ID, 0)
+        .await
+        .expect("the replay succeeds")
+        .expect("the tail is non-empty");
+    assert!(
+        matches!(
+            outcome,
+            DigestOutcome::Extracted {
+                new_boundary: 3,
+                ..
+            }
+        ),
+        "the replay re-extracts the same batch, got {outcome:?}"
+    );
+    assert_eq!(
+        sidecar_ids(&fixture.store).await,
+        graph_edge_ids,
+        "the replayed digest replaces the same rows in place — no dupes"
+    );
 }

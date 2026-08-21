@@ -25,6 +25,7 @@ use tamako_adapter_mock::MockAdapter;
 use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
 use tamako_agent::endpoint::{EmbeddingEndpoint, RigEmbeddingProvider};
 use tamako_agent::merge_confirm::EndpointMergeConfirmer;
+use tamako_agent::recall::DeepRecallConfig;
 use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
@@ -668,11 +669,36 @@ fn build_summary_provider(endpoint: &EndpointConfig) -> Result<Option<Arc<dyn Su
 /// A missing key for the relevance gate degrades the recall ALONE to
 /// the no-op (the wake still runs; the injection list stays empty);
 /// every other recall build error propagates.
+///
+/// Decision 76: when the resolved group configuration has
+/// `deep_recall = true` (the default) AND `embedding_provider` is
+/// `Some` (live mode; replay passes `None` — replay stays shallow-only,
+/// deterministic and network-free, the same discipline as the
+/// decision-73 vector pre-screen), the recall widens with
+/// [`ShallowRecall::with_deep_recall`]: the shared provider Arc, the
+/// group's `vector_candidate_threshold`, and `recall_candidate_cap`.
+/// The deep store sources (KNN over `node_embeddings`, LIKE over
+/// `edge_texts`) ride the chat_id-less single-open-group helpers, which
+/// the SHARED store cannot serve in a multi-group live deployment
+/// (`StoreError::AmbiguousGroup` once a second group's actor opened its
+/// group): with deep recall on, the recall therefore gets a DEDICATED
+/// one-group Store opened here through `GroupEmbeddingTarget::open`
+/// (the same shape as the decision-66 digest enqueue and the embedding
+/// worker's per-group targets — the same per-group store.db file, so
+/// the chat-scoped shallow reads, `injected_memories` dedup included,
+/// see the same data). A failed open degrades to the shallow-only form
+/// over the shared store with a WARN — never a startup failure,
+/// mirroring the digest pipeline's enqueue degrade (decision 66).
+/// `deep_recall = false` never opens the dedicated store and never
+/// calls `with_deep_recall`: the byte-identical pre-76 shallow path.
 fn build_wake_services(
     store: &Arc<Store>,
     memory: &Arc<LbugBackend>,
     endpoints: &LlmEndpoints,
-    recall_injection_cap: u32,
+    data_root: &Path,
+    chat_id: &str,
+    embedding_provider: Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>>,
+    trigger_config: &TriggerConfig,
 ) -> Result<Option<WakeServices>> {
     match (
         RigGate::from_endpoint(&endpoints.gate),
@@ -685,14 +711,47 @@ fn build_wake_services(
                 &endpoints.gate,
                 // The gate renders the cap into its preamble (decision
                 // 65); ShallowRecall enforces the same cap.
-                recall_injection_cap,
+                trigger_config.recall_injection_cap,
             ) {
-                Ok(relevance_gate) => Arc::new(ShallowRecall::new(
-                    Arc::clone(store),
-                    Arc::clone(memory),
-                    relevance_gate,
-                    recall_injection_cap,
-                )),
+                Ok(relevance_gate) => {
+                    // Decision 76: the deep-recall plan of this group.
+                    // `Some` carries the dedicated one-group store and
+                    // the knobs; `None` is the shallow-only form
+                    // (config off, replay mode, or the WARN-degrade).
+                    let deep = match (trigger_config.deep_recall, embedding_provider) {
+                        (true, Some(provider)) => {
+                            deep_recall_store(data_root, chat_id).map(|recall_store| {
+                                (
+                                    recall_store,
+                                    DeepRecallConfig {
+                                        provider,
+                                        vector_candidate_threshold: trigger_config
+                                            .vector_candidate_threshold,
+                                        candidate_cap: trigger_config.recall_candidate_cap,
+                                    },
+                                )
+                            })
+                        }
+                        _ => None,
+                    };
+                    match deep {
+                        Some((recall_store, deep_config)) => Arc::new(
+                            ShallowRecall::new(
+                                recall_store,
+                                Arc::clone(memory),
+                                relevance_gate,
+                                trigger_config.recall_injection_cap,
+                            )
+                            .with_deep_recall(deep_config),
+                        ),
+                        None => Arc::new(ShallowRecall::new(
+                            Arc::clone(store),
+                            Arc::clone(memory),
+                            relevance_gate,
+                            trigger_config.recall_injection_cap,
+                        )),
+                    }
+                }
                 // The same degrade-to-silence policy as the whole
                 // wake build: no provider key, no recall.
                 Err(AgentError::ProviderConfig(error)) => {
@@ -706,7 +765,7 @@ fn build_wake_services(
             info!(
                 gate_model = %endpoints.gate.model,
                 reply_model = %endpoints.reply.model,
-                recall_injection_cap,
+                recall_injection_cap = trigger_config.recall_injection_cap,
                 "wake procedure wired (live recall, gate, and reply)"
             );
             Ok(Some(WakeServices {
@@ -722,6 +781,23 @@ fn build_wake_services(
         }
         (Err(error), _) | (_, Err(error)) => {
             Err(error).context("failed to build the wake services")
+        }
+    }
+}
+
+/// Decision 76: opens the DEDICATED one-group Store the deep-recall
+/// store sources need (the chat_id-less KNN/LIKE helpers reject a
+/// multi-group Store with `StoreError::AmbiguousGroup`), the same
+/// `GroupEmbeddingTarget::open` shape as the decision-66 digest
+/// enqueue. A failed open degrades the recall ALONE to shallow-only
+/// with a WARN — never a startup failure; the wake keeps the pre-76
+/// candidate set and the next restart retries the open.
+fn deep_recall_store(data_root: &Path, chat_id: &str) -> Option<Arc<Store>> {
+    match GroupEmbeddingTarget::open(data_root, chat_id) {
+        Ok(target) => Some(target.store),
+        Err(error) => {
+            warn!(chat_id = %chat_id, %error, "deep recall disabled: the dedicated group store failed to open; recall stays shallow-only this run");
+            None
         }
     }
 }
@@ -945,11 +1021,17 @@ async fn run_replay(
         None,
         &group_config,
     )?;
+    // Decision 76: NO embedding provider in replay (the decision-73
+    // discipline above): the recall stays shallow-only regardless of
+    // the `deep_recall` config key — deterministic and network-free.
     let wake = build_wake_services(
         &store,
         &memory,
         &endpoints,
-        group_config.recall_injection_cap,
+        data_root,
+        &chat_id,
+        None,
+        &group_config,
     )?;
     // The Rule C3 summarizer (decision 62). A missing family API key
     // degrades to the old C3 behavior (drop without a summary) with one
@@ -2095,7 +2177,15 @@ async fn run_live(
                                 &setup.store,
                                 &setup.memory,
                                 &endpoints,
-                                group_config.recall_injection_cap,
+                                setup.store.data_root(),
+                                &chat_id,
+                                // Decision 76: the shared provider Arc (ONE
+                                // per process, the same instance the worker
+                                // and the digest pre-screen use). `None`
+                                // (no OPENAI_API_KEY) keeps the recall
+                                // shallow-only.
+                                embedding_provider.clone(),
+                                &group_config,
                             ) {
                                 Ok(wake) => wake,
                                 Err(error) => {
@@ -2384,6 +2474,31 @@ mod tests {
         let (_lock, _guard) = RustLogGuard::cleared();
         // EnvFilter renders its directive string verbatim.
         assert_eq!(log_filter(false).to_string(), "info");
+    }
+
+    #[test]
+    fn deep_recall_store_opens_a_single_group_store() {
+        // Decision 76: the dedicated store opens the one group of the
+        // recall, so the chat_id-less deep-source helpers (the KNN and
+        // edge_texts reads) accept it.
+        let dir = tempfile::tempdir().expect("a temporary data root");
+        let store = deep_recall_store(dir.path(), "-1001").expect("the store opens");
+        assert_eq!(
+            store.list_edge_text_ids().expect("a single-group read"),
+            Vec::<String>::new(),
+            "the single-open-group contract holds on the dedicated store"
+        );
+    }
+
+    #[test]
+    fn deep_recall_store_degrades_to_none_on_a_failed_open() {
+        // Decision 76: a failed open degrades the recall ALONE to
+        // shallow-only (None) — never a startup failure. A data root
+        // that is a FILE makes the per-group create_dir_all fail.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file_root = dir.path().join("blocker");
+        std::fs::write(&file_root, b"not a directory").expect("the blocker file");
+        assert!(deep_recall_store(&file_root, "-1001").is_none());
     }
 
     #[test]
