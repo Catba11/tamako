@@ -1554,6 +1554,48 @@ v0.0.1 (alpha).
     KEYED boot post-upgrade before merge-tool runs (the re-embed
     drain heals the index — burst mode caps the window).
 
+78. **Warmup trigger implementation (2026-08-18).** Roadmap Phase
+    2 item 7, realizing decision 69's content strategy. Rulings:
+    (a) PROCEDURE — new Section 9.7, independent of Wake/Digest
+    (roadmap Section 6): when due, pick a topic (c), generate with
+    the REPLY purpose (persona preamble + gloss + guardrail + the
+    shared context view + a warmup instruction), pass the
+    decision-59/64 parrot filter like every reply text, send as a
+    PLAIN message — proactive speech never quotes a target and
+    pings nobody (decision 70's spirit extended), emit ONE curated
+    `warmup` INFO line (a deliberate decision-53 addition: a new
+    line KIND for a new trigger kind, still one line per event),
+    persist the outbound row per Rule B1; (b) SCHEDULING —
+    `warmup_quota` (default 1; the spec range is 1–3, start
+    conservative) proactive messages per host-local day, spread
+    uniformly at random over `warmup_active_hours` (default
+    "08:00-23:00", host-local time, no overnight ranges); the next
+    activation persists in the `warmup_next_at` state key — a
+    restart never reshuffles (Rule P1); a warmup is permitted only
+    after `warmup_silence` (4 h) of group silence and never in
+    `muted`; (c) TOPIC SAMPLING — Concept nodes weighted by edge
+    count × recency decay, EXCLUDING: topics on per-topic cooldown
+    (`warmup_topic_cooldown_days`, default 3, state-tracked),
+    topics whose normalized name appears in the 50-row raw-log
+    tail (never restart the conversation that just went quiet),
+    and person-attached interests are framed as open questions to
+    the group, never "X likes Y" (decision 69's social-safety
+    rule); a group with no eligible topic stays silent (no forced
+    small talk — the pet's conservatism applies to warmup too);
+    (d) ENGAGEMENT + BACKOFF — a warmup is ENGAGED when a human
+    reply or a reaction arrives within `warmup_reaction_window`
+    (default 30 min; reactions reach administrator groups only,
+    Section 4.2 — non-admin groups measure replies only, decision
+    69); at window expiry unengaged: `warmup_backoff_factor` += 1
+    (effective quota = max(0, quota − factor), interval multiplier
+    = 2^factor); any engagement resets the factor to 0; (e) CONFIG
+    — `warmup` (bool, default TRUE: the Phase 2 exit criterion
+    needs live measurement, and quota 1 is the conservative
+    start), plus the five keys above, all per-group overridable;
+    (f) METRICS — `warmups_total` and `warmup_engaged_total`
+    counters (the exit-criterion metric), rendered in `--status`.
+    Spec backfill: Sections 5.2, 8.4, 8.5, 9.7, 12, 13.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
