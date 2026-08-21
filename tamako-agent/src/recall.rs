@@ -61,12 +61,14 @@
 //!
 //! Then: dedup EVERYTHING by edge id — source order shallow, then
 //! expansion (which carries the vector entries' edges), then fts,
-//! FIRST occurrence wins — and cap the total at
-//! `recall_candidate_cap` (default 40) BEFORE the relevance gate. The
-//! downstream steps are unchanged: the decision-40 same-fact collapse,
-//! the Section 9.3 `injected_memories` dedup, the relevance gate, the
-//! injection cap. `MAX_PRESENTED_CANDIDATES` stays a hard prompt bound
-//! on top of the configured cap (the defaults are equal: 40).
+//! FIRST occurrence wins — then the decision-40 same-fact collapse,
+//! then cap the total at `recall_candidate_cap` (default 40) BEFORE
+//! the relevance gate (decision 77, S3-F8: the cap counts the
+//! post-collapse candidates presented to the gate). The remaining
+//! downstream steps are unchanged: the Section 9.3
+//! `injected_memories` dedup, the relevance gate, the injection cap.
+//! `MAX_PRESENTED_CANDIDATES` stays a hard prompt bound on top of the
+//! configured cap (the defaults are equal: 40).
 //!
 //! Every deep source degrades INDEPENDENTLY to empty: an embed or
 //! endpoint failure logs WARN, a store or memory read failure logs
@@ -865,9 +867,19 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         if terms.is_empty() {
             return Vec::new();
         }
-        let vectors = match deep.provider.embed_texts(terms).await {
-            Ok(vectors) if vectors.len() == terms.len() => vectors,
-            Ok(vectors) => {
+        // Decision 77 (M3): the provider call runs INLINE in the wake
+        // task — contain a provider panic so it degrades to the
+        // existing failure path (one WARN, the vector entry is
+        // skipped) instead of unwinding into the wake. The CALL itself
+        // sits inside the wrapped future: a panic at call time (not
+        // only at poll time) is contained too.
+        let vectors = match crate::contain_task_panic(async {
+            deep.provider.embed_texts(terms).await
+        })
+        .await
+        {
+            Ok(Ok(vectors)) if vectors.len() == terms.len() => vectors,
+            Ok(Ok(vectors)) => {
                 tracing::warn!(
                     expected = terms.len(),
                     got = vectors.len(),
@@ -876,10 +888,17 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                 );
                 return Vec::new();
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error,
                     "deep recall: the batched embeddings call failed; the vector entry is skipped"
+                );
+                return Vec::new();
+            }
+            Err(panic) => {
+                tracing::warn!(
+                    error = %panic,
+                    "deep recall: the batched embeddings call panicked; the vector entry is skipped"
                 );
                 return Vec::new();
             }
@@ -1183,13 +1202,15 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                 }
             }
 
-            // Dedup + cap (decision 76 (d)): first-wins by edge id in
-            // source order shallow -> expansion -> fts, then truncate
-            // the total at recall_candidate_cap BEFORE the relevance
-            // gate. MAX_PRESENTED_CANDIDATES stays a hard prompt bound
-            // on top (step 5, unchanged).
+            // Dedup (decision 76 (d)): first-wins by edge id in source
+            // order shallow -> expansion -> fts. The cap itself lands
+            // AFTER the same-fact collapse below (decision 77, S3-F8):
+            // recall_candidate_cap counts the candidates PRESENTED to
+            // the gate (post-dedup, post-collapse), so a collapsed pool
+            // never falls below the intended cap.
+            // MAX_PRESENTED_CANDIDATES stays a hard prompt bound on top
+            // (step 5, unchanged).
             let deduped_count = candidates.len();
-            candidates.truncate(deep.candidate_cap as usize);
             tracing::debug!(
                 chat_id = %chat_id,
                 shallow_count = shallow_count,
@@ -1197,7 +1218,6 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                 expansion_count = expansion_count,
                 fts_count = fts_count,
                 deduped_count = deduped_count,
-                capped_count = candidates.len(),
                 "deep recall candidate sources (source order shallow -> expansion -> fts, first-wins dedup)"
             );
         }
@@ -1211,6 +1231,15 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         let fetched_edge_count = candidates.len();
         let mut candidates = collapse_same_fact_candidates(candidates);
         let collapsed_count = fetched_edge_count - candidates.len();
+
+        // The candidate cap (decision 76 (d)), AFTER the same-fact
+        // collapse (decision 77, S3-F8): a capped list truncated BEFORE
+        // the collapse could shrink to fewer candidates than the cap
+        // intends; the cap counts the post-dedup, post-collapse
+        // candidates presented to the gate.
+        if let Some(deep) = &self.deep {
+            candidates.truncate(deep.candidate_cap as usize);
+        }
 
         // Step 3 (Section 9.3): drop the candidates that already have a
         // row in injected_memories. The table holds exactly the current
@@ -3263,6 +3292,124 @@ The context section is read-only orientation; the selection names candidate numb
             1
         );
         assert_eq!(texts.len(), 2);
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    // ---- Decision 77: panic containment (M3) and the
+    // collapse-before-cap fix (S3-F8). ----
+
+    /// A provider double whose every `embed_texts` call PANICS (the M3
+    /// fixture: an inline provider panic must not unwind into the wake
+    /// task).
+    struct PanickingEmbedder;
+
+    impl EmbeddingProvider for PanickingEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _text: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<f32>, EmbeddingError>> + Send + 'a>,
+        > {
+            panic!("the provider exploded")
+        }
+
+        fn embed_texts<'a>(
+            &'a self,
+            _texts: &'a [String],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<Vec<f32>>, EmbeddingError>> + Send + 'a,
+            >,
+        > {
+            panic!("the provider exploded")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_vector_entry_provider_skips_the_source_and_the_wake_succeeds() {
+        // Decision 77 (M3): a PANICKING batched embeddings call
+        // degrades exactly like its failure path — one WARN, the
+        // vector entry is skipped — and the wake continues with the
+        // shallow candidates (here: the seeded shallow fact).
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let edge = recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        seed(&memory, vec![person, topic], vec![edge]).await;
+
+        let embedder = Arc::new(PanickingEmbedder);
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(DeepRecallConfig {
+                provider: embedder,
+                vector_candidate_threshold: 0.80,
+                candidate_cap: 40,
+            });
+        let messages = vec![gate_message(1, "u42", "espresso")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        // The shallow candidate still reached the gate; the wake
+        // never failed on the panic.
+        let texts = presented_texts(&recall.gate);
+        assert_eq!(texts, vec!["Alice likes espresso.".to_string()]);
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn the_candidate_cap_lands_after_the_same_fact_collapse() {
+        // Decision 77 (S3-F8): pre-collapse truncation would cap the
+        // fetched pool [newer dup, older dup, distinct] at 2 and the
+        // collapse would then shrink it to ONE candidate, dropping the
+        // distinct fact. With the cap AFTER the collapse the distinct
+        // fact survives under the cap.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let topic = concept_node("espresso");
+        let hobby = concept_node("go");
+        let now = OffsetDateTime::now_utc();
+        // Two edges of the SAME fact (same source/relationship/target,
+        // different valid_at) plus one distinct fact. created_at
+        // controls the neighbor-fetch order (descending, Section 8.2):
+        // newer dup first, older dup second, the distinct fact LAST.
+        let mut older_dup =
+            recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        older_dup.valid_at = now - time::Duration::days(1);
+        older_dup.created_at = now + time::Duration::seconds(1);
+        let mut newer_dup =
+            recent_fact_edge(&person.id, &topic.id, "related_to", "Alice likes espresso.");
+        newer_dup.valid_at = now;
+        newer_dup.created_at = now + time::Duration::seconds(2);
+        let mut distinct = recent_fact_edge(&person.id, &hobby.id, "related_to", "Alice plays go.");
+        distinct.created_at = now;
+        seed(
+            &memory,
+            vec![person, topic, hobby],
+            vec![older_dup, newer_dup, distinct],
+        )
+        .await;
+
+        // "ok" is a stopword: no candidate terms, the provider is
+        // never called; cap 2.
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(deep_config(embedder, 2));
+        let messages = vec![gate_message(1, "u42", "ok")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+
+        // Post-collapse the pool is [espresso fact, go fact]; both
+        // survive the cap of 2 (pre-collapse truncation would have
+        // dropped "Alice plays go.").
+        let texts = presented_texts(&recall.gate);
+        assert_eq!(
+            texts,
+            vec![
+                "Alice likes espresso.".to_string(),
+                "Alice plays go.".to_string(),
+            ]
+        );
         assert_eq!(outcome, RecallOutcome::default());
     }
 }

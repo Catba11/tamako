@@ -151,3 +151,82 @@ pub use validate::{
     is_snake_case_identifier, validate_relationship_name, RelationshipName,
     FALLBACK_RELATIONSHIP_NAME, RESERVED_RELATIONSHIP_NAMES,
 };
+
+/// Runs one inline LLM-seam call to completion, containing a panic
+/// (decision 77, M3): a panicking embedding provider or resolution
+/// confirmer degrades to its existing failure path (WARN + treat as a
+/// failed call) instead of unwinding into the digest/wake task that
+/// awaited it inline. The panic becomes the same failure class as a
+/// provider error; the returned message carries the `task panicked`
+/// marker, so the logs distinguish a panic from a provider failure.
+///
+/// This MIRRORS tamako-core's `contain_task_panic` (decision 65):
+/// that helper is private to `tamako_core::actor` and tamako-core is a
+/// sibling crate, so the std-only pattern is reproduced here rather
+/// than reused. As there: `futures::FutureExt::catch_unwind` is the
+/// textbook shape, but `futures` is not a dependency of the workspace
+/// and the std covers the same ground (`poll_fn` +
+/// `std::panic::catch_unwind`, no new dependency). The
+/// `AssertUnwindSafe` is sound: after a caught panic the inner future
+/// is NEVER polled again — the wrapper resolves with the error and
+/// drops it — which is exactly the contract `futures`' own
+/// `CatchUnwind` relies on.
+pub(crate) async fn contain_task_panic<F, T>(body: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut body = Box::pin(body);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(format!(
+                "task panicked: {}",
+                panic_payload_text(payload.as_ref())
+            ))),
+        }
+    })
+    .await
+}
+
+/// Renders the payload of a caught panic: the `&str` or `String` of a
+/// `panic!` message; anything else (a `panic_any` payload) reports its
+/// kind, since the payload is opaque. (The same helper as
+/// tamako-core's, kept private to the mirror above.)
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a non-string panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contain_task_panic;
+
+    #[tokio::test]
+    async fn contain_task_panic_converts_a_panic_into_a_marked_failure() {
+        let outcome: Result<(), String> =
+            contain_task_panic(async { panic!("the provider exploded") }).await;
+        let message = outcome.expect_err("the panic becomes an Err");
+        assert!(message.contains("task panicked"));
+        assert!(message.contains("the provider exploded"));
+    }
+
+    #[tokio::test]
+    async fn contain_task_panic_renders_a_non_string_payload_by_kind() {
+        let outcome: Result<(), String> =
+            contain_task_panic(async { std::panic::panic_any(42) }).await;
+        let message = outcome.expect_err("the panic becomes an Err");
+        assert_eq!(message, "task panicked: a non-string panic payload");
+    }
+
+    #[tokio::test]
+    async fn contain_task_panic_passes_a_normal_result_through() {
+        let outcome: Result<u32, String> = contain_task_panic(async { 41 + 1 }).await;
+        assert_eq!(outcome, Ok(42));
+    }
+}

@@ -88,6 +88,14 @@ pub struct AgentDigestPipeline<M: MemoryBackend> {
     /// [`Self::with_single_value_predicates`] never invalidates and
     /// never touches the `facts_invalidated_total` counter.
     single_value_predicates: Vec<String>,
+    /// Decision 77 (S3-F10): one-time latch of the construction WARN —
+    /// `vector_resolution` enabled but the dedicated one-group
+    /// embedding store never wired (`with_vector_prescreen` without
+    /// `with_embedding_store`). The builders run in either order, so
+    /// the missing dependency can only be detected at first USE; the
+    /// latch keeps it ONE construction WARN, not one per digest
+    /// attempt.
+    prescreen_store_warned: std::sync::atomic::AtomicBool,
     config: PipelineConfig,
 }
 
@@ -120,6 +128,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             extractor,
             vector: None,
             single_value_predicates: Vec::new(),
+            prescreen_store_warned: std::sync::atomic::AtomicBool::new(false),
             config,
         }
     }
@@ -173,7 +182,25 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         if !parts.config.enabled {
             return None;
         }
-        let embedding_store = self.embedding_store.as_ref()?;
+        let Some(embedding_store) = self.embedding_store.as_ref() else {
+            // Decision 77 (S3-F10): the toggle is ON but the one-group
+            // embedding store was never wired — a construction-time
+            // misconfiguration that silently disabled step 3 before.
+            // ONE WARN (latched): the builders run in either order, so
+            // first use is the earliest point the missing dependency is
+            // knowable.
+            if !self
+                .prescreen_store_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    "vector_resolution is enabled but the dedicated one-group embedding store \
+                     is not wired (with_vector_prescreen without with_embedding_store); the \
+                     step-3 vector pre-screen is disabled"
+                );
+            }
+            return None;
+        };
         Some(VectorPrescreen {
             provider: &*parts.provider,
             embedding_store,
@@ -271,13 +298,17 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
     }
 
     /// One batch attempt: extraction, post-validation, resolution, and
-    /// the graph write. specs.md Section 10.2.
+    /// the graph write. specs.md Section 10.2. Returns the node/edge
+    /// counts plus the step-3 outcome tallies of THIS attempt; the
+    /// caller (the retry loop) bumps the `vector_resolution_*` counters
+    /// ONCE, post-commit, from the FINAL attempt's stats (decision 77:
+    /// a retried attempt must not double-count the resolution stats).
     async fn extract_and_write(
         &self,
         chat_id: &str,
         input: &ExtractionInput,
         frame: &BatchFrame,
-    ) -> Result<(usize, usize), AgentError> {
+    ) -> Result<(usize, usize, VectorResolutionStats), AgentError> {
         let graph = self.extractor.extract(input).await?;
         // Section 6.3: post-validation in plain Rust. Never trust the
         // prompt.
@@ -303,11 +334,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             self.vector_prescreen().as_ref(),
         )
         .await?;
-        // The step-3 outcome counters (Section 12). Best effort, after
-        // the resolution they describe; the retry loop may re-resolve,
-        // the same per-attempt counting as digest_failures_total.
-        self.bump_vector_counters(chat_id, resolved.vector_stats)
-            .await;
+        let vector_stats = resolved.vector_stats;
         let batch = resolved.batch;
         let node_count = batch.nodes.len();
         let edge_count = batch.edges.len();
@@ -373,16 +400,15 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         // upsert is idempotent and replay-convergent: INSERT OR REPLACE
         // keyed by the deterministic edge id, so a replayed batch
         // re-encodes the same ids and replaces the same rows in place.
-        // An empty item list is a no-op (and skips the store call
-        // entirely).
+        // Decision 77 (S4-F3): ONE batched `upsert_edge_texts` call
+        // (one transaction for the whole batch) replaces the per-row
+        // loop. An empty item list is a no-op (and skips the store
+        // call entirely; the helper itself also early-returns).
         let edge_texts = edge_text_upsert_items(&batch);
         if !edge_texts.is_empty() {
             if let Some(embedding_store) = &self.embedding_store {
                 let result = Self::run_on_store(Arc::clone(embedding_store), move |store| {
-                    for (edge_id, edge_text) in &edge_texts {
-                        store.upsert_edge_text(edge_id, edge_text)?;
-                    }
-                    Ok(())
+                    store.upsert_edge_texts(&edge_texts).map(|_| ())
                 })
                 .await;
                 if let Err(error) = result {
@@ -396,7 +422,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                 }
             }
         }
-        Ok((node_count, edge_count))
+        Ok((node_count, edge_count, vector_stats))
     }
 
     /// One skeleton attempt (Section 7.2 rule 5): the MessageBatch node
@@ -465,9 +491,10 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                     .map(|()| AttemptSuccess::Skeleton)
             } else {
                 self.extract_and_write(chat_id, &input, &frame).await.map(
-                    |(node_count, edge_count)| AttemptSuccess::Extracted {
+                    |(node_count, edge_count, vector_stats)| AttemptSuccess::Extracted {
                         node_count,
                         edge_count,
+                        vector_stats,
                     },
                 )
             };
@@ -481,7 +508,14 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                 Ok(AttemptSuccess::Extracted {
                     node_count,
                     edge_count,
+                    vector_stats,
                 }) => {
+                    // The step-3 outcome counters (Section 12). Best
+                    // effort, bumped ONCE — post-commit, from the FINAL
+                    // attempt's stats only (decision 77): a retried
+                    // attempt re-resolves, and per-attempt counting
+                    // would double-count the resolution stats.
+                    self.bump_vector_counters(chat_id, vector_stats).await;
                     // The actor's curated `digest` line supersedes this
                     // one; the extraction detail stays at debug.
                     tracing::debug!(
@@ -569,6 +603,8 @@ enum AttemptSuccess {
     Extracted {
         node_count: usize,
         edge_count: usize,
+        /// The step-3 tallies of the final attempt, bumped post-commit.
+        vector_stats: VectorResolutionStats,
     },
 }
 
@@ -1855,5 +1891,162 @@ mod tests {
         // path — the pattern of the disabled-enqueue test).
         let reader = dedicated_embedding_store(&dir);
         assert!(reader.list_edge_text_ids().expect("ids").is_empty());
+    }
+
+    // ---- Decision 77: the `vector_resolution_*` counters bump ONCE,
+    // post-commit, from the FINAL attempt's stats. ----
+
+    /// A MemoryBackend wrapper that fails the FIRST
+    /// `upsert_batch_with_registry` call and delegates everything else
+    /// to the real backend (the double-count fixture: attempt 1
+    /// resolves and then fails the graph commit, attempt 2 re-resolves
+    /// and commits).
+    struct FailOnceUpsert {
+        inner: Arc<LbugBackend>,
+        failures_left: std::sync::atomic::AtomicU32,
+    }
+
+    impl MemoryBackend for FailOnceUpsert {
+        async fn ensure_schema(&self, chat_id: &str) -> tamako_memory::Result<()> {
+            self.inner.ensure_schema(chat_id).await
+        }
+
+        async fn upsert_batch(
+            &self,
+            chat_id: &str,
+            batch: &MemoryBatch,
+        ) -> tamako_memory::Result<()> {
+            self.inner.upsert_batch(chat_id, batch).await
+        }
+
+        async fn upsert_batch_with_registry(
+            &self,
+            chat_id: &str,
+            batch: &MemoryBatch,
+            single_value_predicates: &[String],
+        ) -> tamako_memory::Result<tamako_memory::UpsertOutcome> {
+            if self
+                .failures_left
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                > 0
+            {
+                return Err(tamako_memory::MemoryError::Backend(
+                    "rigged commit failure".to_string(),
+                ));
+            }
+            self.inner
+                .upsert_batch_with_registry(chat_id, batch, single_value_predicates)
+                .await
+        }
+
+        async fn checkpoint(&self, chat_id: &str) -> tamako_memory::Result<()> {
+            self.inner.checkpoint(chat_id).await
+        }
+
+        async fn alias_targets(
+            &self,
+            chat_id: &str,
+            alias_node_id: &str,
+        ) -> tamako_memory::Result<Vec<tamako_memory::AliasTarget>> {
+            self.inner.alias_targets(chat_id, alias_node_id).await
+        }
+
+        async fn neighbors(
+            &self,
+            chat_id: &str,
+            node_id: &str,
+        ) -> tamako_memory::Result<Vec<tamako_memory::NeighborEdge>> {
+            self.inner.neighbors(chat_id, node_id).await
+        }
+
+        async fn node_content(
+            &self,
+            chat_id: &str,
+            node_id: &str,
+        ) -> tamako_memory::Result<Option<tamako_memory::NodeContent>> {
+            self.inner.node_content(chat_id, node_id).await
+        }
+
+        async fn node_resolution_infos(
+            &self,
+            chat_id: &str,
+            node_ids: &[String],
+        ) -> tamako_memory::Result<Vec<(String, tamako_memory::NodeResolutionInfo)>> {
+            self.inner.node_resolution_infos(chat_id, node_ids).await
+        }
+
+        async fn close(&self, chat_id: &str) -> tamako_memory::Result<()> {
+            self.inner.close(chat_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retried_attempt_bumps_the_vector_counters_once() {
+        // Decision 77: attempt 1 resolves "Al" through the pre-screen
+        // (an auto-match) and then fails the graph commit; attempt 2
+        // re-resolves (another auto-match) and commits. The counters
+        // reflect ONE resolution pass — the FINAL attempt's stats —
+        // not the per-attempt sum.
+        let (dir, store, memory) = enqueue_fixtures();
+        al_messages(&store);
+        seed_person_node(&memory, &person_id("1001"), "Alice").await;
+        let embedding_store = dedicated_embedding_store(&dir);
+        embedding_store
+            .upsert_node_embedding(&person_id("1001"), &prescreen_unit_vector(0))
+            .expect("seed embedding");
+
+        // Two extraction answers (one per attempt); the provider
+        // answers the batched pre-screen call twice.
+        let provider = Arc::new(ScriptedEmbedder::with_batches(vec![
+            vec![prescreen_unit_vector(0)],
+            vec![prescreen_unit_vector(0)],
+        ]));
+        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![]));
+        let failing_memory = FailOnceUpsert {
+            inner: Arc::clone(&memory),
+            failures_left: std::sync::atomic::AtomicU32::new(1),
+        };
+        let pipeline = AgentDigestPipeline::new(
+            Arc::clone(&store),
+            Arc::new(failing_memory),
+            Arc::new(crate::ScriptedExtractor::with_graphs(vec![
+                al_graph(),
+                al_graph(),
+            ])),
+            PipelineConfig {
+                max_retries: 3,
+                retry_base_delay: Duration::from_millis(1),
+            },
+        )
+        .with_embedding_store(Arc::clone(&embedding_store))
+        .with_vector_prescreen(
+            Arc::clone(&provider) as Arc<dyn CoreEmbeddingProvider>,
+            Arc::clone(&confirmer) as Arc<dyn crate::resolve::ResolutionConfirmer>,
+            VectorResolutionConfig::default(),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("the digest succeeds on the second attempt")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // ONE resolution pass counted: the retried attempt's
+        // auto-match did not double-count.
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
+                .expect("state"),
+            Some("1".to_string())
+        );
+        // The failed attempt itself is still counted.
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "digest_failures_total")
+                .expect("state"),
+            Some("1".to_string())
+        );
+        assert_eq!(provider.call_count(), 2);
     }
 }
