@@ -28,6 +28,18 @@ const KEY_WAKE_INTERVAL_MS: &str = "wake_current_interval_ms";
 // specs.md Section 5.2 says the state keys "include" the listed ones —
 // an open list. This M4 key extends it (reported for spec backfill).
 const KEY_WAKE_LAST_ROW_ID: &str = "wake_last_row_id";
+// specs.md Section 5.2 (decision 78 (b)(d)): the warmup keys.
+const KEY_WARMUP_NEXT_AT: &str = "warmup_next_at";
+const KEY_WARMUP_QUOTA_USED_TODAY: &str = "warmup_quota_used_today";
+const KEY_WARMUP_QUOTA_DAY: &str = "warmup_quota_day";
+const KEY_WARMUP_BACKOFF_FACTOR: &str = "warmup_backoff_factor";
+const KEY_WARMUP_TOPIC_COOLDOWNS: &str = "warmup_topic_cooldowns";
+// The warmup engagement-watch keys (specs.md Section 5.2 names them as
+// a family; decision 78 (d)).
+const KEY_WARMUP_WATCH_ROW_ID: &str = "warmup_watch_row_id";
+const KEY_WARMUP_WATCH_SENT_AT: &str = "warmup_watch_sent_at";
+const KEY_WARMUP_WATCH_EXPIRES_AT: &str = "warmup_watch_expires_at";
+const KEY_WARMUP_WATCH_PENDING: &str = "warmup_watch_pending";
 
 /// Session state of one group. The actor persists it after every mutation
 /// (specs.md Section 6.1, rule 4) and rebuilds it on restart.
@@ -53,6 +65,33 @@ pub struct SessionState {
     /// it. Fresh default 0 (M4 key, reported for spec backfill: Section
     /// 5.2 lists an open key set).
     pub wake_last_row_id: i64,
+    /// specs.md Section 5.2 / 8.4 (decision 78 (b)): the persisted
+    /// warmup schedule. Rule P1: a restart never reshuffles it.
+    pub warmup_next_at: Option<OffsetDateTime>,
+    /// specs.md Section 5.2 (decision 78 (b)): the warmup messages
+    /// already sent on `warmup_quota_day`.
+    pub warmup_quota_used_today: u32,
+    /// specs.md Section 5.2 (decision 78 (b)): the host-local date
+    /// ("YYYY-MM-DD") the quota counter belongs to.
+    pub warmup_quota_day: Option<String>,
+    /// specs.md Sections 5.2/8.5 (decision 78 (d)): the soft-backoff
+    /// factor; the effective quota is max(0, quota − factor).
+    pub warmup_backoff_factor: u32,
+    /// specs.md Sections 5.2/9.7 step 2 (decision 78 (b)): normalized
+    /// topic name -> last-used host-local date ("YYYY-MM-DD").
+    pub warmup_topic_cooldowns: HashMap<String, String>,
+    /// specs.md Section 5.2 (decision 78 (d)): the engagement watch —
+    /// the outbound raw-log row id of the last sent warmup.
+    pub warmup_watch_row_id: Option<i64>,
+    /// specs.md Section 5.2 (decision 78 (d)): when the watched warmup
+    /// was sent.
+    pub warmup_watch_sent_at: Option<OffsetDateTime>,
+    /// specs.md Section 5.2 (decision 78 (d)): when the engagement
+    /// watch expires (`warmup_reaction_window` after the send).
+    pub warmup_watch_expires_at: Option<OffsetDateTime>,
+    /// specs.md Section 5.2 (decision 78 (d)): an engagement watch is
+    /// open.
+    pub warmup_watch_pending: bool,
 }
 
 /// Truncates a duration to whole milliseconds.
@@ -84,6 +123,17 @@ impl SessionState {
             consecutive_bot_msgs: 0,
             wake,
             wake_last_row_id: 0,
+            // Decision 78 (b)(d): no schedule, no quota spent, no
+            // backoff, no cooldowns, no open engagement watch.
+            warmup_next_at: None,
+            warmup_quota_used_today: 0,
+            warmup_quota_day: None,
+            warmup_backoff_factor: 0,
+            warmup_topic_cooldowns: HashMap::new(),
+            warmup_watch_row_id: None,
+            warmup_watch_sent_at: None,
+            warmup_watch_expires_at: None,
+            warmup_watch_pending: false,
         }
     }
 
@@ -96,24 +146,40 @@ impl SessionState {
     /// `consecutive_bot_msgs` (decimal), `wake_msgs_since_wake` (decimal),
     /// `wake_last_wake_at` (RFC 3339), `wake_current_interval_ms` (decimal
     /// milliseconds), `wake_last_row_id` (decimal; M4 key, reported for
-    /// spec backfill).
+    /// spec backfill), and the decision-78 warmup keys: `warmup_next_at`,
+    /// `warmup_watch_sent_at`, `warmup_watch_expires_at` (RFC 3339; `None`
+    /// encodes as the empty string), `warmup_quota_used_today`,
+    /// `warmup_backoff_factor` (decimal), `warmup_quota_day` (the date
+    /// string; `None` encodes as the empty string),
+    /// `warmup_topic_cooldowns` (a JSON object string; the empty map
+    /// encodes as `{}`), `warmup_watch_row_id` (decimal; `None` encodes
+    /// as the empty string), `warmup_watch_pending` ("0"/"1").
     pub fn encode(&self) -> Vec<(String, String)> {
         // Rfc3339 formatting fails only for years outside 0..=9999.
+        let format_at = |at: Option<OffsetDateTime>| {
+            at.map(|at| at.format(&Rfc3339).unwrap_or_else(|_| String::new()))
+                .unwrap_or_default()
+        };
         let last_wake_at = self
             .wake
             .last_wake_at
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::new());
-        let last_digest_at = self
-            .last_digest_at
-            .map(|at| at.format(&Rfc3339).unwrap_or_else(|_| String::new()))
-            .unwrap_or_default();
+        let last_digest_at = format_at(self.last_digest_at);
         // The same pattern as last_digest_at: None encodes as the empty
         // string, Some(v) as decimal.
         let prev_digest_boundary_msg_id = self
             .prev_digest_boundary_msg_id
             .map(|value| value.to_string())
             .unwrap_or_default();
+        let warmup_watch_row_id = self
+            .warmup_watch_row_id
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        // A HashMap<String, String> always serializes; the fallback is
+        // defensive.
+        let warmup_topic_cooldowns = serde_json::to_string(&self.warmup_topic_cooldowns)
+            .unwrap_or_else(|_| "{}".to_string());
         vec![
             (
                 KEY_DIGEST_BOUNDARY.to_string(),
@@ -145,6 +211,39 @@ impl SessionState {
                 KEY_WAKE_LAST_ROW_ID.to_string(),
                 self.wake_last_row_id.to_string(),
             ),
+            (
+                KEY_WARMUP_NEXT_AT.to_string(),
+                format_at(self.warmup_next_at),
+            ),
+            (
+                KEY_WARMUP_QUOTA_USED_TODAY.to_string(),
+                self.warmup_quota_used_today.to_string(),
+            ),
+            (
+                KEY_WARMUP_QUOTA_DAY.to_string(),
+                self.warmup_quota_day.clone().unwrap_or_default(),
+            ),
+            (
+                KEY_WARMUP_BACKOFF_FACTOR.to_string(),
+                self.warmup_backoff_factor.to_string(),
+            ),
+            (
+                KEY_WARMUP_TOPIC_COOLDOWNS.to_string(),
+                warmup_topic_cooldowns,
+            ),
+            (KEY_WARMUP_WATCH_ROW_ID.to_string(), warmup_watch_row_id),
+            (
+                KEY_WARMUP_WATCH_SENT_AT.to_string(),
+                format_at(self.warmup_watch_sent_at),
+            ),
+            (
+                KEY_WARMUP_WATCH_EXPIRES_AT.to_string(),
+                format_at(self.warmup_watch_expires_at),
+            ),
+            (
+                KEY_WARMUP_WATCH_PENDING.to_string(),
+                if self.warmup_watch_pending { "1" } else { "0" }.to_string(),
+            ),
         ]
     }
 
@@ -166,6 +265,18 @@ impl SessionState {
             Some("1") => true,
             _ => fresh.muted,
         };
+        // The RFC 3339 Option pattern of last_digest_at: a missing,
+        // empty, or malformed value decodes to the fresh default (None).
+        let parse_at = |key: &str| {
+            map.get(key)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        };
+        let warmup_watch_pending = match map.get(KEY_WARMUP_WATCH_PENDING).map(String::as_str) {
+            Some("0") => false,
+            Some("1") => true,
+            _ => fresh.warmup_watch_pending,
+        };
         Self {
             last_digest_boundary_msg_id: map
                 .get(KEY_DIGEST_BOUNDARY)
@@ -179,10 +290,7 @@ impl SessionState {
                 .and_then(|value| value.parse().ok()),
             // A missing, empty, or malformed value means the tail was
             // never digested: None is the fresh default.
-            last_digest_at: map
-                .get(KEY_LAST_DIGEST_AT)
-                .filter(|value| !value.is_empty())
-                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok()),
+            last_digest_at: parse_at(KEY_LAST_DIGEST_AT),
             muted,
             consecutive_bot_msgs: map
                 .get(KEY_CONSECUTIVE_BOT)
@@ -209,6 +317,39 @@ impl SessionState {
                 .get(KEY_WAKE_LAST_ROW_ID)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(fresh.wake_last_row_id),
+            // Decision 78 (b)(d): the warmup keys follow the same
+            // per-field total-function fallback policy.
+            warmup_next_at: parse_at(KEY_WARMUP_NEXT_AT),
+            warmup_quota_used_today: map
+                .get(KEY_WARMUP_QUOTA_USED_TODAY)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fresh.warmup_quota_used_today),
+            // The quota-day date string; a missing or empty value means
+            // no quota spent: None is the fresh default.
+            warmup_quota_day: map
+                .get(KEY_WARMUP_QUOTA_DAY)
+                .filter(|value| !value.is_empty())
+                .cloned(),
+            warmup_backoff_factor: map
+                .get(KEY_WARMUP_BACKOFF_FACTOR)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fresh.warmup_backoff_factor),
+            // A missing, empty, or malformed JSON object decodes to the
+            // empty map (the fresh default).
+            warmup_topic_cooldowns: map
+                .get(KEY_WARMUP_TOPIC_COOLDOWNS)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default(),
+            // The prev_digest_boundary pattern: None encodes as the
+            // empty string; missing/empty/malformed decodes to None.
+            warmup_watch_row_id: map
+                .get(KEY_WARMUP_WATCH_ROW_ID)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse().ok()),
+            warmup_watch_sent_at: parse_at(KEY_WARMUP_WATCH_SENT_AT),
+            warmup_watch_expires_at: parse_at(KEY_WARMUP_WATCH_EXPIRES_AT),
+            warmup_watch_pending,
         }
     }
 
@@ -250,12 +391,215 @@ mod tests {
         state.last_digest_at = Some(fixed_now());
         state.wake.msgs_since_wake = 3;
         state.wake_last_row_id = 42;
+        // The decision-78 warmup fields, populated.
+        state.warmup_next_at = Some(fixed_now());
+        state.warmup_quota_used_today = 2;
+        state.warmup_quota_day = Some("2026-08-21".to_string());
+        state.warmup_backoff_factor = 1;
+        state.warmup_topic_cooldowns =
+            HashMap::from([("rust async".to_string(), "2026-08-19".to_string())]);
+        state.warmup_watch_row_id = Some(4242);
+        state.warmup_watch_sent_at = Some(fixed_now());
+        state.warmup_watch_expires_at = Some(fixed_now());
+        state.warmup_watch_pending = true;
 
         let encoded = state.encode();
         let map: HashMap<String, String> = encoded.into_iter().collect();
         let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
 
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn decode_of_missing_empty_or_malformed_warmup_next_at_is_none() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(43);
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.warmup_next_at = Some(fixed_now());
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Round trip.
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_next_at, Some(fixed_now()));
+
+        // Missing key.
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(43),
+        );
+        assert_eq!(decoded.warmup_next_at, None);
+
+        // Malformed value falls back to the fresh default (None).
+        let mut corrupt = map;
+        corrupt.insert(KEY_WARMUP_NEXT_AT.to_string(), "not-a-date".to_string());
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_next_at, None);
+    }
+
+    #[test]
+    fn decode_of_missing_or_malformed_warmup_quota_fields_is_fresh() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(47);
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.warmup_quota_used_today = 3;
+        state.warmup_quota_day = Some("2026-08-21".to_string());
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Round trip.
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_quota_used_today, 3);
+        assert_eq!(decoded.warmup_quota_day.as_deref(), Some("2026-08-21"));
+
+        // Missing keys fall back to the fresh defaults (0 / None).
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(47),
+        );
+        assert_eq!(decoded.warmup_quota_used_today, 0);
+        assert_eq!(decoded.warmup_quota_day, None);
+
+        // Malformed counter / empty day fall back per field.
+        let mut corrupt = map;
+        corrupt.insert(
+            KEY_WARMUP_QUOTA_USED_TODAY.to_string(),
+            "not-a-number".to_string(),
+        );
+        corrupt.insert(KEY_WARMUP_QUOTA_DAY.to_string(), String::new());
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_quota_used_today, 0);
+        assert_eq!(decoded.warmup_quota_day, None);
+    }
+
+    #[test]
+    fn decode_of_missing_or_malformed_warmup_backoff_factor_is_zero() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(53);
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.warmup_backoff_factor = 2;
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Round trip.
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_backoff_factor, 2);
+
+        // Missing or malformed falls back to the fresh default (0).
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(53),
+        );
+        assert_eq!(decoded.warmup_backoff_factor, 0);
+        let mut corrupt = map;
+        corrupt.insert(
+            KEY_WARMUP_BACKOFF_FACTOR.to_string(),
+            "not-a-number".to_string(),
+        );
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_backoff_factor, 0);
+    }
+
+    #[test]
+    fn decode_of_missing_empty_or_malformed_warmup_topic_cooldowns_is_empty() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(59);
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.warmup_topic_cooldowns = HashMap::from([
+            ("rust async".to_string(), "2026-08-19".to_string()),
+            ("coffee".to_string(), "2026-08-20".to_string()),
+        ]);
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Round trip of a populated map.
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_topic_cooldowns, state.warmup_topic_cooldowns);
+
+        // The empty map encodes as "{}" and decodes to the empty map.
+        let state = SessionState::new(&config, fixed_now(), &mut rng);
+        let fresh_map: HashMap<String, String> = state.encode().into_iter().collect();
+        assert_eq!(
+            fresh_map.get(KEY_WARMUP_TOPIC_COOLDOWNS),
+            Some(&"{}".to_string())
+        );
+        let decoded = SessionState::decode(&fresh_map, &config, fixed_now(), &mut rng);
+        assert!(decoded.warmup_topic_cooldowns.is_empty());
+
+        // Missing key.
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(59),
+        );
+        assert!(decoded.warmup_topic_cooldowns.is_empty());
+
+        // Empty or malformed JSON falls back to the empty map.
+        for bad in ["", "not-json", "[1,2]", "{\"a\":1}"] {
+            let mut corrupt = map.clone();
+            corrupt.insert(KEY_WARMUP_TOPIC_COOLDOWNS.to_string(), bad.to_string());
+            let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+            assert!(
+                decoded.warmup_topic_cooldowns.is_empty(),
+                "{bad:?} decodes to the empty map"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_missing_or_malformed_warmup_watch_fields_is_fresh() {
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(61);
+        let mut state = SessionState::new(&config, fixed_now(), &mut rng);
+        state.warmup_watch_row_id = Some(4242);
+        state.warmup_watch_sent_at = Some(fixed_now());
+        state.warmup_watch_expires_at = Some(fixed_now());
+        state.warmup_watch_pending = true;
+        let map: HashMap<String, String> = state.encode().into_iter().collect();
+
+        // Round trip.
+        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_watch_row_id, Some(4242));
+        assert_eq!(decoded.warmup_watch_sent_at, Some(fixed_now()));
+        assert_eq!(decoded.warmup_watch_expires_at, Some(fixed_now()));
+        assert!(decoded.warmup_watch_pending);
+
+        // Missing keys fall back to the fresh defaults.
+        let decoded = SessionState::decode(
+            &HashMap::new(),
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(61),
+        );
+        assert_eq!(decoded.warmup_watch_row_id, None);
+        assert_eq!(decoded.warmup_watch_sent_at, None);
+        assert_eq!(decoded.warmup_watch_expires_at, None);
+        assert!(!decoded.warmup_watch_pending);
+
+        // Malformed values fall back per field (the muted_flag pattern
+        // for pending, the prev_digest_boundary pattern for row_id).
+        let mut corrupt = map;
+        corrupt.insert(
+            KEY_WARMUP_WATCH_ROW_ID.to_string(),
+            "not-a-number".to_string(),
+        );
+        corrupt.insert(
+            KEY_WARMUP_WATCH_SENT_AT.to_string(),
+            "not-a-date".to_string(),
+        );
+        corrupt.insert(
+            KEY_WARMUP_WATCH_EXPIRES_AT.to_string(),
+            "not-a-date".to_string(),
+        );
+        corrupt.insert(KEY_WARMUP_WATCH_PENDING.to_string(), "yes".to_string());
+        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        assert_eq!(decoded.warmup_watch_row_id, None);
+        assert_eq!(decoded.warmup_watch_sent_at, None);
+        assert_eq!(decoded.warmup_watch_expires_at, None);
+        assert!(!decoded.warmup_watch_pending);
     }
 
     #[test]
