@@ -88,19 +88,24 @@ ON MATCH SET n.name = $name, n.updated_at = $updated_at, n.properties = coalesce
 // (source, target, relationship_name, valid_at). The endpoints match by
 // identifier. Rule R5 applies: no full-graph scan entry.
 //
-// Replay convergence (decision 75 (b), Section 7.5): ON MATCH sets
-// `r.invalid_at = $invalid_at` from the BATCH, and a replayed batch carries
-// the edge's ORIGINAL `invalid_at` (NULL for a valid fact). So the replay of
-// an edge that was invalidated in the meantime RE-VALIDATES it. Together with
-// the INVALIDATE_SIBLINGS exclusion of the edge being written itself (full
-// natural key), a replayed batch whose single-value edges have distinct
-// (subject, predicate) pairs invalidates nothing on the second run and is a
-// state-wise no-op: the deterministic natural key MERGEs and `valid_at`
-// refreshes.
+// Replay convergence (decision 75 (b), Section 7.5) with decision 77
+// (M8) coalesce semantics: ON MATCH sets
+// `r.invalid_at = coalesce($invalid_at, r.invalid_at)`. A replayed batch
+// carries the edge's ORIGINAL `invalid_at` (NULL for a valid fact), so
+// the coalesce keeps the STORED value: a replay never wipes a manual
+// `--invalidate` (or a sibling-pass invalidation) that landed between
+// the original run and the replay. An IN-ORDER replay converges exactly
+// as before: the stored invalid_at is then the value the batch itself
+// would produce, so the coalesce is a no-op and the replay stays a
+// state-wise no-op (together with the INVALIDATE_SIBLINGS exclusion of
+// the edge being written itself, full natural key). Caveat: an
+// OUT-OF-ORDER full replay can still rewind the OTHER columns
+// (edge_text, properties) to the replayed batch's values — only
+// invalid_at is protected.
 const MERGE_EDGE: &str = "MATCH (s:Node {id: $source_id}), (t:Node {id: $target_id})
 MERGE (s)-[r:EDGE {relationship_name: $rel, valid_at: $valid_at}]->(t)
 ON CREATE SET r.edge_text = $edge_text, r.invalid_at = $invalid_at, r.created_at = $created_at, r.updated_at = $updated_at, r.properties = $properties
-ON MATCH SET r.edge_text = $edge_text, r.invalid_at = $invalid_at, r.updated_at = $updated_at, r.properties = coalesce($properties, r.properties)";
+ON MATCH SET r.edge_text = $edge_text, r.invalid_at = coalesce($invalid_at, r.invalid_at), r.updated_at = $updated_at, r.properties = coalesce($properties, r.properties)";
 
 // Entity resolution, Section 7.4 step 2: the targets of one alias node.
 // Alias edges are Person -> Alias (known_as) and Concept -> Alias
@@ -117,13 +122,16 @@ RETURN s.id, s.type";
 // graph through the node identifier (Rule R5); the node id is a $param
 // (Section 5.2 rule 4). The LIMIT is interpolated at the call site from
 // the trusted const NEIGHBOR_EXPANSION_LIMIT, the same "trusted values
-// only" policy as `query_rows`.
+// only" policy as `query_rows`. Decision 77 (S3-F7): a deterministic
+// TOTAL order — `created_at DESC` primary (existing), tiebroken by
+// `valid_at DESC, s.id, t.id, r.relationship_name` — so truncation at
+// the LIMIT is stable across reads.
 const NEIGHBORS: &str = "MATCH (s:Node)-[r:EDGE]->(t:Node)
 WHERE (s.id = $node_id OR t.id = $node_id)
   AND r.invalid_at IS NULL
   AND r.relationship_name <> 'contains'
 RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at, r.created_at
-ORDER BY r.created_at DESC
+ORDER BY r.created_at DESC, r.valid_at DESC, s.id, t.id, r.relationship_name
 LIMIT ";
 
 // Phase 2 (current-state.md decision 66): the stored display content of
@@ -145,9 +153,11 @@ RETURN n.id, n.name, n.properties";
 // single LIST parameter (Section 5.2 rule 4), so k round trips and k
 // op-lock acquisitions collapse into one. The OPTIONAL MATCH mirrors
 // ALIAS_TARGETS: alias edges point INTO the alias node, so the target
-// is the SOURCE of a known_as/also_known_as edge. An alias carries at
-// most one row per alias edge; ORDER BY makes the first-wins pick of
-// the decoder deterministic.
+// is the SOURCE of a known_as/also_known_as edge. The query returns one
+// row per (node, alias target); the decoder aggregates those rows into
+// ONE NodeResolutionInfo per node with the alias-target COUNT
+// (decision 77, S3-F6), and ORDER BY makes the first-wins pick
+// deterministic for the single-target case.
 const NODE_RESOLUTION_INFOS: &str = "MATCH (n:Node)
 WHERE n.id IN $node_ids
 OPTIONAL MATCH (s:Node)-[r:EDGE]->(n)
@@ -235,9 +245,10 @@ ON CREATE SET r.valid_at = $now, r.edge_text = $edge_text, r.created_at = $now, 
 // The `NOT (o.id = $target_id AND r.valid_at = $valid_at)` exclusion spares
 // the edge being written itself (its full natural key). That is what makes
 // a REPLAYED batch converge: the replayed edge is not invalidated by its own
-// pass, and its MERGE (step 2) re-validates it, so a re-run invalidates
+// pass, and with the decision-77 (M8) coalesce its MERGE (step 2) keeps the
+// stored invalid_at (NULL on a fresh replay), so a re-run invalidates
 // nothing and is a state-wise no-op. Without the exclusion a replay would
-// invalidate-then-revalidate the same edge.
+// invalidate the edge its own MERGE can no longer re-validate.
 //
 // `RETURN count(r)` yields the number of edges invalidated (feeds the
 // `facts_invalidated_total` counter, decision 75 (e)). Verified against the
@@ -290,7 +301,10 @@ ORDER BY r.valid_at DESC, r.relationship_name, t.id";
 // (Rule R5); the node id and the cutoff are $params (Section 5.2 rule
 // 4). The LIMIT is interpolated at the call site from the trusted
 // per_node_limit argument, the same "trusted values only" policy as
-// `query_rows` and NEIGHBORS.
+// `query_rows` and NEIGHBORS. Decision 77 (S3-F7): a deterministic
+// TOTAL order — `created_at DESC` primary (existing), tiebroken by
+// `valid_at DESC, s.id, t.id, r.relationship_name` — so truncation at
+// the LIMIT is stable across reads.
 const TWO_HOP_EDGES: &str = "MATCH (s:Node)-[r:EDGE]->(t:Node)
 WHERE (s.id = $node_id OR t.id = $node_id)
   AND r.invalid_at IS NULL
@@ -298,7 +312,7 @@ WHERE (s.id = $node_id OR t.id = $node_id)
   AND r.relationship_name <> 'known_as'
   AND (r.valid_at >= $cutoff OR r.created_at >= $cutoff)
 RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at
-ORDER BY r.created_at DESC
+ORDER BY r.created_at DESC, r.valid_at DESC, s.id, t.id, r.relationship_name
 LIMIT ";
 
 // Decision 76 (c): hydrate one sidecar `edge_texts` hit by the natural
@@ -911,16 +925,19 @@ fn read_expansion_edges(
 /// Tiebreak (deterministic): the newest `valid_at` wins; on a `valid_at`
 /// tie the lexicographically SMALLEST opaque edge-id string wins — the
 /// same natural-key ordering the manual ops use. Each invalidation is
-/// counted and DEBUG-logged. Returns the number of edges invalidated.
+/// counted and DEBUG-logged. Returns the invalidation count plus the
+/// natural keys of the invalidated edges (decision 77, H1): the merge
+/// records them in the snapshot, so rollback can clear `invalid_at` on
+/// the survivor's own pre-existing edges the pass invalidated.
 fn enforce_single_value_invariant(
     conn: &Connection,
     survivor_id: &str,
     single_value_predicates: &[String],
     now: OffsetDateTime,
-) -> Result<u32> {
+) -> Result<(u32, Vec<MergeSnapshotEdgeKey>)> {
     let mut read_statement = conn.prepare(VALID_OUTGOING_EDGES).map_err(backend)?;
     let mut set_statement = conn.prepare(SET_EDGE_INVALID_AT).map_err(backend)?;
-    let mut invalidated_total = 0u32;
+    let mut invalidated_keys: Vec<MergeSnapshotEdgeKey> = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
     for predicate in single_value_predicates {
         // A duplicate registry entry would only find the single remaining
@@ -974,7 +991,12 @@ fn enforce_single_value_invariant(
         let (winner_edge_id, _) = &ranked[0];
         for (edge_id, edge) in &ranked[1..] {
             set_edge_invalid_at(conn, &mut set_statement, edge, Some(now), now)?;
-            invalidated_total += 1;
+            invalidated_keys.push(MergeSnapshotEdgeKey {
+                source_id: edge.source_id.clone(),
+                relationship_name: edge.relationship_name.clone(),
+                target_id: edge.target_id.clone(),
+                valid_at: edge.valid_at,
+            });
             tracing::debug!(
                 survivor_id = %survivor_id,
                 relationship_name = %predicate,
@@ -984,7 +1006,8 @@ fn enforce_single_value_invariant(
             );
         }
     }
-    Ok(invalidated_total)
+    let invalidated_total = u32::try_from(invalidated_keys.len()).unwrap_or(u32::MAX);
+    Ok((invalidated_total, invalidated_keys))
 }
 
 /// One endpoint's view of an edge, for the re-point dedup of Section
@@ -996,6 +1019,9 @@ struct EndpointEdge {
     relationship_name: String,
     edge_text: String,
     valid_at: OffsetDateTime,
+    /// `None` means the edge is valid now (Section 6.1). Decision 77
+    /// (H2): the dedup is validity-aware — see [`edges_equivalent`].
+    invalid_at: Option<OffsetDateTime>,
 }
 
 impl EndpointEdge {
@@ -1013,21 +1039,36 @@ impl EndpointEdge {
             relationship_name: edge.relationship_name.clone(),
             edge_text: edge.edge_text.clone(),
             valid_at: edge.valid_at,
+            invalid_at: edge.invalid_at,
         }
     }
 }
 
-/// Section 7.7 step 3: equivalent means same direction, same
-/// relationship name, same other endpoint, and same description text
-/// (the stored `edge_text`; the properties-description convention of
-/// decision 66 applies to nodes, and the write path does not use edge
-/// properties blobs as descriptions). A full natural-key match (same
-/// `valid_at` on an otherwise identical re-pointed edge) also counts,
-/// because the re-point CREATE must never duplicate the natural key of
-/// a pre-existing survivor edge: rollback deletes by natural key and
+/// Section 7.7 step 3, validity-aware per decision 77 (H2): equivalent
+/// means same direction, same relationship name, same other endpoint,
+/// and same description text (the stored `edge_text`; the
+/// properties-description convention of decision 66 applies to nodes,
+/// and the write path does not use edge properties blobs as
+/// descriptions). A full natural-key match (same `valid_at` on an
+/// otherwise identical re-pointed edge) also counts, because the
+/// re-point CREATE must never duplicate the natural key of a
+/// pre-existing survivor edge: rollback deletes by natural key and
 /// would take the pre-existing edge with it.
+///
+/// Dedup requires BOTH edges VALID (`invalid_at IS NULL` on both
+/// sides). The full rule:
+/// - VALID loser edge vs INVALID survivor equivalent: re-point anyway —
+///   the fact survives as VALID on the survivor; the invalid survivor
+///   edge stays historical. (An invalid edge must not suppress the
+///   live fact.)
+/// - INVALID loser edge vs VALID survivor equivalent: the invalid loser
+///   edge is re-pointed AS INVALID (history kept); the valid survivor
+///   edge is untouched.
+/// - VALID vs VALID: dedup as in decision 74.
 fn edges_equivalent(a: &EndpointEdge, b: &EndpointEdge) -> bool {
-    a.outgoing == b.outgoing
+    a.invalid_at.is_none()
+        && b.invalid_at.is_none()
+        && a.outgoing == b.outgoing
         && a.other_id == b.other_id
         && a.relationship_name == b.relationship_name
         && (a.edge_text == b.edge_text || a.valid_at == b.valid_at)
@@ -1544,27 +1585,41 @@ impl MemoryBackend for LbugBackend {
                     Some(Value::String(target)) => Some(target),
                     _ => None,
                 };
-                // ORDER BY n.id groups the rows of one node; first-wins
-                // under ORDER BY s.id keeps the alias-target pick
-                // deterministic when an alias carries several alias
-                // edges. Only an Alias binds a target.
+                // ORDER BY n.id groups the rows of one node: one row
+                // per (node, alias target), so each further row of the
+                // same node is one more alias target. A NULL target row
+                // (the OPTIONAL MATCH miss of a target-less node)
+                // counts 0. First-wins under ORDER BY s.id keeps the
+                // single-target pick deterministic.
                 match infos.last_mut() {
                     Some((last_id, info)) if *last_id == node_id => {
-                        if info.alias_target.is_none() {
-                            info.alias_target = target;
+                        if target.is_some() {
+                            info.alias_target_count += 1;
                         }
                     }
                     _ => infos.push((
                         node_id,
                         NodeResolutionInfo {
                             kind,
+                            // Provisional first-wins pick; cleared below
+                            // when the alias binds more than one target.
                             alias_target: if kind == NodeType::Alias {
-                                target
+                                target.clone()
                             } else {
                                 None
                             },
+                            alias_target_count: u32::from(target.is_some()),
                         },
                     )),
+                }
+            }
+            // Decision 77 (S3-F6): a MULTI-TARGET alias has no single
+            // binding — report the count, leave `alias_target` None, and
+            // let the decision-73 vector pre-screen skip the alias for
+            // Section 7.4 step-2 parity.
+            for (_, info) in &mut infos {
+                if info.alias_target_count != 1 {
+                    info.alias_target = None;
                 }
             }
             Ok(infos)
@@ -1718,7 +1773,7 @@ impl MemoryBackend for LbugBackend {
             let mut deduped = 0u32;
             let mut created_edges: Vec<MergeSnapshotEdgeKey> = Vec::new();
 
-            let single_value_invalidated = transact(conn, |conn| {
+            let (single_value_invalidated, invalidated_survivor_edges) = transact(conn, |conn| {
                 let mut create_statement = conn.prepare(CREATE_EDGE).map_err(backend)?;
                 let mut delete_statement = conn.prepare(DELETE_EDGE).map_err(backend)?;
                 let mut detach_statement = conn.prepare(DETACH_DELETE_NODE).map_err(backend)?;
@@ -1807,20 +1862,22 @@ impl MemoryBackend for LbugBackend {
                 // invariant pass at the END of the SAME transaction,
                 // after every re-point and the tombstone. An empty
                 // registry skips it entirely (the decision-74 behavior).
-                let single_value_invalidated = if registry.is_empty() {
-                    0
+                // Decision 77 (H1): the invalidated edge keys ride into
+                // the snapshot so rollback can re-validate them.
+                if registry.is_empty() {
+                    Ok((0, Vec::new()))
                 } else {
-                    enforce_single_value_invariant(conn, &survivor_id, &registry, now)?
-                };
-                Ok(single_value_invalidated)
+                    enforce_single_value_invariant(conn, &survivor_id, &registry, now)
+                }
             })?;
 
             let snapshot = MergeSnapshot {
-                version: 1,
+                version: 2,
                 survivor_id: survivor_id.clone(),
                 node,
                 edges: loser_edges,
                 created_edges,
+                invalidated_survivor_edges,
             };
             let snapshot_json = serde_json::to_string(&snapshot).map_err(|error| {
                 MemoryError::Backend(format!("merge snapshot serialization failed: {error}"))
@@ -2078,6 +2135,17 @@ impl MemoryBackend for LbugBackend {
                 serde_json::from_str(&snapshot_json).map_err(|error| {
                     MemoryError::Backend(format!("rollback_merge: malformed snapshot: {error}"))
                 })?;
+            // Decision 77 (H1): versions 0 and 1 carry no
+            // invalidated-survivor-edge keys (nothing to revalidate);
+            // version 2 does. An unknown version is a LOUD refusal —
+            // silently skipping a restore step would corrupt the graph.
+            if snapshot.version > 2 {
+                return Err(MemoryError::Backend(format!(
+                    "rollback_merge: unsupported snapshot version {} \
+                     (this build restores versions 0-2)",
+                    snapshot.version
+                )));
+            }
             // Section 7.7 step 4: refuse when the survivor was itself
             // tombstoned by a later merge; chained-merge rollback is
             // out of scope.
@@ -2128,6 +2196,28 @@ impl MemoryBackend for LbugBackend {
                         &key.target_id,
                         key.valid_at,
                     )?;
+                }
+                // Decision 77 (H1): re-validate the survivor edges the
+                // merge's invariant pass invalidated — SET invalid_at =
+                // NULL, updated_at = now — in the SAME transaction, so
+                // the survivor's pre-existing valid edges round-trip to
+                // the exact pre-merge state. Keys a delete above already
+                // removed (a re-pointed edge the pass invalidated) match
+                // no row here, which is harmless: they are gone either
+                // way. Versions 0/1 carry no keys (serde default), so
+                // this loop is a no-op for them.
+                if snapshot.version >= 2 && !snapshot.invalidated_survivor_edges.is_empty() {
+                    let now = OffsetDateTime::now_utc();
+                    let mut set_statement = conn.prepare(SET_EDGE_INVALID_AT).map_err(backend)?;
+                    for key in &snapshot.invalidated_survivor_edges {
+                        let edge_key = EdgeId {
+                            source_id: key.source_id.clone(),
+                            relationship_name: key.relationship_name.clone(),
+                            target_id: key.target_id.clone(),
+                            valid_at: key.valid_at,
+                        };
+                        set_edge_invalid_at(conn, &mut set_statement, &edge_key, None, now)?;
+                    }
                 }
                 Ok(())
             })
@@ -2484,6 +2574,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn neighbors_orders_identical_created_at_edges_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let hub = concept_node("Hub", base);
+        let x = concept_node("Xray", base);
+        let y = concept_node("Yankee", base);
+        let z = concept_node("Zulu", base);
+        // Identical created_at AND valid_at on every edge: the S3-F7
+        // tiebreak (valid_at DESC, s.id, t.id, relationship_name)
+        // decides the order.
+        let stamp = base + Duration::seconds(1);
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(3, 71),
+            nodes: vec![hub.clone(), x.clone(), y.clone(), z.clone()],
+            edges: vec![
+                fact_edge(&hub.id, &z.id, "mentions", None, stamp),
+                fact_edge(&hub.id, &y.id, "likes", None, stamp),
+                fact_edge(&hub.id, &x.id, "likes", None, stamp),
+            ],
+        };
+        backend.upsert_batch("chat_i2", &batch).await.unwrap();
+
+        // Decision 77 (S3-F7): a stable, asserted order across reads.
+        let first = backend.neighbors("chat_i2", &hub.id).await.unwrap();
+        let second = backend.neighbors("chat_i2", &hub.id).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        // created_at and valid_at tie everywhere; the order falls to
+        // t.id ascending, then relationship_name.
+        let mut expected: Vec<(String, String)> = [
+            (x.id.clone(), "likes".to_string()),
+            (y.id.clone(), "likes".to_string()),
+            (z.id.clone(), "mentions".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        expected.sort();
+        let actual: Vec<(String, String)> = first
+            .iter()
+            .map(|edge| (edge.target_id.clone(), edge.relationship_name.clone()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn neighbors_truncates_to_the_expansion_limit_newest_first() {
         let dir = tempfile::tempdir().unwrap();
         let backend = LbugBackend::new(dir.path());
@@ -2765,6 +2901,7 @@ mod tests {
             NodeResolutionInfo {
                 kind: NodeType::MessageBatch,
                 alias_target: None,
+                alias_target_count: 0,
             }
         );
         assert_eq!(
@@ -2772,6 +2909,7 @@ mod tests {
             NodeResolutionInfo {
                 kind: NodeType::Person,
                 alias_target: None,
+                alias_target_count: 0,
             }
         );
         assert_eq!(
@@ -2779,6 +2917,7 @@ mod tests {
             NodeResolutionInfo {
                 kind: NodeType::Concept,
                 alias_target: None,
+                alias_target_count: 0,
             }
         );
         // An alias binds to the source of its known_as edge.
@@ -2787,6 +2926,7 @@ mod tests {
             NodeResolutionInfo {
                 kind: NodeType::Alias,
                 alias_target: Some(person.id.clone()),
+                alias_target_count: 1,
             }
         );
         // ... and of its also_known_as edge.
@@ -2795,6 +2935,7 @@ mod tests {
             NodeResolutionInfo {
                 kind: NodeType::Alias,
                 alias_target: Some(concept.id.clone()),
+                alias_target_count: 1,
             }
         );
     }
@@ -2817,6 +2958,57 @@ mod tests {
                 NodeResolutionInfo {
                     kind: NodeType::Person,
                     alias_target: None,
+                    alias_target_count: 0,
+                },
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_resolution_infos_reports_a_multi_target_alias_with_no_single_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let person_a = person_node("Tama", "1001", base);
+        let person_b = person_node("Koko", "2009", base);
+        let alias = MemoryNode {
+            id: crate::identifiers::alias_id("tama"),
+            name: "tama".to_string(),
+            node_type: NodeType::Alias,
+            created_at: base,
+            updated_at: base,
+            properties: None,
+        };
+        // An ambiguous surface form: TWO known_as edges into one alias.
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(5, 91),
+            nodes: vec![person_a.clone(), person_b.clone(), alias.clone()],
+            edges: vec![
+                fact_edge(&person_a.id, &alias.id, "known_as", None, base),
+                fact_edge(
+                    &person_b.id,
+                    &alias.id,
+                    "known_as",
+                    None,
+                    base + Duration::seconds(1),
+                ),
+            ],
+        };
+        backend.upsert_batch("chat_p2", &batch).await.unwrap();
+
+        let infos = backend
+            .node_resolution_infos("chat_p2", std::slice::from_ref(&alias.id))
+            .await
+            .unwrap();
+        // Decision 77 (S3-F6): ONE row, count 2, no single binding.
+        assert_eq!(
+            infos,
+            vec![(
+                alias.id.clone(),
+                NodeResolutionInfo {
+                    kind: NodeType::Alias,
+                    alias_target: None,
+                    alias_target_count: 2,
                 },
             )]
         );
@@ -3098,6 +3290,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_nodes_repoints_a_valid_loser_edge_past_an_invalid_survivor_equivalent() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let loser = concept_node("Loser", base);
+        let survivor = concept_node("Survivor", base);
+        let x = concept_node("Xray", base);
+        // The survivor's equivalent edge is INVALID (historical)...
+        let mut survivor_likes = fact_edge(
+            &survivor.id,
+            &x.id,
+            "likes",
+            Some(base + Duration::seconds(50)),
+            base + Duration::seconds(1),
+        );
+        survivor_likes.edge_text = "likes-text".to_string();
+        // ... and the loser's is VALID.
+        let mut loser_likes =
+            fact_edge(&loser.id, &x.id, "likes", None, base + Duration::seconds(2));
+        loser_likes.edge_text = "likes-text".to_string();
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(6, 101),
+            nodes: vec![loser.clone(), survivor.clone(), x.clone()],
+            edges: vec![loser_likes, survivor_likes],
+        };
+        backend.upsert_batch("chat_d77d", &batch).await.unwrap();
+
+        let outcome = backend
+            .merge_nodes("chat_d77d", &loser.id, &survivor.id)
+            .await
+            .unwrap();
+        // Decision 77 (H2): dedup requires BOTH valid — an invalid
+        // survivor equivalent does NOT suppress the valid loser edge.
+        assert_eq!(outcome.edges_deduped, 0);
+        assert_eq!(outcome.edges_moved, 1);
+
+        // The fact survives as VALID: the re-pointed edge is valid, the
+        // survivor's original edge stays invalid (historical).
+        let rows = backend
+            .query_rows(
+                "chat_d77d",
+                &format!(
+                    "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(t:Node {{id: '{}'}}) \
+                     WHERE r.relationship_name = 'likes' \
+                     RETURN r.invalid_at, r.created_at ORDER BY r.created_at",
+                    survivor.id, x.id
+                ),
+            )
+            .await
+            .unwrap();
+        let survivor_created = (base + Duration::seconds(1)).format(&Rfc3339).unwrap();
+        let survivor_invalid = (base + Duration::seconds(50)).format(&Rfc3339).unwrap();
+        let loser_created = (base + Duration::seconds(2)).format(&Rfc3339).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![survivor_invalid, survivor_created],
+                vec!["NULL".to_string(), loser_created],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_nodes_repoints_an_invalid_loser_edge_as_invalid_beside_the_valid_survivor_equivalent(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let loser = concept_node("Loser", base);
+        let survivor = concept_node("Survivor", base);
+        let x = concept_node("Xray", base);
+        // The survivor's equivalent edge is VALID...
+        let mut survivor_likes = fact_edge(
+            &survivor.id,
+            &x.id,
+            "likes",
+            None,
+            base + Duration::seconds(1),
+        );
+        survivor_likes.edge_text = "likes-text".to_string();
+        // ... and the loser's is INVALID (history).
+        let mut loser_likes = fact_edge(
+            &loser.id,
+            &x.id,
+            "likes",
+            Some(base + Duration::seconds(50)),
+            base + Duration::seconds(2),
+        );
+        loser_likes.edge_text = "likes-text".to_string();
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(6, 102),
+            nodes: vec![loser.clone(), survivor.clone(), x.clone()],
+            edges: vec![loser_likes, survivor_likes],
+        };
+        backend.upsert_batch("chat_d77e", &batch).await.unwrap();
+
+        let outcome = backend
+            .merge_nodes("chat_d77e", &loser.id, &survivor.id)
+            .await
+            .unwrap();
+        // Decision 77 (H2): dedup requires BOTH valid — the invalid
+        // loser edge is re-pointed AS INVALID (history kept), the valid
+        // survivor edge is untouched.
+        assert_eq!(outcome.edges_deduped, 0);
+        assert_eq!(outcome.edges_moved, 1);
+
+        let rows = backend
+            .query_rows(
+                "chat_d77e",
+                &format!(
+                    "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(t:Node {{id: '{}'}}) \
+                     WHERE r.relationship_name = 'likes' \
+                     RETURN r.invalid_at, r.created_at ORDER BY r.created_at",
+                    survivor.id, x.id
+                ),
+            )
+            .await
+            .unwrap();
+        let survivor_created = (base + Duration::seconds(1)).format(&Rfc3339).unwrap();
+        let loser_created = (base + Duration::seconds(2)).format(&Rfc3339).unwrap();
+        let loser_invalid = (base + Duration::seconds(50)).format(&Rfc3339).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                // The valid survivor edge: untouched.
+                vec!["NULL".to_string(), survivor_created],
+                // The re-pointed loser edge: still invalid, original
+                // created_at (provenance).
+                vec![loser_invalid, loser_created],
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn merge_nodes_snapshot_covers_the_node_every_edge_and_the_created_keys() {
         let dir = tempfile::tempdir().unwrap();
         let backend = LbugBackend::new(dir.path());
@@ -3111,7 +3437,7 @@ mod tests {
         let snapshot: MergeSnapshot = serde_json::from_str(&outcome.snapshot_json).unwrap();
 
         // The loser node, exactly as stored.
-        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.version, 2);
         assert_eq!(snapshot.survivor_id, survivor.id);
         assert_eq!(snapshot.node.id, loser.id);
         assert_eq!(snapshot.node.kind, "Concept");
@@ -3156,6 +3482,9 @@ mod tests {
                 },
             ]
         );
+        // The plain merge (empty registry) invalidates nothing, so the
+        // snapshot v2 field is empty.
+        assert!(snapshot.invalidated_survivor_edges.is_empty());
     }
 
     #[tokio::test]
@@ -3245,6 +3574,194 @@ mod tests {
             .expect_err("a malformed snapshot is a loud error");
         assert!(
             error.to_string().contains("malformed snapshot"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Test helper: the full graph shape WITHOUT the edge `updated_at`
+    /// column — decision 77 (H1) refreshes `updated_at` when it
+    /// re-validates an invalidated survivor edge, so that one column is
+    /// exempt from the exact round-trip (per spec: SET invalid_at =
+    /// NULL, updated_at = now).
+    async fn graph_shape_without_edge_updated_at(
+        backend: &LbugBackend,
+        chat_id: &str,
+    ) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+        let nodes = backend
+            .query_rows(
+                chat_id,
+                "MATCH (n:Node) RETURN n.id, n.name, n.type, n.created_at, n.updated_at, n.properties ORDER BY n.id",
+            )
+            .await
+            .unwrap();
+        let edges = backend
+            .query_rows(
+                chat_id,
+                "MATCH (s:Node)-[r:EDGE]->(t:Node) \
+                 RETURN s.id, t.id, r.relationship_name, r.valid_at, r.invalid_at, r.edge_text, r.created_at, r.properties \
+                 ORDER BY s.id, t.id, r.relationship_name, r.valid_at",
+            )
+            .await
+            .unwrap();
+        (nodes, edges)
+    }
+
+    /// Decision 77 (H1) test graph: the SURVIVOR carries the OLDER valid
+    /// `works_at` edge and the loser the NEWER one, so the merge's
+    /// invariant pass invalidates the survivor's OWN pre-existing edge —
+    /// the rollback-completeness hole of the H1 finding.
+    fn survivor_edge_invalidation_batch() -> (MemoryBatch, [MemoryNode; 4]) {
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let loser = concept_node("Loser", base);
+        let survivor = concept_node("Survivor", base);
+        let org_old = org_node("OrgOld", base);
+        let org_new = org_node("OrgNew", base);
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(11, 132),
+            nodes: vec![
+                loser.clone(),
+                survivor.clone(),
+                org_old.clone(),
+                org_new.clone(),
+            ],
+            edges: vec![
+                // The survivor's OWN edge, older: the invariant pass
+                // invalidates this one.
+                works_at_edge(
+                    &survivor.id,
+                    &org_old.id,
+                    base + Duration::seconds(1),
+                    base + Duration::seconds(1),
+                ),
+                // The loser's edge, newer: moves onto the survivor and
+                // wins the invariant pass.
+                works_at_edge(
+                    &loser.id,
+                    &org_new.id,
+                    base + Duration::seconds(2),
+                    base + Duration::seconds(2),
+                ),
+            ],
+        };
+        (batch, [loser, survivor, org_old, org_new])
+    }
+
+    #[tokio::test]
+    async fn rollback_merge_revalidates_the_survivor_edges_the_invariant_pass_invalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [loser, survivor, org_old, org_new]) = survivor_edge_invalidation_batch();
+        backend.upsert_batch("chat_d77a", &batch).await.unwrap();
+        let pre_merge = graph_shape_without_edge_updated_at(&backend, "chat_d77a").await;
+
+        let outcome = backend
+            .merge_nodes_with_registry("chat_d77a", &loser.id, &survivor.id, &registry())
+            .await
+            .unwrap();
+        assert_eq!(outcome.single_value_invalidated, 1);
+
+        // The snapshot v2 records exactly the survivor's OWN edge.
+        let snapshot: MergeSnapshot = serde_json::from_str(&outcome.snapshot_json).unwrap();
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(
+            snapshot.invalidated_survivor_edges,
+            vec![MergeSnapshotEdgeKey {
+                source_id: survivor.id.clone(),
+                relationship_name: "works_at".to_string(),
+                target_id: org_old.id.clone(),
+                valid_at: datetime!(2026-08-07 10:00 UTC) + Duration::seconds(1),
+            }]
+        );
+        // Sanity: the invalidated edge is the survivor's pre-existing
+        // one (the moved loser's edge to OrgNew won the pass).
+        let kept = backend
+            .query_rows(
+                "chat_d77a",
+                &format!(
+                    "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(t:Node) \
+                     WHERE r.relationship_name = 'works_at' AND r.invalid_at IS NULL RETURN t.id",
+                    survivor.id
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept, vec![vec![org_new.id.clone()]]);
+
+        backend
+            .rollback_merge("chat_d77a", &outcome.snapshot_json)
+            .await
+            .unwrap();
+
+        // The graph is back to the EXACT pre-merge state — including
+        // the survivor's own works_at edge VALID again — except the
+        // re-validated edge's refreshed updated_at (per spec).
+        let post_rollback = graph_shape_without_edge_updated_at(&backend, "chat_d77a").await;
+        assert_eq!(post_rollback, pre_merge);
+        let revalidated = backend
+            .query_rows(
+                "chat_d77a",
+                &format!(
+                    "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(t:Node {{id: '{}'}}) \
+                     WHERE r.relationship_name = 'works_at' RETURN r.invalid_at",
+                    survivor.id, org_old.id
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revalidated, vec![vec!["NULL".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn rollback_merge_accepts_a_version_1_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [loser, survivor, _x, _y, _z], _edges) = merge_batch();
+        backend.upsert_batch("chat_d77b", &batch).await.unwrap();
+        let pre_merge = graph_shape(&backend, "chat_d77b").await;
+
+        let outcome = backend
+            .merge_nodes("chat_d77b", &loser.id, &survivor.id)
+            .await
+            .unwrap();
+        // Emulate a version-1 audit row: no invalidated_survivor_edges
+        // field, version 1. Serde defaults keep it parseable.
+        let mut value: serde_json::Value = serde_json::from_str(&outcome.snapshot_json).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("version".to_string(), serde_json::json!(1));
+        object.remove("invalidated_survivor_edges");
+        let v1_json = serde_json::to_string(&value).unwrap();
+
+        backend.rollback_merge("chat_d77b", &v1_json).await.unwrap();
+        let post_rollback = graph_shape(&backend, "chat_d77b").await;
+        assert_eq!(post_rollback, pre_merge);
+    }
+
+    #[tokio::test]
+    async fn rollback_merge_refuses_an_unknown_snapshot_version_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, [loser, survivor, _x, _y, _z], _edges) = merge_batch();
+        backend.upsert_batch("chat_d77c", &batch).await.unwrap();
+
+        let outcome = backend
+            .merge_nodes("chat_d77c", &loser.id, &survivor.id)
+            .await
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&outcome.snapshot_json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("version".to_string(), serde_json::json!(99));
+        let v99_json = serde_json::to_string(&value).unwrap();
+
+        let error = backend
+            .rollback_merge("chat_d77c", &v99_json)
+            .await
+            .expect_err("an unknown snapshot version is a loud refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported snapshot version 99"),
             "unexpected error: {error}"
         );
     }
@@ -3757,33 +4274,12 @@ mod tests {
         assert_eq!(first.invalidated, 0);
         let (nodes_first, edges_first) = graph_shape(&backend, "chat_d75d").await;
 
-        // Between the runs the operator invalidates the fact; the replay
-        // must re-validate it (MERGE_EDGE's ON MATCH sets invalid_at from
-        // the batch's own NULL).
-        let facts = backend
-            .node_facts("chat_d75d", "Tama")
-            .await
-            .unwrap()
-            .unwrap();
-        let edge_id = works_at_valid(&facts)[0].edge_id.clone();
-        backend
-            .invalidate_edge("chat_d75d", &edge_id, base + Duration::hours(1))
-            .await
-            .unwrap();
-        assert!(works_at_valid(
-            &backend
-                .node_facts("chat_d75d", "Tama")
-                .await
-                .unwrap()
-                .unwrap()
-        )
-        .is_empty());
-
-        // The identical batch replayed: the deterministic natural key
-        // MERGEs, the siblings pass excludes the replayed edge itself (the
-        // WHERE clause spares the full natural key and the only sibling is
-        // already invalid), and the MERGE re-validates. Convergent: no
-        // duplicates, exactly one valid works_at edge, ZERO invalidations.
+        // The identical batch replayed IN ORDER: the deterministic
+        // natural key MERGEs, the siblings pass excludes the replayed
+        // edge itself (the WHERE clause spares the full natural key),
+        // and the decision-77 (M8) coalesce keeps the stored invalid_at
+        // (NULL here). Convergent: no duplicates, the edge stays valid,
+        // ZERO invalidations.
         let second = backend
             .upsert_batch_with_registry("chat_d75d", &batch, &registry())
             .await
@@ -3804,11 +4300,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(valid, 1, "the replayed edge is re-validated");
+        assert_eq!(valid, 1, "the in-order replay keeps the edge valid");
 
         // State-wise no-op: every edge row is bit-identical (all replayed
-        // columns come from the batch, invalid_at and updated_at
-        // included). The node rows are identical except the batch
+        // columns come from the batch, and the coalesce keeps the stored
+        // invalid_at). The node rows are identical except the batch
         // skeleton's wall-clock updated_at (MERGE_BATCH ON MATCH), which
         // is excluded here.
         let (nodes_second, edges_second) = graph_shape(&backend, "chat_d75d").await;
@@ -3828,6 +4324,53 @@ mod tests {
             node_key_columns(nodes_first),
             node_key_columns(nodes_second)
         );
+
+        // Decision 77 (M8): a manual invalidation between runs SURVIVES
+        // an out-of-order replay. Before decision 77 the replay's MERGE
+        // set invalid_at from the batch's own NULL and silently
+        // re-validated the edge; the coalesce keeps the stored value.
+        let facts = backend
+            .node_facts("chat_d75d", "Tama")
+            .await
+            .unwrap()
+            .unwrap();
+        let edge_id = works_at_valid(&facts)[0].edge_id.clone();
+        backend
+            .invalidate_edge("chat_d75d", &edge_id, base + Duration::hours(1))
+            .await
+            .unwrap();
+        assert!(works_at_valid(
+            &backend
+                .node_facts("chat_d75d", "Tama")
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .is_empty());
+
+        // The identical batch replayed after the manual invalidation: no
+        // duplicates, no invalidations, and the edge stays INVALID.
+        let third = backend
+            .upsert_batch_with_registry("chat_d75d", &batch, &registry())
+            .await
+            .unwrap();
+        assert_eq!(third.invalidated, 0);
+        let total = backend
+            .count(
+                "chat_d75d",
+                "MATCH ()-[r:EDGE]->() WHERE r.relationship_name = 'works_at' RETURN count(r)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "no duplicate edges on the out-of-order replay");
+        let valid = backend
+            .count(
+                "chat_d75d",
+                "MATCH ()-[r:EDGE]->() WHERE r.relationship_name = 'works_at' AND r.invalid_at IS NULL RETURN count(r)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid, 0, "the manual invalidation survives the replay");
     }
 
     #[tokio::test]
@@ -4716,6 +5259,67 @@ mod tests {
             .await
             .unwrap();
         assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_orders_identical_created_at_edges_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let base = datetime!(2026-08-07 10:00 UTC);
+        let hub = concept_node("Hub", base);
+        let x = concept_node("Xray", base);
+        let y = concept_node("Yankee", base);
+        let z = concept_node("Zulu", base);
+        // Identical created_at AND valid_at on every edge: the S3-F7
+        // tiebreak (valid_at DESC, s.id, t.id, relationship_name)
+        // decides the order of the hop-1 expansion.
+        let stamp = base + Duration::seconds(1);
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(10, 141),
+            nodes: vec![hub.clone(), x.clone(), y.clone(), z.clone()],
+            edges: vec![
+                fact_edge(&hub.id, &z.id, "mentions", None, stamp),
+                fact_edge(&hub.id, &y.id, "likes", None, stamp),
+                fact_edge(&hub.id, &x.id, "likes", None, stamp),
+            ],
+        };
+        backend.upsert_batch("chat_d76h", &batch).await.unwrap();
+
+        let now = datetime!(2026-08-08 10:00 UTC);
+        // Decision 77 (S3-F7): a stable, asserted order across reads.
+        let first = backend
+            .two_hop_edges(
+                "chat_d76h",
+                std::slice::from_ref(&hub.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        let second = backend
+            .two_hop_edges(
+                "chat_d76h",
+                std::slice::from_ref(&hub.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        let mut expected: Vec<(String, String)> = [
+            (x.id.clone(), "likes".to_string()),
+            (y.id.clone(), "likes".to_string()),
+            (z.id.clone(), "mentions".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        expected.sort();
+        let actual: Vec<(String, String)> = first
+            .iter()
+            .map(|edge| (edge.target_id.clone(), edge.relationship_name.clone()))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

@@ -313,11 +313,17 @@ pub struct NodeContent {
 /// pre-screen of entity resolution. The kind comes from the stored
 /// `type` column (the closed set of Section 6.2). `alias_target` is the
 /// source node id of a `known_as`/`also_known_as` edge into the alias
-/// (Section 7.4 step 2) and is `Some` only for Alias nodes.
+/// (Section 7.4 step 2) and is `Some` only for Alias nodes with
+/// EXACTLY ONE alias edge: a multi-target alias has no single binding
+/// (decision 77, S3-F6), so `alias_target_count > 1` forces
+/// `alias_target` to `None` and the pre-screen skips the alias for
+/// step-2 parity. A target-less alias reports count 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeResolutionInfo {
     pub kind: NodeType,
     pub alias_target: Option<String>,
+    /// The number of `known_as`/`also_known_as` edges into the node.
+    pub alias_target_count: u32,
 }
 
 /// The outcome of one `merge_nodes` call (decision 74, graph-spec
@@ -365,8 +371,10 @@ pub struct UpsertOutcome {
 /// older snapshots keep parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeSnapshot {
-    /// Snapshot layout version. 1 today; snapshots written before the
-    /// field existed parse as 0.
+    /// Snapshot layout version. 2 today; snapshots written before the
+    /// field existed parse as 0. `rollback_merge` accepts 0 and 1
+    /// (nothing to revalidate) and 2, and refuses any unknown version
+    /// loudly (decision 77, H1).
     #[serde(default)]
     pub version: u32,
     /// The survivor node id. Rollback refuses loudly when this node no
@@ -383,6 +391,14 @@ pub struct MergeSnapshot {
     /// Rollback deletes exactly these.
     #[serde(default)]
     pub created_edges: Vec<MergeSnapshotEdgeKey>,
+    /// The natural keys of the survivor edges the single-value
+    /// invariant pass of the merge invalidated (decision 77, H1). Keys
+    /// suffice: the restore only CLEARS `invalid_at` (SET
+    /// `invalid_at = NULL`, `updated_at = now`), in the same transaction
+    /// as the node/edge restoration. Serde-defaulted so version-1 audit
+    /// rows keep parsing.
+    #[serde(default)]
+    pub invalidated_survivor_edges: Vec<MergeSnapshotEdgeKey>,
 }
 
 /// The loser node of one merge, exactly as stored before the merge. The
@@ -926,10 +942,14 @@ pub trait MemoryBackend: Send + Sync {
 
     /// Decision 74 / graph-spec Section 7.7 step 4: rolls one merge
     /// back from its snapshot. Recreates the loser node with its
-    /// original properties, recreates its original edges, and deletes
-    /// the merge-created edges listed in the snapshot. Refuses loudly
-    /// when the survivor no longer exists (chained-merge rollback is
-    /// out of scope) and on a malformed snapshot.
+    /// original properties, recreates its original edges, deletes
+    /// the merge-created edges listed in the snapshot, and — snapshot
+    /// version 2 (decision 77, H1) — clears `invalid_at` on exactly the
+    /// survivor edges the merge's single-value invariant pass
+    /// invalidated, all in one transaction. Refuses loudly on an
+    /// unknown snapshot version, when the survivor no longer exists
+    /// (chained-merge rollback is out of scope), and on a malformed
+    /// snapshot.
     ///
     /// The default errors loudly so that noop test doubles stay
     /// source-compatible with the extended trait.
