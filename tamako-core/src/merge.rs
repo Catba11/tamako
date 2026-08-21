@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tamako_memory::{EdgeId, MemoryBackend, MemoryError, MergeOutcome, NodeMergeStats, NodeType};
 use tamako_store::{MergeAuditRow, Store, StoreError};
 use time::OffsetDateTime;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// The per-node KNN width of the candidate scan (decision 74 / Section
 /// 7.7 step 1). Five nearest neighbors per embedded node is generous at
@@ -546,8 +546,32 @@ fn audit_row(
     }
 }
 
-/// Applies one plan action: the graph mutation first, then the audit
-/// row (Section 7.7 step 3 order). Returns the new audit id.
+/// Applies one plan action and returns the new audit id.
+///
+/// Decision 77 (H4), audit-row-first for the 'same' verdict — the
+/// honest two-phase version (the snapshot only EXISTS after
+/// `merge_nodes` builds it):
+///
+/// 1. PLANNED ROW FIRST: insert the audit row with the
+///    verdict/reason/confirmed_by/loser fields filled and snapshot NULL
+///    BEFORE the graph mutation. A crash mid-merge leaves a detectable
+///    snapshot-NULL 'same' row instead of an unaudited mutation, and a
+///    rigged merge failure (the survivor deleted between plan and
+///    apply) still leaves the row.
+/// 2. The graph mutation (`merge_nodes_with_registry`) builds the
+///    snapshot.
+/// 3. UPDATE the row by id with the actual snapshot, the final reason
+///    (the decision-75 invariant note included), and the edge counters.
+///    A crash between the graph commit and this update leaves the
+///    detectable snapshot-NULL row of phase 1. If the UPDATE itself
+///    fails, the row and the graph state survive: log ERROR with the
+///    audit id (rollback of that merge is impossible — the snapshot is
+///    lost — but the failure is loud and the audit trail names the id).
+///
+/// The sidecar tombstones stay best-effort (WARN, never an action
+/// failure; the next startup reconciliation prunes the orphans).
+/// 'related'/'different' rows stay a single insert as before: no
+/// snapshot exists for them.
 ///
 /// Decision 75 (c): the 'same' merge rides the resolved single-value
 /// registry, so the invariant pass closes the re-point hole on the
@@ -561,8 +585,13 @@ async fn apply_one<M: MemoryBackend>(
     confirmed_by: &str,
     single_value_predicates: &[String],
 ) -> Result<i64, MergeError> {
-    let outcome = match action.verdict {
+    match action.verdict {
         MergeVerdict::Same => {
+            // Phase 1: the planned audit row BEFORE the graph mutation.
+            let planned = audit_row(action, confirmed_by, None);
+            let audit_id =
+                store_call(store, move |store| store.insert_merge_audit(&planned)).await?;
+            // Phase 2: the graph mutation builds the snapshot.
             let outcome = memory
                 .merge_nodes_with_registry(
                     chat_id,
@@ -571,6 +600,34 @@ async fn apply_one<M: MemoryBackend>(
                     single_value_predicates,
                 )
                 .await?;
+            // Phase 3: fill the row in. The final reason carries the
+            // decision-75 invariant note (audit_row appends it when the
+            // outcome invalidated single-value duplicates).
+            let final_reason = audit_row(action, confirmed_by, Some(&outcome)).reason;
+            {
+                let snapshot_json = outcome.snapshot_json.clone();
+                let edges_moved = outcome.edges_moved;
+                let self_loops_dropped = outcome.self_loops_dropped;
+                let edges_deduped = outcome.edges_deduped;
+                if let Err(error) = store_call(store, move |store| {
+                    store.update_merge_audit_outcome(
+                        audit_id,
+                        &snapshot_json,
+                        &final_reason,
+                        edges_moved,
+                        self_loops_dropped,
+                        edges_deduped,
+                    )
+                })
+                .await
+                {
+                    // The merge committed and the planned row survives
+                    // (snapshot NULL, detectable). Rollback of this
+                    // merge is impossible; the ERROR names the audit id
+                    // so the operator can investigate the row by hand.
+                    error!(chat_id, audit_id, loser_id = %action.loser_id, survivor_id = %action.survivor_id, %error, "merge apply: the post-commit audit update failed; the graph mutation stands and the planned audit row survives with a NULL snapshot (rollback of this merge is impossible)");
+                }
+            }
             // Decision 75 (e): the invariant-pass count feeds the same
             // `facts_invalidated_total` counter as the digest write
             // path. Best effort, like every counter: a failure is a
@@ -650,7 +707,7 @@ async fn apply_one<M: MemoryBackend>(
                     warn!(chat_id, loser_id = %action.loser_id, %error, "merge apply: edge_texts scan failed; reconciliation will prune the orphans");
                 }
             }
-            Some(outcome)
+            Ok(audit_id)
         }
         MergeVerdict::Related => {
             // The edge runs survivor -> loser: the survivor is the
@@ -660,16 +717,20 @@ async fn apply_one<M: MemoryBackend>(
             memory
                 .link_also_known_as(chat_id, &action.survivor_id, &action.loser_id)
                 .await?;
-            None
+            // specs.md Section 5.2: one append-only audit row per
+            // merge-tool action, ALL three verdicts — the audit is the
+            // record of the confirmation itself. 'related' carries no
+            // snapshot: single insert.
+            let row = audit_row(action, confirmed_by, None);
+            store_call(store, move |store| store.insert_merge_audit(&row)).await
         }
-        // specs.md Section 5.2: one append-only audit row per
-        // merge-tool action, ALL three verdicts — the audit is the
-        // record of the confirmation itself. 'different' mutates
-        // nothing but still gets its row (snapshot NULL).
-        MergeVerdict::Different => None,
-    };
-    let row = audit_row(action, confirmed_by, outcome.as_ref());
-    store_call(store, move |store| store.insert_merge_audit(&row)).await
+        // 'different' mutates nothing but still gets its row (snapshot
+        // NULL): single insert.
+        MergeVerdict::Different => {
+            let row = audit_row(action, confirmed_by, None);
+            store_call(store, move |store| store.insert_merge_audit(&row)).await
+        }
+    }
 }
 
 /// Executes a confirmed plan (decision 74 point 3: only `--apply`
@@ -751,10 +812,10 @@ pub async fn rollback_merge_action<M: MemoryBackend>(
     chat_id: &str,
     audit_id: i64,
 ) -> Result<(), MergeError> {
-    let rows = store_call(store, Store::list_merge_audit).await?;
-    let row = rows
-        .into_iter()
-        .find(|row| row.id == audit_id)
+    // Decision 77 (M14): the point lookup replaces the list_merge_audit
+    // full scan.
+    let row = store_call(store, move |store| store.get_merge_audit(audit_id))
+        .await?
         .ok_or_else(|| MergeError::Rollback(format!("no merge_audit row with id {audit_id}")))?;
     if row.verdict != MergeVerdict::Same.as_str() {
         return Err(MergeError::Rollback(format!(
@@ -773,6 +834,42 @@ pub async fn rollback_merge_action<M: MemoryBackend>(
     memory.rollback_merge(chat_id, &snapshot).await?;
     store_call(store, move |store| store.mark_merge_rolled_back(audit_id)).await?;
     Ok(())
+}
+
+/// Decision 77 (H6a): the staleness hash of the two-step apply. The
+/// `--merge-tool` dry run writes the confirmed plan to
+/// `{data_root}/{chat_id}/merge_plan.json`; `--apply` re-runs the SCAN
+/// (cheap, no LLM) and executes the FILE's actions only when the
+/// candidate set still matches. The hash covers the candidate set only
+/// — the ordered (a_id, b_id) pair and the scan score of every
+/// scanned candidate, verdict-independent — so a graph change between
+/// the dry run and the apply (a new candidate, a linked or deleted
+/// node, a re-embedded vector) mismatches and `--apply` refuses loudly.
+///
+/// Canonical input: one `a_id\nb_id\n<score bits as 16 lowercase hex>`
+/// line per candidate, sorted (the pair order a_id < b_id holds by
+/// construction); the score rides its f64 bit pattern so the hash is
+/// jitter-free across runs over the same stored vectors. The hash
+/// itself reuses the pinned FNV-1a of
+/// [`crate::digest::embedding_content_hash`]: a change detector, not a
+/// cryptographic hash (the file sits next to the data it describes;
+/// tampering with both is out of scope).
+pub fn merge_candidate_set_hash<'a>(
+    candidates: impl IntoIterator<Item = &'a MergeCandidate>,
+) -> String {
+    let mut lines: Vec<String> = candidates
+        .into_iter()
+        .map(|candidate| {
+            format!(
+                "{}\n{}\n{:016x}",
+                candidate.a_id,
+                candidate.b_id,
+                candidate.score.to_bits()
+            )
+        })
+        .collect();
+    lines.sort();
+    crate::digest::embedding_content_hash(&lines.join("\n"), "")
 }
 
 #[cfg(test)]
@@ -2037,5 +2134,142 @@ mod tests {
             assert_eq!(MergeVerdict::from_str(wire), Some(verdict));
         }
         assert_eq!(MergeVerdict::from_str("maybe"), None);
+    }
+
+    #[tokio::test]
+    async fn apply_leaves_a_planned_audit_row_when_the_merge_fails() {
+        // Decision 77 (H4): the audit row lands BEFORE the graph
+        // mutation. A rigged merge failure (the survivor deleted
+        // between plan and apply) still leaves the 'same' row —
+        // verdict/reason/confirmed_by/loser filled, snapshot NULL, the
+        // edge counters zero. The row is the detectable crash marker.
+        let fixture = fixture();
+        let (_dir, store, memory) = seeded(&fixture).await;
+        let confirmer = ScriptedConfirmer::default().with(
+            "Rust",
+            "Rust Language",
+            MergeVerdict::Same,
+            "identical concept",
+        );
+        let mut plan = plan_merges(&store, &memory, CHAT, 0.85, &confirmer, 10)
+            .await
+            .expect("plan");
+        plan.actions
+            .retain(|action| action.verdict == MergeVerdict::Same);
+        // Rig the failure: the survivor vanishes between plan and apply.
+        for action in &mut plan.actions {
+            action.survivor_id = identifiers::concept_id("gone");
+        }
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "llm:test-model", &[]).await;
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.audit_ids.is_empty());
+
+        let rows = store.list_merge_audit().expect("audit");
+        assert_eq!(rows.len(), 1, "the planned row survives the failure");
+        let row = &rows[0];
+        assert_eq!(row.verdict, "same");
+        assert_eq!(row.loser_id, fixture.rustlang.id);
+        assert_eq!(row.survivor_id, identifiers::concept_id("gone"));
+        assert_eq!(row.loser_name, "Rust Language");
+        assert_eq!(row.reason, "identical concept");
+        assert_eq!(row.confirmed_by, "llm:test-model");
+        assert_eq!(row.snapshot, None, "no snapshot without the merge");
+        assert_eq!(row.edges_moved, 0);
+        assert!(!row.rolled_back);
+        // The graph is untouched.
+        assert!(memory
+            .node_content(CHAT, &fixture.rustlang.id)
+            .await
+            .expect("content")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_fills_the_planned_row_with_the_snapshot_and_counts() {
+        // Decision 77 (H4) happy path: the phase-3 update lands the
+        // snapshot and the ACTUAL counters on the row inserted before
+        // the graph mutation (one row per action, none duplicated).
+        let (_dir, store, _memory, fixture, report) = applied().await;
+        assert!(report.failures.is_empty());
+        let rows = store.list_merge_audit().expect("audit");
+        assert_eq!(rows.len(), 3, "exactly one row per action");
+        let same = rows
+            .iter()
+            .find(|row| row.verdict == "same")
+            .expect("same row");
+        assert_eq!(same.loser_id, fixture.rustlang.id);
+        assert!(same.snapshot.is_some(), "the rollback source landed");
+        assert_eq!(same.edges_moved, 1);
+        assert_eq!(same.self_loops_dropped, 1);
+        assert_eq!(same.edges_deduped, 1);
+        // The report's audit ids are the row ids of the planned rows.
+        assert!(report.audit_ids.contains(&same.id));
+        // The phase-3 update failure path logs ERROR with the audit id
+        // and keeps the row + the graph state (see the error! call in
+        // apply_one); log capture is unavailable here, so the path is
+        // covered by code + comment.
+    }
+
+    #[tokio::test]
+    async fn merge_candidate_set_hash_is_stable_and_detects_graph_changes() {
+        // Decision 77 (H6a): the staleness hash of the two-step apply.
+        // The same scan hashes identically (deterministic across
+        // calls); a graph change between the dry run and the apply
+        // (here: a pair linked, which the scan then excludes) changes
+        // the candidate set and therefore the hash — the --apply
+        // refusal trigger.
+        let fixture = fixture();
+        let (_dir, store, memory) = seeded(&fixture).await;
+        let scan = || scan_merge_candidates(&store, &memory, CHAT, 0.85);
+
+        let first = scan().await.expect("scan");
+        assert_eq!(first.len(), 3);
+        let hash = merge_candidate_set_hash(&first);
+        // Deterministic: a second identical scan hashes the same.
+        assert_eq!(merge_candidate_set_hash(&scan().await.expect("scan")), hash);
+
+        // Link the 'same' pair: the next scan excludes it (already
+        // linked), the candidate set shrinks, the hash changes.
+        memory
+            .link_also_known_as(CHAT, &fixture.rust.id, &fixture.rustlang.id)
+            .await
+            .expect("link");
+        let after = scan().await.expect("scan");
+        assert_eq!(after.len(), 2);
+        assert_ne!(merge_candidate_set_hash(&after), hash);
+    }
+
+    #[test]
+    fn merge_candidate_set_hash_ignores_verdicts_and_covers_scores() {
+        // The hash is verdict-independent by construction: it covers
+        // ids + scores only. A score change (a re-embedded vector pair
+        // at a different similarity) changes the hash.
+        let candidate = |score: f64| MergeCandidate {
+            a_id: "a".to_string(),
+            b_id: "b".to_string(),
+            a_name: "A".to_string(),
+            b_name: "B".to_string(),
+            a_description: String::new(),
+            b_description: String::new(),
+            kind: NodeType::Concept,
+            score,
+        };
+        let one = [candidate(0.9)];
+        let other_score = [candidate(0.8)];
+        assert_eq!(
+            merge_candidate_set_hash(&one),
+            merge_candidate_set_hash(&[candidate(0.9)]),
+            "stable for the same set"
+        );
+        assert_ne!(
+            merge_candidate_set_hash(&one),
+            merge_candidate_set_hash(&other_score),
+            "a score change is a candidate-set change"
+        );
+        assert_ne!(
+            merge_candidate_set_hash(&one),
+            merge_candidate_set_hash(&[]),
+            "an empty set differs"
+        );
     }
 }

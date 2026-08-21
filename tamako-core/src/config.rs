@@ -114,6 +114,13 @@ pub struct TriggerConfig {
     /// `embedding_model`. Default `https://openrouter.ai/api/v1`.
     /// The env var TAMAKO_EMBEDDING_BASE_URL wins at wiring time.
     pub embedding_llm_base_url: String,
+    /// The embedding kill switch (decision 77, M6a). GLOBAL-ONLY and
+    /// flat, the same standing as `embedding_model`: `false` disables
+    /// the embedding provider build at wiring time (the binary reads
+    /// this key; the provider-less worker then runs reconciliation
+    /// only, no drains). Default true. Deviation: specs.md Section 13
+    /// has no such key; reported for spec backfill.
+    pub embedding_enabled: bool,
     /// How the structured calls enforce their output shape on the wire:
     /// `schema` (the default), `json_object`, or `prompt_only`. `None`
     /// means the agent layer resolves the default. Deviation: specs.md
@@ -237,6 +244,7 @@ impl Default for TriggerConfig {
             summary_model: None,
             embedding_model: "qwen/qwen3-embedding-8b".to_string(),
             embedding_llm_base_url: "https://openrouter.ai/api/v1".to_string(),
+            embedding_enabled: true,
             structured_output: None,
             digest_structured_output: None,
             gate_structured_output: None,
@@ -328,6 +336,9 @@ pub struct TriggerConfigToml {
     /// The embedding base URL (decision 66; global-only). Refer to
     /// `TriggerConfig::embedding_llm_base_url`.
     pub embedding_llm_base_url: Option<String>,
+    /// The embedding kill switch (decision 77, M6a; global-only).
+    /// Refer to `TriggerConfig::embedding_enabled`.
+    pub embedding_enabled: Option<bool>,
     /// The structured-output mode. Refer to
     /// `TriggerConfig::structured_output`.
     pub structured_output: Option<String>,
@@ -387,6 +398,32 @@ pub struct TriggerConfigToml {
 }
 
 impl TriggerConfigToml {
+    /// The name of the first GLOBAL-ONLY key this table sets, if any
+    /// (decision 77, S6-F7). The global-only set, verified against
+    /// specs.md Section 13 and the `TriggerConfig` key docs:
+    /// `llm_session_id` ("one session id per deployment... do not"
+    /// override per group), `embedding_model`, `embedding_llm_base_url`
+    /// (both "global only"), and `embedding_enabled` (decision 77,
+    /// M6a). `llm_api`/`llm_base_url` are NOT global-only — Section 13
+    /// resolves LLM access from the per-group effective configuration —
+    /// and neither are the per-purpose `*_llm_*` / model /
+    /// structured-output keys.
+    fn global_only_key(&self) -> Option<&'static str> {
+        if self.llm_session_id.is_some() {
+            return Some("llm_session_id");
+        }
+        if self.embedding_model.is_some() {
+            return Some("embedding_model");
+        }
+        if self.embedding_llm_base_url.is_some() {
+            return Some("embedding_llm_base_url");
+        }
+        if self.embedding_enabled.is_some() {
+            return Some("embedding_enabled");
+        }
+        None
+    }
+
     /// Applies the set fields over `base`. A `None` field changes nothing.
     pub fn apply(&self, base: &mut TriggerConfig) {
         if let Some(value) = self.wake_msg_count {
@@ -473,6 +510,9 @@ impl TriggerConfigToml {
         if let Some(value) = &self.embedding_llm_base_url {
             base.embedding_llm_base_url = value.clone();
         }
+        if let Some(value) = self.embedding_enabled {
+            base.embedding_enabled = value;
+        }
         if let Some(value) = &self.structured_output {
             base.structured_output = Some(value.clone());
         }
@@ -547,6 +587,18 @@ pub enum ConfigError {
     /// The TOML text is not valid.
     #[error("failed to parse the configuration file: {0}")]
     Parse(#[from] toml::de::Error),
+    /// A global-only key appeared under a `[groups.<chat_id>]` table
+    /// (decision 77, S6-F7). Global-only keys live under `[global]`
+    /// only; a group-table occurrence would otherwise apply silently.
+    #[error(
+        "the key '{key}' is global-only and cannot appear under [groups.{group}]; move it to [global]"
+    )]
+    GlobalOnlyKey {
+        /// The offending key name.
+        key: &'static str,
+        /// The group table the key appeared under.
+        group: String,
+    },
 }
 
 /// The root configuration of the bot.
@@ -580,8 +632,21 @@ impl BotConfig {
 
     /// Parses the TOML configuration file. The file has a `[global]`
     /// section and one `[groups.<chat_id>]` table per group override.
+    /// A global-only key under a group table is a LOUD error
+    /// (decision 77, S6-F7) naming the key and the group.
     pub fn from_toml_str(text: &str) -> Result<BotConfig, ConfigError> {
         let parsed: BotConfigToml = toml::from_str(text)?;
+        // Sorted group ids keep the reported error deterministic.
+        let mut groups: Vec<&String> = parsed.groups.keys().collect();
+        groups.sort();
+        for group in groups {
+            if let Some(key) = parsed.groups[group].global_only_key() {
+                return Err(ConfigError::GlobalOnlyKey {
+                    key,
+                    group: group.clone(),
+                });
+            }
+        }
         let mut global = TriggerConfig::default();
         if let Some(overlay) = &parsed.global {
             overlay.apply(&mut global);
@@ -1144,5 +1209,88 @@ embedding_llm_base_url = "https://embeddings.example/v1"
     #[test]
     fn from_toml_str_rejects_invalid_toml() {
         assert!(BotConfig::from_toml_str("[global\n").is_err());
+    }
+
+    #[test]
+    fn embedding_enabled_defaults_to_true_and_parses_under_global() {
+        // Decision 77 (M6a): the kill switch is flat, GLOBAL-ONLY, and
+        // concrete — true by default, `false` under [global] applies.
+        let defaults = TriggerConfig::default();
+        assert!(defaults.embedding_enabled);
+
+        let text = r#"
+[global]
+embedding_enabled = false
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert!(!config.global.embedding_enabled);
+        // No group override exists (global-only): every group resolves
+        // the global value.
+        assert!(!config.for_group("-100999").embedding_enabled);
+
+        // A key the TOML does not set keeps the default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert!(plain.global.embedding_enabled);
+    }
+
+    #[test]
+    fn global_only_keys_under_a_group_are_a_loud_parse_error() {
+        // Decision 77 (S6-F7): the verified global-only set is
+        // llm_session_id, embedding_model, embedding_llm_base_url, and
+        // embedding_enabled. Each one under [groups.*] is a ConfigError
+        // naming the key AND the group.
+        for (key, value) in [
+            ("llm_session_id", "\"my-deployment\""),
+            ("embedding_model", "\"text-embedding-3-large\""),
+            (
+                "embedding_llm_base_url",
+                "\"https://embeddings.example/v1\"",
+            ),
+            ("embedding_enabled", "false"),
+        ] {
+            let text = format!("[groups.\"-100777\"]\n{key} = {value}\n");
+            let error = BotConfig::from_toml_str(&text)
+                .expect_err(&format!("{key} under a group must fail loudly"));
+            let message = error.to_string();
+            assert!(
+                message.contains(key),
+                "the error names the key {key}: {message}"
+            );
+            assert!(
+                message.contains("-100777"),
+                "the error names the group: {message}"
+            );
+        }
+        // Per-group keys (llm_api/llm_base_url are NOT global-only)
+        // still parse under a group.
+        let per_group = r#"
+[groups."-100777"]
+llm_api = "openai-compatible"
+llm_base_url = "https://group.example/v1"
+"#;
+        assert!(BotConfig::from_toml_str(per_group).is_ok());
+    }
+
+    #[test]
+    fn global_only_keys_under_global_still_parse() {
+        // The same four keys under [global] parse and apply.
+        let text = r#"
+[global]
+llm_session_id = "my-deployment"
+embedding_model = "text-embedding-3-large"
+embedding_llm_base_url = "https://embeddings.example/v1"
+embedding_enabled = false
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the global-only TOML loads");
+        assert_eq!(
+            config.global.llm_session_id.as_deref(),
+            Some("my-deployment")
+        );
+        assert_eq!(config.global.embedding_model, "text-embedding-3-large");
+        assert_eq!(
+            config.global.embedding_llm_base_url,
+            "https://embeddings.example/v1"
+        );
+        assert!(!config.global.embedding_enabled);
     }
 }

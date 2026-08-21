@@ -2017,11 +2017,12 @@ async fn start_wake(
     // already moved `session.wake_last_row_id`): the wake's new
     // messages stay OUT of the view and render in the gates' per-call
     // sections. The SAME bytes reach both gate calls of this wake (the
-    // recall relevance gate and the participation gate), so the two
-    // calls warm the SAME provider prefix; across wakes the view is a
-    // prefix-extension (the append-only tail, Rules C1/C2). The
-    // `gate_context` kill switch passes None and restores the pre-72
-    // delta-only input.
+    // recall relevance gate and the participation gate), but the two
+    // gates carry DISJOINT preambles and never warm each other — the
+    // provider-cache win is per-gate and cross-WAKE: each gate's own
+    // prefix grows across consecutive wakes (the append-only tail,
+    // Rules C1/C2). The `gate_context` kill switch passes None and
+    // restores the pre-72 delta-only input.
     let context_view = if config.gate_context {
         Some(context.gate_context_view(after_id))
     } else {
@@ -2092,7 +2093,9 @@ async fn start_wake(
 /// shared context view (`Some`) rendered once at wake start from the
 /// pre-advance marker, or `None` (the `gate_context` kill switch); the
 /// SAME bytes go to the recall relevance gate and the participation
-/// gate, so both calls of one wake warm the same provider prefix.
+/// gate, but the two gates have disjoint preambles and never warm each
+/// other — the provider-cache win is per-gate across wakes (each gate
+/// re-sees its own growing prefix).
 #[allow(clippy::too_many_arguments)]
 async fn run_wake_calls(
     chat_id: &str,
