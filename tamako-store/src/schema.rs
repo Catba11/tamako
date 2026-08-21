@@ -289,6 +289,33 @@ CREATE TABLE merge_audit (
 );
 ",
     ),
+    (
+        10,
+        "\
+-- Deep-recall edge-description sidecar (decision 76, ruling 76c). One
+-- row per graph edge: the opaque edge id (tamako-memory's EdgeId JSON
+-- encoding of source/relationship/target/valid_at — the graph EDGE
+-- table has no id column, so the store treats edge ids as opaque TEXT)
+-- plus the edge description text. Written post-commit at digest time
+-- and repaired by the startup reconciliation pass (extended to edges).
+--
+-- WHY NOT FTS5 (76c): at our edge counts (thousands) a trigram index
+-- buys nothing, and the FTS5 trigram tokenizer cannot match CJK terms
+-- shorter than three characters — a fatal hole for two-character
+-- Chinese words like 咖啡, the deployment language. The table is
+-- scanned with parameterized LIKE and ESCAPE '\\' (see
+-- Store::search_edge_texts); FTS5-trigram is the documented upgrade
+-- path when edge counts justify it.
+--
+-- No timestamps: an edge_texts row is derived data, re-writable from
+-- the graph edge at any time, unlike the audit/queue rows that carry
+-- the house RFC 3339 stamp.
+CREATE TABLE edge_texts (
+    edge_id   TEXT PRIMARY KEY,
+    edge_text TEXT NOT NULL
+);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
