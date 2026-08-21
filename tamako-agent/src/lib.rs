@@ -23,6 +23,11 @@
 //!   the main `reply_model` over the live context (specs.md Section 9
 //!   step 4). The live implementation is `RigReplyGenerator`; tests use
 //!   `ScriptedReplyGenerator`.
+//! - Warmup generation (`warmup`): the Phase 2 warmup trigger generates
+//!   one casual opener with the REPLY purpose over the live context
+//!   plus the sampled topic (specs.md Section 9.7, decision 78). The
+//!   live implementation is `RigWarmupGenerator`; tests use
+//!   `ScriptedWarmupGenerator`.
 //! - The Rule C3 segmented summarizer (`summary`): when a digest
 //!   removes a chunk from the live context, the actor summarizes the
 //!   chunk and keeps the two newest summaries (specs.md Section 10,
@@ -125,6 +130,7 @@ pub mod rig_impl;
 pub mod skeleton;
 pub mod summary;
 pub mod validate;
+pub mod warmup;
 
 pub use endpoint::{
     EndpointClient, EndpointConfig, LlmApi, LlmConfigValues, LlmEndpoints, LlmPurpose,
@@ -151,6 +157,7 @@ pub use validate::{
     is_snake_case_identifier, validate_relationship_name, RelationshipName,
     FALLBACK_RELATIONSHIP_NAME, RESERVED_RELATIONSHIP_NAMES,
 };
+pub use warmup::{render_warmup_instruction, RigWarmupGenerator, ScriptedWarmupGenerator};
 
 /// Runs one inline LLM-seam call to completion, containing a panic
 /// (decision 77, M3): a panicking embedding provider or resolution
