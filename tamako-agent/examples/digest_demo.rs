@@ -163,6 +163,7 @@ async fn main() {
         // The demo has no wake services (M4 wiring enters in a later
         // subtask).
         wake: None,
+        warmup: None,
         // The demo has no summarizer: the old Rule C3 behavior (drop
         // without a summary) applies.
         summary_provider: None,
