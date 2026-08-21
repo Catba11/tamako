@@ -3,6 +3,15 @@
 //! Rule P5: one SQLite file per group at `{data_root}/{chat_id}/store.db`.
 //! All store APIs take a `chat_id`. One group's data never crosses into
 //! another group.
+//!
+//! Single-group helper invariant (decision 77, M12): the chat_id-less
+//! helpers (the embedding sidecar, merge_audit, edge_texts — everything
+//! routed through `with_single_group_conn`) are only valid on a Store
+//! with EXACTLY ONE open group, the GroupEmbeddingTarget shape of
+//! tamako-core. That shape is a deprecated interface for NEW consumers:
+//! write new code against the chat_id-taking APIs. The GroupStore
+//! refactor that retires the single-group helpers is deferred to
+//! Phase 3.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -352,6 +361,11 @@ impl Store {
         let dir = self.data_root.join(chat_id);
         std::fs::create_dir_all(&dir)?;
         let mut conn = Connection::open(dir.join("store.db"))?;
+        // Decision 77 (M5): wait out brief SQLITE_BUSY windows (another
+        // process mid-checkpoint, a second tamako instance racing the
+        // same store.db) instead of failing the open immediately. The
+        // read-only path (open_read_only) makes the same choice.
+        conn.busy_timeout(Duration::from_secs(2))?;
         // Refer to specs.md Section 5.1: WAL mode, synchronous=NORMAL.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -360,6 +374,26 @@ impl Store {
         // touches node_embeddings.
         register_sqlite_vec(&conn)?;
         schema::run_migrations(&mut conn)?;
+        self.lock().insert(chat_id.to_string(), conn);
+        Ok(())
+    }
+
+    /// Decision 77 (M7): the READ-ONLY group open of the offline
+    /// inspection tools (--merge-tool dry run, --facts). Unlike
+    /// [`Store::open_group`] this creates NO directory, runs NO
+    /// migrations (a read-only connection must never migrate), and never
+    /// writes — it exists so the read paths ride
+    /// SQLITE_OPEN_READ_ONLY like `read_group_status` does. The vec0
+    /// registration still happens (decision 66 rule: registration is
+    /// per-connection; without it any query touching node_embeddings
+    /// fails with "no such module: vec0"). A missing store.db fails the
+    /// open (the same loud behavior as a read-only `Connection` open);
+    /// the callers pre-check the file for a clearer message. A write
+    /// through this Store fails with SQLITE_READONLY — mutating modes
+    /// must use [`Store::open_group`].
+    pub fn open_group_read_only(&self, chat_id: &str) -> Result<()> {
+        validate_chat_id(chat_id)?;
+        let conn = open_read_only(&self.data_root.join(chat_id).join("store.db"))?;
         self.lock().insert(chat_id.to_string(), conn);
         Ok(())
     }
@@ -882,18 +916,25 @@ impl Store {
     }
 
     /// Enqueues (node_id, content_hash) pairs into the embedding queue
-    /// (decision 66). INSERT OR IGNORE dedups through the
-    /// pending_embeddings_dedup UNIQUE index; returns the number of
-    /// rows actually inserted. A pair already queued (or already done)
-    /// inserts nothing; a changed hash for a known node inserts a new
-    /// row.
+    /// (decision 66). Resurrecting upsert (decision 77, H3) through the
+    /// pending_embeddings_dedup UNIQUE index: a pair whose row flipped
+    /// to 'failed' (attempts cap reached) is reset to status='pending'
+    /// with attempts=0, so the startup reconciliation can re-drive a
+    /// row the worker gave up on — plain INSERT OR IGNORE would wedge
+    /// it forever. Rows already 'pending' or 'done' are left UNTOUCHED
+    /// (the upsert's WHERE excludes them); a changed hash for a known
+    /// node still inserts a new row. Returns the number of rows
+    /// inserted OR resurrected — not the number of brand-new rows.
     pub fn enqueue_embeddings(&self, items: &[(String, String)]) -> Result<usize> {
         self.with_single_group_conn(|conn| {
             let now = schema::now_rfc3339()?;
             let mut stmt = conn.prepare(
-                "INSERT OR IGNORE INTO pending_embeddings
+                "INSERT INTO pending_embeddings
                     (node_id, content_hash, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)",
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT (node_id, content_hash) DO UPDATE
+                    SET status = 'pending', attempts = 0
+                    WHERE status = 'failed'",
             )?;
             let mut inserted = 0;
             for (node_id, content_hash) in items {
@@ -966,6 +1007,13 @@ impl Store {
     /// vec0 0.1.9 does not implement INSERT OR REPLACE on a TEXT primary
     /// key (it raises the UNIQUE constraint error instead of
     /// replacing), so the upsert is DELETE + INSERT in one transaction.
+    ///
+    /// Known cost (decision 77, S6-F9 comment): with vec0 0.1.9 this
+    /// DELETE + INSERT churns the vec0 shadow tables and the database
+    /// grows MONOTONICALLY on every re-embed (the freed pages are not
+    /// reclaimed). Upstream fixed the growth only in 0.1.10-alpha, so
+    /// bumping the pinned `sqlite-vec = "=0.1.9"` is a re-review
+    /// trigger, not a routine dependency update.
     pub fn upsert_node_embedding(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
         let blob = embedding_to_blob(embedding)?;
         self.with_single_group_conn(|conn| {
@@ -983,6 +1031,13 @@ impl Store {
     /// The tombstone-cleanup primitive (decisions 66/67): removes every
     /// trace of a merged-away node — its vec row AND all its queue rows
     /// — in one transaction.
+    ///
+    /// Tombstone race (decision 77, S2-F2): a tombstone can land while
+    /// the embedding worker still holds a CLAIMED queue row for the
+    /// same node and drains it afterwards, re-writing the vec row this
+    /// delete just removed. That leftover is not wedged — the next
+    /// restart's reconciliation pass diffs `all_embedding_node_ids`
+    /// against the graph and prunes the orphan.
     pub fn delete_node_embedding_rows(&self, node_id: &str) -> Result<()> {
         self.with_single_group_conn(|conn| {
             let tx = conn.transaction()?;
@@ -1189,6 +1244,24 @@ impl Store {
         })
     }
 
+    /// One merge_audit row by primary key (decision 77, M14). The
+    /// rollback paths look their audit row up by id; they use this
+    /// point query instead of full-scanning `list_merge_audit`.
+    /// Returns `None` for an unknown id.
+    pub fn get_merge_audit(&self, id: i64) -> Result<Option<MergeAuditRow>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, loser_id, survivor_id, loser_kind, loser_name,
+                        loser_description, verdict, reason, confirmed_by,
+                        edges_moved, self_loops_dropped, edges_deduped,
+                        snapshot, rolled_back, created_at
+                 FROM merge_audit WHERE id = ?1",
+            )?;
+            let row = stmt.query_row([id], merge_audit_row).optional()?;
+            Ok(row)
+        })
+    }
+
     /// Flips the rolled_back flag of one audit row (the
     /// `--merge-rollback` flow of graph-spec Section 7.7). A missing
     /// audit id is a LOUD error — a rollback against a nonexistent
@@ -1198,6 +1271,45 @@ impl Store {
             let updated = conn.execute(
                 "UPDATE merge_audit SET rolled_back = 1 WHERE id = ?1",
                 rusqlite::params![id],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::InvalidValue {
+                    key: "merge_audit_id".to_string(),
+                    value: format!("no merge_audit row with id {id}"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    /// Decision 77 (H4), phase 3 of the audit-row-first merge apply:
+    /// fills in the planned 'same' row (inserted BEFORE the graph
+    /// mutation with a NULL snapshot) with the actual rollback snapshot,
+    /// the final reason (which carries the decision-75 single-value
+    /// invariant note), and the edge counters. A missing audit id is a
+    /// LOUD error, the same discipline as [`Store::mark_merge_rolled_back].
+    pub fn update_merge_audit_outcome(
+        &self,
+        id: i64,
+        snapshot_json: &str,
+        reason: &str,
+        edges_moved: u32,
+        self_loops_dropped: u32,
+        edges_deduped: u32,
+    ) -> Result<()> {
+        self.with_single_group_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE merge_audit SET snapshot = ?2, reason = ?3,
+                        edges_moved = ?4, self_loops_dropped = ?5, edges_deduped = ?6
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    snapshot_json,
+                    reason,
+                    edges_moved,
+                    self_loops_dropped,
+                    edges_deduped
+                ],
             )?;
             if updated == 0 {
                 return Err(StoreError::InvalidValue {
@@ -1226,6 +1338,37 @@ impl Store {
                 rusqlite::params![edge_id, edge_text],
             )?;
             Ok(())
+        })
+    }
+
+    /// Batch form of upsert_edge_text (decision 77, S6): writes every
+    /// (edge_id, edge_text) pair inside ONE transaction, so a digest
+    /// edge_texts harvest either lands whole or not at all (S4-F3).
+    /// INSERT OR REPLACE per row: a re-digest of an edge with changed
+    /// text replaces the row in place. Returns the number of rows
+    /// written. An empty slice returns Ok(0) without opening a
+    /// transaction.
+    ///
+    /// Same single-group contract as upsert_edge_text: the digest
+    /// writer has exactly one group open.
+    pub fn upsert_edge_texts(&self, items: &[(String, String)]) -> Result<usize> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        self.with_single_group_conn(|conn| {
+            let tx = conn.transaction()?;
+            let mut written = 0;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR REPLACE INTO edge_texts (edge_id, edge_text)
+                     VALUES (?1, ?2)",
+                )?;
+                for (edge_id, edge_text) in items {
+                    written += stmt.execute(rusqlite::params![edge_id, edge_text])?;
+                }
+            }
+            tx.commit()?;
+            Ok(written)
         })
     }
 
@@ -1279,6 +1422,24 @@ impl Store {
             let mut stmt = conn.prepare("SELECT edge_id FROM edge_texts ORDER BY edge_id")?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Every (edge_id, edge_text) pair in the sidecar, ordered by
+    /// edge_id for determinism. The edge_texts reconciliation of
+    /// decision 77 (S6-F6) diffs BY CONTENT — text changed -> rewrite,
+    /// row absent from the graph -> delete — so unlike
+    /// list_edge_text_ids this carries the text too.
+    pub fn list_edge_texts(&self) -> Result<Vec<(String, String)>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT edge_id, edge_text FROM edge_texts ORDER BY edge_id")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -2533,6 +2694,62 @@ mod tests {
     }
 
     #[test]
+    fn open_group_refuses_a_schema_newer_than_the_binary() {
+        let (dir, store) = temp_store();
+        let group = dir.path().join("c1");
+        std::fs::create_dir_all(&group).expect("group dir");
+        // Hand-stamp a schema version beyond the binary's known tip, the
+        // state a NEWER tamako would have left the database in.
+        {
+            let conn = Connection::open(group.join("store.db")).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                INSERT INTO schema_migrations (version, applied_at)
+                    VALUES (99, '2026-08-21T00:00:00Z');",
+            )
+            .expect("stamp version 99");
+        }
+
+        let known = schema::MIGRATIONS.last().expect("migrations").0;
+        let err = store
+            .open_group("c1")
+            .expect_err("a schema from the future must fail loudly");
+        match &err {
+            StoreError::SchemaFromTheFuture { found, known: k } => {
+                assert_eq!(*found, 99);
+                assert_eq!(*k, known);
+            }
+            other => panic!("expected SchemaFromTheFuture, got {other}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("99"),
+            "the message names the found version: {msg}"
+        );
+        assert!(
+            msg.contains(&known.to_string()),
+            "the message names the known maximum: {msg}"
+        );
+
+        // A fresh zero-version database still migrates to the tip.
+        let (_dir2, fresh) = temp_store();
+        fresh.open_group("c1").expect("fresh open");
+        fresh
+            .with_conn("c1", |conn| {
+                let tip: u32 =
+                    conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(tip, known, "a fresh db migrates to the tip");
+                Ok(())
+            })
+            .expect("tip check");
+    }
+
+    #[test]
     fn injected_memories_insert_and_list_round_trip() {
         let (_dir, store) = temp_store();
         let id1 = store
@@ -3369,6 +3586,103 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_embeddings_resurrects_a_failed_row_but_never_a_done_one() {
+        let (_dir, store) = embedding_store();
+        store
+            .enqueue_embeddings(&[
+                ("n-fail".to_string(), "h1".to_string()),
+                ("n-done".to_string(), "h2".to_string()),
+                ("n-pend".to_string(), "h3".to_string()),
+            ])
+            .expect("enqueue");
+        let batch = store.claim_embedding_batch(10).expect("claim");
+        let failed = batch
+            .iter()
+            .find(|p| p.node_id == "n-fail")
+            .expect("n-fail");
+        let done = batch
+            .iter()
+            .find(|p| p.node_id == "n-done")
+            .expect("n-done");
+        let pend = batch
+            .iter()
+            .find(|p| p.node_id == "n-pend")
+            .expect("n-pend");
+
+        // Drain one row to 'done', wedge another to 'failed', and leave
+        // the third pending with a nonzero attempts count (to pin that
+        // the re-enqueue does NOT touch a live pending row).
+        store.mark_embedding_done(done.id).expect("done");
+        for _ in 0..MAX_EMBEDDING_ATTEMPTS {
+            store
+                .mark_embedding_attempt_failed(failed.id)
+                .expect("fail");
+        }
+        store
+            .mark_embedding_attempt_failed(pend.id)
+            .expect("fail 1");
+        let claim = store.claim_embedding_batch(10).expect("claim after cap");
+        assert_eq!(claim.len(), 1, "the failed row left the claim set");
+
+        // What the startup reconciliation does: re-enqueue every pair.
+        // ONLY the failed row is resurrected (and counted); the done
+        // row and the pending row are untouched.
+        assert_eq!(
+            store
+                .enqueue_embeddings(&[
+                    ("n-fail".to_string(), "h1".to_string()),
+                    ("n-done".to_string(), "h2".to_string()),
+                    ("n-pend".to_string(), "h3".to_string()),
+                ])
+                .expect("re-enqueue"),
+            1,
+            "the count covers the resurrected row, not the untouched ones"
+        );
+
+        store
+            .with_conn("c1", |conn| {
+                let rows: Vec<(String, String, i64)> = conn
+                    .prepare(
+                        "SELECT node_id, status, attempts
+                         FROM pending_embeddings ORDER BY node_id",
+                    )?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(
+                    rows,
+                    vec![
+                        ("n-done".to_string(), "done".to_string(), 0),
+                        // Resurrected: pending again, attempts reset.
+                        ("n-fail".to_string(), "pending".to_string(), 0),
+                        // Untouched: still pending with its attempt kept.
+                        ("n-pend".to_string(), "pending".to_string(), 1),
+                    ]
+                );
+                Ok(())
+            })
+            .expect("row states");
+
+        // The resurrected row drains to completion: the queue unwedges.
+        let batch = store.claim_embedding_batch(10).expect("claim resurrected");
+        let resurrected = batch
+            .iter()
+            .find(|p| p.node_id == "n-fail")
+            .expect("n-fail claimable again");
+        store.mark_embedding_done(resurrected.id).expect("drain");
+        store
+            .with_conn("c1", |conn| {
+                let status: String = conn.query_row(
+                    "SELECT status FROM pending_embeddings WHERE node_id = 'n-fail'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(status, "done");
+                Ok(())
+            })
+            .expect("drained");
+    }
+
+    #[test]
     fn node_embedding_vec_roundtrip_replace_and_delete() {
         let (_dir, store) = embedding_store();
         let v1 = test_vector(7);
@@ -3693,6 +4007,113 @@ mod tests {
     }
 
     #[test]
+    fn get_merge_audit_returns_the_row_by_id_and_none_for_an_unknown_id() {
+        let (_dir, store) = embedding_store();
+        let merge = sample_merge_audit();
+        let id = store.insert_merge_audit(&merge).expect("insert");
+
+        // Present: the point query returns the full row.
+        let row = store.get_merge_audit(id).expect("get").expect("present");
+        assert_eq!(row.id, id);
+        assert_eq!(row.loser_id, merge.loser_id);
+        assert_eq!(row.survivor_id, merge.survivor_id);
+        assert_eq!(row.verdict, "same");
+        assert_eq!(row.snapshot, merge.snapshot);
+
+        // Absent: an unknown id is None, not an error.
+        assert!(store
+            .get_merge_audit(id + 1000)
+            .expect("get absent")
+            .is_none());
+    }
+
+    #[test]
+    fn update_merge_audit_outcome_fills_in_the_planned_row() {
+        // Decision 77 (H4): the audit-row-first apply inserts the
+        // 'same' row with a NULL snapshot BEFORE the graph mutation and
+        // fills it in afterwards.
+        let (_dir, store) = embedding_store();
+        let planned = MergeAuditRow {
+            snapshot: None,
+            edges_moved: 0,
+            self_loops_dropped: 0,
+            edges_deduped: 0,
+            ..sample_merge_audit()
+        };
+        let id = store.insert_merge_audit(&planned).expect("insert");
+
+        let outcome = sample_merge_audit();
+        store
+            .update_merge_audit_outcome(
+                id,
+                outcome.snapshot.as_deref().expect("snapshot"),
+                "same display name; single-value invariant: invalidated 1 edge(s)",
+                outcome.edges_moved,
+                outcome.self_loops_dropped,
+                outcome.edges_deduped,
+            )
+            .expect("update");
+
+        let row = store.get_merge_audit(id).expect("get").expect("present");
+        assert_eq!(row.snapshot, outcome.snapshot);
+        assert_eq!(
+            row.reason,
+            "same display name; single-value invariant: invalidated 1 edge(s)"
+        );
+        assert_eq!(row.edges_moved, 4);
+        assert_eq!(row.self_loops_dropped, 1);
+        assert_eq!(row.edges_deduped, 2);
+        // The planned fields the update must NOT touch survive intact.
+        assert_eq!(row.loser_id, planned.loser_id);
+        assert_eq!(row.survivor_id, planned.survivor_id);
+        assert_eq!(row.verdict, "same");
+        assert!(!row.rolled_back);
+
+        // A missing audit id is a loud error, never a silent no-op.
+        let err = store
+            .update_merge_audit_outcome(id + 1000, "{}", "r", 0, 0, 0)
+            .expect_err("missing id must fail");
+        assert!(
+            matches!(err, StoreError::InvalidValue { .. }),
+            "expected InvalidValue, got {err}"
+        );
+    }
+
+    #[test]
+    fn open_group_read_only_reads_but_never_writes() {
+        // Decision 77 (M7): the read-only open runs NO migrations and
+        // registers vec0 (the embedding reads need the module); a write
+        // through it fails with SQLITE_READONLY.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Store::new(dir.path().to_path_buf());
+        writer.open_group("c1").expect("create the group");
+        writer
+            .insert_merge_audit(&sample_merge_audit())
+            .expect("seed one audit row");
+        drop(writer);
+
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group_read_only("c1").expect("read-only open");
+        // Reads work, the single-group helpers included.
+        assert_eq!(store.list_merge_audit().expect("list").len(), 1);
+        // Writes fail loudly (SQLITE_READONLY), they never silently
+        // succeed on a read-only connection.
+        let err = store
+            .insert_merge_audit(&sample_merge_audit())
+            .expect_err("a write on a read-only group must fail");
+        assert!(
+            err.to_string().contains("readonly") || err.to_string().contains("READONLY"),
+            "expected a readonly error, got {err}"
+        );
+        // A missing store.db fails the open; nothing is created.
+        let err = store
+            .open_group_read_only("no-such-group")
+            .expect_err("a missing store.db must fail");
+        assert!(!dir.path().join("no-such-group").exists());
+        let _ = err;
+    }
+
+    #[test]
     fn merge_audit_rejects_an_unknown_verdict() {
         let (_dir, store) = embedding_store();
         let bad = MergeAuditRow {
@@ -3931,6 +4352,88 @@ mod tests {
         assert_eq!(
             store.list_edge_text_ids().expect("list"),
             vec!["e-a".to_string(), "e-b".to_string(), "e-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn upsert_edge_texts_writes_a_batch_in_one_transaction() {
+        let (_dir, store) = embedding_store();
+
+        // Empty input is Ok(0) and touches nothing.
+        assert_eq!(store.upsert_edge_texts(&[]).expect("empty batch"), 0);
+        assert_eq!(
+            store.list_edge_text_ids().expect("list after empty batch"),
+            Vec::<String>::new()
+        );
+
+        // A batch writes every row and reports the count.
+        let written = store
+            .upsert_edge_texts(&[
+                ("e2".to_string(), "Carol joined the tea club".to_string()),
+                (
+                    "e1".to_string(),
+                    "Alice discussed coffee with Bob".to_string(),
+                ),
+            ])
+            .expect("batch upsert");
+        assert_eq!(written, 2);
+        assert_eq!(
+            store.list_edge_texts().expect("list after batch"),
+            vec![
+                (
+                    "e1".to_string(),
+                    "Alice discussed coffee with Bob".to_string()
+                ),
+                ("e2".to_string(), "Carol joined the tea club".to_string()),
+            ]
+        );
+
+        // INSERT OR REPLACE: a second batch re-writing e1 changes its
+        // text in place and still counts the row as written.
+        let written = store
+            .upsert_edge_texts(&[(
+                "e1".to_string(),
+                "Alice discussed espresso with Bob".to_string(),
+            )])
+            .expect("replace batch");
+        assert_eq!(written, 1);
+        assert_eq!(
+            store.search_edge_texts("coffee").expect("search old text"),
+            Vec::<String>::new(),
+            "the replaced text is gone"
+        );
+        assert_eq!(
+            store.list_edge_texts().expect("list after replace"),
+            vec![
+                (
+                    "e1".to_string(),
+                    "Alice discussed espresso with Bob".to_string()
+                ),
+                ("e2".to_string(), "Carol joined the tea club".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_edge_texts_returns_id_and_text_pairs_ordered_by_edge_id() {
+        let (_dir, store) = embedding_store();
+        assert_eq!(
+            store.list_edge_texts().expect("empty list"),
+            Vec::<(String, String)>::new()
+        );
+
+        for (id, text) in [("e-c", "text c"), ("e-a", "text a"), ("e-b", "text b")] {
+            store.upsert_edge_text(id, text).expect("upsert");
+        }
+        // Ordered by edge_id, regardless of insert order; the text
+        // comes along (the reconciliation diffs by content).
+        assert_eq!(
+            store.list_edge_texts().expect("list"),
+            vec![
+                ("e-a".to_string(), "text a".to_string()),
+                ("e-b".to_string(), "text b".to_string()),
+                ("e-c".to_string(), "text c".to_string()),
+            ]
         );
     }
 }

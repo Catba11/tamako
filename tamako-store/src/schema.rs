@@ -319,6 +319,12 @@ CREATE TABLE edge_texts (
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
+///
+/// Downgrade guard (decision 77, S6-F9): a database whose recorded schema
+/// version EXCEEDS the binary's known maximum was written by a newer
+/// tamako. Opening it with this binary would misread newer rows, so the
+/// runner refuses with [`StoreError::SchemaFromTheFuture`] naming both
+/// versions. A fresh (zero-version) database still migrates to the tip.
 pub fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -332,6 +338,13 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         .query_map([], |row| row.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
+
+    let known = MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(0);
+    if let Some(&found) = applied.iter().max() {
+        if found > known {
+            return Err(StoreError::SchemaFromTheFuture { found, known });
+        }
+    }
 
     for (version, sql) in MIGRATIONS {
         if applied.contains(version) {
