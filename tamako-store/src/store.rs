@@ -486,6 +486,28 @@ impl Store {
         })
     }
 
+    /// The newest `limit` log rows, RETURNED in ascending id order
+    /// (oldest of the window first). Warmup-trigger read support
+    /// (decision 78): the Section 9.7 step 2 topic exclusion reads the
+    /// 50-row raw-log tail with this method, and the Section 8.4
+    /// silence gate reads it with `limit = 1` — the newest row of ANY
+    /// direction resets the silence clock: the bot's own speech also
+    /// breaks group silence for warmup purposes.
+    pub fn list_latest_messages(&self, chat_id: &str, limit: u32) -> Result<Vec<MessageRow>> {
+        self.with_conn(chat_id, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY id DESC LIMIT ?1"
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit], message_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .rev()
+                .collect();
+            Ok(rows)
+        })
+    }
+
     /// Counts the INBOUND raw-log rows with `id > after_id`. The M4
     /// recency re-check (specs.md Section 6.2) uses it: newer human
     /// messages after the target decide whether a generated reply is
@@ -823,6 +845,30 @@ impl Store {
             let rows = stmt
                 .query_map([], reaction_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// The newest `limit` reaction rows, RETURNED in ascending id order
+    /// (oldest of the window first). Backs the Section 8.5 warmup
+    /// engagement watch (decision 78 (d)): a bounded recent window of
+    /// reaction events. There is NO timestamp predicate in the SQL:
+    /// stored RFC 3339 timestamps are not lexically ordered (variable
+    /// fractional-second precision), so the caller filters by
+    /// timestamp.
+    pub fn list_latest_reactions(&self, chat_id: &str, limit: u32) -> Result<Vec<ReactionRow>> {
+        self.with_conn(chat_id, |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, platform_msg_id, reactor_user_id, anonymous, aggregated,
+                        old_emojis, new_emojis, timestamp
+                 FROM reactions ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit], reaction_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .rev()
+                .collect();
             Ok(rows)
         })
     }
@@ -2576,6 +2622,55 @@ mod tests {
     }
 
     #[test]
+    fn list_latest_messages_returns_the_newest_rows_in_ascending_order() {
+        // Backs decision 78: the Section 9.7 step 2 raw-log tail read
+        // (50 rows) and the Section 8.4 silence gate (`limit = 1`).
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let mut ids = Vec::new();
+        for index in 1..=5_i64 {
+            let msg = NewMessage {
+                platform_msg_id: format!("m{index}"),
+                timestamp: base.timestamp + time::Duration::seconds(index),
+                text: format!("text {index}"),
+                ..base.clone()
+            };
+            match store.insert_message("c1", &msg).expect("insert") {
+                InsertOutcome::Inserted(id) => ids.push(id),
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+
+        // The newest 3 rows come back oldest-of-the-window first.
+        let tail = store.list_latest_messages("c1", 3).expect("tail");
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].id, ids[2]);
+        assert_eq!(tail[1].id, ids[3]);
+        assert_eq!(tail[2].id, ids[4]);
+        assert_eq!(tail[0].text, "text 3");
+        assert_eq!(tail[2].text, "text 5");
+
+        // The silence gate reads only the newest row.
+        let newest = store.list_latest_messages("c1", 1).expect("newest");
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].id, ids[4]);
+
+        // A limit above the row count returns all rows, still ascending.
+        let all = store.list_latest_messages("c1", 50).expect("all");
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].id, ids[0]);
+        assert_eq!(all[4].id, ids[4]);
+
+        // A zero limit returns an empty vec.
+        let empty = store.list_latest_messages("c1", 0).expect("zero");
+        assert!(empty.is_empty());
+
+        // Rule P5: one group's data never crosses into another group.
+        let other = store.list_latest_messages("c2", 3).expect("other group");
+        assert!(other.is_empty());
+    }
+
+    #[test]
     fn state_round_trip_set_overwrite_and_missing() {
         let (_dir, store) = temp_store();
         assert_eq!(store.get_state("c1", "muted_flag").expect("get"), None);
@@ -2956,6 +3051,52 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].reactor_user_id, Some("u1".to_string()));
         assert_eq!(rows[1].reactor_user_id, Some("u2".to_string()));
+    }
+
+    #[test]
+    fn list_latest_reactions_returns_the_newest_rows_in_ascending_order() {
+        // Backs decision 78 (d): the Section 8.5 warmup engagement watch
+        // reads a bounded recent window of reaction events. Timestamp
+        // filtering is the caller's job — stored RFC 3339 timestamps are
+        // not lexically ordered, so the query has no timestamp
+        // predicate.
+        let (_dir, store) = temp_store();
+        let base = named_reaction();
+        let mut ids = Vec::new();
+        for index in 1..=5_i64 {
+            let reaction = NewReaction {
+                platform_msg_id: format!("m{index}"),
+                timestamp: base.timestamp + time::Duration::seconds(index),
+                ..base.clone()
+            };
+            match store.insert_reaction("c1", &reaction).expect("insert") {
+                InsertOutcome::Inserted(id) => ids.push(id),
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+
+        // The newest 3 rows come back oldest-of-the-window first.
+        let tail = store.list_latest_reactions("c1", 3).expect("tail");
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].id, ids[2]);
+        assert_eq!(tail[1].id, ids[3]);
+        assert_eq!(tail[2].id, ids[4]);
+        assert_eq!(tail[0].platform_msg_id, "m3");
+        assert_eq!(tail[2].platform_msg_id, "m5");
+
+        // A limit above the row count returns all rows, still ascending.
+        let all = store.list_latest_reactions("c1", 50).expect("all");
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].id, ids[0]);
+        assert_eq!(all[4].id, ids[4]);
+
+        // A zero limit returns an empty vec.
+        let empty = store.list_latest_reactions("c1", 0).expect("zero");
+        assert!(empty.is_empty());
+
+        // Rule P5: one group's data never crosses into another group.
+        let other = store.list_latest_reactions("c2", 3).expect("other group");
+        assert!(other.is_empty());
     }
 
     #[test]
