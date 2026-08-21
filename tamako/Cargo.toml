@@ -14,9 +14,12 @@ tamako-adapter-teloxide.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Decision 77 (H5): the per-group cross-process lock (.tamako.lock).
+fd-lock.workspace = true
 # Timestamps. GroupActorParams.started_at is a time::OffsetDateTime.
 time.workspace = true
 

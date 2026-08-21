@@ -46,6 +46,11 @@ uuid = { version = "1", features = ["v5", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Cross-process advisory file locks (decision 77, H5): the per-group
+# .tamako.lock of the binary — a running --live holds the group locks and
+# every mutating offline CLI refuses to run against a locked group.
+fd-lock = "4"
+
 # Wake-trigger jitter. Refer to specs.md Section 8.3.
 rand = "0.9"
 

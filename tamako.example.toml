@@ -44,6 +44,18 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 
 # Embeddings for the vector sidecar (global-only; decision 66). Keyed by
 # OPENAI_API_KEY; the default pair is OpenRouter + qwen3-embedding-8b (ZDR).
+#
+# DUAL-USE NOTE (decision 77): embeddings ALWAYS read OPENAI_API_KEY — the
+# same environment variable the openai-compatible COMPLETIONS endpoints
+# read. The embedding base URL resolves from TAMAKO_EMBEDDING_BASE_URL,
+# then embedding_llm_base_url below, then the OpenRouter default; the
+# model resolves from TAMAKO_EMBEDDING_MODEL, then embedding_model. So
+# when your completions point elsewhere (the Opencode Go recipe above)
+# while embeddings keep the default OpenRouter base URL, your
+# OPENAI_API_KEY must be valid for OpenRouter — startup logs one WARN
+# when it detects exactly this mismatch. To dual-use one provider key
+# (e.g. Opencode Go embeddings), set embedding_llm_base_url to the same
+# base as llm_base_url.
 # embedding_model = "qwen/qwen3-embedding-8b"
 # embedding_llm_base_url = "https://openrouter.ai/api/v1"
 
