@@ -71,7 +71,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 
 - `messages` table: one row per normalized inbound or outbound message. Outbound rows store the bot's own speech. Rule B1 applies. Sender identity columns carry the sender id and the display name; schema v4 adds the nullable `sender_username`. Rows written before v4 read it as NULL. Schema v6 extends the dedup key with the message text, so several edits of one message persist.
 - `reactions` table: one row per reaction event on a group message. The Phase 2 warmup backoff consumes this table. Reaction data is not recoverable later, so collection starts at intake time in Phase 1.
-- `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `prev_digest_boundary_msg_id`, `wake_last_row_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`.
+- `state` table: key-value rows. Keys include `last_digest_boundary_msg_id`, `prev_digest_boundary_msg_id`, `wake_last_row_id`, `muted_flag`, `consecutive_bot_msgs`, `warmup_backoff_factor`, `warmup_quota_used_today`, `warmup_next_at`, `warmup_topic_cooldowns`, and the warmup engagement-watch keys.
 - `injected_memories` table: one row per injected recall. Columns: edge id, injection position, message-id range tag, rendered content. The rendered content is stored so a restart rebuild is bit-identical without graph queries. Refer to Section 9.5.
 - `context_summaries` table: one row per summarized removed chunk. Columns: the message-id range `(first_msg_id, last_msg_id]` as the natural dedup key, the rendered summary text, and a creation timestamp. The text is persisted at creation time so a restart rebuild is bit-identical without re-calling the model. Rule P1 applies. Rows of rotated-out summaries stay for forensics.
 - `pending_embeddings` table (schema v7): the embedding work queue. One row per (node id, content hash) pair — the unique key makes re-enqueue retry-safe. Columns: status (`pending`/`done`/`failed`), attempts, timestamps. The digest pipeline enqueues after the graph commit (best-effort); the embedding worker drains it. Refer to `proposed-graph-database-specs.md` Section 7.6.
@@ -167,14 +167,16 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 
 ### 8.4 Warmup trigger
 
-- Daily quota: `warmup_quota` (1–3) proactive messages, spread at random over the configured active hours.
+- Daily quota: `warmup_quota` (default 1; the range is 1–3) proactive messages, spread uniformly at random over `warmup_active_hours` (default "08:00-23:00", host-local time; overnight ranges are unsupported).
 - A warmup message is permitted only if the group has been silent for at least `warmup_silence` (4 h).
 - The `muted` state suppresses warmup. The soft backoff in Section 8.5 adjusts the effective quota.
+- The next scheduled activation persists in the `warmup_next_at` state key: a restart never reshuffles the schedule (Rule P1).
+- The master switch `warmup` (default true) disables the trigger entirely when false. The procedure is Section 9.7.
 
 ### 8.5 Speech suppression
 
 - Hard rule (monologue lock): if the last `monologue_limit` (2) messages in the group are all from the bot, enter the `muted` state. In `muted`, proactive speech and warmup are forbidden. A forced wake is still permitted. Any human message clears the state.
-- Soft rule (warmup backoff): if a warmup message receives zero reactions and zero replies within the reaction window, the effective daily quota decreases and the next warmup interval doubles. The backoff resets on any successful engagement.
+- Soft rule (warmup backoff): a warmup is ENGAGED when a human reply or a reaction arrives within `warmup_reaction_window` (30 min; reactions reach administrator groups only — Section 4.2 — so non-administrator groups measure replies only). A warmup with zero engagement at window expiry increments `warmup_backoff_factor` by one: the effective daily quota becomes max(0, `warmup_quota` − factor) and the warmup interval multiplier becomes 2^factor. Any successful engagement resets the factor to zero.
 - Participation rate is a metric. The calibration band is 30 to 60 percent. Refer to Section 12.
 
 ## 9. Wake procedure
@@ -225,6 +227,16 @@ One wake executes these steps in this sequence:
 - The decision uses a cheap model. The main model runs only on a positive decision.
 - The recall result is part of the input on purpose: a topic with strong personal memories is a valid reason to participate.
 
+### 9.7 Warmup procedure
+
+One warmup executes these steps in this sequence (independent of the Wake procedure; roadmap Section 6):
+
+1. Check the gates: `warmup` enabled, not `muted`, quota remains for today (after the Section 8.5 backoff), the group silent for `warmup_silence`, and the persisted `warmup_next_at` due. Any failure exits quietly (DEBUG).
+2. Pick a topic: sample the group's Concept nodes weighted by edge count × recency decay, excluding topics on their per-topic cooldown (`warmup_topic_cooldown_days`, 3 days) and topics whose normalized name appears in the 50-row raw-log tail (never restart the conversation that just went quiet). No eligible topic means no warmup — forced small talk is worse than silence.
+3. Generate with the reply purpose: the persona preamble, the gloss, the guardrail, the shared context view, and a warmup instruction naming the topic. An interest attached to a specific person is framed as an open question to the group, never as "X likes Y" — the Section 9.4 guardrail spirit extended to proactive speech. The decision-59/64 parrot filter applies to the generated text like every reply.
+4. Send as a plain standalone message. Proactive speech never quotes a target (Section 6.2's quoting rule governs replies; warmup has no target). Write the outbound row to the raw log first. Rule B1 applies.
+5. Emit one curated `warmup` INFO line, persist the engagement-watch state, and schedule the next activation (`warmup_next_at`).
+
 ## 10. Digest pipeline
 
 ### 10.1 Input
@@ -269,6 +281,7 @@ Metrics per group:
 | Dead-letter count | Skipped batches. Requires operator attention. |
 | Fallback attachment rate | Refer to `proposed-graph-database-specs.md` Section 10. Primary entity-resolution quality metric. |
 | Wake rate | Wakes per hour. Watch against the floor configuration. |
+| Warmup activity | `warmups_total` and `warmup_engaged_total`. The engagement ratio is the Phase 2 exit-criterion metric (roadmap Section 4); watch it per group via `--status`. |
 | Summarization failures | `summaries_failed_total`, cumulative. A rising count warns of a stuck summarizer before the circuit breaker of Section 10.2 engages. |
 | Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Counted post-commit from the final attempt only (decision 77). Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. |
 
@@ -302,6 +315,11 @@ Global defaults. Every item is overridable per group.
 | `resolution_confirm_budget` | 5 per digest batch | graph 7.4 |
 | `merge_candidate_threshold` | 0.85 (provisional) | graph 7.7 |
 | `single_value_predicates` | `currently_playing`, `works_at`, `lives_in`, `dating` | graph 7.5 |
+| `warmup` | true | 8.4 |
+| `warmup_quota` | 1 (range 1–3) | 8.4 |
+| `warmup_active_hours` | "08:00-23:00" host-local | 8.4 |
+| `warmup_reaction_window` | 30 min | 8.5 |
+| `warmup_topic_cooldown_days` | 3 | 9.7 |
 | `deep_recall` | true | 9.1 |
 | `recall_candidate_cap` | 40 per wake | 9.1 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
