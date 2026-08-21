@@ -11,7 +11,8 @@
 //! generator; the implementations live in tamako-agent. Segmented
 //! summarization adds the summary provider contract (`summary`, specs.md
 //! Section 10 keep-two retention); the live implementation lives in
-//! tamako-agent.
+//! tamako-agent. Phase 2 adds the warmup-trigger contracts and pure
+//! logic (`warmup`, specs.md Sections 8.4/8.5/9.7, decision 78).
 //!
 //! This crate is model-agnostic: no rig or LLM dependency. tamako-agent
 //! converts `context::ContextMessage` to rig completion messages in M4.
@@ -28,3 +29,4 @@ pub mod session;
 pub mod summary;
 pub mod trigger;
 pub mod wake;
+pub mod warmup;
