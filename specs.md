@@ -77,6 +77,7 @@ Each `chat_id` has one directory `{data_root}/{chat_id}/`:
 - `pending_embeddings` table (schema v7): the embedding work queue. One row per (node id, content hash) pair — the unique key makes re-enqueue retry-safe. Columns: status (`pending`/`done`/`failed`), attempts, timestamps. The digest pipeline enqueues after the graph commit (best-effort); the embedding worker drains it. Refer to `proposed-graph-database-specs.md` Section 7.6.
 - `node_embeddings` virtual table (schema v7): the sqlite-vec `vec0` sidecar index, one 4096-dimension embedding per node id. Derived, recomputable data — never the source of truth. The sqlite-vec extension registers at connection open on every code path that opens a store; a connection without it cannot even SELECT the virtual table. Schema v8 recreates the table with `distance_metric=cosine` (dropping the v7 L2 table; the reconciliation pass re-embeds — derived data).
 - `merge_audit` table (schema v9): one append-only row per merge-tool action. Columns: loser id, survivor id, loser kind/name/description, the three-way verdict (`same`/`related`/`different` — only `same` merges), reason, confirmed_by (`llm:<model>` or `operator`), edge counters (moved, self-loops dropped, deduped), the rollback snapshot (JSON: the loser node and its original edges, plus the created edge identifiers; NULL for non-merge verdicts), a rolled_back flag, and a timestamp. Refer to `proposed-graph-database-specs.md` Section 7.7.
+- `edge_texts` table (schema v10): the full-text sidecar over edge descriptions (the "who discussed X" pattern of `proposed-graph-database-specs.md` Section 8.2), scanned with parameterized LIKE. Derived, recomputable; written post-commit at digest time (best-effort) and repaired by the startup reconciliation pass.
 - Vector index: sqlite-vec virtual tables in the same file. The embeddings of Person, Alias, and Concept names and descriptions live here. Refer to `proposed-graph-database-specs.md` Section 7.6.
 
 To delete the memory of a group, delete the directory. Both files share one lifecycle.
@@ -188,8 +189,9 @@ One wake executes these steps in this sequence:
 
 ### 9.1 Recall call
 
-- The recall worker reads the new messages of this wake and queries the memory backend through the read path of `proposed-graph-database-specs.md` Section 8. Entry resolution: mentions and replies, exact alias match, then vector search. Candidate generation reads the new messages only; widening it is the deep-recall item of the roadmap (Phase 2).
+- The recall worker reads the new messages of this wake and queries the memory backend through the read path of `proposed-graph-database-specs.md` Section 8. Candidate terms come from the new messages only. Entry resolution: mentions and replies, exact alias match, then vector search (accept at or above `vector_candidate_threshold`; no confirmation call on the read path). With `deep_recall` enabled (the default), candidates widen two more ways: graph expansion to two hops under the Section 8.2 rules (validity filter, the 90-day window, the per-node expansion limit, hub truncation; `contains` and `known_as` excluded, `also_known_as` included), and full-text matches on edge descriptions through the `edge_texts` sidecar (the "who discussed X" pattern). All candidate sources dedup by edge id and cap at `recall_candidate_cap` (40) before the relevance gate.
 - The recall worker uses a cheap model. It never calls the main model.
+- With `deep_recall` set to false, candidate generation is the Phase 1 shallow form: direct neighbors only, one hop, entry by mentions/replies and exact alias match only.
 - If the decision at step 3 is negative, the main model is never called. The recall cost is the fixed cost of every wake.
 
 ### 9.2 Relevance gate
@@ -300,6 +302,8 @@ Global defaults. Every item is overridable per group.
 | `resolution_confirm_budget` | 5 per digest batch | graph 7.4 |
 | `merge_candidate_threshold` | 0.85 (provisional) | graph 7.7 |
 | `single_value_predicates` | `currently_playing`, `works_at`, `lives_in`, `dating` | graph 7.5 |
+| `deep_recall` | true | 9.1 |
+| `recall_candidate_cap` | 40 per wake | 9.1 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):

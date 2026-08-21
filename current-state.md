@@ -1458,6 +1458,43 @@ v0.0.1 (alpha).
     history queries stay a Phase-3-class concern. Spec backfill:
     graph-spec Section 7.5, specs.md Sections 13 and 14.
 
+76. **Deep recall (2026-08-17).** Roadmap Phase 2 item 6 — the
+    candidate-BREADTH fix, paired with decision 72's
+    judgment-context fix. Rulings: (a) SCOPE — candidate generation
+    widens three ways: vector entry on the read path (accept at or
+    above `vector_candidate_threshold`; NO confirmation call —
+    confirmation is write-path only), two-hop graph expansion under
+    the Section 8.2 rules, and full-text candidate matches on edge
+    descriptions (the "who discussed X" pattern); candidate TERMS
+    still come from the new messages only; (b) WHITELIST — recall
+    expansion traverses everything except `contains` (provenance)
+    and `known_as` (surface forms, resolved at entry);
+    `also_known_as` is included deliberately (the cross-language
+    bridge, decision 74); (c) SIDECAR FORM — migration v10 adds a
+    PLAIN `edge_texts` table (edge id + description text) scanned
+    with parameterized LIKE: at our edge counts (thousands) a
+    trigram-FTS5 index buys nothing, and its tokenizer cannot match
+    CJK terms shorter than three characters — a fatal hole for
+    two-character Chinese words like 咖啡. FTS5-trigram is the
+    documented upgrade path when edge counts justify it. Written
+    post-commit at digest time (a local write needs no queue) and
+    repaired by the startup reconciliation pass (extended to
+    edges); (d) BUDGETS — per-node expansion keeps the 500-edge
+    limit with hub truncation; total candidates cap at
+    `recall_candidate_cap` (40) before the relevance gate; the
+    injection cap (5) is unchanged; (e) CONFIG — `deep_recall`
+    (bool, default true; false restores the Phase 1 shallow form)
+    and `recall_candidate_cap`, per-group overridable; (f) COST —
+    vector entry adds one batched embeddings call per wake that has
+    candidate terms (negligible at $0.01/M); zero candidates still
+    never call the model; (g) OBSERVABILITY — DEBUG lines with
+    per-source candidate counts; curated INFO frozen (decision 53).
+    The recall PROTOCOL (Sections 9.3–9.5) is untouched: the
+    producer improves behind the RecallProvider seam — exactly the
+    interface protection roadmap Section 6 predicted. Spec
+    backfill: graph-spec Sections 7.6/8.2, specs.md Sections
+    5.2/9.1/13.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
