@@ -200,7 +200,7 @@ One wake executes these steps in this sequence:
 - If nothing is relevant, nothing is injected. An empty injection is forbidden.
 - At most `recall_injection_cap` (5) memories are injected per wake.
 - The injection rate is a metric. The expected healthy range is 20 to 40 percent of wakes.
-- The relevance gate receives the same shared context view of Section 9.6, rendered ahead of the new messages and the candidate list. The `gate_context` switch applies to it equally.
+- The relevance gate receives the same shared context view of Section 9.6, rendered ahead of the new messages and the candidate list. The `gate_context` switch applies to it equally. Its cache prefix is its own (per-gate, per-group — the two gates never share a cache, Section 9.6).
 
 ### 9.3 Deduplication
 
@@ -220,7 +220,7 @@ One wake executes these steps in this sequence:
 
 ### 9.6 Participation decision
 
-- Input: the new messages plus the injected memories. Ahead of them the gate receives the shared context view: the same rendered bytes the reply model sees (the two newest summaries, the previous chunk, the current tail up to this wake's marker). Only the new messages of this wake are targetable; the context view is reference material for judgment quality. The view renders ahead of the per-call sections so consecutive gate calls share a growing byte prefix (provider prompt cache; invalidation rides digest tempo, the same rhythm as the reply path). Setting `gate_context` to false restores the delta-only input.
+- Input: the new messages plus the injected memories. Ahead of them the gate receives the shared context view: the same rendered bytes the reply model sees (the two newest summaries, the previous chunk, the current tail up to this wake's marker). Only the new messages of this wake are targetable; the context view is reference material for judgment quality. The view renders ahead of the per-call sections so consecutive calls OF THE SAME GATE across wakes share a growing byte prefix (provider prompt cache; invalidation rides digest tempo, the same rhythm as the reply path). The two gates carry different preambles, so their caches never warm each other — each gate's prefix is cached per gate, per group. Setting `gate_context` to false restores the delta-only input.
 - Output: a binary decision, with the target message for the reply.
 - The decision uses a cheap model. The main model runs only on a positive decision.
 - The recall result is part of the input on purpose: a topic with strong personal memories is a valid reason to participate.
