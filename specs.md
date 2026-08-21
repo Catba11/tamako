@@ -270,7 +270,7 @@ Metrics per group:
 | Fallback attachment rate | Refer to `proposed-graph-database-specs.md` Section 10. Primary entity-resolution quality metric. |
 | Wake rate | Wakes per hour. Watch against the floor configuration. |
 | Summarization failures | `summaries_failed_total`, cumulative. A rising count warns of a stuck summarizer before the circuit breaker of Section 10.2 engages. |
-| Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. |
+| Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Counted post-commit from the final attempt only (decision 77). Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. |
 
 The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the counters, the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
@@ -320,6 +320,7 @@ LLM access resolves from the per-group effective configuration (global defaults 
 | `llm_session_id` | `"tamako"` | Session-affinity identifier sent as the `x-opencode-session` request header on every LLM call. Gateways that honor the header (Opencode Go) keep the prompt cache on one upstream. No per-purpose variant. One session id per deployment is the intent; the per-group resolution means a group table could override it — do not. Empty string counts as unset. Environment override: `TAMAKO_LLM_SESSION_ID`. |
 | `embedding_model` | `"qwen/qwen3-embedding-8b"` | Embedding model for the vector sidecar (schema v7). Global only: no per-purpose and no per-group variant. Environment override: `TAMAKO_EMBEDDING_MODEL`. |
 | `embedding_llm_base_url` | `"https://openrouter.ai/api/v1"` | Base URL of the openai-compatible embeddings endpoint. Global only. Environment override: `TAMAKO_EMBEDDING_BASE_URL`. The embedding dimension is pinned at 4096; changing it means recreating the `node_embeddings` table. |
+| `embedding_enabled` | true | Master switch for the embedding sidecar: the provider, the worker, and the digest-path enqueue. Global only. When false, no content leaves for embeddings; enabling later backfills through the reconciliation pass. |
 
 A purpose (`digest`, `gate`, `reply`, `summary`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
 
