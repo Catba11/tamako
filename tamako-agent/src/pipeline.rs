@@ -13,7 +13,7 @@ use tamako_core::actor::CoreError;
 use tamako_core::digest::{embedding_content_hash, DigestOutcome, DigestPipeline};
 use tamako_core::embedding::EmbeddingProvider as CoreEmbeddingProvider;
 use tamako_memory::identifiers::{batch_id as message_batch_id, normalize};
-use tamako_memory::{MemoryBackend, MemoryBatch, NodeType};
+use tamako_memory::{EdgeId, MemoryBackend, MemoryBatch, NodeType};
 use tamako_store::{MessageRow, Store, StoreError};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -362,6 +362,40 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                 }
             }
         }
+        // Decision 76 (Section 7.6 step 6): immediately AFTER the graph
+        // commit, upsert the batch's edge descriptions into the
+        // `edge_texts` sidecar (the LIKE-search mirror of the graph
+        // edges' descriptions). A LOCAL write, no queue — the same
+        // best-effort discipline as the enqueue above, through the same
+        // dedicated one-group embedding store: a failure logs a WARN
+        // and never fails the digest, and the startup reconciliation
+        // (extended to edges, decision 76c) repairs the loss. The
+        // upsert is idempotent and replay-convergent: INSERT OR REPLACE
+        // keyed by the deterministic edge id, so a replayed batch
+        // re-encodes the same ids and replaces the same rows in place.
+        // An empty item list is a no-op (and skips the store call
+        // entirely).
+        let edge_texts = edge_text_upsert_items(&batch);
+        if !edge_texts.is_empty() {
+            if let Some(embedding_store) = &self.embedding_store {
+                let result = Self::run_on_store(Arc::clone(embedding_store), move |store| {
+                    for (edge_id, edge_text) in &edge_texts {
+                        store.upsert_edge_text(edge_id, edge_text)?;
+                    }
+                    Ok(())
+                })
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(
+                        chat_id,
+                        batch_id = %frame.batch_id,
+                        error = %error,
+                        "edge_texts harvest failed after the graph commit; \
+                         the startup reconciliation will repair the loss"
+                    );
+                }
+            }
+        }
         Ok((node_count, edge_count))
     }
 
@@ -613,6 +647,34 @@ fn embedding_enqueue_items(graph: &KnowledgeGraph, batch: &MemoryBatch) -> Vec<(
         items.push((node.id.clone(), hash));
     }
     items
+}
+
+/// Builds the (edge_id, edge_text) upsert pairs of one committed batch
+/// (decision 76, Section 7.6 step 6). One pair per batch edge with a
+/// non-empty description: the edge id is the [`EdgeId::encode`] of the
+/// resolved natural key (`source_id` / `relationship_name` /
+/// `target_id` / `valid_at`) the graph commit MERGEd, so the pairs
+/// name the sidecar rows of exactly the edges the graph now holds.
+/// Every edge kind is harvested — the recall LIKE scan decides what to
+/// match; the sidecar must mirror the graph whole, or the startup
+/// reconciliation's set difference would prune the harvested rows. An
+/// edge with an empty `edge_text` is skipped: nothing to search.
+fn edge_text_upsert_items(batch: &MemoryBatch) -> Vec<(String, String)> {
+    batch
+        .edges
+        .iter()
+        .filter(|edge| !edge.edge_text.is_empty())
+        .map(|edge| {
+            let edge_id = EdgeId {
+                source_id: edge.source_id.clone(),
+                relationship_name: edge.relationship_name.clone(),
+                target_id: edge.target_id.clone(),
+                valid_at: edge.valid_at,
+            }
+            .encode();
+            (edge_id, edge.edge_text.clone())
+        })
+        .collect()
 }
 
 /// Maps the crate error to the core error (the `DigestPipeline`
@@ -1569,5 +1631,229 @@ mod tests {
             rows.iter().all(|(_, invalid_at)| invalid_at == "NULL"),
             "no invalidation without a registry"
         );
+    }
+
+    // ---- Decision 76: the edge_texts harvest after the graph commit.
+    // Real temp Store + real LbugBackend, scripted extractor (the
+    // pattern of the decision-66 tests above). ----
+
+    /// The fact-edge id of the `alice_deploy_graph` digest: the
+    /// [`EdgeId::encode`] of the resolved natural key (the sender-bound
+    /// Alice person, the deterministic concept id; valid_at = batch_end
+    /// = the last message's timestamp, resolve.rs Section 7.5).
+    fn works_on_edge_id() -> String {
+        EdgeId {
+            source_id: person_id("1001"),
+            relationship_name: "works_on".to_string(),
+            target_id: concept_id("the deploy"),
+            valid_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp"),
+        }
+        .encode()
+    }
+
+    /// The sorted edge ids of the graph (the reconciliation truth of
+    /// decision 76c).
+    async fn graph_edge_ids(memory: &LbugBackend) -> Vec<String> {
+        let mut ids: Vec<String> = memory
+            .list_all_edges(ENQUEUE_CHAT)
+            .await
+            .expect("edges")
+            .into_iter()
+            .map(|(edge_id, _)| edge_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn the_graph_commit_harvests_the_edge_descriptions() {
+        // Decision 76 (Section 7.6 step 6): after the graph commit the
+        // batch's edge descriptions land in the edge_texts sidecar,
+        // keyed by the encoded natural key. Every edge kind is
+        // harvested (fact, surface-form, contains provenance), so the
+        // sidecar mirrors the graph whole.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        // The sidecar mirrors the graph's edges exactly.
+        assert_eq!(
+            embedding_store.list_edge_text_ids().expect("ids"),
+            graph_edge_ids(&memory).await
+        );
+        // The fact edge's row carries the extracted description under
+        // the resolved natural-key id.
+        assert_eq!(
+            embedding_store
+                .search_edge_texts("deploys the fix tonight")
+                .expect("search"),
+            vec![works_on_edge_id()]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeating_the_digest_converges_the_edge_text_rows() {
+        // The upsert is idempotent and replay-convergent: the same
+        // digest twice re-encodes the same deterministic edge ids and
+        // replaces the same rows — same rows, no error.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph(), alice_deploy_graph()]),
+            Some(Arc::clone(&embedding_store)),
+        );
+
+        for run in 1..=2 {
+            let outcome = pipeline
+                .run_digest(ENQUEUE_CHAT, 0)
+                .await
+                .expect("digest")
+                .expect("non-empty tail");
+            assert!(
+                matches!(outcome, DigestOutcome::Extracted { .. }),
+                "run {run} must extract"
+            );
+        }
+
+        assert_eq!(
+            embedding_store.list_edge_text_ids().expect("ids"),
+            graph_edge_ids(&memory).await,
+            "one row per graph edge, no duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edge_with_an_empty_description_is_not_harvested() {
+        // Nothing to search: an edge with an empty edge_text never gets
+        // a sidecar row. (The reconciliation's missing-from-sidecar
+        // branch mirrors the skip, so the row never flaps.)
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        let mut graph = alice_deploy_graph();
+        graph.edges[0].description = String::new();
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![graph]),
+            Some(Arc::clone(&embedding_store)),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("digest")
+            .expect("non-empty tail");
+        assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
+
+        let ids = embedding_store.list_edge_text_ids().expect("ids");
+        // The graph DOES hold the empty-text edge…
+        assert!(graph_edge_ids(&memory).await.contains(&works_on_edge_id()));
+        // …but the sidecar has no row for it, while every other graph
+        // edge is mirrored.
+        assert!(!ids.contains(&works_on_edge_id()));
+        assert_eq!(ids.len(), graph_edge_ids(&memory).await.len() - 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_edge_text_harvest_never_fails_the_digest() {
+        // Decision 76 best-effort discipline, the same rig as the
+        // decision-66 enqueue failure test: an embedding Store with two
+        // open groups fails every single-group helper
+        // (StoreError::AmbiguousGroup); the digest still succeeds and
+        // the failure never enters the Phase 1 digest error taxonomy.
+        let (dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let embedding_store = dedicated_embedding_store(&dir);
+        embedding_store
+            .open_group("edge_text_test_other")
+            .expect("open");
+        let pipeline = enqueue_pipeline(
+            &store,
+            &memory,
+            crate::ScriptedExtractor::with_graphs(vec![alice_deploy_graph()]),
+            Some(embedding_store),
+        );
+
+        let outcome = pipeline
+            .run_digest(ENQUEUE_CHAT, 0)
+            .await
+            .expect("the digest is Ok despite the harvest failure")
+            .expect("non-empty tail");
+        match outcome {
+            // Person + Concept + 2 Alias + MessageBatch.
+            DigestOutcome::Extracted { node_count, .. } => assert_eq!(node_count, 5),
+            other => panic!("expected Extracted, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "digest_failures_total")
+                .expect("state"),
+            None
+        );
+        // Nothing was written (a fresh one-group reader on the same
+        // path — the pattern of the disabled-enqueue test).
+        let reader = dedicated_embedding_store(&dir);
+        assert!(reader.list_edge_text_ids().expect("ids").is_empty());
     }
 }
