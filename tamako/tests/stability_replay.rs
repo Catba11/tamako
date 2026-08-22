@@ -286,6 +286,7 @@ fn spawn_on(
             gate: Arc::clone(&doubles.gate) as Arc<dyn ParticipationGate>,
             reply: Arc::clone(&doubles.reply) as Arc<dyn ReplyGenerator>,
         }),
+        warmup: None,
         summary_provider: Some(summary as Arc<dyn SummaryProvider>),
         outbound: Some(outbound),
         bot_name: Some("Tamako".to_string()),
