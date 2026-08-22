@@ -39,7 +39,8 @@ use tamako_agent::recall::DeepRecallConfig;
 use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
-    RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, RigSummary, ShallowRecall,
+    RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, RigSummary, RigWarmupGenerator,
+    ShallowRecall,
 };
 use tamako_core::actor::{
     spawn_group_actor, GroupActorHandle, GroupActorParams, DEFAULT_INBOX_CAPACITY,
@@ -56,6 +57,7 @@ use tamako_core::merge::{
 };
 use tamako_core::summary::SummaryProvider;
 use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
+use tamako_core::warmup::WarmupServices;
 use tamako_memory::{LbugBackend, MemoryBackend, NodeType};
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
 use tamako_store::{read_group_status, GroupStatus, Store, StoreError};
@@ -834,6 +836,30 @@ fn build_wake_services(
     }
 }
 
+/// Builds the warmup-trigger services (specs.md Sections 8.4/8.5/9.7,
+/// decision 78) for the resolved REPLY endpoint: the warmup is a
+/// reply-purpose generation (decision 78 (a), Section 13), so it rides
+/// the same endpoint the wake's reply generator uses. The degrade
+/// doctrine mirrors `build_wake_services`: a missing family API key
+/// (reported as `AgentError::ProviderConfig`) degrades to `Ok(None)`
+/// with one warning — the actor treats `None` as fully inert — and
+/// every other build error propagates.
+fn build_warmup_services(endpoints: &LlmEndpoints) -> Result<Option<WarmupServices>> {
+    match RigWarmupGenerator::from_endpoint(&endpoints.reply) {
+        Ok(generator) => {
+            info!(reply_model = %endpoints.reply.model, "warmup trigger wired (reply endpoint)");
+            Ok(Some(WarmupServices {
+                generator: Arc::new(generator),
+            }))
+        }
+        Err(AgentError::ProviderConfig(error)) => {
+            warn!(%error, "warmup disabled: no provider configuration; the bot never starts conversations this run");
+            Ok(None)
+        }
+        Err(error) => Err(error).context("failed to build the warmup services"),
+    }
+}
+
 /// Decision 76: opens the DEDICATED one-group Store the deep-recall
 /// store sources need (the chat_id-less KNN/LIKE helpers reject a
 /// multi-group Store with `StoreError::AmbiguousGroup`), the same
@@ -1135,6 +1161,14 @@ async fn run_replay(
         // stays a seam for observers that need no actor state.
         post_digest_hook: None,
         wake,
+        // Decision 78: NO warmup in replay (the decision-73/76
+        // discipline): replay runs the mock adapter and must stay
+        // deterministic and network-free. Warmup scheduling is
+        // wall-clock host-local and would draw slots against replay
+        // wall time, not fixture time. The actor-side test
+        // `unwired_warmup_services_are_fully_inert` covers this inert
+        // path.
+        warmup: None,
         summary_provider,
         outbound: Some(outbound_tx),
         bot_name: Some(setup.bot_name.clone()),
@@ -2338,8 +2372,9 @@ fn format_apply_report(
 
 /// Renders one group status snapshot as aligned text (specs.md Sections
 /// 10.3 and 12). Pure: the unit tests assert the exact shape. Counter
-/// keys absent from the state table print as 0; the rates print only
-/// when wakes_total > 0.
+/// keys absent from the state table print as 0; the rates print per
+/// denominator: the wake rates need wakes_total > 0, the warmup
+/// engagement rate (decision 78 (f)) needs warmups_total > 0.
 ///
 /// The per-group capability of specs.md Section 4.2 is NOT printed: it
 /// is never persisted by design (current-state.md decision 29) and
@@ -2366,6 +2401,8 @@ fn format_group_status(
     let digest_failures = counter("digest_failures_total");
     let summaries_failed = counter("summaries_failed_total");
     let facts_invalidated = counter("facts_invalidated_total");
+    let warmups = counter("warmups_total");
+    let warmup_engaged = counter("warmup_engaged_total");
     let dead_letters_counter = counter("dead_letters_total");
     let last_boundary = counter("last_digest_boundary_msg_id");
     let prev_boundary = counter("prev_digest_boundary_msg_id");
@@ -2390,28 +2427,43 @@ fn format_group_status(
         "    {:<27}{facts_invalidated}",
         "facts_invalidated_total:"
     );
+    let _ = writeln!(out, "    {:<27}{warmups}", "warmups_total:");
+    let _ = writeln!(out, "    {:<27}{warmup_engaged}", "warmup_engaged_total:");
     let _ = writeln!(
         out,
         "    {:<27}{dead_letters_counter}",
         "dead_letters_total:"
     );
-    // The rates are meaningful only once the bot woke at least once.
-    if wakes > 0 {
-        let participation_rate = participations as f64 * 100.0 / wakes as f64;
-        let injection_rate = injection_wakes as f64 * 100.0 / wakes as f64;
+    // A rate is meaningful only once its denominator is non-zero: the
+    // wake rates need a wake, the warmup engagement rate (specs.md
+    // Section 12, decision 78 (f)) needs a warmup — so the rates block
+    // opens when EITHER counter moved, and each line keeps its own gate.
+    if wakes > 0 || warmups > 0 {
         let _ = writeln!(out, "  rates:");
-        let _ = writeln!(
-            out,
-            "    {:<27}{participation_rate:.1}% ({participations}/{wakes}) \
-             (healthy target: below 50%)",
-            "participation rate:"
-        );
-        let _ = writeln!(
-            out,
-            "    {:<27}{injection_rate:.1}% ({injection_wakes}/{wakes}) \
-             (expected band: 20 to 40%)",
-            "injection rate:"
-        );
+        if wakes > 0 {
+            let participation_rate = participations as f64 * 100.0 / wakes as f64;
+            let injection_rate = injection_wakes as f64 * 100.0 / wakes as f64;
+            let _ = writeln!(
+                out,
+                "    {:<27}{participation_rate:.1}% ({participations}/{wakes}) \
+                 (healthy target: below 50%)",
+                "participation rate:"
+            );
+            let _ = writeln!(
+                out,
+                "    {:<27}{injection_rate:.1}% ({injection_wakes}/{wakes}) \
+                 (expected band: 20 to 40%)",
+                "injection rate:"
+            );
+        }
+        if warmups > 0 {
+            let engagement_rate = warmup_engaged as f64 * 100.0 / warmups as f64;
+            let _ = writeln!(
+                out,
+                "    {:<27}{engagement_rate:.1}% ({warmup_engaged}/{warmups})",
+                "warmup engagement rate:"
+            );
+        }
     }
     let _ = writeln!(out, "  boundaries:");
     let _ = writeln!(
@@ -2681,6 +2733,19 @@ async fn run_live(
                                     break;
                                 }
                             };
+                            // Decision 78: the warmup trigger rides the
+                            // SAME per-group resolved endpoints the wake
+                            // build uses (the warmup is a reply-purpose
+                            // call); the degrade doctrine mirrors
+                            // build_wake_services (no provider key, no
+                            // warmup — the actor stays inert).
+                            let warmup = match build_warmup_services(&endpoints) {
+                                Ok(warmup) => warmup,
+                                Err(error) => {
+                                    fatal = Some(error);
+                                    break;
+                                }
+                            };
                             // The Rule C3 summarizer (decision 62), as
                             // in the replay path.
                             let summary_provider =
@@ -2709,6 +2774,7 @@ async fn run_live(
                                 digest,
                                 post_digest_hook: None,
                                 wake,
+                                warmup,
                                 summary_provider,
                                 outbound: Some(outbound_tx.clone()),
                                 bot_name: Some(setup.bot_name.clone()),
@@ -3544,6 +3610,14 @@ mod tests {
             "text:\n{text}"
         );
         assert!(
+            text.contains("warmups_total:             0"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("warmup_engaged_total:      0"),
+            "text:\n{text}"
+        );
+        assert!(
             text.contains("dead_letters_total:        0"),
             "text:\n{text}"
         );
@@ -3570,6 +3644,8 @@ mod tests {
                 ("digest_failures_total", "0"),
                 ("summaries_failed_total", "3"),
                 ("facts_invalidated_total", "4"),
+                ("warmups_total", "10"),
+                ("warmup_engaged_total", "4"),
                 ("dead_letters_total", "2"),
                 ("last_digest_boundary_msg_id", "91"),
                 ("prev_digest_boundary_msg_id", "82"),
@@ -3630,6 +3706,20 @@ mod tests {
             "text:\n{text}"
         );
         assert!(
+            text.contains("warmups_total:             10"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("warmup_engaged_total:      4"),
+            "text:\n{text}"
+        );
+        // The warmup engagement rate (specs.md Section 12, decision 78
+        // (f)): engaged over sent warmups.
+        assert!(
+            text.contains("warmup engagement rate:    40.0% (4/10)"),
+            "text:\n{text}"
+        );
+        assert!(
             text.contains("  dead letters: 2 total (most recent first)\n"),
             "text:\n{text}"
         );
@@ -3650,6 +3740,43 @@ mod tests {
         );
         // The counter and the table count agree: no note.
         assert!(!text.contains("note:"), "text:\n{text}");
+    }
+
+    #[test]
+    fn format_group_status_prints_the_warmup_rate_without_any_wake() {
+        // Regression-pin the rates gate (decision 78 (f)): a group that
+        // warmed up but never woke still shows its warmup engagement
+        // rate; the wake rates stay gated on wakes_total > 0.
+        let status = status_fixture(
+            &[("warmups_total", "3"), ("warmup_engaged_total", "1")],
+            0,
+            Vec::new(),
+        );
+        let text = format_group_status("-1", Path::new("./data/-1/store.db"), &status, 5);
+        assert!(text.contains("  rates:\n"), "text:\n{text}");
+        assert!(
+            text.contains("warmup engagement rate:    33.3% (1/3)"),
+            "text:\n{text}"
+        );
+        assert!(!text.contains("participation rate:"), "text:\n{text}");
+        assert!(!text.contains("injection rate:"), "text:\n{text}");
+    }
+
+    #[test]
+    fn the_example_config_parses_and_keeps_its_group_table() {
+        // Pins tamako.example.toml against drift: the file must always
+        // parse through the real config loader and keep its example
+        // group table. The six decision-78 warmup keys are commented
+        // out in the file (ST3 covers the keys themselves); this guard
+        // catches a key spelling that stops parsing or a dropped table.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tamako.example.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} reads: {error}", path.display()));
+        let config = BotConfig::from_toml_str(&text).expect("the example config parses");
+        assert!(
+            config.overrides.contains_key("-1001234567890"),
+            "the example group table exists"
+        );
     }
 
     #[test]
