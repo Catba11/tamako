@@ -79,11 +79,14 @@ pub const MAX_SCHEDULE_DAYS_AHEAD: u32 = 30;
 /// persisted cooldown dates (decision 78 (c)).
 const DATE_FORMAT: &[FormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
-/// The effective daily quota under the Section 8.5 soft backoff:
-/// max(0, `warmup_quota` − `backoff_factor`). Zero means no warmup
-/// until a successful engagement resets the factor.
+/// The effective daily quota under the Section 8.5 soft backoff as
+/// amended by decision 79 (a): max(1, `warmup_quota` −
+/// `backoff_factor`). The backoff lengthens the spacing through the
+/// 2^factor [`interval_multiplier`] but NEVER zeroes the quota — at
+/// quota 0 the engagement reset (which requires SENDING a warmup) was
+/// unreachable, a silenced-forever fixed point.
 pub fn effective_quota(warmup_quota: u32, backoff_factor: u32) -> u32 {
-    warmup_quota.saturating_sub(backoff_factor)
+    warmup_quota.saturating_sub(backoff_factor).max(1)
 }
 
 /// The Section 8.5 interval multiplier 2^`backoff_factor`. Saturates
@@ -129,8 +132,10 @@ pub fn day_active_window(
 /// ever committed — the returned `warmup_next_at` persists (Rule P1:
 /// a restart never reshuffles); unchosen candidate points evaporate.
 ///
-/// `None` when the effective quota is 0 (the Section 8.5 backoff maxed
-/// out — no warmup until the factor resets).
+/// `None` when the effective quota is 0 — unreachable in practice: the
+/// decision-79 (a) floor keeps the effective quota ≥ 1. The arm below
+/// stays as a defensive invariant guarding the `span / quota`
+/// division; a zero here would mean a future change broke the floor.
 ///
 /// Lower bound: the point must be ≥ `now`, and — when `prev` is `Some`
 /// (the slot being replaced, i.e. the slot that just fired or was
@@ -160,6 +165,9 @@ pub fn schedule_next(
     rng: &mut impl Rng,
 ) -> Option<OffsetDateTime> {
     let quota = effective_quota(config.warmup_quota, backoff_factor);
+    // Defensive invariant: the decision-79 (a) floor guarantees
+    // quota ≥ 1, so this arm is dead — a zero here would mean a future
+    // change broke the floor; no slots rather than a division by zero.
     if quota == 0 {
         return None;
     }
@@ -396,12 +404,16 @@ mod tests {
     }
 
     #[test]
-    fn effective_quota_saturates_at_zero() {
-        // specs.md Section 8.5: max(0, quota − factor).
+    fn effective_quota_floors_at_one() {
+        // specs.md Section 8.5 as amended by decision 79 (a): max(1,
+        // quota − factor). The backoff lengthens the spacing through
+        // the 2^factor multiplier but never zeroes the quota — quota 1
+        // with factor 3 still schedules, eight windows out.
         assert_eq!(effective_quota(3, 0), 3);
         assert_eq!(effective_quota(3, 1), 2);
-        assert_eq!(effective_quota(1, 1), 0);
-        assert_eq!(effective_quota(2, 10), 0);
+        assert_eq!(effective_quota(1, 1), 1);
+        assert_eq!(effective_quota(2, 10), 1);
+        assert_eq!(interval_multiplier(3), 8);
     }
 
     #[test]
@@ -448,8 +460,11 @@ mod tests {
     }
 
     #[test]
-    fn schedule_next_returns_none_when_the_backoff_zeroes_the_quota() {
-        // Section 8.5: quota 1 with factor 1 has effective quota 0.
+    fn schedule_next_still_schedules_at_the_quota_floor() {
+        // Decision 79 (a): the effective quota can no longer reach 0 —
+        // quota 1 with factor 1 floors at 1 (the decision-78 reading
+        // returned None here), so the backoff only widens the spacing
+        // and the slot still schedules.
         let config = config(1, "08:00-23:00");
         let mut rng = StdRng::seed_from_u64(1);
         let scheduled = schedule_next(
@@ -460,7 +475,7 @@ mod tests {
             UtcOffset::UTC,
             &mut rng,
         );
-        assert_eq!(scheduled, None);
+        assert!(scheduled.is_some());
     }
 
     #[test]

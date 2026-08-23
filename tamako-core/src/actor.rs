@@ -7679,37 +7679,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_due_slot_is_skipped_when_the_effective_quota_is_zero() {
-        // Section 8.5: quota 1 with backoff factor 1 has effective
-        // quota 0. TZ-safe: the consume reschedule draws nothing
-        // (schedule_next returns None at effective quota 0).
+    async fn the_quota_floor_keeps_a_due_slot_firing_under_backoff() {
+        // Decision 79 (a), replacing the decision-78 zero-floor skip
+        // test: the effective quota floors at 1, so quota 1 with
+        // backoff factor 3 no longer gate-skips — the slot FIRES, and
+        // the backoff only lengthens the spacing: the rescheduled slot
+        // honors the 2^3 = 8× window gap.
         let fixture = make_fixture();
         let due = t0() + time::Duration::hours(1);
         seed_state(
             &fixture,
             &[
                 ("warmup_next_at", rfc3339(due)),
-                ("warmup_backoff_factor", "1".to_string()),
+                ("warmup_backoff_factor", "3".to_string()),
             ],
         )
         .await;
-        let capture = EventCapture::default();
-        let _guard = tracing::subscriber::set_default(capture.clone());
-        let generator = ScriptedWarmup::new("never used");
+        let generator = ScriptedWarmup::new("warmup hello");
         fixture.memory.set_topics(vec![topic("Tea")]);
-        let (handle, mut outbound) =
-            spawn_with_warmup(&fixture, warmup_config(), generator.clone());
+        let config = warmup_config();
+        let (handle, mut outbound) = spawn_with_warmup(&fixture, config.clone(), generator.clone());
 
         handle
             .send(ActorCommand::Tick(due))
             .await
             .expect("send succeeds");
+        wait_for_warmup_calls(&generator, 1).await;
+        assert_eq!(generator.call_count(), 1);
+        let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "warmup hello");
+        wait_for_counter(&fixture.store, "warmups_total", 1).await;
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direction, Direction::Outbound);
+
+        // The reschedule at fire time: effective quota 1 makes the
+        // whole active window one slot (the span comes from the
+        // config's own "00:00-23:59"), and factor 3 pushes the next
+        // slot ≥ 8 windows past the fired one.
         let session = handle.snapshot().await.expect("snapshot succeeds");
-        assert_eq!(session.warmup_next_at, None, "the slot was consumed");
-        assert!(capture.contains("gate=\"quota\""));
-        assert_eq!(generator.call_count(), 0);
-        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
-        assert!(list_messages(&fixture.store).await.is_empty());
+        let next_at = session
+            .warmup_next_at
+            .expect("the floor keeps the next slot schedulable");
+        let min_gap_secs =
+            config.warmup_active_hours.span_seconds() * crate::warmup::interval_multiplier(3);
+        assert!(
+            next_at >= due + time::Duration::seconds(min_gap_secs as i64),
+            "the next slot honors the 2^3 spacing: {next_at} ≥ {due} + {min_gap_secs} s"
+        );
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
@@ -8194,13 +8211,15 @@ mod tests {
         let generator = ScriptedWarmup::new("warmup hello");
         fixture.memory.set_topics(vec![topic("Tea")]);
 
-        // Phase 1: a gate-skipped slot (effective quota 0) — no line.
+        // Phase 1: a gate-skipped slot (the muted gate — the
+        // decision-79 (a) floor keeps the effective quota ≥ 1, so the
+        // quota gate can no longer skip on a zeroed quota) — no line.
         let due = t0();
         seed_state(
             &fixture,
             &[
                 ("warmup_next_at", rfc3339(due)),
-                ("warmup_backoff_factor", "1".to_string()),
+                ("muted_flag", "1".to_string()),
             ],
         )
         .await;
@@ -8211,10 +8230,16 @@ mod tests {
             .await
             .expect("send succeeds");
         let session = handle.snapshot().await.expect("snapshot succeeds");
-        assert_eq!(
-            session.warmup_next_at, None,
+        assert_ne!(
+            session.warmup_next_at,
+            Some(due),
             "the skipped slot was consumed"
         );
+        assert!(
+            session.warmup_next_at.is_some(),
+            "the next slot is scheduled"
+        );
+        assert_eq!(generator.call_count(), 0);
         // No curated line: it is the only event kind that carries
         // action="sent" together with the `warmup` message.
         assert_eq!(
@@ -8225,13 +8250,14 @@ mod tests {
         handle.shutdown().await.expect("shutdown succeeds");
 
         // Phase 2: a real fire — exactly ONE curated line, naming the
-        // topic, on the same capture.
+        // topic, on the same capture. The reseed lifts the Phase-1
+        // mute (the seeded state persists on the same store).
         let due2 = t0() + time::Duration::hours(2);
         seed_state(
             &fixture,
             &[
                 ("warmup_next_at", rfc3339(due2)),
-                ("warmup_backoff_factor", "0".to_string()),
+                ("muted_flag", "0".to_string()),
             ],
         )
         .await;
