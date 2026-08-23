@@ -74,8 +74,9 @@ pub struct SessionState {
     /// specs.md Section 5.2 (decision 78 (b)): the host-local date
     /// ("YYYY-MM-DD") the quota counter belongs to.
     pub warmup_quota_day: Option<String>,
-    /// specs.md Sections 5.2/8.5 (decision 78 (d)): the soft-backoff
-    /// factor; the effective quota is max(0, quota − factor).
+    /// specs.md Sections 5.2/8.5 (decisions 78 (d)/79 (a)): the
+    /// soft-backoff factor; the effective quota is max(1, quota −
+    /// factor).
     pub warmup_backoff_factor: u32,
     /// specs.md Sections 5.2/9.7 step 2 (decision 78 (b)): normalized
     /// topic name -> last-used host-local date ("YYYY-MM-DD").

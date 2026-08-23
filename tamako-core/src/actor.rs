@@ -53,6 +53,20 @@
 //!    records the bot message for the monologue lock.
 //! 5. Done at start (refer to step 3).
 //!
+//! The forced-wake cooldown (specs.md Sections 8.1/6.2, decision 79
+//! (c)): a forced wake that produced a reply starts an in-memory
+//! cooldown (`forced_wake_cooldown`, default 10 s, 0 disables)
+//! anchored at the forcing message's intake timestamp — the same
+//! deterministic replay clock the intake path compares on. A forcing
+//! arriving inside the window is suppressed: the row is persisted and
+//! enters the context as today (Rule P1 untouched — it lands in the
+//! next wake's presented set, so no information is lost), but no wake
+//! fires, nothing queues, and `forced_pending`/`wake_last_row_id` stay
+//! untouched. The cooldown suppresses the back-to-back reply chains of
+//! a mention/reply rally. It is a rate limiter, NOT rebuild state: on
+//! a restart (Rule P1) it is simply not running, and the rebuild stays
+//! bit-identical.
+//!
 //! The warmup trigger (specs.md Sections 8.4/8.5/9.7, decision 78) is
 //! live since Phase 2. It is evaluated ONLY on the timer tick, AFTER the
 //! wake evaluation (the tick order is Digest → Wake → Warmup); intake
@@ -1050,6 +1064,12 @@ async fn run_actor<M: MemoryBackend>(
     // requeue-once mark of decision 65.
     let mut wake_in_flight = false;
     let mut forced_pending: Option<ForcedWakeEntry> = None;
+    // The forced-wake cooldown (specs.md Sections 8.1/6.2, decision 79
+    // (c)): a forced wake that produced a reply suppresses new forcings
+    // until this instant. An in-memory rate limiter, NOT persisted —
+    // on a rebuild (Rule P1) the cooldown is simply not running, which
+    // is acceptable; nothing about the rebuild changes (bit-identical).
+    let mut forced_cooldown_until: Option<OffsetDateTime> = None;
     // One warmup generation at a time per group (decision 78, the
     // Section 6.1 rule-3 analog): the flag lives in memory next to
     // `wake_in_flight`; the spawned task's `WarmupCompleted` report
@@ -1094,6 +1114,7 @@ async fn run_actor<M: MemoryBackend>(
                     wake_services.as_ref(),
                     &mut wake_in_flight,
                     &mut forced_pending,
+                    forced_cooldown_until,
                     &inbox_sender,
                     msg,
                 )
@@ -1285,6 +1306,8 @@ async fn run_actor<M: MemoryBackend>(
                             outbound.as_ref(),
                             &bot_name,
                             report,
+                            forced.as_ref().map(|entry| entry.forced_at),
+                            &mut forced_cooldown_until,
                         )
                         .await?;
                     }
@@ -1294,25 +1317,38 @@ async fn run_actor<M: MemoryBackend>(
                 // wake completes. The intake time of the forcing message
                 // is its `now` (deterministic replay). A forced wake
                 // requeued by the failure path above starts here too.
+                // Decision 79 (c) extension: when the completion JUST
+                // started the forced-wake cooldown (the reply went out),
+                // a queued forcing inside the window is dropped with the
+                // suppression DEBUG — otherwise it would fire immediately
+                // and produce the back-to-back replies the cooldown
+                // rules against. The drop leaves no queue entry
+                // (specs.md Section 6.2); the mention is already in the
+                // log/context and lands in the next natural wake's
+                // presented set.
                 if let Some(services) = wake_services.as_ref() {
                     if let Some(entry) = forced_pending.take() {
-                        let forced_at = entry.forced_at;
-                        start_wake(
-                            &store,
-                            &chat_id,
-                            &config,
-                            &mut session,
-                            &mut wake,
-                            &mut rng,
-                            &context,
-                            services,
-                            &mut wake_in_flight,
-                            &inbox_sender,
-                            Some(entry),
-                            forced_at,
-                            "forced",
-                        )
-                        .await?;
+                        if forced_cooldown_until.is_some_and(|until| entry.forced_at < until) {
+                            debug!(chat_id = %chat_id, "forced wake suppressed: the forced-wake cooldown is running");
+                        } else {
+                            let forced_at = entry.forced_at;
+                            start_wake(
+                                &store,
+                                &chat_id,
+                                &config,
+                                &mut session,
+                                &mut wake,
+                                &mut rng,
+                                &context,
+                                services,
+                                &mut wake_in_flight,
+                                &inbox_sender,
+                                Some(entry),
+                                forced_at,
+                                "forced",
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -1740,6 +1776,9 @@ async fn handle_message(
     wake_services: Option<&WakeServices>,
     wake_in_flight: &mut bool,
     forced_pending: &mut Option<ForcedWakeEntry>,
+    // The forced-wake cooldown (decision 79 (c)); intake only READS it
+    // (a copy — the completion handler owns the mutation).
+    forced_cooldown_until: Option<OffsetDateTime>,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     msg: NormalizedMessage,
 ) -> Result<(), CoreError> {
@@ -1863,7 +1902,14 @@ async fn handle_message(
             text: msg.text.clone(),
         });
     if let Some(forcing) = forcing {
-        if *wake_in_flight {
+        if forced_cooldown_until.is_some_and(|until| now < until) {
+            // Suppressed (specs.md Sections 8.1/6.2, decision 79 (c)):
+            // the row is persisted and in the context (Rule P1
+            // untouched — it lands in the next wake's presented set);
+            // NO wake fires, NO queue entry, `forced_pending`
+            // untouched, `wake_last_row_id` untouched.
+            debug!(chat_id = %chat_id, "forced wake suppressed: the forced-wake cooldown is running");
+        } else if *wake_in_flight {
             // Section 6.2: a forced Wake moves to the head of the queue;
             // it does not preempt a running call. It starts immediately
             // after the current wake completes. A second forced wake
@@ -2048,9 +2094,10 @@ async fn handle_tick<M: MemoryBackend>(
 /// slot — `warmup_next_at` reschedules from the spent slot (`prev =
 /// Some(due)`, so the Section 8.5 backoff spacing applies), never a
 /// same-slot retry — and persist. The caller logs the one DEBUG line
-/// naming the failed gate first. A `None` schedule (an effective quota
-/// of 0, or the pathological-multiplier bound) is retried on a later
-/// tick, costing nothing.
+/// naming the failed gate first. A `None` schedule is a defensive
+/// invariant: decision 79 (a) floored the effective quota at 1, so
+/// only the pathological-multiplier bound of `schedule_next` can yield
+/// `None`; it is retried on a later tick, costing nothing.
 #[allow(clippy::too_many_arguments)]
 async fn consume_warmup_slot(
     store: &Arc<Store>,
@@ -2127,8 +2174,9 @@ async fn handle_warmup_tick<M: MemoryBackend>(
     // Scheduling (Section 8.4, Rule P1): a fresh group draws its first
     // slot once and persists it; a restart never reshuffles. The fresh
     // slot is in the future by construction, so this tick is done
-    // either way; an effective-quota-0 `None` is retried on a later
-    // tick, costing nothing.
+    // either way; a `None` (defensive: decision 79 (a) floored the
+    // effective quota at 1, so only the pathological-multiplier bound
+    // can yield it) is retried on a later tick, costing nothing.
     if session.warmup_next_at.is_none() {
         session.warmup_next_at = schedule_next(
             config,
@@ -2846,6 +2894,11 @@ async fn handle_wake_report(
     outbound: Option<&mpsc::Sender<OutboundAction>>,
     bot_name: &str,
     report: WakeReport,
+    // The anchor of the forced-wake cooldown (decision 79 (c)): the
+    // forcing message's intake timestamp of this completion's forced
+    // entry, `None` for an unforced wake.
+    forced_reply_at: Option<OffsetDateTime>,
+    forced_cooldown_until: &mut Option<OffsetDateTime>,
 ) -> Result<(), CoreError> {
     // The injection lifecycle of Section 9. The injections were planned
     // in step 2 (recall), BEFORE the participation decision, so they
@@ -3013,6 +3066,29 @@ async fn handle_wake_report(
     // rule 4.
     bump_counter(store, chat_id, "participations_total").await;
     persist_session(store, chat_id, session).await?;
+    // Decision 79 (c): the reply of a FORCED wake went out — start the
+    // forced-wake cooldown. The anchor is the FORCING MESSAGE's intake
+    // timestamp (`ForcedWakeEntry.forced_at`), NOT the wall-clock send
+    // time: the intake path compares on the deterministic replay clock
+    // (`msg.timestamp`), where a wall-clock anchor would be incoherent
+    // (replay fixtures carry historical timestamps — every later forced
+    // wake would read as inside a window anchored at the real now).
+    // Anchoring at `forced_at` keeps live and replay on one clock; in
+    // live, message timestamps are wall-clock, so the window matches
+    // the ruled seconds of wall time. A zero cooldown disables the
+    // suppression. The early-return arms above (gate-no,
+    // discarded-stale, outbound-row failure) produce NO send, so they
+    // start NO cooldown; a failed wake (the `Err` arm of
+    // `WakeCompleted`) starts nothing either.
+    if report.forced && !config.forced_wake_cooldown.is_zero() {
+        // A forced completion always carries its forced entry; the
+        // `if let` is the defensive invariant.
+        if let Some(forced_at) = forced_reply_at {
+            let span = time::Duration::try_from(config.forced_wake_cooldown)
+                .unwrap_or(time::Duration::MAX);
+            *forced_cooldown_until = Some(forced_at.saturating_add(span));
+        }
+    }
     // The curated line of this wake: the reply went out.
     log_wake_line(
         chat_id,
@@ -5348,6 +5424,15 @@ mod tests {
                 .len()
         }
 
+        /// Every recorded gate input, in call order (the forced-wake
+        /// cooldown tests inspect the presented set).
+        fn calls(&self) -> Vec<GateInput> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
         /// Every context view the gate received, in call order
         /// (decision 72).
         fn views(&self) -> Vec<Option<String>> {
@@ -6449,9 +6534,17 @@ mod tests {
         let hold = Arc::new(Notify::new());
         let gate = ScriptedGate::yes(GateTarget::Last);
         let reply = ScriptedReply::held("monologue reply", Arc::clone(&hold));
+        // Decision 79 (c): this test drives two forced wakes 1 s apart
+        // and needs BOTH replies (its subject is the monologue lock,
+        // not the cooldown), so the forced-wake cooldown is disabled;
+        // the default 10 s would suppress the queued second forcing.
+        let config = TriggerConfig {
+            forced_wake_cooldown: Duration::ZERO,
+            ..wake_config(3)
+        };
         let (handle, mut outbound) = spawn_with_wake(
             &fixture,
-            wake_config(3),
+            config,
             Arc::new(NoopRecall),
             Arc::clone(&gate),
             Arc::clone(&reply),
@@ -7004,6 +7097,233 @@ mod tests {
         assert_eq!(gate.call_count(), 1);
         assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
         handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    // --- Decision 79 (c) forced-wake cooldown tests ---
+
+    #[tokio::test]
+    async fn a_forced_reply_starts_the_cooldown_and_suppresses_the_next_forcing() {
+        // specs.md Sections 8.1/6.2, decision 79 (c): a forced wake
+        // that produced a reply starts the 10 s cooldown anchored at
+        // the forcing message's intake timestamp (m1 at t0+1 s, so the
+        // window runs to t0+11 s). A forcing inside the window is
+        // suppressed — the row is persisted and in the context, but NO
+        // wake fires and NO queue entry forms; a forcing past the
+        // window fires normally.
+        let fixture = make_fixture();
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("cooldown reply");
+        // A high count: only a mention can fire the wake.
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(100),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+        let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "cooldown reply");
+        assert_eq!(reply_to, Some("m1".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+
+        // The second mention lands INSIDE the window: suppressed. The
+        // one DEBUG line names the suppression (decision 53: no
+        // curated `wake` line — no wake happened).
+        handle
+            .send_event(InboundEvent::Message(message("m2", 6, true)))
+            .await
+            .expect("send succeeds");
+        wait_for_event(
+            &capture,
+            "forced wake suppressed: the forced-wake cooldown is running",
+        )
+        .await;
+        // No wake, no reply, no new outbound row, no queued entry
+        // (a queued entry would fire its own wake later — the totals
+        // below prove none exists).
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+        assert_eq!(reply.call_count(), 1);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(1));
+        assert_eq!(list_messages(&fixture.store).await.len(), 3);
+
+        // Past the window a forcing fires normally — and the suppressed
+        // mention never produced its own wake (2 wakes total, one per
+        // fired mention).
+        handle
+            .send_event(InboundEvent::Message(message("m3", 12, true)))
+            .await
+            .expect("send succeeds");
+        let (_, _, third_reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(third_reply_to, Some("m3".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 2).await;
+        assert_eq!(reply.call_count(), 2);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_zero_cooldown_disables_the_suppression() {
+        // Decision 79 (c): `forced_wake_cooldown = 0` disables the
+        // suppression — two mentions 1 s apart produce two replies
+        // (the pre-79 rally shape).
+        let fixture = make_fixture();
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("rally reply");
+        let config = TriggerConfig {
+            forced_wake_cooldown: Duration::ZERO,
+            ..wake_config(100)
+        };
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            config,
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        for (id, seconds) in [("m1", 1), ("m2", 2)] {
+            handle
+                .send_event(InboundEvent::Message(message(id, seconds, true)))
+                .await
+                .expect("send succeeds");
+            let (_, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+            assert_eq!(text, "rally reply");
+            assert_eq!(reply_to, Some(id.to_string()));
+        }
+        wait_for_counter(&fixture.store, "participations_total", 2).await;
+        assert_eq!(reply.call_count(), 2);
+        assert_eq!(counter_value(&fixture.store, "wakes_total").await, Some(2));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_suppressed_mention_lands_in_the_next_wakes_presented_set() {
+        // Decision 79 (c), Rule P1: the suppression touches the TRIGGER
+        // only — the suppressed mention is persisted and enters the
+        // live context exactly as today, so the NEXT wake presents it
+        // and no information is lost.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("presented reply");
+        // Count threshold 1: after the suppression a Tick fires an
+        // unforced wake over the suppressed mention.
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(1),
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+        expect_send_text(next_action(&mut outbound).await);
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+
+        // Inside the window (t0+6 s < t0+11 s): suppressed.
+        handle
+            .send_event(InboundEvent::Message(message("m2", 6, true)))
+            .await
+            .expect("send succeeds");
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+
+        // The intake was untouched: the raw log holds both mentions
+        // (m1, the bot reply, m2) and the live context carries the
+        // suppressed one.
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.text == "text of m2"));
+        let items = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert!(items.iter().any(|item| item.content.contains("text of m2")));
+
+        // The next (unforced, tick) wake presents the suppressed
+        // mention: its row is in the gate input, and the wake answers
+        // it.
+        handle
+            .send(ActorCommand::Tick(t0() + time::Duration::seconds(100)))
+            .await
+            .expect("send succeeds");
+        wait_for_gate_calls(&gate, 1).await;
+        let presented = &gate.calls()[0].new_messages;
+        assert!(
+            presented.iter().any(|msg| msg.text == "text of m2"),
+            "the suppressed mention is in the presented set: {presented:?}"
+        );
+        let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "presented reply");
+        wait_for_counter(&fixture.store, "participations_total", 2).await;
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn the_cooldown_does_not_survive_a_restart_and_the_rebuild_is_identical() {
+        // Decision 79 (c): the cooldown is IN-MEMORY actor state, NOT
+        // P1 rebuild state — on a restart it is simply not running
+        // (accepted), and the rebuilt session/context is bit-identical
+        // to a no-cooldown restart (the cooldown left no persisted
+        // trace).
+        let fixture = make_fixture();
+        let gate = ScriptedGate::no();
+        let reply = ScriptedReply::new("restart reply");
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(100),
+            Arc::new(NoopRecall),
+            gate,
+            reply,
+        );
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, true)))
+            .await
+            .expect("send succeeds");
+        expect_send_text(next_action(&mut outbound).await);
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+        // The reply started the cooldown (window: t0+1 s .. t0+11 s).
+        let first = handle.snapshot().await.expect("snapshot succeeds");
+        let first_context = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        handle.shutdown().await.expect("shutdown succeeds");
+
+        // A NEW actor on the same store: the rebuild is bit-identical
+        // (the `restart_rebuilds_identical_state` pattern).
+        let (restarted, mut restarted_outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(100),
+            Arc::new(NoopRecall),
+            ScriptedGate::no(),
+            ScriptedReply::new("after restart"),
+        );
+        let rebuilt = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(first, rebuilt);
+        let rebuilt_context = restarted
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(first_context, rebuilt_context);
+
+        // The accepted rebuild behavior: no cooldown is running after
+        // the restart, so a mention well INSIDE the original window
+        // (t0+2 s < t0+11 s) fires immediately.
+        restarted
+            .send_event(InboundEvent::Message(message("m2", 2, true)))
+            .await
+            .expect("send succeeds");
+        let (_, text, reply_to) = expect_send_text(next_action(&mut restarted_outbound).await);
+        assert_eq!(text, "after restart");
+        assert_eq!(reply_to, Some("m2".to_string()));
+        wait_for_counter(&fixture.store, "participations_total", 2).await;
+        restarted.shutdown().await.expect("shutdown succeeds");
     }
 
     // --- M5 injection-protocol tests ---

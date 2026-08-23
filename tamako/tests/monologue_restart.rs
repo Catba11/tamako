@@ -331,6 +331,11 @@ async fn monologue_lock_survives_a_restart_and_unlocks_on_a_human_message() {
         // A fixed jitter makes the current interval exactly 60 s.
         wake_jitter_min: 1.0,
         wake_jitter_max: 1.0,
+        // The subject is the monologue lock, not the cooldown: the two
+        // mentions below arrive 1 s apart and must BOTH force a wake.
+        // Decision 79 (c)'s 10 s forced-wake cooldown would suppress the
+        // second — 0 disables it (specs.md Section 8.1).
+        forced_wake_cooldown: Duration::ZERO,
         ..TriggerConfig::default()
     };
 

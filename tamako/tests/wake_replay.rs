@@ -652,6 +652,11 @@ async fn monologue_lock_suppresses_unforced_wakes_until_a_human_message() {
         // A fixed jitter makes the current interval exactly 60 s.
         wake_jitter_min: 1.0,
         wake_jitter_max: 1.0,
+        // The subject is the monologue lock, not the cooldown: m1/m2
+        // arrive seconds apart and must both force a wake; decision
+        // 79 (c)'s default 10 s cooldown would suppress m2 — 0 disables
+        // it (specs.md Section 8.1).
+        forced_wake_cooldown: Duration::ZERO,
         ..TriggerConfig::default()
     };
     // Rows: m1=1, m2=2 (both intaken before the first completion),
@@ -872,6 +877,11 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
         wake_msg_count: 3,
         wake_floor: Duration::ZERO,
         wake_interval: HUGE_INTERVAL,
+        // The subject is the parrot filter, not the cooldown: the
+        // scenario mentions the bot repeatedly within seconds; decision
+        // 79 (c)'s default 10 s forced-wake cooldown would suppress the
+        // later forcings — 0 disables it (specs.md Section 8.1).
+        forced_wake_cooldown: Duration::ZERO,
         ..TriggerConfig::default()
     };
     // Forced wakes bypass the gate; an exhausted scripted gate fails
