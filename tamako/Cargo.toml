@@ -20,6 +20,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # Decision 77 (H5): the per-group cross-process lock (.tamako.lock).
 fd-lock.workspace = true
+# Decision 80: the live-mode persona hot-reload watcher (persona_watch.rs).
+notify.workspace = true
 # Timestamps. GroupActorParams.started_at is a time::OffsetDateTime.
 time.workspace = true
 
