@@ -684,8 +684,10 @@ fn vector_counter(store: &Store, key: &str) -> Option<String> {
 async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_nodes() {
     // The decision-73 acceptance test: ONE scripted batch through the
     // full pipeline TWICE (a replayed/retried batch, specs.md Section
-    // 10.3). Run 1: "Al" auto-matches the pre-seeded person node
-    // (similarity 1.0 >= 0.92, the matched counter increments); "GRPO"
+    // 10.3). Run 1: "Al" hits the pre-seeded person node in the top
+    // band (similarity 1.0 >= 0.92) — a Person binding, so decision
+    // 79 (b) confirms it first; the accept binds the reused id (the
+    // confirmed counter increments); "GRPO"
     // finds no compatible hit and creates its deterministic concept
     // node. Between the runs the decision-66 WORKER is emulated by
     // upserting the run-1 concept node's embedding into the sidecar
@@ -711,12 +713,16 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
     // ONE batched embeddings call covers both unresolved entities, in
     // graph order: "Al" identical to the seeded candidate, "GRPO"
     // orthogonal to every indexed vector. Run 2 needs no second batch:
-    // the run-1 alias edges bind both entities deterministically.
+    // the run-1 alias edges bind both entities deterministically. The
+    // decision-79 (b) top-band Person confirmation accepts.
     let provider = Arc::new(ScriptedEmbedder::with_batches(vec![vec![
         unit_vector(0),
         unit_vector(1),
     ]]));
-    let confirmer = Arc::new(ScriptedConfirmer::with_answers(vec![]));
+    let confirmer = Arc::new(ScriptedConfirmer::with_answers(vec![ConfirmationAnswer {
+        same: true,
+        reason: "scripted: the same person".to_string(),
+    }]));
     let pipeline = prescreen_pipeline(
         &store,
         &memory,
@@ -746,17 +752,19 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
         }
         other => panic!("expected Extracted, got {other:?}"),
     }
-    // The auto-match bound "Al" to the seeded node; no confirmation ran.
+    // The decision-79 (b) confirmation bound "Al" to the seeded node;
+    // a top-band Person confirm counts as `confirmed`, never as an
+    // auto-match.
     assert_eq!(
-        vector_counter(&store, "vector_resolution_matched_total"),
+        vector_counter(&store, "vector_resolution_confirmed_total"),
         Some("1".to_string())
     );
     assert_eq!(
-        vector_counter(&store, "vector_resolution_confirmed_total"),
+        vector_counter(&store, "vector_resolution_matched_total"),
         None
     );
     assert_eq!(provider.call_count(), 1);
-    assert!(confirmer.calls().is_empty());
+    assert_eq!(confirmer.calls().len(), 1);
 
     // The worker emulation: the run-1 concept node's embedding lands in
     // the sidecar index before the replay.
@@ -817,11 +825,11 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
         "one person node across the replay"
     );
     // (c) The run-1 alias edges made step 2 deterministic: the replay
-    // did not even call the provider, and the matched counter did not
-    // double.
+    // did not even call the provider, and the confirmed counter did
+    // not double.
     assert_eq!(provider.call_count(), 1);
     assert_eq!(
-        vector_counter(&store, "vector_resolution_matched_total"),
+        vector_counter(&store, "vector_resolution_confirmed_total"),
         Some("1".to_string())
     );
 }

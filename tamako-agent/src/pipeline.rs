@@ -1411,12 +1411,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_auto_match_binds_and_increments_the_matched_counter() {
-        // Decision 73 end to end: "Al" reaches step 3, the seeded
-        // person node is a top-band hit (sim 1.0 >= 0.92), the entity
-        // reuses the node id, no confirmation call runs, and the
-        // state-table counter increments (the house counter mechanism
-        // of specs.md Section 12).
+    async fn the_person_top_band_confirms_and_increments_the_confirmed_counter() {
+        // Decision 79 (b) end to end: "Al" reaches step 3, the seeded
+        // person node is a top-band hit (sim 1.0 >= 0.92) — a
+        // PERSON-kind binding, so the budget-capped confirmation call
+        // runs (the same call the middle band makes); the accept binds
+        // the reused id and the `confirmed` state-table counter
+        // increments (the house counter mechanism of specs.md Section
+        // 12). No auto-match happened: `matched` stays absent.
         let (dir, store, memory) = enqueue_fixtures();
         al_messages(&store);
         seed_person_node(&memory, &person_id("1001"), "Alice").await;
@@ -1428,7 +1430,12 @@ mod tests {
         let provider = Arc::new(ScriptedEmbedder::with_batches(vec![vec![
             prescreen_unit_vector(0),
         ]]));
-        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![]));
+        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![
+            crate::resolve::ConfirmationAnswer {
+                same: true,
+                reason: "scripted".to_string(),
+            },
+        ]));
         let pipeline = enqueue_pipeline(
             &store,
             &memory,
@@ -1459,17 +1466,19 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
+                .get_state(ENQUEUE_CHAT, "vector_resolution_confirmed_total")
                 .expect("state"),
             Some("1".to_string())
         );
+        // A top-band Person confirm is NEVER an auto-match (decision
+        // 79 (b)): the matched counter does not move.
         assert_eq!(
             store
-                .get_state(ENQUEUE_CHAT, "vector_resolution_confirmed_total")
+                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
                 .expect("state"),
             None
         );
-        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(confirmer.calls().len(), 1);
         assert_eq!(provider.call_count(), 1);
     }
 
@@ -1983,10 +1992,11 @@ mod tests {
     #[tokio::test]
     async fn a_retried_attempt_bumps_the_vector_counters_once() {
         // Decision 77: attempt 1 resolves "Al" through the pre-screen
-        // (an auto-match) and then fails the graph commit; attempt 2
-        // re-resolves (another auto-match) and commits. The counters
-        // reflect ONE resolution pass — the FINAL attempt's stats —
-        // not the per-attempt sum.
+        // (a top-band Person binding — decision 79 (b) confirms it) and
+        // then fails the graph commit; attempt 2 re-resolves (another
+        // confirmation accept) and commits. The counters reflect ONE
+        // resolution pass — the FINAL attempt's stats — not the
+        // per-attempt sum.
         let (dir, store, memory) = enqueue_fixtures();
         al_messages(&store);
         seed_person_node(&memory, &person_id("1001"), "Alice").await;
@@ -1996,12 +2006,20 @@ mod tests {
             .expect("seed embedding");
 
         // Two extraction answers (one per attempt); the provider
-        // answers the batched pre-screen call twice.
+        // answers the batched pre-screen call twice, and each attempt's
+        // Person top band makes ONE confirmation call.
         let provider = Arc::new(ScriptedEmbedder::with_batches(vec![
             vec![prescreen_unit_vector(0)],
             vec![prescreen_unit_vector(0)],
         ]));
-        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![]));
+        let accept = || crate::resolve::ConfirmationAnswer {
+            same: true,
+            reason: "scripted".to_string(),
+        };
+        let confirmer = Arc::new(crate::resolve::ScriptedConfirmer::with_answers(vec![
+            accept(),
+            accept(),
+        ]));
         let failing_memory = FailOnceUpsert {
             inner: Arc::clone(&memory),
             failures_left: std::sync::atomic::AtomicU32::new(1),
@@ -2033,12 +2051,20 @@ mod tests {
         assert!(matches!(outcome, DigestOutcome::Extracted { .. }));
 
         // ONE resolution pass counted: the retried attempt's
-        // auto-match did not double-count.
+        // confirmation accept did not double-count.
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "vector_resolution_confirmed_total")
+                .expect("state"),
+            Some("1".to_string())
+        );
+        // A top-band Person confirm is never an auto-match (decision
+        // 79 (b)): the matched counter does not move.
         assert_eq!(
             store
                 .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
                 .expect("state"),
-            Some("1".to_string())
+            None
         );
         // The failed attempt itself is still counted.
         assert_eq!(
