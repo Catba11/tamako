@@ -1685,6 +1685,45 @@ v0.0.1 (alpha).
     specs.md Sections 5.3 (loaded-once wording), 6.1 (inbox
     variant), 7.2 C4 (the mechanism), 13 (no new keys).
 
+81. **Embedding model switch to Gemini (2026-08-18,
+    operator-ruled).** The default embedding pair becomes
+    OpenRouter `google/gemini-embedding-2` at its NATIVE 3072
+    dimensions (operator confirmed: the OpenRouter id is exactly
+    `google/gemini-embedding-2`, served by google-vertex with ZDR;
+    per Google's own docs 3072 is the top of the Matryoshka
+    ladder, i.e. the full vector, not a truncation). Because the
+    target dimension IS the model's native dimension, the
+    OpenAI-compatible `dimensions` parameter OpenRouter may or may
+    not pass through is behaviorally irrelevant — the response is
+    3072 either way, and the hard dimension pin (a startup/lint
+    error on any other length) is the guard. (a) MIGRATION v11 —
+    the v8 template again: DROP `node_embeddings`, recreate with
+    `float[3072]`, clear the done journal (a full re-embed on next
+    boot; burst drain applies). Additive-only, no old rows touched.
+    (b) DIMENSION CONSTANT — `tamako-store::EMBEDDING_DIM` and
+    `tamako-agent::endpoint::EMBEDDING_DIMS` both become 3072
+    (single-source by the same const pair; every consumer derives
+    from them). (c) DEFAULT MODEL — `TriggerConfig::embedding_model`
+    default becomes `google/gemini-embedding-2` (per-group
+    override + env unchanged); tamako.example.toml documents the
+    new pair. (d) THRESHOLDS RESET TO PROVISIONAL —
+    `vector_match_threshold` / `vector_candidate_threshold` /
+    `merge_candidate_threshold` carry the SAME provisional numbers
+    (0.92/0.80/0.85) but their calibration status resets to
+    UNCALIBRATED: the qwen-derived values do not transfer
+    verbatim, and recalibration against the live
+    `vector_resolution_*` counters + the merge-tool candidate
+    corpus is part of the next deploy observation window (the
+    counters are the instrument); (e) SPIKE — the ignored
+    live-API embedding_spike test switches to the new model/dims
+    and is the pre-deploy smoke check (run it explicitly once
+    before deploying; `TAMAKO_LIVE_*` discipline unchanged). The
+    `EmbeddingProvider` seam is untouched — this is exactly the
+    provider swap the seam was built for, with zero new API
+    families (still OpenRouter, still OpenAI-compatible). Spec
+    backfill: graph-spec Sections 7.4/7.6/7.7 (thresholds
+    uncalibrated note), specs.md Sections 5.2 (v11), 13 (defaults).
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
