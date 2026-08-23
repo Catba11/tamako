@@ -67,7 +67,8 @@ pub struct VectorResolutionConfig {
     pub enabled: bool,
     /// `vector_match_threshold` (default 0.92). The cosine SIMILARITY
     /// at or above which the best compatible hit binds without a
-    /// confirmation call.
+    /// confirmation call — except a PERSON-kind binding, which still
+    /// confirms (decision 79 (b)).
     pub match_threshold: f64,
     /// `vector_candidate_threshold` (default 0.80). The lower bound of
     /// the LLM confirmation band; below it the entity creates a new
@@ -75,7 +76,8 @@ pub struct VectorResolutionConfig {
     pub candidate_threshold: f64,
     /// `resolution_confirm_budget` (default 5). The cap of LLM
     /// confirmation calls per digest batch; an exhausted budget treats
-    /// middle-band entities as below-threshold.
+    /// middle-band entities (and top-band Person bindings, decision
+    /// 79 (b)) as below-threshold.
     pub confirm_budget: u32,
 }
 
@@ -98,11 +100,15 @@ impl Default for VectorResolutionConfig {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct VectorResolutionStats {
     /// Auto-matches: the best compatible hit scored at or above the
-    /// match threshold and bound without a confirmation call.
+    /// match threshold and bound without a confirmation call. Never a
+    /// Person-kind binding — decision 79 (b) routes the top-band
+    /// Person calls through `confirmed`/`rejected`.
     pub auto_matched: u32,
-    /// Middle-band hits the confirmation call accepted.
+    /// Hits the confirmation call accepted (the middle band and,
+    /// decision 79 (b), the top-band Person bindings).
     pub confirmed: u32,
-    /// Middle-band hits the confirmation call REJECTED. Call failures
+    /// Hits the confirmation call REJECTED (the middle band and,
+    /// decision 79 (b), the top-band Person bindings). Call failures
     /// and an exhausted budget are NOT rejections (they are
     /// below-threshold falls-through); they are not counted here.
     pub rejected: u32,
@@ -915,11 +921,16 @@ async fn prescreen_one<M: MemoryBackend>(
         let Some(info) = info_by_id.get(node_id.as_str()) else {
             continue;
         };
-        let bind_id: Option<String> = match info.kind {
+        // The BINDING of a compatible hit: the id AND the kind of the
+        // node the entity would bind to. Decision 79 (b): the kind is
+        // the BINDING target's — a direct Person/Concept hit carries
+        // `info.kind`, a single-target Alias hit carries its TARGET's
+        // kind (an Alias-of-Person auto-match is a Person binding).
+        let binding: Option<(String, NodeType)> = match info.kind {
             NodeType::Person | NodeType::Concept
                 if kind_compatible(info.kind, extracted.node_type) =>
             {
-                Some(node_id.clone())
+                Some((node_id.clone(), info.kind))
             }
             // Decision 77 (S3-F6): a MULTI-TARGET alias has no single
             // binding — skip it and continue to the next compatible
@@ -932,7 +943,7 @@ async fn prescreen_one<M: MemoryBackend>(
             NodeType::Alias => match &info.alias_target {
                 Some(target) => match target_by_id.get(target.as_str()) {
                     Some(target_info) if kind_compatible(target_info.kind, extracted.node_type) => {
-                        Some(target.clone())
+                        Some((target.clone(), target_info.kind))
                     }
                     // The alias target is gone or incompatible: skip.
                     _ => None,
@@ -941,14 +952,14 @@ async fn prescreen_one<M: MemoryBackend>(
             },
             _ => None,
         };
-        let Some(bind_id) = bind_id else {
+        let Some((bind_id, bind_kind)) = binding else {
             continue;
         };
         // The metric of the sidecar index is COSINE DISTANCE (schema
         // v8); the decision-73 thresholds are similarities.
         let similarity = 1.0 - f64::from(*distance);
         return decide_band(
-            memory, chat_id, extracted, &bind_id, similarity, prescreen, budget, stats,
+            memory, chat_id, extracted, &bind_id, bind_kind, similarity, prescreen, budget, stats,
         )
         .await;
     }
@@ -967,24 +978,33 @@ fn kind_compatible(kind: NodeType, entity: ExtractedNodeType) -> bool {
     )
 }
 
-/// The threshold band of the best compatible hit (Section 7.4 step 3):
-/// at or above the match threshold the hit binds directly; in the
-/// candidate band ONE budget-bounded LLM confirmation call decides;
-/// below the candidate threshold (or with an exhausted budget, or after
-/// a failed confirmation) the entity falls through to step 4.
+/// The threshold band of the best compatible hit (Section 7.4 step 3).
+/// At or above the match threshold the hit binds directly — EXCEPT a
+/// PERSON-kind binding (`bind_kind`; a direct Person hit or an Alias of
+/// a Person target), which takes the same budget-bounded confirmation
+/// call as the middle band (decision 79 (b): a wrong Person binding is
+/// social damage the merge tool cannot cleanly undo, unlike a Concept
+/// fragment). In the candidate band ONE budget-bounded LLM confirmation
+/// call decides; below the candidate threshold (or with an exhausted
+/// budget, or after a failed confirmation) the entity falls through to
+/// step 4.
 #[allow(clippy::too_many_arguments)]
 async fn decide_band<M: MemoryBackend>(
     memory: &M,
     chat_id: &str,
     extracted: &ExtractedNode,
     bind_id: &str,
+    bind_kind: NodeType,
     similarity: f64,
     prescreen: &VectorPrescreen<'_>,
     budget: &mut u32,
     stats: &mut VectorResolutionStats,
 ) -> Option<ResolvedEntity> {
     let config = prescreen.config;
-    if similarity >= config.match_threshold {
+    // The auto-match branch: the top band binds directly ONLY for a
+    // non-Person binding (decision 79 (b) carve-out — a top-band Person
+    // binding falls through to the confirmation path below).
+    if similarity >= config.match_threshold && bind_kind != NodeType::Person {
         tracing::debug!(
             name = %extracted.name,
             node_id = bind_id,
@@ -1012,10 +1032,21 @@ async fn decide_band<M: MemoryBackend>(
         );
         return None;
     }
-    // The middle band: ONE confirmation call (budget-bounded). The
-    // candidate's stored name and description feed the prompt; a
-    // candidate whose content can no longer be read falls through
-    // WITHOUT spending budget (no call was made).
+    // Decision 79 (b): a top-band PERSON binding enters confirmation
+    // here (the middle band reaches this point directly).
+    if bind_kind == NodeType::Person && similarity >= config.match_threshold {
+        tracing::debug!(
+            name = %extracted.name,
+            node_id = bind_id,
+            similarity,
+            "vector pre-screen Person auto-match candidate; confirming (decision 79)"
+        );
+    }
+    // The confirmation path (the middle band and, decision 79 (b), the
+    // top-band Person bindings): ONE confirmation call
+    // (budget-bounded). The candidate's stored name and description
+    // feed the prompt; a candidate whose content can no longer be read
+    // falls through WITHOUT spending budget (no call was made).
     let content = match memory.node_content(chat_id, bind_id).await {
         Ok(Some(content)) => content,
         Ok(None) => {
@@ -1886,9 +1917,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_3_auto_match_reuses_the_node_without_a_confirmation_call() {
-        // Section 7.4 step 3, top band: similarity >= match threshold
-        // binds directly; the confirmer is never called.
+    async fn step_3_person_top_band_confirms_before_binding() {
+        // Section 7.4 step 3, top band, decision 79 (b): a PERSON hit
+        // at or above the match threshold makes the SAME budget-capped
+        // confirmation call as the middle band; an accept binds and
+        // counts as `confirmed`, never `auto_matched`.
+        let (_dir, memory, store) = prescreen_fixtures().await;
+        seed_node(
+            &memory,
+            &person_id("1001"),
+            "Tama",
+            NodeType::Person,
+            Some("The cat of the group."),
+        )
+        .await;
+        store
+            .upsert_node_embedding(&person_id("1001"), &unit_vector(0))
+            .expect("seed embedding");
+
+        let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
+        let confirmer = ScriptedConfirmer::with_answers(vec![answer(true)]);
+        let config = VectorResolutionConfig::default();
+        let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
+
+        let extracted = graph(vec![node("Tama-chan", ExtractedNodeType::Person)], vec![]);
+        let resolved = resolve_with_prescreen(&memory, &extracted, &[], Some(&prescreen)).await;
+
+        let bound = find_node(&resolved.batch, &person_id("1001")).expect("bound person");
+        assert_eq!(bound.node_type, NodeType::Person);
+        // The same MERGE-coalesce protection as the step-2 alias match:
+        // no properties overwrite of the stored identity blob.
+        assert_eq!(bound.properties, None);
+        assert_eq!(resolved.vector_stats.confirmed, 1);
+        assert_eq!(resolved.vector_stats.auto_matched, 0);
+        // Exactly ONE confirmation call, with the extracted entity and
+        // the STORED candidate content (name + description).
+        let calls = confirmer.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.name, "Tama-chan");
+        assert_eq!(calls[0].1.name, "Tama");
+        assert_eq!(calls[0].1.description, "The cat of the group.");
+        // The query text rode the single-sourced composer (decision 66
+        // layout), batched as ONE call.
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn step_3_person_top_band_confirmation_reject_creates_new() {
+        // Decision 79 (b): the top-band Person confirmation REJECTED —
+        // the entity falls through to step 4 exactly like a middle-band
+        // rejection.
+        let (_dir, memory, store) = prescreen_fixtures().await;
+        seed_node(
+            &memory,
+            &person_id("1001"),
+            "Tama",
+            NodeType::Person,
+            Some("The cat of the group."),
+        )
+        .await;
+        store
+            .upsert_node_embedding(&person_id("1001"), &unit_vector(0))
+            .expect("seed embedding");
+
+        let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
+        let confirmer = ScriptedConfirmer::with_answers(vec![answer(false)]);
+        let config = VectorResolutionConfig::default();
+        let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
+
+        let extracted = graph(vec![node("Tama-chan", ExtractedNodeType::Person)], vec![]);
+        let resolved = resolve_with_prescreen(&memory, &extracted, &[], Some(&prescreen)).await;
+
+        // The rejection falls through to step 4: the person attaches to
+        // its own fallback Alias node; the candidate stays untouched.
+        assert!(find_node(&resolved.batch, &person_id("1001")).is_none());
+        let alias = find_node(&resolved.batch, &alias_id("Tama-chan")).expect("fallback alias");
+        assert!(alias
+            .properties
+            .as_deref()
+            .unwrap_or_default()
+            .contains("\"attachment\":\"fallback\""));
+        assert_eq!(resolved.vector_stats.rejected, 1);
+        assert_eq!(resolved.vector_stats.auto_matched, 0);
+        assert_eq!(confirmer.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn step_3_person_top_band_with_an_exhausted_budget_falls_through() {
+        // Decision 79 (b): a top-band Person hit with
+        // `resolution_confirm_budget` 0 never calls the confirmer; the
+        // entity falls through to step 4 (treated as below-threshold).
         let (_dir, memory, store) = prescreen_fixtures().await;
         seed_node(
             &memory,
@@ -1904,22 +2022,27 @@ mod tests {
 
         let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
         let confirmer = ScriptedConfirmer::with_answers(vec![]);
-        let config = VectorResolutionConfig::default();
+        let config = VectorResolutionConfig {
+            confirm_budget: 0,
+            ..VectorResolutionConfig::default()
+        };
         let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
 
         let extracted = graph(vec![node("Tama-chan", ExtractedNodeType::Person)], vec![]);
         let resolved = resolve_with_prescreen(&memory, &extracted, &[], Some(&prescreen)).await;
 
-        let bound = find_node(&resolved.batch, &person_id("1001")).expect("bound person");
-        assert_eq!(bound.node_type, NodeType::Person);
-        // The same MERGE-coalesce protection as the step-2 alias match:
-        // no properties overwrite of the stored identity blob.
-        assert_eq!(bound.properties, None);
-        assert_eq!(resolved.vector_stats.auto_matched, 1);
+        // The step-4 fallback: the candidate stays untouched and the
+        // person attaches to its own fallback Alias node.
+        assert!(find_node(&resolved.batch, &person_id("1001")).is_none());
+        let alias = find_node(&resolved.batch, &alias_id("Tama-chan")).expect("fallback alias");
+        assert!(alias
+            .properties
+            .as_deref()
+            .unwrap_or_default()
+            .contains("\"attachment\":\"fallback\""));
         assert_eq!(confirmer.calls().len(), 0);
-        // The query text rode the single-sourced composer (decision 66
-        // layout), batched as ONE call.
-        assert_eq!(provider.call_count(), 1);
+        // No call was made: no stat moved.
+        assert_eq!(resolved.vector_stats, VectorResolutionStats::default());
     }
 
     #[tokio::test]
@@ -2024,9 +2147,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_3_alias_hit_binds_to_the_alias_target() {
-        // The top KNN hit is an ALIAS node: the compatible kind is its
-        // target's, and the binding uses the target id.
+    async fn step_3_alias_of_a_person_top_band_also_confirms() {
+        // The top KNN hit is an ALIAS node whose single target is a
+        // Person: the binding uses the target id, and the BINDING kind
+        // is the target's — decision 79 (b): an Alias-of-Person
+        // auto-match is a Person binding, so the top band confirms. An
+        // accept binds to the TARGET id.
         let (_dir, memory, store) = prescreen_fixtures().await;
         seed_person_alias(&memory, "1001", "Tama", "tama-alias").await;
         store
@@ -2034,7 +2160,7 @@ mod tests {
             .expect("seed embedding");
 
         let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
-        let confirmer = ScriptedConfirmer::with_answers(vec![]);
+        let confirmer = ScriptedConfirmer::with_answers(vec![answer(true)]);
         let config = VectorResolutionConfig::default();
         let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
 
@@ -2043,14 +2169,21 @@ mod tests {
 
         let bound = find_node(&resolved.batch, &person_id("1001")).expect("bound target");
         assert_eq!(bound.node_type, NodeType::Person);
-        assert_eq!(resolved.vector_stats.auto_matched, 1);
-        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(resolved.vector_stats.confirmed, 1);
+        assert_eq!(resolved.vector_stats.auto_matched, 0);
+        // The confirmation call fired — the candidate is the TARGET's
+        // stored content, not the alias surface form.
+        let calls = confirmer.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.name, "Tama-chan");
+        assert_eq!(calls[0].1.name, "Tama");
     }
 
     #[tokio::test]
     async fn step_3_kind_filter_prefers_the_lower_compatible_hit() {
         // The top hit (a Concept, sim 1.0) is INCOMPATIBLE with a
-        // Person entity; the lower compatible hit (sim ~0.95) wins.
+        // Person entity; the lower compatible hit (sim ~0.95) wins —
+        // a top-band Person binding, so decision 79 (b) confirms it.
         let (_dir, memory, store) = prescreen_fixtures().await;
         seed_node(
             &memory,
@@ -2076,7 +2209,7 @@ mod tests {
             .expect("seed embedding");
 
         let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
-        let confirmer = ScriptedConfirmer::with_answers(vec![]);
+        let confirmer = ScriptedConfirmer::with_answers(vec![answer(true)]);
         let config = VectorResolutionConfig::default();
         let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
 
@@ -2085,8 +2218,9 @@ mod tests {
 
         assert!(find_node(&resolved.batch, &person_id("1001")).is_some());
         assert!(find_node(&resolved.batch, &concept_id("tama")).is_none());
-        assert_eq!(resolved.vector_stats.auto_matched, 1);
-        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(resolved.vector_stats.confirmed, 1);
+        assert_eq!(resolved.vector_stats.auto_matched, 0);
+        assert_eq!(confirmer.calls().len(), 1);
     }
 
     #[tokio::test]
@@ -2164,7 +2298,10 @@ mod tests {
             &concept_id("group relative policy optimization")
         )
         .is_none());
+        // Decision 79 (b) carves out PERSON bindings only: a Concept
+        // auto-match still binds directly, no confirmation call.
         assert_eq!(resolved.vector_stats.auto_matched, 1);
+        assert_eq!(confirmer.calls().len(), 0);
     }
 
     #[tokio::test]
@@ -2467,8 +2604,11 @@ mod tests {
 
     /// A scripted MemoryBackend for the decision-77 (S3-F6) guard:
     /// `node_resolution_infos` answers with the rigged infos (filtered
-    /// to the requested ids), every other read the resolution path
-    /// touches is empty. Lets the tests hand the pre-screen a
+    /// to the requested ids), and `node_content` stands in a bare
+    /// name-only content for every known id (the decision-79 (b)
+    /// confirmation path reads the candidate's content before the
+    /// call); every other read the resolution path touches is empty.
+    /// Lets the tests hand the pre-screen a
     /// multi-target alias that STILL carries a provisional `Some`
     /// target (the stale shape the memory layer's decision-77
     /// normalization already prevents; the agent-side guard must not
@@ -2523,6 +2663,24 @@ mod tests {
                 .collect())
         }
 
+        async fn node_content(
+            &self,
+            _chat_id: &str,
+            node_id: &str,
+        ) -> tamako_memory::Result<Option<tamako_memory::NodeContent>> {
+            // The rigged infos carry no display names; the id stands
+            // in. A known id yields a bare content so the confirmation
+            // path reaches the confirmer.
+            Ok(self
+                .infos
+                .iter()
+                .any(|(known, _)| known == node_id)
+                .then(|| tamako_memory::NodeContent {
+                    name: node_id.to_string(),
+                    description: String::new(),
+                }))
+        }
+
         async fn close(&self, _chat_id: &str) -> tamako_memory::Result<()> {
             Ok(())
         }
@@ -2575,7 +2733,7 @@ mod tests {
         };
 
         let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
-        let confirmer = ScriptedConfirmer::with_answers(vec![]);
+        let confirmer = ScriptedConfirmer::with_answers(vec![answer(true)]);
         let config = VectorResolutionConfig::default();
         let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
 
@@ -2583,19 +2741,22 @@ mod tests {
         let resolved = resolve_with_prescreen(&memory, &extracted, &[], Some(&prescreen)).await;
 
         // The multi-target alias was SKIPPED: no binding to its
-        // provisional target; the next compatible hit won (top band,
-        // no confirmation call).
+        // provisional target; the next compatible hit won (a top-band
+        // Person binding — decision 79 (b) confirmed it first).
         assert!(find_node(&resolved.batch, &person_id("1001")).is_none());
         let bound = find_node(&resolved.batch, &person_id("2002")).expect("bound person");
         assert_eq!(bound.node_type, NodeType::Person);
-        assert_eq!(resolved.vector_stats.auto_matched, 1);
-        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(resolved.vector_stats.confirmed, 1);
+        assert_eq!(resolved.vector_stats.auto_matched, 0);
+        assert_eq!(confirmer.calls().len(), 1);
     }
 
     #[tokio::test]
     async fn step_3_a_single_target_alias_still_binds() {
         // The guard targets count > 1 ONLY: a single-target alias
-        // (count exactly 1) still binds to its target.
+        // (count exactly 1) still binds to its target. The target is a
+        // Person, so decision 79 (b) confirms the top-band binding
+        // first.
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(Store::new(dir.path()));
         store.open_group(CHAT).expect("open group");
@@ -2616,7 +2777,7 @@ mod tests {
         };
 
         let provider = ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]);
-        let confirmer = ScriptedConfirmer::with_answers(vec![]);
+        let confirmer = ScriptedConfirmer::with_answers(vec![answer(true)]);
         let config = VectorResolutionConfig::default();
         let prescreen = test_prescreen(&provider, &store, &confirmer, &config);
 
@@ -2625,7 +2786,8 @@ mod tests {
 
         let bound = find_node(&resolved.batch, &person_id("1001")).expect("bound target");
         assert_eq!(bound.node_type, NodeType::Person);
-        assert_eq!(resolved.vector_stats.auto_matched, 1);
-        assert_eq!(confirmer.calls().len(), 0);
+        assert_eq!(resolved.vector_stats.confirmed, 1);
+        assert_eq!(resolved.vector_stats.auto_matched, 0);
+        assert_eq!(confirmer.calls().len(), 1);
     }
 }
