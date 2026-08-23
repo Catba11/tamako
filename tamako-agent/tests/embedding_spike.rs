@@ -1,35 +1,38 @@
 //! Live-API spike: OpenRouter embeddings round-trip for the Phase 2
-//! embedding sidecar (current-state.md decision 66). Ignored by
+//! embedding sidecar (current-state.md decision 81). Ignored by
 //! default; run with `TAMAKO_LIVE_TEST=1` and `OPENAI_API_KEY` set:
 //!
 //! ```sh
 //! TAMAKO_LIVE_TEST=1 cargo test -p tamako-agent --test embedding_spike -- --ignored --nocapture
 //! ```
 //!
-//! Ground truth (decision 66): embeddings go through the
+//! Ground truth (decision 81): embeddings go through the
 //! openai-compatible `/v1/embeddings` endpoint at OpenRouter with model
-//! `qwen/qwen3-embedding-8b`, dimension pinned at 4096. The spike uses
-//! rig-core 0.41's embedding surface — the SAME client family
-//! tamako-agent's endpoint layer already builds for openai-compatible
-//! completions (`rig::providers::openai::CompletionsClient`), extended
-//! with `rig::client::EmbeddingsClient::embedding_model_with_ndims`.
-//! No production code changes; this file only proves the round-trip.
+//! `google/gemini-embedding-2` (served by google-vertex, ZDR),
+//! dimension pinned at 3072 — the model's NATIVE dimension (the top of
+//! the Matryoshka ladder), so the response is 3072 whether or not the
+//! `dimensions` request parameter is honored and the hard length pin
+//! is the guard. This spike is the pre-deploy smoke for the
+//! decision-81 switch (decision 66's pair was
+//! `qwen/qwen3-embedding-8b` at 4096). The spike uses rig-core 0.41's
+//! embedding surface — the SAME client family tamako-agent's endpoint
+//! layer already builds for openai-compatible completions
+//! (`rig::providers::openai::CompletionsClient`), extended with
+//! `rig::client::EmbeddingsClient::embedding_model_with_ndims`. No
+//! production code changes; this file only proves the round-trip.
 
 use rig::client::EmbeddingsClient as _;
 use rig::embeddings::EmbeddingModel as _;
+use tamako_agent::endpoint::EMBEDDING_DIMS;
 
-/// decision 66: openai-compatible base URL of the embedding provider.
-/// rig uses the base URL verbatim, so the request lands on
-/// `{base}/embeddings` = `https://openrouter.ai/api/v1/embeddings`.
+/// decision 81 (unchanged from decision 66): openai-compatible base
+/// URL of the embedding provider. rig uses the base URL verbatim, so
+/// the request lands on `{base}/embeddings` =
+/// `https://openrouter.ai/api/v1/embeddings`.
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-/// decision 66: the embedding model.
-const EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
-
-/// decision 66: the pinned dimension. rig sends it as the
-/// openai-compatible `dimensions` request field
-/// (`embedding_model_with_ndims`).
-const EMBEDDING_DIMS: usize = 4096;
+/// decision 81: the embedding model.
+const EMBEDDING_MODEL: &str = "google/gemini-embedding-2";
 
 /// Cosine similarity of two equal-length vectors.
 fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
@@ -47,7 +50,7 @@ fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
 
 #[tokio::test]
 #[ignore = "live API test; run with TAMAKO_LIVE_TEST=1 and OPENAI_API_KEY set"]
-async fn openrouter_qwen3_embedding_round_trip() {
+async fn openrouter_gemini_embedding_round_trip() {
     if std::env::var("TAMAKO_LIVE_TEST").as_deref() != Ok("1") {
         eprintln!("skipping: set TAMAKO_LIVE_TEST=1 (and OPENAI_API_KEY) to run the live spike");
         return;
@@ -118,7 +121,7 @@ async fn openrouter_qwen3_embedding_round_trip() {
         assert_eq!(
             embedding.vec.len(),
             EMBEDDING_DIMS,
-            "decision 66 pins the dimension at {EMBEDDING_DIMS}"
+            "decision 81 pins the dimension at {EMBEDDING_DIMS}"
         );
     }
 

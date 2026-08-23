@@ -198,19 +198,28 @@ pub const DEFAULT_REPLY_MODEL: &str = "claude-sonnet-4-5";
 /// `summary_*` keys.
 pub const DEFAULT_SUMMARY_MODEL: &str = anthropic::completion::CLAUDE_HAIKU_4_5;
 
-/// The default embedding model (current-state.md decision 66).
-pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
+/// The default embedding model (current-state.md decision 81).
+/// Decision 66 first pinned `qwen/qwen3-embedding-8b`; decision 81
+/// switches to `google/gemini-embedding-2` (the OpenRouter id, served
+/// by google-vertex with ZDR).
+pub const DEFAULT_EMBEDDING_MODEL: &str = "google/gemini-embedding-2";
 
-/// The default embedding base URL (decision 66): OpenRouter's
-/// openai-compatible endpoint. rig uses the base URL verbatim, so the
-/// request lands on `{base}/embeddings`.
+/// The default embedding base URL (decision 66; unchanged by decision
+/// 81 — the gemini-embedding-2 id is served via OpenRouter):
+/// OpenRouter's openai-compatible endpoint. rig uses the base URL
+/// verbatim, so the request lands on `{base}/embeddings`.
 pub const DEFAULT_EMBEDDING_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-/// The pinned embedding dimension (decision 66). rig sends it as the
-/// openai-compatible `dimensions` request field
-/// (`embedding_model_with_ndims`); a response vector of any other
-/// length is a hard error (the store schema pins the dimension).
-pub const EMBEDDING_DIMS: usize = 4096;
+/// The pinned embedding dimension (decision 81). Decision 66 first
+/// pinned 4096 (qwen3-embedding-8b); decision 81 re-pins to 3072,
+/// google/gemini-embedding-2's NATIVE dimension (the top of the
+/// Matryoshka ladder — the response is 3072 whether or not the
+/// `dimensions` request parameter is honored, so the hard length pin
+/// is the guard). rig sends it as the openai-compatible `dimensions`
+/// request field (`embedding_model_with_ndims`); a response vector of
+/// any other length is a hard error (the store schema pins the
+/// dimension).
+pub const EMBEDDING_DIMS: usize = 3072;
 
 /// The per-attempt completion timeout (H4b). One bound around every
 /// endpoint completion attempt: the first call AND the one repair
@@ -1179,15 +1188,15 @@ impl EmbeddingProvider for RigEmbeddingProvider {
     }
 }
 
-/// The dimension pin of decision 66 and the f64→f32 narrowing (the
-/// store schema holds f32). A vector of any length other than
-/// [`EMBEDDING_DIMS`] is a HARD error: a wrong-dimension vector must
-/// never reach the store. Pure, so the pin and the narrowing are
-/// unit-testable without a network.
+/// The dimension pin of decision 81 (decision 66 first pinned 4096)
+/// and the f64→f32 narrowing (the store schema holds f32). A vector of
+/// any length other than [`EMBEDDING_DIMS`] is a HARD error: a
+/// wrong-dimension vector must never reach the store. Pure, so the pin
+/// and the narrowing are unit-testable without a network.
 fn checked_embedding_vector(vec: Vec<f64>) -> Result<Vec<f32>, AgentError> {
     if vec.len() != EMBEDDING_DIMS {
         return Err(AgentError::Extraction(format!(
-            "embedding dimension mismatch: expected {EMBEDDING_DIMS} (decision 66 pins the dimension), got {}",
+            "embedding dimension mismatch: expected {EMBEDDING_DIMS} (decision 81 pins the dimension), got {}",
             vec.len()
         )));
     }
@@ -2168,7 +2177,7 @@ mod tests {
         let provider = RigEmbeddingProvider::build(&endpoint).expect("the provider builds");
         let debug = format!("{provider:?}");
         assert!(debug.contains("local-embedding-model"));
-        assert!(debug.contains("4096"));
+        assert!(debug.contains(&EMBEDDING_DIMS.to_string()));
     }
 
     #[test]
@@ -2190,9 +2199,9 @@ mod tests {
     }
 
     #[test]
-    fn the_dimension_pin_accepts_exactly_4096_and_narrows_to_f32() {
+    fn the_dimension_pin_accepts_exactly_3072_and_narrows_to_f32() {
         let vec: Vec<f64> = (0..EMBEDDING_DIMS).map(|i| i as f64 * 0.5).collect();
-        let narrowed = checked_embedding_vector(vec).expect("4096 passes the pin");
+        let narrowed = checked_embedding_vector(vec).expect("3072 passes the pin");
         assert_eq!(narrowed.len(), EMBEDDING_DIMS);
         assert_eq!(narrowed[3], 1.5_f32);
     }
@@ -2217,12 +2226,12 @@ mod tests {
     }
 
     #[test]
-    fn the_batch_dimension_pin_accepts_n_vectors_of_4096_in_input_order() {
+    fn the_batch_dimension_pin_accepts_n_vectors_of_3072_in_input_order() {
         let vecs: Vec<Vec<f64>> = (0..3)
             .map(|row| (0..EMBEDDING_DIMS).map(|i| (row + i) as f64).collect())
             .collect();
 
-        let narrowed = checked_batch_vectors(vecs).expect("three 4096-vectors pass the pin");
+        let narrowed = checked_batch_vectors(vecs).expect("three 3072-vectors pass the pin");
 
         assert_eq!(narrowed.len(), 3);
         // Input order carried through; every element pinned + narrowed.
