@@ -105,6 +105,16 @@
 //! touches nothing else — no context item, no counter, no session
 //! mutation.
 //!
+//! Persona hot reload (decision 80, live mode only): the binary's
+//! debounced watcher broadcasts the freshly rendered preamble as
+//! `ActorCommand::ReloadPreamble` through the FIFO inbox (specs.md
+//! Section 6.1 rule 1 — it serializes behind in-flight work, never
+//! interrupts a running call). The handler swaps context item 0 in
+//! memory (Rule C4); nothing persists — the persona file is the state,
+//! a restart rebuild renders the same bytes (Rule P1 untouched). The
+//! broadcast is best-effort (`GroupActorHandle::try_send`): a dead or
+//! backlogged actor is skipped; its next start reads the file.
+//!
 //! The actor owns the live context of specs.md Section 7: a
 //! materialized view of the raw log (Rule P1). Intake appends items
 //! (Rule C1), a completed digest removes the previous chunk with the
@@ -274,6 +284,14 @@ pub enum ActorCommand {
     /// Returns a clone of the live context items (tests; M4 reads the
     /// context through the actor too). A FIFO barrier like `Snapshot`.
     ContextSnapshot(oneshot::Sender<Vec<ContextItem>>),
+    /// The live-mode persona hot reload (decision 80, amending specs.md
+    /// Section 6.1 rule 1): carries the freshly rendered preamble,
+    /// broadcast by the binary's debounced watcher. It serializes
+    /// through the FIFO inbox like every other command — it never
+    /// interrupts in-flight work. The handler swaps context item 0 in
+    /// memory (Rule C4); nothing persists (the persona file is the
+    /// state).
+    ReloadPreamble(String),
     /// The spawned digest task reports its result through this command
     /// (internal plumbing). Every session mutation stays serialized in
     /// the actor loop — specs.md Section 6.1, rule 2.
@@ -355,6 +373,17 @@ impl GroupActorHandle {
     /// Sends one inbound event to the FIFO inbox.
     pub async fn send_event(&self, ev: InboundEvent) -> Result<(), CoreError> {
         self.send(ActorCommand::Inbound(ev)).await
+    }
+
+    /// Non-blocking send (decision 80): the persona-reload broadcast
+    /// skips a dead or backlogged actor instead of waiting (best-effort;
+    /// the file is the state — the actor's next start reads it). The
+    /// error collapses `TrySendError::Full` and `TrySendError::Closed`
+    /// into `CoreError::InboxClosed` deliberately — the caller only
+    /// needs skip-vs-ok (the same collapse `send` applies to its send
+    /// error).
+    pub fn try_send(&self, cmd: ActorCommand) -> Result<(), CoreError> {
+        self.inbox.try_send(cmd).map_err(|_| CoreError::InboxClosed)
     }
 
     /// Returns a snapshot of the current session state.
@@ -1728,6 +1757,22 @@ async fn run_actor<M: MemoryBackend>(
                 // Same rule as Snapshot: a dropped receiver is not an
                 // actor failure.
                 let _ = reply.send(context.items().to_vec());
+            }
+            ActorCommand::ReloadPreamble(preamble) => {
+                // Decision 80 (specs.md Section 6.1 rule 1 as amended):
+                // the live-mode persona hot reload. IN-MEMORY ONLY: the
+                // Rule C4 item-0 swap mutates no session state and
+                // persists nothing — the persona file is the state; a
+                // restart rebuild renders the same bytes (Rule P1
+                // untouched). Decision 53: DEBUG only — the curated INFO
+                // line lives at the binary's watcher site, not here.
+                let preamble_len = preamble.len();
+                context.reload_preamble(preamble);
+                debug!(
+                    chat_id = %chat_id,
+                    preamble_len,
+                    "persona preamble reloaded (in-memory item-0 swap)"
+                );
             }
             ActorCommand::Shutdown => break,
         }
@@ -3750,6 +3795,106 @@ mod tests {
         assert_eq!(rows.len(), 5);
         assert!(advanced.wake.msgs_since_wake > rebuilt.wake.msgs_since_wake);
         restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn reload_preamble_swaps_item_zero_and_touches_nothing_else() {
+        let (fixture, handle) = spawn_fixture(TriggerConfig::default());
+        for index in 1..=2 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+        // A snapshot is a FIFO barrier: when it returns, both messages are
+        // processed.
+        let session_before = handle.snapshot().await.expect("snapshot succeeds");
+        let context_before = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        let persisted_before =
+            blocking_store_call(&fixture.store, |store| store.load_all_state(CHAT_ID)).await;
+
+        handle
+            .send(ActorCommand::ReloadPreamble("new preamble".to_string()))
+            .await
+            .expect("send succeeds");
+        // FIFO barrier: when this snapshot returns, the reload ran.
+        let session_after = handle.snapshot().await.expect("snapshot succeeds");
+        let context_after = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        let persisted_after =
+            blocking_store_call(&fixture.store, |store| store.load_all_state(CHAT_ID)).await;
+
+        // Item 0 is exactly the new preamble (kind Preamble); every other
+        // item is byte-identical to before.
+        assert_eq!(context_after.len(), context_before.len());
+        assert_eq!(context_after[0].kind, ContextItemKind::Preamble);
+        assert_eq!(context_after[0].content, "new preamble");
+        assert_eq!(context_after[1..], context_before[1..]);
+        // Nothing persisted: the reload is in-memory only, so the session
+        // snapshot before/after is EQUAL (encode derives from the
+        // PartialEq state). No state-table write happened by construction
+        // — the handler calls only `LiveContext::reload_preamble` — and
+        // the persisted state rows prove it.
+        assert_eq!(session_before, session_after);
+        assert_eq!(persisted_before, persisted_after);
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn reload_preamble_serializes_behind_in_flight_work() {
+        // FIFO serialization is STRUCTURAL: one inbox, one loop, one
+        // command at a time (specs.md Section 6.1 rule 1) — a reload can
+        // never interrupt in-flight work; no gating machinery is needed
+        // to prove it. The cheap assertion: a context snapshot enqueued
+        // BEFORE the reload observes the old preamble, one enqueued
+        // AFTER it observes the new preamble — FIFO order of application.
+        let (_fixture, handle) = spawn_fixture(TriggerConfig::default());
+        let before = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        handle
+            .send(ActorCommand::ReloadPreamble("hot preamble".to_string()))
+            .await
+            .expect("send succeeds");
+        let after = handle
+            .context_snapshot()
+            .await
+            .expect("context snapshot succeeds");
+        assert_eq!(before[0].content, TEST_PREAMBLE);
+        assert_eq!(after[0].content, "hot preamble");
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn try_send_reports_a_dead_actor() {
+        let (_fixture, mut handle) = spawn_fixture(TriggerConfig::default());
+        handle
+            .send(ActorCommand::Shutdown)
+            .await
+            .expect("send succeeds");
+        // Await the task WITHOUT consuming the handle (`shutdown()` would
+        // take the inbox sender with it): the JoinHandle is Unpin, so a
+        // `&mut` awaits it.
+        (&mut handle.join)
+            .await
+            .expect("the actor task joins")
+            .expect("shutdown succeeds");
+        let result = handle.try_send(ActorCommand::ReloadPreamble("x".to_string()));
+        assert!(matches!(result, Err(CoreError::InboxClosed)));
+        // The full-inbox arm (`TrySendError::Full`) is not tested: it
+        // needs 256 pending commands, and the collapsed error makes the
+        // dead-actor arm the deterministic cheap proof — both arms share
+        // the same `map_err` code path.
     }
 
     #[tokio::test]
