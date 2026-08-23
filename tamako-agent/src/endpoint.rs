@@ -1151,41 +1151,16 @@ impl EmbeddingProvider for RigEmbeddingProvider {
         })
     }
 
-    fn embed_texts<'a>(
-        &'a self,
-        texts: &'a [String],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, AgentError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            // An empty batch never reaches the endpoint.
-            if texts.is_empty() {
-                return Ok(Vec::new());
-            }
-            // ONE batched provider call (decision 73): rig's openai
-            // surface asserts the response row count equals the input
-            // count and zips rows with inputs in order, so the output
-            // order is the input order. The same per-attempt bound of
-            // H4b covers the whole batch call.
-            let embeddings = tokio::time::timeout(
-                ENDPOINT_TIMEOUT,
-                self.model.embed_texts(texts.iter().cloned()),
-            )
-            .await
-            .map_err(|_| {
-                AgentError::Extraction(format!(
-                    "endpoint timeout after {ENDPOINT_TIMEOUT:?}: no embedding response from the endpoint"
-                ))
-            })?
-            .map_err(|error| AgentError::Extraction(format!("embedding failed: {error}")))?;
-            checked_batch_vectors(
-                embeddings
-                    .into_iter()
-                    .map(|embedding| embedding.vec)
-                    .collect(),
-            )
-        })
-    }
+    // embed_texts is NOT overridden: decision 81 addendum — the
+    // default OpenRouter route for google/gemini-embedding-2 serves
+    // ARRAY input only from google-ai-studio (excluded under the
+    // account's ZDR-only policy → the embeddings call 404s), while
+    // single-text input is served by the ZDR google-vertex endpoints.
+    // The trait's default sequential embed loop is the correct surface
+    // for this provider: one POST per text, the same rate-limit and
+    // timeout discipline as the rest of the embeddings path, and every
+    // call takes the ZDR route. (Verified empirically 2026-08-22:
+    // single-text 200, array 404, repeatedly.)
 }
 
 /// The dimension pin of decision 81 (decision 66 first pinned 4096)
@@ -1210,7 +1185,10 @@ fn checked_embedding_vector(vec: Vec<f64>) -> Result<Vec<f32>, AgentError> {
 /// The batch flavor of [`checked_embedding_vector`] (decision 73): the
 /// dimension pin and the f64→f32 narrowing applied per element, the
 /// input order carried through. Pure, so the batched shape logic is
-/// unit-testable without a network.
+/// unit-testable without a network. Test-only since the decision-81
+/// addendum (the live batch surface is the trait's default sequential
+/// loop; see `RigEmbeddingProvider`).
+#[cfg(test)]
 fn checked_batch_vectors(vecs: Vec<Vec<f64>>) -> Result<Vec<Vec<f32>>, AgentError> {
     vecs.into_iter().map(checked_embedding_vector).collect()
 }
