@@ -5,15 +5,15 @@
 //!
 //! 1. vec0 registers on a rusqlite `Connection` that uses our exact
 //!    `Store::open_group` pragmas (WAL + synchronous=NORMAL, bundled SQLite).
-//! 2. A `float[4096]` vec0 virtual table supports insert + KNN (`MATCH` +
+//! 2. A `float[3072]` vec0 virtual table supports insert + KNN (`MATCH` +
 //!    `k = ?`) with the rowid as the node id, and ranks an identical vector
 //!    first at distance ~0.
 //! 3. The vec0 table coexists with normal schema tables in the SAME .db
 //!    file under WAL, across close/reopen.
 //! 4. Reopening the file REQUIRES re-registering the extension on the new
 //!    connection (registration is per-connection, not persisted).
-//! 5. Rough storage cost of N=100 random 4096-dim f32 vectors (bytes/node
-//!    vs the naive 4096*4 = 16384 baseline).
+//! 5. Rough storage cost of N=100 random 3072-dim f32 vectors (bytes/node
+//!    vs the naive 3072*4 = 12288 baseline).
 //!
 //! Registration idiom: `sqlite-vec` 0.1.9 exports only the raw C entry
 //! point `sqlite3_vec_init`, declared (incorrectly, with no parameters)
@@ -25,10 +25,10 @@
 
 use rusqlite::Connection;
 use std::path::Path;
-use tamako_store::register_sqlite_vec;
-
-/// Embedding dimension pinned by current-state.md decision 66.
-const DIM: usize = 4096;
+// The spike measures the pinned sidecar dimension, so DIM is the store
+// crate's pin (decision 81: 3072, google/gemini-embedding-2's native
+// dimension) instead of a local copy.
+use tamako_store::{register_sqlite_vec, EMBEDDING_DIM as DIM};
 
 /// Opens a file DB exactly like `Store::open_group` does: WAL +
 /// synchronous=NORMAL, then registers sqlite-vec via the canonical
@@ -94,11 +94,11 @@ fn vec0_knn_roundtrip_coexists_with_normal_tables_under_wal() {
         );
 
         // The vec0 table and a normal schema-style table in the SAME file.
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[4096]);
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[{DIM}]);
              CREATE TABLE normal_table (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
              INSERT INTO normal_table (note) VALUES ('hello');",
-        )
+        ))
         .expect("create tables");
 
         // vec0 idiom: the virtual table's rowid IS the node id.
@@ -180,13 +180,15 @@ fn vec0_requires_registration_on_every_new_connection() {
 }
 
 #[test]
-fn vec0_storage_cost_4096_dim() {
+fn vec0_storage_cost_3072_dim() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("store.db");
 
     let conn = open_spike_db(&db_path).expect("open");
-    conn.execute_batch("CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[4096]);")
-        .expect("create vec table");
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[{DIM}]);"
+    ))
+    .expect("create vec table");
     // Fold the WAL back so the .db file size reflects the table content.
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint");
@@ -219,7 +221,7 @@ fn vec0_storage_cost_4096_dim() {
 
     // vec0 allocates storage in chunk granules: default chunk_size = 1024
     // vectors, each chunk preallocated as a zeroblob of
-    // chunk_size * DIM * 4 bytes (16 MiB for float[4096]). The first 100
+    // chunk_size * DIM * 4 bytes (12 MiB for float[3072]). The first 100
     // vectors therefore cost one whole granule. Filling the rest of the
     // chunk (vectors 101..1024) must cost ~nothing.
     let delta_first_chunk = size_at_100 - size_before;
@@ -236,8 +238,9 @@ fn vec0_storage_cost_4096_dim() {
         delta_fill as f64 / (1024 - N) as f64
     );
 
-    // The granule is exactly one 1024-slot chunk (1024 * 16384 = 16 MiB)
-    // plus a handful of shadow-table/btree pages.
+    // The granule is exactly one 1024-slot chunk (1024 * 12288 = 12 MiB)
+    // plus a handful of shadow-table/btree pages. The `64 * 4096` slack
+    // below is 64 SQLite 4 KiB pages, not dimension math.
     let granule = 1024 * naive;
     assert!(
         delta_first_chunk >= granule && delta_first_chunk < granule + 64 * 4096,

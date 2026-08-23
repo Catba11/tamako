@@ -236,9 +236,12 @@ pub struct ReactionRow {
     pub timestamp: OffsetDateTime,
 }
 
-/// Embedding dimension pinned by current-state.md decision 66. The vec0
-/// virtual-table dimension is fixed at table creation (migration v7).
-pub const EMBEDDING_DIM: usize = 4096;
+/// Embedding dimension pinned by current-state.md decision 81.
+/// Decision 66 first pinned 4096 (qwen3-embedding-8b); decision 81
+/// re-pins to 3072, google/gemini-embedding-2's NATIVE dimension. The
+/// vec0 virtual-table dimension is fixed at table creation, so changing
+/// it means recreating `node_embeddings` — schema v11 does exactly that.
+pub const EMBEDDING_DIM: usize = 3072;
 
 /// A claimed row of the `pending_embeddings` queue (migration v7,
 /// decision 66).
@@ -2040,7 +2043,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations");
-        assert_eq!(count, 10);
+        assert_eq!(count, schema::MIGRATIONS.len() as i64);
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -2050,7 +2053,10 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        // The expected tip tracks MIGRATIONS, so appending a version
+        // does not break this assertion.
+        let expected: Vec<u32> = (1..=schema::MIGRATIONS.len() as u32).collect();
+        assert_eq!(versions, expected);
 
         // Migration v4 added sender_username. The SELECT proves the column
         // exists: a missing column is an error, an empty log yields Ok(None).
@@ -2102,9 +2108,9 @@ mod tests {
     fn migration_v6_upgrades_a_v5_database_in_place() {
         // A database created by the previous release carries migrations
         // v1-v5 and live data. Opening it with this build must apply only
-        // v6 (index-only: no data touched) plus the additive v7-v10
-        // (embedding sidecar, merge audit, edge texts), keep the data,
-        // and be a no-op on reopen.
+        // v6 (index-only: no data touched) plus the additive v7 through
+        // the tip (embedding sidecar, merge audit, edge texts), keep the
+        // data, and be a no-op on reopen.
         let dir = tempfile::tempdir().expect("tempdir");
         let group_dir = dir.path().join("c1");
         std::fs::create_dir_all(&group_dir).expect("create group dir");
@@ -2183,7 +2189,8 @@ mod tests {
             ]
         );
 
-        // Migration bookkeeping: exactly five versions were added.
+        // Migration bookkeeping: the v5-era database was upgraded to
+        // the current tip (v6 through the tip were added).
         let versions: Vec<u32> = {
             let mut stmt = conn
                 .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -2193,7 +2200,8 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let expected: Vec<u32> = (1..=schema::MIGRATIONS.len() as u32).collect();
+        assert_eq!(versions, expected);
     }
 
     /// The column names of one index, in key order, via PRAGMA index_info.
@@ -2277,7 +2285,7 @@ mod tests {
             .expect("insert summary");
         assert!(summary_id > 0);
 
-        // Migration bookkeeping: the upgrade applied v5 through v10.
+        // Migration bookkeeping: the upgrade applied v5 through the tip.
         let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
         let versions: Vec<u32> = {
             let mut stmt = conn
@@ -2288,7 +2296,8 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect versions")
         };
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let expected: Vec<u32> = (1..=schema::MIGRATIONS.len() as u32).collect();
+        assert_eq!(versions, expected);
     }
 
     #[test]
@@ -3427,8 +3436,14 @@ mod tests {
             .expect("queue row");
         }
 
-        // Vectors in the L2 table that v8 must discard.
-        let blob = embedding_to_blob(&test_vector(7)).expect("blob");
+        // Vectors in the L2 table that v8 must discard. The v7 table
+        // shape is float[4096] (the decision-66 pin of its era), so the
+        // blob is built by hand: EMBEDDING_DIM has since moved to 3072
+        // (decision 81) and test_vector no longer matches this table.
+        let blob: Vec<u8> = vec![0.5f32; 4096]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         conn.execute(
             "INSERT INTO node_embeddings (node_id, embedding) VALUES ('n-done-1', ?1)",
             [blob],
@@ -3516,6 +3531,159 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(v8_rows, 1, "v8 recorded exactly once");
+                Ok(())
+            })
+            .expect("reopen assertions");
+    }
+
+    /// Builds a v10-shaped store.db by hand: MIGRATIONS 1..=10 applied
+    /// in order (leaving a COSINE float[4096] node_embeddings table +
+    /// the queue), schema_migrations stamped at 1..=10, so
+    /// Store::open_group runs ONLY migration v11.
+    fn v10_shaped_db(dir: &std::path::Path) {
+        let group = dir.join("c1");
+        std::fs::create_dir_all(&group).expect("group dir");
+        let conn = Connection::open(group.join("store.db")).expect("open v10 db");
+        register_sqlite_vec(&conn).expect("register vec0");
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .expect("schema_migrations");
+        for (version, sql) in schema::MIGRATIONS.iter().filter(|(v, _)| *v <= 10) {
+            conn.execute_batch(sql).expect("migration DDL");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at)
+                 VALUES (?1, '2026-08-16T00:00:00Z')",
+                [version],
+            )
+            .expect("stamp version");
+        }
+
+        // Queue rows in every status: a pending claim, a failed row,
+        // and two done-journal rows (decision 66 journal).
+        for (node_id, hash, status) in [
+            ("n-pending", "h-p", "pending"),
+            ("n-failed", "h-f", "failed"),
+            ("n-done-1", "h-d1", "done"),
+            ("n-done-2", "h-d2", "done"),
+        ] {
+            conn.execute(
+                "INSERT INTO pending_embeddings
+                    (node_id, content_hash, status, attempts, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, '2026-08-16T00:00:00Z', '2026-08-16T00:00:00Z')",
+                rusqlite::params![node_id, hash, status],
+            )
+            .expect("queue row");
+        }
+
+        // One vector in the cosine 4096 table that v11 must discard.
+        // The pre-v11 shape is float[4096] (decision 66), so the blob
+        // is built by hand — EMBEDDING_DIM is 3072 now (decision 81).
+        let blob: Vec<u8> = vec![0.5f32; 4096]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        conn.execute(
+            "INSERT INTO node_embeddings (node_id, embedding) VALUES ('n-done-1', ?1)",
+            [blob],
+        )
+        .expect("vec row");
+    }
+
+    #[test]
+    fn migration_v11_recreates_node_embeddings_at_3072_and_resets_the_done_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        v10_shaped_db(dir.path());
+
+        // Open through the real path: v11 runs on top of the v10 shape.
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("c1").expect("open_group runs v11");
+
+        store
+            .with_conn("c1", |conn| {
+                // v11 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 11)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v11 must be recorded in schema_migrations");
+
+                // The vec0 table was recreated: a fresh shadow set
+                // exists, and the pre-v11 vector is gone.
+                let tables: Vec<String> = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type = 'table' AND name LIKE 'node_embeddings%'",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert!(tables.iter().any(|t| t == "node_embeddings"));
+                assert!(
+                    tables.iter().any(|t| t == "node_embeddings_rowids"),
+                    "fresh vec0 shadow tables must exist: {tables:?}"
+                );
+                let vec_rows: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM node_embeddings", [], |row| row.get(0))?;
+                assert_eq!(vec_rows, 0, "recreation drops the old 4096-dim rows");
+
+                // The done-journal was reset; pending and failed rows
+                // survive and stay claimable.
+                let statuses: Vec<String> = conn
+                    .prepare("SELECT status FROM pending_embeddings ORDER BY node_id")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(statuses, vec!["failed", "pending"]);
+                Ok(())
+            })
+            .expect("v11 assertions");
+
+        assert_eq!(store.done_embedding_hashes().expect("journal"), vec![]);
+        let claimed = store.claim_embedding_batch(10).expect("claim");
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|p| p.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["n-pending"],
+            "the surviving pending row stays claimable"
+        );
+
+        // The fresh 3072-dim cosine table takes new vectors
+        // immediately. test_vector is EMBEDDING_DIM long, so routing
+        // through it proves the table accepts the new pin (3072).
+        let v1 = test_vector(11);
+        assert_eq!(v1.len(), 3072, "decision 81 pin");
+        store.upsert_node_embedding("n-new", &v1).expect("upsert");
+        let hits = store.knn_node_embeddings(&v1, 1).expect("knn");
+        assert_eq!(hits[0].0, "n-new");
+        assert!(hits[0].1.abs() < 1e-6);
+
+        // A 4096-dim insert is REJECTED: the EMBEDDING_DIM hard length
+        // pin is the guard against the old model's vectors.
+        let old_dim_vector = vec![0.0f32; 4096];
+        assert!(
+            store
+                .upsert_node_embedding("n-bad", &old_dim_vector)
+                .is_err(),
+            "a 4096-dim vector must be rejected by the pin"
+        );
+
+        // Tip idempotency: a reopen re-runs nothing, data survives.
+        store.open_group("c1").expect("reopen");
+        let hits = store.knn_node_embeddings(&v1, 1).expect("knn after reopen");
+        assert_eq!(hits[0].0, "n-new");
+        store
+            .with_conn("c1", |conn| {
+                let v11_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 11",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(v11_rows, 1, "v11 recorded exactly once");
                 Ok(())
             })
             .expect("reopen assertions");

@@ -316,6 +316,38 @@ CREATE TABLE edge_texts (
 );
 ",
     ),
+    (
+        11,
+        "\
+-- Model switch (decision 81): the default embedding model becomes
+-- google/gemini-embedding-2 at its NATIVE 3072 dimensions (Vertex,
+-- ZDR). 3072 is the model's native dimension (the top of the
+-- Matryoshka ladder — the full vector, not a truncation), so the
+-- OpenAI-compatible `dimensions` request parameter is behaviorally
+-- irrelevant and the hard length pin (EMBEDDING_DIM in store.rs) is
+-- the guard. Embeddings are derived data, recomputable from node
+-- content, so the drop is free — the same drop-and-recreate template
+-- as v8 (metric cutover), now for the dimension change.
+DROP TABLE node_embeddings;
+
+-- Same shape as v8 (TEXT primary key, cosine metric, chunk_size =
+-- 128) at the new dimension. chunk_size = 128 now gives 1.5 MiB
+-- preallocation granules (128 * 3072 * 4 bytes). The vec0 module
+-- registration still happens before migrations in Store::open_group.
+CREATE VIRTUAL TABLE node_embeddings USING vec0(
+    node_id TEXT PRIMARY KEY,
+    embedding float[3072] distance_metric=cosine,
+    chunk_size=128
+);
+
+-- Done-journal reset (identical contract to v8): the recreated
+-- table invalidates every 'done' claim of pending_embeddings, so
+-- they are deleted and the next startup reconciliation re-enqueues
+-- every node for a full re-embed. 'pending' and 'failed' rows
+-- SURVIVE and stay claimable.
+DELETE FROM pending_embeddings WHERE status = 'done';
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
