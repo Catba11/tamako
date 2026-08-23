@@ -162,9 +162,11 @@ pub struct TriggerConfig {
     /// decision 66). GLOBAL-ONLY and flat: no per-purpose and no
     /// per-group machinery (the same standing as `llm_session_id`).
     /// Unlike the purpose model keys this is a concrete value, not an
-    /// Option: decision 66 pins the default
-    /// `qwen/qwen3-embedding-8b`. The env var TAMAKO_EMBEDDING_MODEL
-    /// wins at wiring time. Deviation: specs.md Section 13 has no
+    /// Option: decision 66 introduced the key (pinning the
+    /// `qwen/qwen3-embedding-8b` default); decision 81 re-pins the
+    /// default to `google/gemini-embedding-2` (native 3072 dims).
+    /// The env var TAMAKO_EMBEDDING_MODEL wins at wiring time.
+    /// Deviation: specs.md Section 13 has no
     /// embedding keys; reported for spec backfill (Phase 2).
     pub embedding_model: String,
     /// The base URL of the openai-compatible embedding endpoint
@@ -320,7 +322,7 @@ impl Default for TriggerConfig {
             gate_model: None,
             reply_model: None,
             summary_model: None,
-            embedding_model: "qwen/qwen3-embedding-8b".to_string(),
+            embedding_model: "google/gemini-embedding-2".to_string(),
             embedding_llm_base_url: "https://openrouter.ai/api/v1".to_string(),
             embedding_enabled: true,
             structured_output: None,
@@ -1322,10 +1324,10 @@ summary_model = "group-summary-model"
 
     #[test]
     fn toml_parse_and_apply_covers_the_embedding_keys() {
-        // Decision 66: the embedding keys are flat, GLOBAL-ONLY, and
-        // concrete (no Option): the defaults are pinned.
+        // Decision 66 introduced the embedding keys: flat, GLOBAL-ONLY,
+        // and concrete (no Option); decision 81 re-pins the default.
         let defaults = TriggerConfig::default();
-        assert_eq!(defaults.embedding_model, "qwen/qwen3-embedding-8b");
+        assert_eq!(defaults.embedding_model, "google/gemini-embedding-2");
         assert_eq!(
             defaults.embedding_llm_base_url,
             "https://openrouter.ai/api/v1"
@@ -1344,9 +1346,9 @@ embedding_llm_base_url = "https://embeddings.example/v1"
             "https://embeddings.example/v1"
         );
 
-        // Keys the TOML does not set keep the decision-66 defaults.
+        // Keys the TOML does not set keep the decision-81 default.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
-        assert_eq!(plain.global.embedding_model, "qwen/qwen3-embedding-8b");
+        assert_eq!(plain.global.embedding_model, "google/gemini-embedding-2");
         assert_eq!(
             plain.global.embedding_llm_base_url,
             "https://openrouter.ai/api/v1"

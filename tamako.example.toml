@@ -43,7 +43,11 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # summary_model = "mimo-v2.5"   # segmented C3 summarizer (7.3); default claude-haiku-4-5
 
 # Embeddings for the vector sidecar (global-only; decision 66). Keyed by
-# OPENAI_API_KEY; the default pair is OpenRouter + qwen3-embedding-8b (ZDR).
+# OPENAI_API_KEY; the default pair is OpenRouter +
+# google/gemini-embedding-2 (served by Google Vertex, ZDR). Decision 81
+# re-pins the dimension to the model's NATIVE 3072; schema v11 recreated
+# the vec0 table, so a boot after upgrade re-embeds everything — the
+# reconciliation burst heals the index.
 #
 # DUAL-USE NOTE (decision 77): embeddings ALWAYS read OPENAI_API_KEY — the
 # same environment variable the openai-compatible COMPLETIONS endpoints
@@ -56,7 +60,7 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # when it detects exactly this mismatch. To dual-use one provider key
 # (e.g. Opencode Go embeddings), set embedding_llm_base_url to the same
 # base as llm_base_url.
-# embedding_model = "qwen/qwen3-embedding-8b"
+# embedding_model = "google/gemini-embedding-2"
 # embedding_llm_base_url = "https://openrouter.ai/api/v1"
 
 # Per-purpose endpoint overrides for mixed deployments. Example:

@@ -3525,11 +3525,12 @@ mod tests {
             values.embedding_llm_base_url.as_deref(),
             Some("https://embeddings.example/v1")
         );
-        // The defaults map through as concrete values too.
+        // The defaults map through as concrete values too (decision 81
+        // re-pins the default model).
         let values = llm_config_values(&TriggerConfig::default());
         assert_eq!(
             values.embedding_model.as_deref(),
-            Some("qwen/qwen3-embedding-8b")
+            Some("google/gemini-embedding-2")
         );
         assert_eq!(
             values.embedding_llm_base_url.as_deref(),
