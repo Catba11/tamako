@@ -51,6 +51,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # every mutating offline CLI refuses to run against a locked group.
 fd-lock = "4"
 
+# Filesystem watcher for the live-mode persona hot reload (decision 80).
+# Binary-only: the recommended-mode watcher of the tamako binary, never a
+# library concern. Default features; the debounce is hand-rolled in
+# tamako/src/persona_watch.rs (no notify-debouncer-* crates).
+notify = "8"
+
 # Wake-trigger jitter. Refer to specs.md Section 8.3.
 rand = "0.9"
 

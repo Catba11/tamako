@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
+
+mod persona_watch;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1012,9 +1014,14 @@ fn spawn_embedding_worker(
 /// The run setup shared by both modes: bot configuration, the rendered
 /// persona preamble, the persona name (the sender display name of
 /// outbound raw-log rows), and the two storage backends.
+///
+/// Decision 80: `preamble` sits behind an `Arc<RwLock>` — the live
+/// persona watcher rewrites it on each accepted reload, so actors
+/// spawned after a reload are born current. Both spawn sites read
+/// through the lock with the house poison-recovery pattern.
 struct SharedSetup {
     bot_config: BotConfig,
-    preamble: String,
+    preamble: Arc<RwLock<String>>,
     bot_name: String,
     store: Arc<Store>,
     memory: Arc<LbugBackend>,
@@ -1036,7 +1043,9 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     info!(persona = %persona.name, preamble_len = preamble.len(), "persona preamble rendered");
     Ok(SharedSetup {
         bot_config,
-        preamble,
+        // Decision 80: updatable in live mode; the startup render is the
+        // initial value.
+        preamble: Arc::new(RwLock::new(preamble)),
         bot_name: persona.name,
         store: Arc::new(Store::new(cli.data_root.clone())),
         memory: Arc::new(LbugBackend::new(cli.data_root.clone())),
@@ -1154,8 +1163,16 @@ async fn run_replay(
         config: group_config,
         started_at: OffsetDateTime::now_utc(),
         inbox_capacity: DEFAULT_INBOX_CAPACITY,
-        // Rule C4: the rendered preamble seeds item 0 of the live context.
-        preamble: setup.preamble.clone(),
+        // Rule C4: the rendered preamble seeds item 0 of the live
+        // context. Decision 80: read through the shared lock like the
+        // live spawn site — but replay never spawns the persona watcher
+        // (Rule P1 replay determinism), so it reads the startup value
+        // forever.
+        preamble: setup
+            .preamble
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
         digest,
         // The actor performs the Rule C3 removal itself (M2); the hook
         // stays a seam for observers that need no actor state.
@@ -2630,6 +2647,23 @@ async fn run_live(
     }
 
     let mut actors: HashMap<String, GroupActorHandle> = HashMap::new();
+
+    // Decision 80: the live-mode persona hot-reload watcher (persona
+    // watch on {data_root}/persona.toml, debounced, one reload per save
+    // burst). The returned watcher MUST stay bound for the loop's
+    // lifetime — dropping it stops the watch. `None` (creation failed,
+    // one WARN already logged) drops the sender, so the select branch
+    // below stays inert. Replay never spawns this watcher (Rule P1).
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<persona_watch::ReloadNotice>(4);
+    let _persona_watcher = persona_watch::spawn_persona_watcher(
+        setup.store.data_root().to_path_buf(),
+        setup
+            .preamble
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        reload_tx,
+    );
     // Decision 77 (H5): one held group lock per served group, dropped
     // (releasing the OS locks) at the end of the run.
     let mut group_locks: HashMap<String, GroupLock> = HashMap::new();
@@ -2769,8 +2803,15 @@ async fn run_live(
                                 started_at: OffsetDateTime::now_utc(),
                                 inbox_capacity: DEFAULT_INBOX_CAPACITY,
                                 // Rule C4: the rendered preamble seeds item 0
-                                // of the live context.
-                                preamble: setup.preamble.clone(),
+                                // of the live context. Decision 80: read
+                                // through the shared lock at spawn time — an
+                                // actor spawned after a persona reload is
+                                // born current.
+                                preamble: setup
+                                    .preamble
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone(),
                                 digest,
                                 post_digest_hook: None,
                                 wake,
@@ -2837,6 +2878,24 @@ async fn run_live(
                 // channel never closes here.
                 None => break,
             },
+            // Decision 80: one applied persona reload. The pattern
+            // disables the branch when the watcher never started (the
+            // sender dropped at spawn) or exited (shutdown).
+            Some(notice) = reload_rx.recv() => {
+                // The shared preamble FIRST: actors spawned after this
+                // reload are born current (decision 80 (c)).
+                *setup
+                    .preamble
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = notice.preamble.clone();
+                let skipped = persona_watch::broadcast_preamble(&actors, &notice.preamble);
+                // ONE curated INFO line per applied reload (decision-53
+                // addition, the decision-78 warmup line's class): a
+                // deliberate operator event is exactly the startup-class
+                // kind. The fields mirror the startup "persona preamble
+                // rendered" line and add the skip count.
+                info!(persona = %notice.persona_name, preamble_len = notice.preamble.len(), skipped = skipped.len(), "persona preamble reloaded");
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("ctrl-c received; shutting down");
                 break;
