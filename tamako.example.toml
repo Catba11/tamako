@@ -114,6 +114,8 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # warmup_reaction_window_secs = 1800  # engagement window (8.5); reactions reach administrator groups only (4.2)
 # warmup_topic_cooldown_days = 3      # per-topic cooldown (9.7)
 
+# forced_wake_cooldown_secs = 10      # suppress back-to-back forced wakes (8.1); 0 disables
+
 # -------------------------------------------------------------- Groups ----
 # One table per group. An empty table registers the group with defaults.
 # Telegram supergroup ids are negative and start with -100. Quote them.
