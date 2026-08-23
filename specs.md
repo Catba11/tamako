@@ -84,18 +84,18 @@ To delete the memory of a group, delete the directory. Both files share one life
 
 ### 5.3 Persona configuration
 
-- One global persona configuration at `{data_root}/persona.toml`. Loaded once at startup.
+- One global persona configuration at `{data_root}/persona.toml`. Loaded at startup; in live mode a filesystem watcher reloads it on deliberate edits (decision 80: the rendered preamble is broadcast to every spawned group actor through its inbox, applied in memory only — the file is the state, the next rebuild renders the same bytes). Replay mode never watches.
 - An optional `system_prefix` string is rendered verbatim before the identity line, with exactly one blank line as the separator. It carries system-level directives, such as alignment notes. When the key is absent, the rendered preamble is bit-identical to a configuration without it. Rule C4 applies. The injection guardrail is code-owned and is never configurable.
 - A code-owned context-format explanation renders into the preamble after the persona sections and before the injection guardrail. It describes the XML item rendering of Section 7.3 in detail, and it forbids the model to write the `<msg>` or `<you>` structure itself. It is version-controlled and never configurable, like the guardrail. The same text feeds the participation-gate and the recall relevance-gate preambles.
 - In live mode the persona file is required. A missing or invalid file fails startup with a clear error. An explicit operator flag permits the lenient fallback chain for experiments. Replay mode is always lenient. The preamble is the cache anchor. Its source must be deliberate. Rule C4 applies.
-- The persona service renders the system preamble. The preamble is the prefix of every model context and never changes inside a context lifetime. Rule C4 applies.
+- The persona service renders the system preamble. The preamble is the prefix of every model context and never changes inside a context lifetime — EXCEPT through the deliberate reload event of decision 80 (an operator edit broadcast to all groups; in-flight calls keep their old snapshot, the next call of every purpose pays a cold prefix). Rule C4 applies.
 - The persona rendering layer is an interface. The pet persona is one implementation. This decoupling permits reuse of the runtime for other personas or purposes.
 
 ## 6. Per-group actor and concurrency
 
 ### 6.1 Actor model
 
-1. One actor per group. All trigger events enter one FIFO inbox.
+1. One actor per group. All trigger events enter one FIFO inbox. The inbox also carries the persona-reload command of decision 80 (live mode only): a reload serializes behind in-flight work and never interrupts a running call.
 2. LLM calls run concurrently across groups. Inside one group, the following operations are strictly serialized: graph writes, context mutations, session-state mutations.
 3. Graph writes per group are serialized through the actor. LadybugDB permits one writer per database file. A blocked batch must not block the queue. Refer to Section 10.4.
 4. The actor persists the session state after every mutation. On restart, the actor rebuilds the live context from the raw log and the session state.
@@ -126,7 +126,7 @@ Each item carries a message-id range tag. The boundary pair (`prev_digest_bounda
 - C1: Between two digests, the context is append-only. Rule P2 applies.
 - C2: A recall injection is always appended at the tail, directly after the messages that triggered it. An insertion into the middle of the history is forbidden.
 - C3: At digest time, the actor summarizes the chunk being removed, then removes every item with a range tag at or below the previous boundary. Summary items are exempt from the removal; their retention is count-based (Section 7.3). The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. The summary is persisted before the removal. If the summarization fails, the removal defers one cycle and the raw chunk stays. Refer to Section 10.3. The actor performs the summarization, the removal, the deduplication pruning of Section 10.2, and the boundary update as one serialized flow (Section 6.1). Post-digest hooks are stateless observers only. They must not mutate the context.
-- C4: A persona preamble change invalidates the provider cache for all groups. Preamble edits are deliberate events, not runtime side effects.
+- C4: A persona preamble change invalidates the provider cache for all groups. Preamble edits are deliberate events, not runtime side effects. The live-mode mechanism is decision 80: a debounced file watcher broadcasts the re-rendered preamble through each actor's inbox; the actor swaps context item 0 in memory (nothing persists — the file is the state); a malformed intermediate file keeps the current preamble with one WARN; a dead or backlogged actor is skipped (its next start reads the file).
 - C5: The context size is bounded by approximately two digest chunks plus two summaries. The maximum size follows from the digest thresholds in Section 8.2.
 - C6: Context items render in the XML form of Section 7.3. Every rendered attribute derives from persisted raw-log columns. Rule P1 applies.
 

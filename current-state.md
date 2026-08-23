@@ -1645,6 +1645,42 @@ v0.0.1 (alpha).
     back-to-back replies seconds apart. Spec backfill: graph-spec
     Section 7.4, specs.md Sections 6.2, 8.1, 8.4, 8.5, 13.
 
+80. **Persona hot reload (2026-08-18, operator-ruled).** Roadmap
+    Phase 2 item 8. Rule C4's "deliberate event" is the explicit
+    operator action of editing `{data_root}/persona.toml`; the
+    reload is LIVE-ONLY (`--replay` never watches — P1 replay
+    determinism). (a) WATCHER — `notify` (recommended-mode
+    watcher, no polling), events debounced ~500 ms (editors write
+    in bursts); a malformed intermediate state leaves the CURRENT
+    preamble in place with one WARN, and the watcher keeps running;
+    (b) BROADCAST — the new preamble is rendered ONCE at the
+    watcher site (identical bytes for every group, one CURATED
+    INFO line — a deliberate decision-53 addition like decision
+    78's warmup line: a deliberate operator event is exactly the
+    startup-class kind); each spawned actor receives it through a
+    new `ActorCommand::ReloadPreamble` inbox variant (the FIFO
+    mailbox of Section 6.1 rule 2 — a reload serializes behind
+    in-flight work, never interrupts a running call); the actor
+    applies it through the context module's existing
+    `reload_preamble` (item 0 swap, the C4 seam), and the swap is
+    IN-MEMORY ONLY — nothing persists, the next rebuild renders
+    the same preamble from the same file (the file is the state);
+    (c) COORDINATION — the watcher lives in the binary beside the
+    actor map, holds `GroupActorHandle`s, and SKELETONS the send:
+    an actor that died or whose inbox is full is skipped with one
+    WARN (its next restart picks the file up — the reload is
+    best-effort, the file is authoritative); a group whose actor
+    spawns AFTER the reload renders the preamble at spawn time
+    from the file, so it is born current; (d) C4 SEMANTICS — the
+    swap invalidates the provider prefix cache for that group's
+    next call: in-flight calls are untouched (they carry the old
+    preamble snapshot), the NEXT call of every purpose pays a
+    cold prefix (accepted; the cache miss is the point of the
+    event). The gate's disjoint preamble is NOT the persona
+    preamble (Section 9.6) and does not reload. Spec backfill:
+    specs.md Sections 5.3 (loaded-once wording), 6.1 (inbox
+    variant), 7.2 C4 (the mechanism), 13 (no new keys).
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
