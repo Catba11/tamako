@@ -281,6 +281,13 @@ pub struct TriggerConfig {
     pub warmup_topic_cooldown_days: u32,
     /// specs.md Section 8.5. Default 2.
     pub monologue_limit: u32,
+    /// specs.md Sections 8.1/13 (decision 79 (c)): the forced-wake
+    /// cooldown. A forced wake that produced a reply suppresses new
+    /// forcings for this long (the mention/reply is still logged and
+    /// lands in the next wake's presented set; no wake fires). Default
+    /// 10 s; 0 disables. The TOML key is `u64` seconds, which cannot be
+    /// negative — the type IS the validation.
+    pub forced_wake_cooldown: Duration,
 }
 
 impl Default for TriggerConfig {
@@ -345,6 +352,7 @@ impl Default for TriggerConfig {
             warmup_reaction_window: Duration::from_secs(30 * 60),
             warmup_topic_cooldown_days: 3,
             monologue_limit: 2,
+            forced_wake_cooldown: Duration::from_secs(10),
         }
     }
 }
@@ -482,6 +490,9 @@ pub struct TriggerConfigToml {
     /// `TriggerConfig::warmup_topic_cooldown_days`.
     pub warmup_topic_cooldown_days: Option<u32>,
     pub monologue_limit: Option<u32>,
+    /// The forced-wake cooldown in seconds (decision 79 (c)); 0
+    /// disables. Refer to `TriggerConfig::forced_wake_cooldown`.
+    pub forced_wake_cooldown_secs: Option<u64>,
 }
 
 impl TriggerConfigToml {
@@ -680,6 +691,9 @@ impl TriggerConfigToml {
         if let Some(value) = self.monologue_limit {
             base.monologue_limit = value;
         }
+        if let Some(value) = self.forced_wake_cooldown_secs {
+            base.forced_wake_cooldown = Duration::from_secs(value);
+        }
     }
 }
 
@@ -856,6 +870,9 @@ wake_floor_secs = 60
         assert_eq!(config.warmup_reaction_window, Duration::from_secs(30 * 60));
         assert_eq!(config.warmup_topic_cooldown_days, 3);
         assert_eq!(config.monologue_limit, 2);
+        // Decision 79 (c) (specs.md Sections 8.1/13): the forced-wake
+        // cooldown defaults to 10 s.
+        assert_eq!(config.forced_wake_cooldown, Duration::from_secs(10));
         // The M4 keys: every Option is None by default; the staleness
         // threshold is 20 (M4 deviation, reported for spec backfill).
         assert_eq!(config.llm_api, None);
@@ -1418,6 +1435,41 @@ warmup_quota = 3
         assert!(plain.global.warmup);
         assert_eq!(plain.global.warmup_quota, 1);
         assert_eq!(plain.global.warmup_active_hours, ActiveHours::DEFAULT);
+    }
+
+    #[test]
+    fn toml_override_sets_forced_wake_cooldown() {
+        // Decision 79 (c) (specs.md Sections 8.1/13): the forced-wake
+        // cooldown follows the same per-key overlay pattern as every
+        // other trigger key (AGENT.md Section 6.3: overridable per
+        // group).
+        let text = r#"
+[global]
+forced_wake_cooldown_secs = 30
+
+[groups."-100777"]
+forced_wake_cooldown_secs = 5
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert_eq!(config.global.forced_wake_cooldown, Duration::from_secs(30));
+        // A group override wins over the global value.
+        assert_eq!(
+            config.for_group("-100777").forced_wake_cooldown,
+            Duration::from_secs(5)
+        );
+        // A group without an override inherits the global value.
+        assert_eq!(
+            config.for_group("-100999").forced_wake_cooldown,
+            Duration::from_secs(30)
+        );
+        // Keys the TOML does not set keep the decision-79 default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(plain.global.forced_wake_cooldown, Duration::from_secs(10));
+        // 0 parses and applies: the suppression is disabled (decision
+        // 79 (c)).
+        let disabled = BotConfig::from_toml_str("[global]\nforced_wake_cooldown_secs = 0\n")
+            .expect("a zero cooldown loads");
+        assert_eq!(disabled.global.forced_wake_cooldown, Duration::ZERO);
     }
 
     #[test]

@@ -100,6 +100,12 @@ fn wake_config() -> TriggerConfig {
         wake_msg_count: 3,
         wake_floor: Duration::ZERO,
         wake_interval: HUGE_INTERVAL,
+        // Decision 79 (c): these scenarios mention the bot repeatedly
+        // within seconds of one another; the default 10 s forced-wake
+        // cooldown would suppress every forced wake after the first.
+        // The subjects here are recall/injection/digest behavior, not
+        // the cooldown — 0 disables it (specs.md Section 8.1).
+        forced_wake_cooldown: Duration::ZERO,
         ..TriggerConfig::default()
     }
 }
