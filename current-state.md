@@ -36,7 +36,9 @@ v0.0.1 (alpha).
   round (decision 77: all 6 High + mediums + lows), and the warmup
   trigger (decision 78: persisted P1 slot scheduling, interest-topic
   sampling with cooldown and tail exclusion, engagement backoff,
-  `warmups_total`/`warmup_engaged_total` in `--status`). Next:
+    `warmups_total`/`warmup_engaged_total` in `--status`), and the
+  decision-79 behavior round (warmup quota floor, H6c Person
+  confirmation, forced-wake cooldown). Next:
   persona hot reload (roadmap item 8), then metrics (item 9).
   - **M1 (digest pipeline end to end): COMPLETE.** The pipeline runs
     against the replayed log before any live traffic: batch assembly,
@@ -237,8 +239,12 @@ v0.0.1 (alpha).
     persisted P1 slot scheduling (`warmup_next_at`; a restart fires
     exactly once, never reshuffles), the topic weighting/exclusion
     logic, the engagement watch + backoff math, and the curated
-    `warmup` INFO line.
-    | 278 |
+    `warmup` INFO line. Decision 79 (a): the effective-quota floor
+    (the zero-floor fixed point removed); (c): the
+    `forced_wake_cooldown` key + the in-memory, forced_at-anchored
+    suppression in the intake path (never in SessionState — rebuild
+    bit-identical).
+    | 283 |
 | `tamako-store` | `store.db`: embedded migration runner (v1–v6), `messages` (idempotent insert, range read `list_messages_after`; nullable `sender_username` since v4, decision 61), `state` KV with atomic multi-write and counters, `injected_memories` (with the rendered `content` column since v2; `delete_injected_memories_up_to` for the Section 10.2 step 4 prune), `dead_letter`, `reactions` (migration v3, Section 5.2: `insert_reaction` with dedup UNIQUE INDEX with COALESCE → Duplicate), `context_summaries` (migration v5, decision 62: `(first_msg_id, last_msg_id)` natural dedup key with `INSERT OR IGNORE` for the check-before-call replay idempotency, `find_context_summary`, `list_newest_context_summaries` for the keep-two rebuild, `list_messages_in_range` for the summarizer input; rotated-out rows kept for forensics); migration v6 extends the `messages_dedup` key with `text` (decision 65 H1: same-second different-text edits persist; index-only, no data touched); `find_latest_message_by_platform_msg_id` (decision 65: newest row by id, for the invisible-edit intake filter). `find_sender_by_platform_msg_id` (M5: reply-target entry resolution of the recall, Section 8.1 step 1). `find_reply_target` (decision 61: reply-target rendering resolution — `platform_msg_id` → MIN(id) original row + display name). `read_group_status` (M6: the read-only status query of the `--status` modes — SQLITE_OPEN_READ_ONLY, no create, no migrate, 2 s busy timeout; specs.md Sections 10.3 and 12). WAL + `synchronous=NORMAL`. `chat_id` validation. Decision 66: migration v7 — the `pending_embeddings` queue (UNIQUE(node_id, content_hash), status/attempts discipline) and the `node_embeddings` vec0 virtual table (chunk_size 128), with sqlite-vec registered at EVERY connection open (an unregistered connection cannot even SELECT the virtual table); the done journal makes re-embedding idempotent. Decision 73: migration v8 drops and recreates `node_embeddings` with `distance_metric=cosine` and clears the done journal so the reconciliation pass re-embeds (a discrimination test pins the cutover). Decision 74: migration v9 — the `merge_audit` table with the rollback snapshot; audit helpers plus scan helpers (`embedded_node_ids`, `node_embedding`). Decision 76: migration v10 — `edge_texts` (plain table + escaped LIKE, not FTS5: the trigram tokenizer cannot match CJK terms shorter than three characters); the KNN/LIKE helpers for the deep-recall candidate sources. Decision 77: queue resurrection (ON CONFLICT resurrect-failed), `busy_timeout` on RW opens, `get_merge_audit` by id, the schema-version ceiling. Decision 78: latest-row read ops for the warmup silence check and the raw-log tail. | 72 |
 | `tamako-memory` | `MemoryBackend` trait (`Send` futures) with `alias_targets` (entity resolution step 2) and `neighbors` (M5: the Section 8.2 direct-neighbor read path — valid edges only, `contains` excluded, 500-edge expansion limit truncated by `created_at` descending, one hop, Rule R5 identifier entry; `NeighborEdge::edge_id` is the Section 9.3 dedup key), `LbugBackend` on `lbug 0.18` (schema creation, transactional idempotent `upsert_batch`, `CHECKPOINT`, per-group isolation, `query_rows` read helper; M6: ALL per-group operations serialized on a per-group async mutex — lbug 0.18 `Send + Sync` does not imply read-during-write safety, decision 47), deterministic UUID5 identifiers with NFKC normalization. Decision 66: `node_content` / `list_node_contents` reads for the embedding worker and the reconciliation pass. Decision 73: `node_resolution_infos` batch read (kind + alias target) for the vector pre-screen. Decision 74: `merge_nodes` / `link_also_known_as` / `rollback_merge` — snapshot-before-mutation, one write-only lbug transaction per operation over a shared `transact()` helper (upsert_batch refactored onto it, behavior identical), DETACH DELETE verified in the bundled lbug parser/executor. Decision 75: single-value invalidation in the write path (batch-order invalidate-then-write per registry edge, one transaction, replay-convergent), the manual ops `invalidate_edge` / `revalidate_edge` / `node_facts` (edge ids are a compact JSON of the natural key — the EDGE table has no id column), and the merge-tool invariant patch (`merge_nodes_with_registry` invalidates older valid same-predicate edges on the survivor). Decision 76: `two_hop_edges` (the graph-spec 8.2 rules: whitelist excludes contains/known_as, also_known_as traversed, validity filter, 90-day window, 500-edge per-node truncation at both hops), `edges_by_ids`, `list_all_edges`. Decision 77: snapshot v2 (`invalidated_survivor_edges`, version-checked restore), validity-aware merge dedup, deterministic truncation tiebreaks. Decision 78: `sample_interest_topics` (Concept nodes with edge counts and latest activity; the lbug all-DISTINCT-aggregates quirk documented). Tested against the real driver. | 73 (incl. the concurrent-access regression test) |
 | `tamako-persona` | `persona.toml` loading, `PreambleRenderer` trait, `PetPreambleRenderer` with the Section 9.4 injection guardrail, example persona at the repo root. Decision 63: the code-owned `CONTEXT_FORMAT_GLOSS` (the XML context-format explanation, single-source for the reply preamble and the agent gate/recall preambles) and the amended `INJECTION_GUARDRAIL` naming the `<memory>`/`<summary>` tags (still rendered last); the decision-54 bit-identical-without-prefix property is deliberately broken by the gloss. Decision 64: the gloss gains the no-imitation line (never write `<msg>`/`<you>` blocks — context structure, never speech; the deliberate second preamble event). | 18 |
@@ -276,9 +282,14 @@ v0.0.1 (alpha).
     Decision 78: the `WarmupGenerator` sibling seam
     (`RigWarmupGenerator` over the reply endpoint; the ephemeral
     instruction names the topic and carries the decision-69 framing
-    rule and the F2 sentence, drift-test-caught).
+    rule and the F2 sentence, drift-test-caught). Decision 79 (b):
+    `decide_band` takes the binding target's kind — a top-band
+    PERSON binding (direct or through an Alias target) falls into
+    the budget-capped confirmation path (accepted counts
+    `confirmed`, never `auto_matched`); Concept/Alias-of-Concept
+    auto-match unchanged.
     Live-API smoke tests ignored by default
-    (`TAMAKO_LIVE_TEST=1`). | 258 (+4 ignored) |
+    (`TAMAKO_LIVE_TEST=1`). | 260 (+4 ignored) |
 
 ## 3. Key decisions and deviations so far
 
