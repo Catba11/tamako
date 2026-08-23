@@ -103,7 +103,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 ### 6.2 Trigger ordering
 
 - If several triggers are pending, `Digest` runs before `Wake`. Recall sees the freshest graph.
-- A forced `Wake` (mention or reply to the bot) moves to the head of the queue. It does not preempt a running call.
+- A forced `Wake` (mention or reply to the bot) moves to the head of the queue. It does not preempt a running call. A forced wake is suppressed while a `forced_wake_cooldown` is running (Section 8.1): a suppressed forced wake leaves no queue entry.
 - Inbound messages during a running `Wake` are logged and appended to the context. They do not interrupt the running call. Before the bot sends a reply, the actor re-checks the recency of the target message. If the number of newer human messages after the target exceeds `reply_staleness_threshold` (20), the reply is discarded, not regenerated. The next wake is the natural retry.
 - A non-forced wake reply quotes (replies-to) its target message only when the number of newer human messages after the target exceeds `reply_quote_threshold` (10). A recent target gets a plain standalone message: a Telegram reply notifies the author, and a recent target needs no context anchor. A forced wake always quotes — the human engaged the bot directly.
 - If a wake fails, `wake_last_row_id` rolls back to its pre-wake value: the messages are presented again at the next wake. A failed forced wake requeues once. A second failure emits a distinct error, because Section 8.1 obliges the bot to respond.
@@ -151,6 +151,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 - Duplicate deliveries: the raw log insert is idempotent. The wake counter counts each delivery. The counter is a scheduling hint; the log row is the source of truth. Rule P1 applies.
 - An edited message appends a new log row with the edit time as its timestamp. An edit whose text is identical to the latest stored row of that message appends nothing: it is not an event (Section 4.2 lists the platform causes). Extracted facts are not retracted. Refer to Section 15.
 - A mention of the bot or a reply to the bot triggers a forced `Wake`. The bot must respond when addressed directly. The `muted` state does not suppress a forced wake. Refer to Section 8.4.
+- Forced-wake cooldown: a forced wake that produced a reply starts a `forced_wake_cooldown` (default 10 s, per-group overridable, 0 disables). A new forced wake during the cooldown is suppressed: the mention or reply is still logged to the raw log and the context (it lands in the next wake's presented set, so no information is lost), but no immediate wake fires. The cooldown suppresses the back-to-back reply chains of a mention/reply rally (decision 79).
 
 ### 8.2 Digest trigger
 
@@ -176,7 +177,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 ### 8.5 Speech suppression
 
 - Hard rule (monologue lock): if the last `monologue_limit` (2) messages in the group are all from the bot, enter the `muted` state. In `muted`, proactive speech and warmup are forbidden. A forced wake is still permitted. Any human message clears the state.
-- Soft rule (warmup backoff): a warmup is ENGAGED when a human reply or a reaction arrives within `warmup_reaction_window` (30 min; reactions reach administrator groups only — Section 4.2 — so non-administrator groups measure replies only). A warmup with zero engagement at window expiry increments `warmup_backoff_factor` by one: the effective daily quota becomes max(0, `warmup_quota` − factor) and the warmup interval multiplier becomes 2^factor. Any successful engagement resets the factor to zero.
+- Soft rule (warmup backoff): a warmup is ENGAGED when a human reply or a reaction arrives within `warmup_reaction_window` (30 min; reactions reach administrator groups only — Section 4.2 — so non-administrator groups measure replies only). A warmup with zero engagement at window expiry increments `warmup_backoff_factor` by one: the effective daily quota becomes max(1, `warmup_quota` − factor) — the floor of one keeps the engagement reset reachable (decision 79: backoff lengthens spacing, it never silences permanently) — and the warmup interval multiplier becomes 2^factor. Any successful engagement resets the factor to zero.
 - Participation rate is a metric. The calibration band is 30 to 60 percent. Refer to Section 12.
 
 ## 9. Wake procedure
@@ -308,6 +309,7 @@ Global defaults. Every item is overridable per group.
 | `monologue_limit` | 2 | 8.5 |
 | `reply_staleness_threshold` | 20 newer human messages | 6.2 |
 | `reply_quote_threshold` | 10 newer human messages | 6.2 |
+| `forced_wake_cooldown` | 10 s (0 disables) | 8.1 |
 | `gate_context` | true | 9.6 |
 | `vector_resolution` | true | graph 7.4 |
 | `vector_match_threshold` | 0.92 (provisional) | graph 7.4 |

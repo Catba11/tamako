@@ -1609,6 +1609,31 @@ v0.0.1 (alpha).
     counters (the exit-criterion metric), rendered in `--status`.
     Spec backfill: Sections 5.2, 8.4, 8.5, 9.7, 12, 13.
 
+79. **Three behavior rulings (2026-08-18, operator-ruled).** (a)
+    WARMUP BACKOFF FLOOR — decision 78's formula had an
+    unreachable-reset fixed point: at `warmup_quota` 1 one unengaged
+    warmup drove the effective quota to max(0, 1−1) = 0, and since
+    the engagement reset requires sending a warmup, a flopped warmup
+    silenced the pet permanently. Ruled: the effective daily quota
+    is max(1, quota − factor) — backoff lengthens spacing (2^factor
+    multiplier, unchanged) but never zeroes the quota. A pet that
+    can never come back is worse than a pet that tries once a day.
+    (b) H6c — the Person-kind auto-match band (≥
+    `vector_match_threshold`) now makes the SAME budget-capped
+    three-way confirmation call as the middle band (Section 7.4
+    budget counts it): a wrong Person binding is social damage the
+    merge tool cannot cleanly undo (merged-away utterance
+    authorship), unlike a Concept fragment. Ruled: confirm. (c)
+    FORCED-WAKE COOLDOWN — the shelved spec question from the
+    decision-65 round is ruled: a forced Wake that produced a reply
+    starts a `forced_wake_cooldown` (default 10 s, per-group
+    overridable, 0 disables) during which new forced wakes are
+    suppressed — the intake event (mention/reply) is still logged
+    and lands in the next wake's presented set, so no information
+    is lost; the mention/reply chain can no longer produce
+    back-to-back replies seconds apart. Spec backfill: graph-spec
+    Section 7.4, specs.md Sections 6.2, 8.1, 8.4, 8.5, 13.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
@@ -1699,13 +1724,10 @@ Deliberately not done, in priority order:
   presented-set check dedups an already-replied target, so a marker
   regression would bring K2 back unimpeded. The sunset criterion
   stays marker-focused.
-- **Forced-wake chains bypass the floor (conforming; spec question
-  pending)**: a human replying to the bot's answer triggers another
-  forced wake (specs.md Section 8.1), which bypasses the gate, the
-  monologue lock, AND `wake_floor` — mention/reply chains can produce
-  back-to-back replies seconds apart. Conforming to the spec as
-  written; a forced-wake cooldown is a spec-revision candidate the
-  operator has not ruled on.
+- **Forced-wake chains bypass the floor: RULED (decision 79).** A
+  forced wake that produced a reply starts a `forced_wake_cooldown`
+  (default 10 s) suppressing new forced wakes; the intake events
+  still land in the next wake's presented set.
 
 ## 5. Phase 1 milestones
 
