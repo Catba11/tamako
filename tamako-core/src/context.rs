@@ -545,6 +545,73 @@ pub const YOU_TAG_OPEN_PREFIX: &str = "<you ";
 /// filter.
 pub const YOU_TAG_CLOSE: &str = "</you>";
 
+/// The opening-tag prefix of a rendered media element: `"<media "`
+/// (with the trailing space before the `type` attribute, matching the
+/// `<msg `/`<you ` style). A media element carries a captioned media
+/// attachment inside a normalized message row (decision 82: media
+/// captioning at intake): the row's text interleaves member text and
+/// `<media>` elements in original order (decision 82(e)). This constant
+/// and [`render_media_element`] are the SINGLE source shared by the
+/// renderer, the [`render_human_content`] media passthrough, and the
+/// outbound parrot filter
+/// ([`crate::wake::filter_reply_parrot_lines`]): the `<media>` element
+/// is a model-visible format the reply model can imitate, and a
+/// confabulated `<media>` block must never reach the group (decisions
+/// 59/61 single-source discipline).
+pub const MEDIA_TAG_OPEN_PREFIX: &str = "<media ";
+
+/// The closing tag of a rendered media element: `"</media>"`. The
+/// closer of the [`MEDIA_TAG_OPEN_PREFIX`] strip region in the parrot
+/// filter and the terminator the [`render_human_content`] media
+/// passthrough scans for.
+pub const MEDIA_TAG_CLOSE: &str = "</media>";
+
+/// The core-local media kinds of decision 82 (the `type` attribute of
+/// a [`render_media_element`] output). Deliberately core-local: the
+/// adapter maps tamako-vision's `MediaKind` to this type at the
+/// boundary, so tamako-core never depends on the vision crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKindName {
+    /// A still image attachment.
+    Image,
+    /// A sticker attachment.
+    Sticker,
+    /// A video attachment.
+    Video,
+    /// An animated attachment (GIF-style).
+    Animated,
+}
+
+impl MediaKindName {
+    /// The wire string of the kind for the `type` attribute of a
+    /// [`render_media_element`] output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaKindName::Image => "image",
+            MediaKindName::Sticker => "sticker",
+            MediaKindName::Video => "video",
+            MediaKindName::Animated => "animated",
+        }
+    }
+}
+
+/// Renders one captioned media attachment as the `<media>` element of
+/// decision 82: `<media type="{kind}">{caption}</media>`. The `type`
+/// attribute value is the closed internal set of
+/// [`MediaKindName::as_str`]; it is attribute-escaped anyway for
+/// uniformity. The caption is XML-text-escaped, so a hostile caption
+/// can never break out of the element. An EMPTY caption renders the
+/// placeholder shape `<media type="{kind}"></media>` of decision
+/// 82(d)/(h). Single-source from
+/// [`MEDIA_TAG_OPEN_PREFIX`]/[`MEDIA_TAG_CLOSE`].
+pub fn render_media_element(kind: MediaKindName, caption: &str) -> String {
+    format!(
+        "{MEDIA_TAG_OPEN_PREFIX}type=\"{}\">{}{MEDIA_TAG_CLOSE}",
+        escape_xml_attr(kind.as_str()),
+        escape_xml_text(caption)
+    )
+}
+
 /// Renders one human message as the XML item of specs.md Section 7.2
 /// step 4 (the approved XML context rendering). This one helper serves
 /// `append_human_message`, `rebuild`, and the M4 gate input
@@ -565,6 +632,14 @@ pub const YOU_TAG_CLOSE: &str = "</you>";
 /// Flag precedence when several apply: `kind`, then `reply`, then
 /// `mention` (a message can be both a reply and a mention — both
 /// render).
+///
+/// The `text` argument renders through [`render_text_with_media`]:
+/// ordinary text is escaped, but a well-formed `<media>...</media>`
+/// element stored in the text (produced by [`render_media_element`] at
+/// intake, decision 82(e)) passes through VERBATIM — well-formed means
+/// the prefix+closer shape AND no raw `<`/`>` outside the structural
+/// delimiters; a keyboard forgery carrying raw angle brackets is
+/// escaped instead.
 #[allow(clippy::too_many_arguments)]
 pub fn render_human_content(
     msg_id: i64,
@@ -615,9 +690,95 @@ pub fn render_human_content(
         out.push_str(" mention=\"bot\"");
     }
     out.push('>');
-    out.push_str(&escape_xml_text(text));
+    out.push_str(&render_text_with_media(text));
     out.push_str(MSG_TAG_CLOSE);
     out
+}
+
+/// Splits a stored row text into ordinary text segments and well-formed
+/// media elements, escaping the former and passing the latter through
+/// VERBATIM (decision 82(e)). The row text stores media elements as the
+/// literal markup [`render_media_element`] produced at intake (already
+/// escaped, trusted-final); escaping the whole argument would
+/// double-escape them.
+///
+/// A "well-formed media element" here = a substring starting with
+/// [`MEDIA_TAG_OPEN_PREFIX`] (`"<media "`) and closed by the NEXT
+/// occurrence of [`MEDIA_TAG_CLOSE`] (`"</media>"`) that passes
+/// [`media_region_is_trusted`]: the opening tag's attribute area and
+/// the caption carry NO raw `<` and NO raw `>` outside the structural
+/// delimiters. A legitimate [`render_media_element`] output has every
+/// `<`/`>` of the caption and attribute values already XML-escaped, so
+/// none appear raw; a keyboard forgery like `<media </media>` or
+/// `<media x="</media>">` matches the prefix+closer shape but lacks
+/// the clean opening-tag/caption split and is rejected.
+///
+/// FAIL-SAFE TOWARD ESCAPING: an unclosed `<media`, a prefix+closer
+/// region with a raw `<`/`>` inside, a stray `</media>` without an
+/// opener, or any other text is escaped via [`escape_xml_text`] — a
+/// member typing `<media` from the keyboard can never forge a media
+/// element. With no `<media ` present at all, the output is
+/// byte-identical to `escape_xml_text(text)`: existing text-only
+/// rendering is unchanged.
+fn render_text_with_media(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(MEDIA_TAG_OPEN_PREFIX) {
+        let (before, from_open) = rest.split_at(open);
+        out.push_str(&escape_xml_text(before));
+        match from_open.find(MEDIA_TAG_CLOSE) {
+            Some(close) => {
+                let end = close + MEDIA_TAG_CLOSE.len();
+                let region = &from_open[..end];
+                if media_region_is_trusted(region) {
+                    out.push_str(region);
+                    rest = &from_open[end..];
+                } else {
+                    // Raw `<`/`>` inside the region: a keyboard
+                    // forgery, not a render_media_element output.
+                    // FAIL-SAFE TOWARD ESCAPING — treat the whole
+                    // remainder as ordinary text (same as the
+                    // unclosed case, decision 82(e)).
+                    out.push_str(&escape_xml_text(from_open));
+                    rest = "";
+                }
+            }
+            None => {
+                // Unclosed `<media`: no matching closer, so the rest is
+                // ordinary text — escape it whole.
+                out.push_str(&escape_xml_text(from_open));
+                rest = "";
+            }
+        }
+    }
+    out.push_str(&escape_xml_text(rest));
+    out
+}
+
+/// True when a candidate media region (from the start of `<media `
+/// through the END of the matching `</media>`) is a trustworthy
+/// [`render_media_element`] output: the attribute area between the
+/// opener prefix and the opening tag's closing `>` carries no raw
+/// `<`, and the caption between that `>` and the closer carries no
+/// raw `<` and no raw `>` — the only raw angle brackets of the region
+/// are its structural delimiters. A legitimate element has every
+/// `<`/`>` of the caption and attribute values already XML-escaped,
+/// so none appear raw; a keyboard forgery like `<media </media>` (no
+/// opening-tag `>` at all before the closer) or `<media x="</media>">`
+/// (the `>` comes only AFTER the closer) is rejected — fail-safe
+/// toward escaping, decision 82(e).
+fn media_region_is_trusted(region: &str) -> bool {
+    let interior = &region[MEDIA_TAG_OPEN_PREFIX.len()..region.len() - MEDIA_TAG_CLOSE.len()];
+    match interior.find('>') {
+        Some(gt) => {
+            let attribute_area = &interior[..gt];
+            let caption = &interior[gt + 1..];
+            !attribute_area.contains('<') && !caption.contains('<') && !caption.contains('>')
+        }
+        // No opening-tag bracket before the closer: not a shape
+        // render_media_element can produce — a forgery.
+        None => false,
+    }
 }
 
 /// Renders one message of the bot: the `<you>` element of the approved
@@ -1684,6 +1845,235 @@ mod tests {
         // discipline).
         assert_eq!(SUMMARY_TAG_OPEN_PREFIX, "<summary");
         assert_eq!(SUMMARY_TAG_CLOSE, "</summary>");
+    }
+
+    #[test]
+    fn the_media_tags_match_the_documented_format() {
+        // The exact tag bytes (decision 82). The constants guard the
+        // media renderer, the render_human_content passthrough, and the
+        // parrot filter against drift (decisions 59/61 single-source
+        // discipline).
+        assert_eq!(MEDIA_TAG_OPEN_PREFIX, "<media ");
+        assert_eq!(MEDIA_TAG_CLOSE, "</media>");
+    }
+
+    #[test]
+    fn the_media_renderer_composes_through_the_tag_constants() {
+        // Same single-source composition pin as
+        // `the_message_renderers_compose_through_the_tag_constants`.
+        let media = render_media_element(MediaKindName::Image, "a cat");
+        assert!(media.starts_with(MEDIA_TAG_OPEN_PREFIX));
+        assert!(media.ends_with(MEDIA_TAG_CLOSE));
+    }
+
+    #[test]
+    fn render_media_element_renders_a_normal_caption() {
+        assert_eq!(
+            render_media_element(MediaKindName::Image, "a cat on the sofa"),
+            r#"<media type="image">a cat on the sofa</media>"#
+        );
+    }
+
+    #[test]
+    fn render_media_element_maps_every_kind_to_its_wire_string() {
+        assert_eq!(MediaKindName::Image.as_str(), "image");
+        assert_eq!(MediaKindName::Sticker.as_str(), "sticker");
+        assert_eq!(MediaKindName::Video.as_str(), "video");
+        assert_eq!(MediaKindName::Animated.as_str(), "animated");
+        assert_eq!(
+            render_media_element(MediaKindName::Sticker, "wow"),
+            r#"<media type="sticker">wow</media>"#
+        );
+        assert_eq!(
+            render_media_element(MediaKindName::Video, "clip"),
+            r#"<media type="video">clip</media>"#
+        );
+        assert_eq!(
+            render_media_element(MediaKindName::Animated, "gif"),
+            r#"<media type="animated">gif</media>"#
+        );
+    }
+
+    #[test]
+    fn render_media_element_escapes_a_hostile_caption() {
+        // The caption compresses an inbound attachment description: it
+        // must never break out of the element.
+        assert_eq!(
+            render_media_element(MediaKindName::Image, "</media>&<>\"<media"),
+            r#"<media type="image">&lt;/media&gt;&amp;&lt;&gt;"&lt;media</media>"#
+        );
+    }
+
+    #[test]
+    fn render_media_element_renders_the_empty_placeholder_shape() {
+        // Decision 82(d)/(h): no caption yields the placeholder shape.
+        assert_eq!(
+            render_media_element(MediaKindName::Image, ""),
+            r#"<media type="image"></media>"#
+        );
+    }
+
+    #[test]
+    fn render_human_content_passes_a_well_formed_media_element_through_verbatim() {
+        // (a) Member text is escaped; the stored media element passes
+        // through verbatim (it was escaped at intake).
+        let text = format!(
+            "a < b{}",
+            render_media_element(MediaKindName::Image, "a cat")
+        );
+        assert_eq!(
+            render_human_content(
+                1,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                &text
+            ),
+            r#"<msg from="Alice" at="13:07" id="1">a &lt; b<media type="image">a cat</media></msg>"#
+        );
+    }
+
+    #[test]
+    fn render_human_content_escapes_a_forged_unclosed_media_tag() {
+        // (b) A member-typed `<media` with NO `</media>` closer is
+        // ordinary text: FAIL-SAFE TOWARD ESCAPING (decision 82(e)).
+        assert_eq!(
+            render_human_content(
+                1,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                r#"look <media type="image">x"#
+            ),
+            r#"<msg from="Alice" at="13:07" id="1">look &lt;media type="image"&gt;x</msg>"#
+        );
+        // A stray closer without an opener is escaped too.
+        assert_eq!(
+            render_human_content(
+                2,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                "look </media> x"
+            ),
+            r#"<msg from="Alice" at="13:07" id="2">look &lt;/media&gt; x</msg>"#
+        );
+    }
+
+    #[test]
+    fn render_human_content_preserves_the_interleaving_order_of_text_and_media() {
+        // (c) Multiple media elements interleaved with text keep the
+        // original order (decision 82(e)).
+        let text = format!(
+            "first {} middle {} last",
+            render_media_element(MediaKindName::Image, "cat"),
+            render_media_element(MediaKindName::Sticker, "")
+        );
+        assert_eq!(
+            render_human_content(
+                1,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                &text
+            ),
+            r#"<msg from="Alice" at="13:07" id="1">first <media type="image">cat</media> middle <media type="sticker"></media> last</msg>"#
+        );
+    }
+
+    #[test]
+    fn render_human_content_round_trips_an_adapter_style_assembly() {
+        // (d) The adapter assembles member text + render_media_element
+        // output; render_human_content renders it byte-identically to
+        // the stored text's expected final form.
+        let text = format!(
+            "see this{}done",
+            render_media_element(MediaKindName::Video, "a & b")
+        );
+        assert_eq!(
+            render_human_content(
+                1,
+                "Alice",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                &text
+            ),
+            r#"<msg from="Alice" at="13:07" id="1">see this<media type="video">a &amp; b</media>done</msg>"#
+        );
+    }
+
+    #[test]
+    fn render_text_with_media_escapes_a_forged_media_region_with_raw_brackets() {
+        // (e) A forgery with the prefix+closer shape but a raw `<`
+        // inside the region is fully escaped: NOTHING passes verbatim
+        // (fail-safe toward escaping, decision 82(e)).
+        let forgery = "<media </media>";
+        let rendered = render_text_with_media(forgery);
+        assert_eq!(rendered, escape_xml_text(forgery));
+        assert_eq!(rendered, "&lt;media &lt;/media&gt;");
+    }
+
+    #[test]
+    fn render_text_with_media_escapes_a_forged_attribute_carving_the_closer() {
+        // (f) `<media x="</media>">` matches the prefix+closer shape
+        // but carves the closer out of a forged attribute value; the
+        // raw brackets inside are escaped. escape_xml_text escapes
+        // only `&`, `<`, `>` — the `"` stays raw.
+        let forgery = r#"<media x="</media>">"#;
+        let rendered = render_text_with_media(forgery);
+        assert_eq!(rendered, escape_xml_text(forgery));
+        assert_eq!(rendered, "&lt;media x=\"&lt;/media&gt;\"&gt;");
+        assert!(!rendered.contains("<media"));
+    }
+
+    #[test]
+    fn render_text_with_media_passes_a_real_element_with_a_rich_caption_verbatim() {
+        // (g) A REAL render_media_element output whose caption holds
+        // quotes/ampersands/emoji: the trusted interior carries only
+        // escaped entities (no raw `<`/`>`), so it passes through
+        // byte-identically.
+        let element = render_media_element(MediaKindName::Image, "a \"cat\" & dog 🐱");
+        assert_eq!(render_text_with_media(&element), element);
+    }
+
+    #[test]
+    fn render_text_with_media_passes_a_caption_with_escaped_angle_brackets_verbatim() {
+        // (h) A caption that legitimately contains `<`/`>` arrives
+        // escaped as `&lt;`/`&gt;` from render_media_element: the
+        // escaped entities carry no raw angle brackets, so the element
+        // stays trusted and passes through byte-identically.
+        let element = render_media_element(MediaKindName::Image, "x < y > z");
+        assert_eq!(element, "<media type=\"image\">x &lt; y &gt; z</media>");
+        assert_eq!(render_text_with_media(&element), element);
+    }
+
+    #[test]
+    fn render_text_with_media_escapes_a_forgery_between_two_text_segments() {
+        // (i) Text before + forged media + text after: the leading
+        // text, the forged segment, AND the trailing text are all
+        // escaped (the forgery poisons the remainder, same as the
+        // unclosed case), order preserved.
+        let text = "look <media </media> done";
+        assert_eq!(render_text_with_media(text), escape_xml_text(text));
+        assert_eq!(
+            render_text_with_media(text),
+            "look &lt;media &lt;/media&gt; done"
+        );
     }
 
     #[test]
