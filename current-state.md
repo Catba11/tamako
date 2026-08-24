@@ -1858,17 +1858,16 @@ v0.0.1 (alpha).
     (h) VIDEO/WEBM DECOUPLING: every cutover seam takes a
         media-kind parameter (the vision crate's normalize entry,
         the purpose's request assembly, the render helper, the
-        placeholder). Video at cutover is accepted but rendered
-        through the placeholder path (a `<media type="video"></media>`
-        element with the unsupported-note caption left EMPTY is
-        NOT emitted — an unsupported kind renders a fixed
-        placeholder element exactly like a failed caption, so the
-        log marks its existence). Animated stickers (webm/tgs) and
-        GIFs are out of scope at cutover and render the same
-        placeholder. The later video path normalizes container/
-        duration/size and sends base64 video through the same
-        caption purpose (M3 eats video natively) — no new
-        architecture, one new normalize implementation.
+        placeholder). Video and animated media (webm/tgs/GIF) are
+        OUT OF SCOPE at cutover: an inbound video/animated item
+        renders the SAME placeholder element as a failed caption
+        (`<media type="video"></media>`, empty body) — the log
+        marks its existence, the digest sees the marker, and no
+        caption call is attempted. The later video path
+        normalizes container/duration/size and sends base64 video
+        through the same caption purpose (M3 eats video natively)
+        — no new architecture, one new normalize implementation
+        and one new kind branch.
     (i) A4/A5: Rule A4's normalized message gains an ordered media
         part list (kind, caption text) — text and media interleave
         in one normalized body before the row is written, so A1
