@@ -27,6 +27,10 @@ tempfile = "3"
 # The offline demo example replays the shipped fixture through the mock
 # adapter (examples/digest_demo.rs).
 tamako-adapter-mock.workspace = true
+# The caption spike (tests/caption_spike.rs) builds its test image
+# through the real normalize pipeline.
+tamako-vision.workspace = true
+image.workspace = true
 # The endpoint probe example (examples/probe_endpoint.rs) posts raw HTTP
 # so it stays independent of rig. 0.12 matches the reqwest version rig
 # 0.41 already pulls in (Cargo.lock).

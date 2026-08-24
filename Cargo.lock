@@ -2791,6 +2791,7 @@ dependencies = [
 name = "tamako-agent"
 version = "0.1.0"
 dependencies = [
+ "image",
  "reqwest 0.12.28",
  "rig-core",
  "schemars 1.2.2",
@@ -2801,6 +2802,7 @@ dependencies = [
  "tamako-memory",
  "tamako-persona",
  "tamako-store",
+ "tamako-vision",
  "tempfile",
  "thiserror",
  "time",

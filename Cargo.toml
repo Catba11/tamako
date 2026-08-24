@@ -98,3 +98,4 @@ tamako-agent = { path = "tamako-agent" }
 tamako-persona = { path = "tamako-persona" }
 tamako-adapter-mock = { path = "tamako-adapter-mock" }
 tamako-adapter-teloxide = { path = "tamako-adapter-teloxide" }
+tamako-vision = { path = "tamako-vision" }
