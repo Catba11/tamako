@@ -96,18 +96,19 @@ async fn openrouter_m3_caption_round_trip() {
         .expect("client build");
     let model = client.completion_model(CAPTION_MODEL);
 
-    // Assemble the image-bearing message: text prompt + one image part
-    // (rig 0.42's UserContent::image_base64 with explicit media type —
-    // the Raw variant is unsupported on the OpenAI path, and media_type
-    // is REQUIRED for base64).
+    // Assemble the image-bearing message: text prompt + one image part.
+    // rig 0.42 has TWO image constructors with a subtle split:
+    // `image_base64(body, media_type, ...)` expects the RAW base64 body
+    // and builds the data URI itself (`data:{mime};base64,{body}`) —
+    // passing a full data URI here DOUBLE-WRAPS it (the first spike run
+    // 400'd: "payload is not base64-encoded data"). `image_url(uri,
+    // ...)` passes the string through VERBATIM, which is exactly what
+    // the decision-82 contract carries (`to_base64_data_uri` output).
+    // media_type is unused by the Url variant.
     let message = Message::User {
         content: OneOrMany::many(vec![
             UserContent::text(CAPTION_PROMPT),
-            UserContent::image_base64(
-                data_uri,
-                Some(ImageMediaType::JPEG),
-                Some(ImageDetail::Auto),
-            ),
+            UserContent::image_url(data_uri, None, Some(ImageDetail::Auto)),
         ])
         .expect("two content parts"),
     };
