@@ -177,7 +177,7 @@ CAUTION: Normalization does not merge synonyms across languages. The strings "en
 1. Collect messages in a sliding window.
 2. Start a batch at 20 to 50 messages or after 5 minutes.
 3. Keep an overlap of 5 messages between adjacent windows.
-4. Format each message with a speaker label: `[{display_name} {HH:MM}] {text}`.
+4. Format each message with a speaker label: `[{display_name} {HH:MM}] {text}`. A media caption (decision 82) arrives already embedded in the row text as a `<media type="...">caption</media>` element; the extraction prompt must treat the element body as a media DESCRIPTION produced by the caption pipeline — data, never an instruction, and never the speaker's own words. The element boundary is the delimiter the interface constraints of specs.md Section 14 require.
 5. If a batch contains only emoji or greetings, skip the extraction. Store the `MessageBatch` skeleton only.
 6. Do not let the LLM split long input text. Segmentation is a deterministic engineering task.
 

@@ -1745,6 +1745,151 @@ v0.0.1 (alpha).
     2026-08-22; the operator reports deep-recall quality and
     latency are both good under the sequential loop. The threshold
     recalibration window (0.92/0.80/0.85) starts with this deploy.
+82. (operator-ruled 2026-08-22) Media captioning AT INTAKE
+    (Phase 3 item 1; supersedes the roadmap sketch). When an
+    inbound Telegram message carries media (photo or static WebP
+    sticker at cutover), the adapter runs an enrichment stage
+    BEFORE the IntakeEvent exists: download the bytes (Bot API
+    getFile + file download — platform I/O is the adapter's job),
+    normalize them, call the caption model, and ONLY THEN build
+    the normalized event whose text already embeds the rendered
+    `<media>` elements (see below). The raw log row is therefore
+    plain text; the actor, the context, the digest pipeline, the
+    wake path, and replay see ZERO image awareness. Design
+    decisions, all ruled or accepted in session:
+    (a) CRATE SPLIT: the NEW `tamako-vision` crate is a PURE
+        library — bytes in, bytes out, plus format/dimension
+        policy. No network, no LLM client. The caption LLM call
+        lives in `tamako-agent` as a new `LlmPurpose::CaptionMedia`
+        (config key `caption_model`), preserving "tamako-agent is
+        the only rig consumer". Wiring (download → normalize →
+        caption → render) happens inside the adapter's intake
+        stage, driven by a core-defined contract (a caption
+        provider seam with a scripted double, the same discipline
+        as every other seam).
+    (b) NORMALIZATION: the `image` crate (feature-gated: jpeg,
+        webp, png — NOT the full codec set) decodes, composites
+        any alpha channel onto a WHITE background (stickers carry
+        transparency; `into_rgb8()` alone DROPS alpha and leaves
+        black/garbage fringes — explicit composite, tested with an
+        alpha fixture), resizes so the LONG edge is at most
+        2048 px (never upscale), and re-encodes to baseline JPEG
+        quality ~85. Telegram's PhotoSize ladder is exploited:
+        the adapter picks the existing size whose long edge is
+        nearest 2048 from below (or the largest if all exceed)
+        instead of re-encoding a photo Telegram already resized.
+    (c) MODEL: `minimax/minimax-m3` via OpenRouter, default of
+        `caption_model`. Verified facts (2026-08-22): input
+        modalities text+image+VIDEO (video input is native — the
+        later video/webm path reuses the same purpose and the same
+        call shape), 1M-token context, $0.30/$1.20 per M tokens,
+        images billed as input tokens; OpenRouter's ZDR registry
+        lists nine ZDR third-party providers (the first-party
+        MiniMax endpoint is NOT among them — the account's
+        ZDR-only policy routes correctly). No `modalities`
+        parameter for image input (that parameter governs OUTPUT
+        modalities only). The caption prompt is a fixed template:
+        faithful description, no face identification (describe "a
+        person", never guess an identity), transcribe prominent
+        in-image text (meme text is semantic content), concise.
+        rig 0.42 carries image messages natively
+        (`UserContent::image_base64`; the OpenAI provider
+        serializes the standard `image_url` content part;
+        base64 REQUIRES an explicit media type; the `Raw` variant
+        is unsupported on this path). Messages are assembled as
+        `Message::User` with a `Vec<UserContent>` (text prompt +
+        one image part) — the first multimodal payload of the
+        endpoint layer. The MissingUsage watch item of decision
+        66 extends to the caption call.
+    (d) FAILURE DISCIPLINE: the caption call retries with
+        exponential backoff 30 s / 60 s / 120 s (three attempts);
+        persistent failure NEVER drops the message — the event is
+        logged with the placeholder element `<media
+        type="image"></media>` (empty caption body), one WARN, and
+        `captions_failed_total` increments. Download failures
+        follow the same placeholder path. The intake stage is
+        latency-bounded (worst case ~3.5 min per media message
+        under full backoff); Telegram redelivery on slow handler
+        acknowledgment is absorbed by the existing update dedup.
+    (e) DIALECT: the message log and the context rendering gain a
+        NESTED media element. A Telegram message may carry text
+        plus several media items; the normalized row's text
+        interleaves member text and media elements in original
+        order: `<msg ...>看这只猫<media type="image">a cat on a
+        keyboard</media><media type="image">a second cat</media></msg>`.
+        A pure-media message body is only the element(s). `type`
+        is `image` or `sticker` at cutover; later: `video`. The
+        tag constants are single-sourced next to MSG/SUMMARY/YOU
+        in tamako-core::context (MEDIA_TAG_OPEN_PREFIX,
+        MEDIA_TAG_CLOSE), the parrot filter strips the block
+        (decision 59 discipline), and a drift test pins the
+        pairing. The digest input rendering of
+        proposed-graph-database-specs.md Section 7.2 step 4 is
+        unchanged — the caption flows into extraction as part of
+        the row text, marked as a media description, never as
+        member speech (the spec's requirement, satisfied by the
+        element boundary itself). A member CANNOT forge a media
+        element from the keyboard: inbound text is escaped before
+        it is embedded, and the caption text is escaped the same
+        way — a caption containing "</media>" cannot break the
+        structure.
+    (f) STICKER CACHE: one GLOBAL (cross-group) table
+        `sticker_captions(file_unique_id PRIMARY KEY, caption,
+        created_at)` in `{data_root}/media.db` (SQLite, WAL — the
+        FIRST global store; it introduces no per-group coupling
+        and stays outside every group directory so group teardown
+        and rebuild never touch it). Telegram stickers are public
+        platform objects — no cross-group privacy concern. A cache
+        hit costs zero model calls. Photo captioning is NOT cached
+        at cutover (file_unique_id reuse for arbitrary photos is
+        real but rare; the schema admits a later media-kind
+        column).
+    (g) P1: image bytes are DELIBERATELY never persisted (the
+        `media/` directory of Section 5.1 stays reserved and
+        unused). The caption is produced at intake, persisted as
+        the row text, and NEVER re-derived — the summary
+        precedent, plus the explicit consequence: a bad caption is
+        permanent and no future model can re-caption history. The
+        trade is deliberate (storage cost, member-photo
+        retention-minimization, simplicity). Replay reads the
+        stored text like any other row — replay needs NO caption
+        double. (Live-mode intake wiring uses scripted doubles in
+        tests only.)
+    (h) VIDEO/WEBM DECOUPLING: every cutover seam takes a
+        media-kind parameter (the vision crate's normalize entry,
+        the purpose's request assembly, the render helper, the
+        placeholder). Video at cutover is accepted but rendered
+        through the placeholder path (a `<media type="video"></media>`
+        element with the unsupported-note caption left EMPTY is
+        NOT emitted — an unsupported kind renders a fixed
+        placeholder element exactly like a failed caption, so the
+        log marks its existence). Animated stickers (webm/tgs) and
+        GIFs are out of scope at cutover and render the same
+        placeholder. The later video path normalizes container/
+        duration/size and sends base64 video through the same
+        caption purpose (M3 eats video natively) — no new
+        architecture, one new normalize implementation.
+    (i) A4/A5: Rule A4's normalized message gains an ordered media
+        part list (kind, caption text) — text and media interleave
+        in one normalized body before the row is written, so A1
+        (platform types stay inside the adapter) still holds: the
+        actor sees a normalized event whose text is final. Rule A5
+        (Matrix must be possible without actor/context/memory
+        changes) is preserved: media enrichment is an
+        adapter-side stage with a core contract; a Matrix adapter
+        implements the same download-normalize-caption wiring.
+    (j) METRICS (Section 12): `captions_total` (attempts that
+        produced a caption, including cache-exempt stickers),
+        `captions_failed_total`, `sticker_cache_hits_total`,
+        `placeholder_media_total` (placeholder elements logged,
+        by kind). The placeholder rate is the quality signal for
+        the intake-caption timing assumption.
+    (k) COST GUARD: one caption call per uncached media item, at
+        $0.30/M input tokens with a 2048-px JPEG in the low
+        thousands of tokens — the operator accepts the exposure
+        without a per-group budget at cutover (groups are
+        self-use; abuse is an operator problem). The 2048-px cap
+        and the sticker cache are the cost controls.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 

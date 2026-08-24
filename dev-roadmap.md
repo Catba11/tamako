@@ -74,7 +74,7 @@ Exit criteria:
 
 Ordered by expected value:
 
-1. Vision captioning under the constraints of `specs.md` Section 14. The caption model has no tool access; caption text is data, marked with delimiters in the digest input.
+1. ~~Vision captioning under the constraints of `specs.md` Section 14~~ DELIVERED for photos and static WebP stickers (decision 82, 2026-08-22): captioning at intake, `tamako-vision` pure-normalization crate, `LlmPurpose::CaptionMedia` (`caption_model`, default `minimax/minimax-m3` via OpenRouter ZDR third parties), nested `<media>` dialect elements, global `media.db` sticker cache. Video/webm reuses the same seams (M3 eats video natively); animated media stays placeholder-only.
 2. Negation detection and the `supersedes` edge. Refer to `proposed-graph-database-specs.md` Section 7.5.
 3. The repair tool for dead-letter batches, using the retained raw log.
 4. `EditedMessage` retraction semantics: edits carry full intake semantics since schema v6 (decision 65: `edit_date` timestamps, text-aware dedup, invisible-edit drop). What remains open is retracting facts extracted from pre-edit text. Refer to `specs.md` Section 15.
