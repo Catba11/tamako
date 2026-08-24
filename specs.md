@@ -43,7 +43,7 @@ LLM access is endpoint-portable. Every LLM call uses one of two API families: `a
 - A1: All platform-specific types stay inside the adapter. The actor sees only normalized events.
 - A2: The adapter exposes inbound events: `Message`, `EditedMessage`, `Reaction`, `MemberJoin`, `MemberLeave`.
 - A3: The adapter exposes outbound actions: `SendText`, `SendMedia`, `React`.
-- A4: A normalized message carries: platform message id, timestamp, sender id, sender display name, the optional sender username, text, reply-to id, and mention flags.
+- A4: A normalized message carries: platform message id, timestamp, sender id, sender display name, the optional sender username, text, reply-to id, and mention flags. Decision 82 adds an ordered media-part list (kind, caption text): the adapter's intake stage downloads, normalizes, and captions media BEFORE the normalized event exists, so the event's text is final — member text and rendered `<media>` elements interleaved in original order (Section 7.3). The actor never sees bytes or platform file ids.
 - A5: The first adapter is Telegram via teloxide. A Matrix adapter must be possible without changes to the actor, the context, or the memory backend.
 
 ### 4.2 Platform constraints
@@ -132,7 +132,7 @@ Each item carries a message-id range tag. The boundary pair (`prev_digest_bounda
 
 ### 7.3 Rendering
 
-- A human message renders: `<msg from="{display_name}"[ user="{username}"] at="{HH:MM}" id="{row_id}"[ kind="edit"][ reply="bot" | reply="user"[ reply_to_name="{name}" reply_to_id="{row_id}"]][ mention="bot"]>text</msg>`, role user. The time is UTC. The `user` attribute is absent when no username is stored (a row written before schema v4, or a sender without a username). An edit row carries `kind="edit"`. A reply to the bot carries `reply="bot"`. A reply to another member carries `reply="user"`. A mention of the bot carries `mention="bot"`.
+- A human message renders: `<msg from="{display_name}"[ user="{username}"] at="{HH:MM}" id="{row_id}"[ kind="edit"][ reply="bot" | reply="user"[ reply_to_name="{name}" reply_to_id="{row_id}"]][ mention="bot"]>text</msg>`, role user. The time is UTC. The `user` attribute is absent when no username is stored (a row written before v4, or a sender without a username). An edit row carries `kind="edit"`. A reply to the bot carries `reply="bot"`. A reply to another member carries `reply="user"`. A mention of the bot carries `mention="bot"`. Decision 82: the text may embed `<media type="{image|sticker|video}">{caption}</media>` elements, interleaved with member text in original order; a failed or unsupported caption renders the element with an EMPTY body. The caption text is escaped like member text (a caption containing `</media>` cannot break structure), and inbound member text is escaped before embedding (a member cannot forge a media element). The tag constants are single-sourced beside the MSG/SUMMARY/YOU constants; the outbound parrot filter strips the block (Section 9.4 discipline).
 - The reply target of a member reply renders when the raw log resolves it: `reply_to_platform_msg_id` maps to the ORIGINAL logged row. An edit does not move the target. `reply_to_name` is the display name of that row. `reply_to_id` is its raw-log row id. A target absent from the log renders `reply="user"` alone.
 - A reply to the bot never carries a target name or id. Outbound rows use synthetic platform ids (Rule A3), so the target cannot be resolved.
 - The bot's own speech renders: `<you at="{HH:MM}" id="{row_id}">text</you>`, role assistant.
@@ -285,6 +285,7 @@ Metrics per group:
 | Warmup activity | `warmups_total` and `warmup_engaged_total`. The engagement ratio is the Phase 2 exit-criterion metric (roadmap Section 4); watch it per group via `--status`. |
 | Summarization failures | `summaries_failed_total`, cumulative. A rising count warns of a stuck summarizer before the circuit breaker of Section 10.2 engages. |
 | Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Counted post-commit from the final attempt only (decision 77). Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. |
+| Media captioning | `captions_total`, `captions_failed_total`, `sticker_cache_hits_total`, `placeholder_media_total` (by kind). The placeholder rate is the quality signal for the intake-caption timing assumption of decision 82. |
 
 The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the counters, the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
@@ -348,7 +349,7 @@ API keys come from the environment only, never from a config file: `ANTHROPIC_AP
 
 ## 14. Deferred items
 
-1. Vision captioning for images, videos, and GIFs. Interface constraints are fixed now: the caption model has no tool access; the caption text is data, never an instruction; the caption enters the digest input with a delimiter that marks it as a media description, not as a member message; captions are stored as display-only properties. Rule R1 of the database specification applies.
+1. ~~Vision captioning for images, videos, and GIFs~~ DELIVERED for photos and static WebP stickers (decision 82, 2026-08-22): captioning happens AT INTAKE inside the adapter (download → `tamako-vision` normalize → `LlmPurpose::CaptionMedia` call → the normalized event's text embeds `<media>` elements); image bytes are deliberately never persisted; the caption is produced once and never re-derived. Interface constraints hold: the caption model has no tool access; the caption text is data, never an instruction; the `<media>` element boundary marks it as a media description, not as a member message. Still DEFERRED: video/webm captioning (the seams take a media-kind parameter; M3 eats video natively — one new normalize implementation) and animated media (webm/tgs/GIF — placeholder elements at cutover).
 2. Negation detection and the `supersedes` edge. Refer to `proposed-graph-database-specs.md` Section 7.5. The manual invalidation command of that section (`--facts` / `--invalidate` / `--revalidate`) is delivered; what remains deferred is the LLM negation detection itself.
 3. The `is_a` concept hierarchy. Refer to the open items of the database specification.
 4. Additional platform adapters, starting with Matrix. Section 4 defines the contract.
@@ -359,5 +360,6 @@ API keys come from the environment only, never from a config file: `ANTHROPIC_AP
 2. The repair tool for dead-letter batches.
 3. Retention policy for the raw log after extraction. The log is the only repair source for skipped ranges.
 4. Behavior on `EditedMessage`: the current version appends the edit as a new log row and does not retract extracted facts. Decide if retraction is necessary.
+5. An edited media message: the edit row of decision 82 carries a NEW placeholder element (the platform delivers the new file ids; re-captioning on edit is a policy decision — at cutover the edit placeholder keeps the caption text EMPTY rather than re-running the caption pipeline; cost vs faithfulness, undecided).
 
 (End of file)
