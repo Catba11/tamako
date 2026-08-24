@@ -1889,6 +1889,27 @@ v0.0.1 (alpha).
         without a per-group budget at cutover (groups are
         self-use; abuse is an operator problem). The 2048-px cap
         and the sticker cache are the cost controls.
+    IMPLEMENTATION NOTES (2026-08-23, Block 1 `0c6bf33` + Block 2
+    `e8b3e7c`, 955/0 gates): the live spike (`caption_spike.rs`)
+    verified rig's `UserContent::image_url` (verbatim data URI —
+    `image_base64` DOUBLE-WRAPS and OpenRouter 400s), the ZDR
+    third-party routing of minimax-m3, and the tamako-vision
+    output as payload (1.8 s round-trip). rig is pinned 0.41 (the
+    "0.42" of the research notes was the latest-version lookup;
+    the spike compiles against the workspace pin). ACCEPTED
+    SIMPLIFICATION: the row text assembles as
+    `caption text + " " + <media> element` (element pinned at the
+    END), not a true positional interleave — Telegram delivers at
+    most one media item per message at cutover, so the
+    information loss is the middle-of-text media position only;
+    a true interleave would need caption-entity position
+    heuristics. Revisit when video lands or position proves to
+    matter. Accepted follow-ups: per-group caption_model
+    resolution (the keys are per-group-capable; intake uses one
+    process-wide provider at cutover); `--status` surfacing of the
+    five caption counters (emitted as structured tracing events
+    for now); the dual-use OPENAI_API_KEY WARN mirror for the
+    caption endpoint.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
