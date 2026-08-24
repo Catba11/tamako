@@ -1,0 +1,9 @@
+[package]
+name = "tamako-vision"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image.workspace = true
+base64.workspace = true
+thiserror.workspace = true

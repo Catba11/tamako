@@ -13,12 +13,15 @@
 //! Section 10 keep-two retention); the live implementation lives in
 //! tamako-agent. Phase 2 adds the warmup-trigger contracts and pure
 //! logic (`warmup`, specs.md Sections 8.4/8.5/9.7, decision 78).
+//! Phase 3 adds the media caption provider contract (`caption`,
+//! decision 82); the live implementation lives in tamako-agent.
 //!
 //! This crate is model-agnostic: no rig or LLM dependency. tamako-agent
 //! converts `context::ContextMessage` to rig completion messages in M4.
 
 pub mod actor;
 pub mod adapter;
+pub mod caption;
 pub mod config;
 pub mod context;
 pub mod digest;

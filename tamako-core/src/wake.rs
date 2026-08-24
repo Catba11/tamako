@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use crate::actor::CoreError;
 use crate::context::{
-    escape_xml_text, ContextMessage, MSG_TAG_CLOSE, MSG_TAG_OPEN_PREFIX, SUMMARY_TAG_CLOSE,
-    SUMMARY_TAG_OPEN_PREFIX, YOU_TAG_CLOSE, YOU_TAG_OPEN_PREFIX,
+    escape_xml_text, ContextMessage, MEDIA_TAG_CLOSE, MEDIA_TAG_OPEN_PREFIX, MSG_TAG_CLOSE,
+    MSG_TAG_OPEN_PREFIX, SUMMARY_TAG_CLOSE, SUMMARY_TAG_OPEN_PREFIX, YOU_TAG_CLOSE,
+    YOU_TAG_OPEN_PREFIX,
 };
 
 /// One message presented to the participation gate (Section 9.6 input).
@@ -123,8 +124,8 @@ fn is_parrot_line(line: &str) -> bool {
 struct StripRegion {
     /// The opener prefix of the region: the open tag minus its trailing
     /// `>` (`"<memory"` / `"<summary"`), or the open tag plus its
-    /// trailing space (`"<msg "` / `"<you "`, before the attributes).
-    /// Line-start anchored only.
+    /// trailing space (`"<msg "` / `"<you "` / `"<media "`, before the
+    /// attributes). Line-start anchored only.
     open_line_prefix: &'static str,
     /// The closer tag; the first line containing it ends the region.
     closer: &'static str,
@@ -155,6 +156,12 @@ struct StripRegion {
 ///   these elements on every wake (they ARE its context) and imitated
 ///   them live (the 2026-08-14 soak incident); a confabulated `<msg>`
 ///   or `<you>` block must never reach the group.
+/// - `<media>` (media captioning at intake, decision 82): the SAME
+///   block semantics over
+///   [`MEDIA_TAG_OPEN_PREFIX`]/[`MEDIA_TAG_CLOSE`]. Media elements are
+///   model-visible inside `<msg>` text, so the reply model can imitate
+///   them like the other context structure; the reply model must never
+///   emit media blocks.
 ///
 /// The reply model can imitate the injection format (the injections
 /// enter its context as assistant-role messages, Sections 9.3-9.5) and
@@ -174,7 +181,7 @@ pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
     // Single-source discipline (decisions 59/61): the memory opener is
     // derived from the tag constant; the summary and message shapes use
     // the context.rs constants shared with the renderers.
-    let regions: [StripRegion; 4] = [
+    let regions: [StripRegion; 5] = [
         StripRegion {
             open_line_prefix: SUMMARY_TAG_OPEN_PREFIX,
             closer: SUMMARY_TAG_CLOSE,
@@ -190,6 +197,10 @@ pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
         StripRegion {
             open_line_prefix: YOU_TAG_OPEN_PREFIX,
             closer: YOU_TAG_CLOSE,
+        },
+        StripRegion {
+            open_line_prefix: MEDIA_TAG_OPEN_PREFIX,
+            closer: MEDIA_TAG_CLOSE,
         },
     ];
     let mut stripped_parrot = false;
@@ -619,6 +630,44 @@ mod tests {
         let filtered = filter_reply_parrot_lines(
             "one\n<you at=\"13:07\" id=\"2\">never closed\nrest of the text",
         );
+        assert_eq!(filtered.text, "one");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_single_line_media_block() {
+        // The `<media>` shape (decision 82) shares the `<memory>` block
+        // semantics: one line carrying both tags strips as one. The
+        // reply model must never emit media blocks.
+        let filtered = filter_reply_parrot_lines(
+            "<media type=\"image\">confabulated</media>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_multi_line_media_block() {
+        let filtered = filter_reply_parrot_lines(
+            "<media type=\"image\">confabulated\ncaption</media>\nthe cafe on main street",
+        );
+        assert_eq!(filtered.text, "the cafe on main street");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_a_bare_media_closer_line() {
+        // The surrounding legitimate text is preserved.
+        let filtered = filter_reply_parrot_lines("one\n</media>\ntwo");
+        assert_eq!(filtered.text, "one\ntwo");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_parrot_filter_strips_an_unterminated_media_block_to_the_end() {
+        // No closer appears: the region strips to the end of the text.
+        let filtered =
+            filter_reply_parrot_lines("one\n<media type=\"image\">never closed\nrest of the text");
         assert_eq!(filtered.text, "one");
         assert!(filtered.stripped_parrot);
     }

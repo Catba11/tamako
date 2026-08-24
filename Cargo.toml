@@ -11,6 +11,7 @@ members = [
     "tamako-persona",
     "tamako-adapter-mock",
     "tamako-adapter-teloxide",
+    "tamako-vision",
 ]
 
 [workspace.dependencies]
@@ -80,6 +81,14 @@ schemars = { version = "1", features = ["preserve_order"] }
 # it requires rustc >= 1.85. Rule A1: no teloxide type crosses the adapter
 # boundary.
 teloxide = "0.17"
+
+# Image normalization for media captioning at intake (decision 82).
+# tamako-vision only: jpeg/webp/png codecs, no full codec set.
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "png"] }
+
+# Base64 data-URI encoding of the normalized JPEG for the vision
+# caption model (decision 82). tamako-vision only.
+base64 = "0.22"
 
 # Internal crates.
 tamako-core = { path = "tamako-core" }
