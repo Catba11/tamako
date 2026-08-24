@@ -16,6 +16,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// The shared default base URL of the openai-compatible OpenRouter
+/// endpoints (embedding, decision 66; captioning, decision 82 (c)).
+const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// The default media captioning model of decision 82 (c).
+const DEFAULT_CAPTION_MODEL: &str = "minimax/minimax-m3";
+
 /// The `warmup_active_hours` window of specs.md Section 8.4, parsed
 /// ("HH:MM-HH:MM", host-local; overnight ranges unsupported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +188,20 @@ pub struct TriggerConfig {
     /// only, no drains). Default true. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill.
     pub embedding_enabled: bool,
+    /// The media captioning model of decision 82 (c): photos/stickers
+    /// are captioned at intake by this vision model. Flat and concrete
+    /// like `embedding_model` (the default is materialized here, not
+    /// resolved by the agent layer), but UNLIKE the embedding keys
+    /// this key follows the ordinary per-group-override pattern of the
+    /// other model keys (`digest_model`, `gate_model`, ...) — a group
+    /// may pin a different caption model. Deviation: specs.md
+    /// Section 13 has no caption keys; reported for spec backfill.
+    pub caption_model: String,
+    /// The base URL of the openai-compatible caption endpoint
+    /// (decision 82 (c)). Default `https://openrouter.ai/api/v1` (the
+    /// same OpenRouter default as the embedding endpoint).
+    /// Per-group-overridable like `caption_model`; refer to it.
+    pub caption_llm_base_url: String,
     /// How the structured calls enforce their output shape on the wire:
     /// `schema` (the default), `json_object`, or `prompt_only`. `None`
     /// means the agent layer resolves the default. Deviation: specs.md
@@ -323,8 +344,10 @@ impl Default for TriggerConfig {
             reply_model: None,
             summary_model: None,
             embedding_model: "google/gemini-embedding-2".to_string(),
-            embedding_llm_base_url: "https://openrouter.ai/api/v1".to_string(),
+            embedding_llm_base_url: DEFAULT_OPENROUTER_BASE_URL.to_string(),
             embedding_enabled: true,
+            caption_model: DEFAULT_CAPTION_MODEL.to_string(),
+            caption_llm_base_url: DEFAULT_OPENROUTER_BASE_URL.to_string(),
             structured_output: None,
             digest_structured_output: None,
             gate_structured_output: None,
@@ -423,6 +446,12 @@ pub struct TriggerConfigToml {
     /// The embedding kill switch (decision 77, M6a; global-only).
     /// Refer to `TriggerConfig::embedding_enabled`.
     pub embedding_enabled: Option<bool>,
+    /// The media captioning model (decision 82 (c); per-group
+    /// overridable). Refer to `TriggerConfig::caption_model`.
+    pub caption_model: Option<String>,
+    /// The caption endpoint base URL (decision 82 (c); per-group
+    /// overridable). Refer to `TriggerConfig::caption_llm_base_url`.
+    pub caption_llm_base_url: Option<String>,
     /// The structured-output mode. Refer to
     /// `TriggerConfig::structured_output`.
     pub structured_output: Option<String>,
@@ -507,7 +536,10 @@ impl TriggerConfigToml {
     /// M6a). `llm_api`/`llm_base_url` are NOT global-only — Section 13
     /// resolves LLM access from the per-group effective configuration —
     /// and neither are the per-purpose `*_llm_*` / model /
-    /// structured-output keys.
+    /// structured-output keys. The decision-82 (c) caption keys are
+    /// NOT global-only either: unlike the embedding keys (one vector
+    /// space deployment-wide), a group may legitimately pin a
+    /// different caption model or endpoint.
     fn global_only_key(&self) -> Option<&'static str> {
         if self.llm_session_id.is_some() {
             return Some("llm_session_id");
@@ -612,6 +644,12 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.embedding_enabled {
             base.embedding_enabled = value;
+        }
+        if let Some(value) = &self.caption_model {
+            base.caption_model = value.clone();
+        }
+        if let Some(value) = &self.caption_llm_base_url {
+            base.caption_llm_base_url = value.clone();
         }
         if let Some(value) = &self.structured_output {
             base.structured_output = Some(value.clone());
@@ -1678,5 +1716,64 @@ embedding_enabled = false
             "https://embeddings.example/v1"
         );
         assert!(!config.global.embedding_enabled);
+    }
+
+    #[test]
+    fn toml_parse_and_apply_covers_the_caption_keys() {
+        // Decision 82 (c): the caption keys are flat and concrete like
+        // the embedding keys, but PER-GROUP overridable (unlike them).
+        let defaults = TriggerConfig::default();
+        assert_eq!(defaults.caption_model, "minimax/minimax-m3");
+        assert_eq!(
+            defaults.caption_llm_base_url,
+            "https://openrouter.ai/api/v1"
+        );
+
+        // Explicit values in [global] parse and apply.
+        let text = r#"
+[global]
+caption_model = "acme/vision-1"
+caption_llm_base_url = "https://captions.example/v1"
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the caption TOML loads");
+        assert_eq!(config.global.caption_model, "acme/vision-1");
+        assert_eq!(
+            config.global.caption_llm_base_url,
+            "https://captions.example/v1"
+        );
+
+        // Keys the TOML does not set keep the decision-82 defaults.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(plain.global.caption_model, "minimax/minimax-m3");
+        assert_eq!(
+            plain.global.caption_llm_base_url,
+            "https://openrouter.ai/api/v1"
+        );
+    }
+
+    #[test]
+    fn caption_keys_are_per_group_overridable() {
+        // Decision 82 (c): UNLIKE the embedding keys, the caption keys
+        // are NOT in the global-only set — a `[groups.*]` table
+        // carrying them is NOT rejected by the global-only check, and
+        // the override applies over the default.
+        let text = r#"
+[groups."-100"]
+caption_model = "acme/other"
+caption_llm_base_url = "https://group-captions.example/v1"
+"#;
+        let config = BotConfig::from_toml_str(text)
+            .expect("caption keys under a group are not global-only: the TOML loads");
+        let overridden = config.for_group("-100");
+        assert_eq!(overridden.caption_model, "acme/other");
+        assert_eq!(
+            overridden.caption_llm_base_url,
+            "https://group-captions.example/v1"
+        );
+        // A group without an override receives the decision-82
+        // defaults (no [global] overlay set them).
+        let plain = config.for_group("-200");
+        assert_eq!(plain.caption_model, "minimax/minimax-m3");
+        assert_eq!(plain.caption_llm_base_url, "https://openrouter.ai/api/v1");
     }
 }

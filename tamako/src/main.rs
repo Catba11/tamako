@@ -32,17 +32,17 @@ mod persona_watch;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tamako_adapter_mock::MockAdapter;
-use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, TeloxideAdapter};
+use tamako_adapter_teloxide::{BotChatStatus, GroupEvent, MediaEnricher, TeloxideAdapter};
 use tamako_agent::endpoint::{
-    EmbeddingEndpoint, LlmApi, RigEmbeddingProvider, DEFAULT_EMBEDDING_BASE_URL,
+    CaptionEndpoint, EmbeddingEndpoint, LlmApi, RigEmbeddingProvider, DEFAULT_EMBEDDING_BASE_URL,
 };
 use tamako_agent::merge_confirm::EndpointMergeConfirmer;
 use tamako_agent::recall::DeepRecallConfig;
 use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
 use tamako_agent::{
     AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
-    RigExtractor, RigGate, RigRelevanceGate, RigReplyGenerator, RigSummary, RigWarmupGenerator,
-    ShallowRecall,
+    RetryCaptionProvider, RigCaptionProvider, RigExtractor, RigGate, RigRelevanceGate,
+    RigReplyGenerator, RigSummary, RigWarmupGenerator, ShallowRecall,
 };
 use tamako_core::actor::{
     spawn_group_actor, GroupActorHandle, GroupActorParams, DEFAULT_INBOX_CAPACITY,
@@ -62,7 +62,7 @@ use tamako_core::wake::{NoopRecall, RecallProvider, WakeServices};
 use tamako_core::warmup::WarmupServices;
 use tamako_memory::{LbugBackend, MemoryBackend, NodeType};
 use tamako_persona::{load_persona, PersonaConfig, PetPreambleRenderer, PreambleRenderer};
-use tamako_store::{read_group_status, GroupStatus, Store, StoreError};
+use tamako_store::{read_group_status, GroupStatus, MediaStore, Store, StoreError};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
@@ -572,6 +572,12 @@ fn llm_config_values(config: &TriggerConfig) -> LlmConfigValues {
         // (the same env-wins idiom as the purpose keys).
         embedding_model: Some(config.embedding_model.clone()),
         embedding_llm_base_url: Some(config.embedding_llm_base_url.clone()),
+        // Decision 82 (c) (global-only for construction, the same
+        // standing as the embedding pair): the config always carries the
+        // resolved value; TAMAKO_CAPTION_MODEL / TAMAKO_CAPTION_BASE_URL
+        // win inside CaptionEndpoint::resolve (the same env-wins idiom).
+        caption_model: Some(config.caption_model.clone()),
+        caption_llm_base_url: Some(config.caption_llm_base_url.clone()),
     }
 }
 
@@ -970,6 +976,71 @@ fn build_embedding_provider(
     RigEmbeddingProvider::build(&endpoint).map(|provider| {
         Arc::new(AgentEmbeddingProvider(provider))
             as Arc<dyn tamako_core::embedding::EmbeddingProvider>
+    })
+}
+
+/// Builds the process-wide caption provider of decision 82 (media
+/// captioning AT INTAKE), consumed by the teloxide adapter's
+/// `MediaEnricher`: ONE `Arc` per process, the same standing as
+/// [`build_embedding_provider`]. The caption endpoint is GLOBAL-only
+/// for construction, so resolution uses the GLOBAL trigger config.
+/// Decision 82 made `caption_model` / `caption_llm_base_url`
+/// per-group-overridable keys, but the intake enrichment is a single
+/// process-wide provider at cutover (one adapter, one caption pipeline);
+/// resolving per-group caption models is follow-up the config keys
+/// already admit. The degrade mirrors the embedding builder: a missing
+/// `OPENAI_API_KEY` logs one WARN inside `RigCaptionProvider::build`
+/// and the result is `None` — the adapter gets a `None` enricher and
+/// media messages behave as before Block 2 (silently skipped when no
+/// text). The rig provider rides inside [`RetryCaptionProvider`], the
+/// decorator carrying the decision-82 (d) retry policy (three attempts,
+/// 30 s/60 s backoff).
+fn build_caption_provider(
+    setup: &SharedSetup,
+) -> Option<Arc<dyn tamako_core::caption::CaptionProvider>> {
+    let endpoint = CaptionEndpoint::resolve(&llm_config_values(&setup.bot_config.global));
+    RigCaptionProvider::build(&endpoint).map(|provider| {
+        let inner: Arc<dyn tamako_core::caption::CaptionProvider> = Arc::new(provider);
+        Arc::new(RetryCaptionProvider::new(inner)) as Arc<dyn tamako_core::caption::CaptionProvider>
+    })
+}
+
+/// Builds the [`MediaEnricher`] of decision 82 for the live adapter:
+/// the caption provider of [`build_caption_provider`] plus the global
+/// sticker-caption cache (`{data_root}/media.db`, decision 82 (f)).
+/// `Some` only when BOTH halves are available; `None` keeps the
+/// pre-enrichment behavior byte-identical (a media message with no
+/// text is skipped). The degrade doctrine mirrors the embedding
+/// worker: a missing `OPENAI_API_KEY` (no provider) or a failed
+/// `MediaStore::open` logs one WARN and yields `None` — captioning
+/// degrades, never a startup failure. `MediaStore::open` is
+/// synchronous like the whole store crate, so it runs on the blocking
+/// pool (AGENT.md Section 6.2).
+///
+/// Metrics (specs.md Section 12): the adapter emits the decision-82
+/// counters (`captions_total`, `captions_failed_total`,
+/// `captions_empty_total`, `sticker_cache_hits_total`,
+/// `placeholder_media_total`) as structured tracing fields through
+/// this wired path. Surfacing them through `--status` is follow-up
+/// work owned by the primary agent.
+async fn build_media_enricher(setup: &SharedSetup) -> Option<MediaEnricher> {
+    let data_root = setup.store.data_root().to_path_buf();
+    let opened = tokio::task::spawn_blocking(move || MediaStore::open(&data_root)).await;
+    let media_store = match opened {
+        Ok(Ok(store)) => Arc::new(store),
+        Ok(Err(error)) => {
+            warn!(%error, "media store failed to open; media captioning is disabled for this run");
+            return None;
+        }
+        Err(join_error) => {
+            warn!(%join_error, "the media store open task failed; media captioning is disabled for this run");
+            return None;
+        }
+    };
+    let caption = build_caption_provider(setup)?;
+    Some(MediaEnricher {
+        caption,
+        media_store,
     })
 }
 
@@ -2618,9 +2689,17 @@ async fn run_live(
         .ok()
         .filter(|token| !token.trim().is_empty())
         .context("set TELOXIDE_TOKEN to the Telegram bot token to run in --live mode")?;
+    // Decision 82 (media captioning at intake): the live adapter gets
+    // the process-wide MediaEnricher (caption provider + global sticker
+    // cache). `None` — a missing OPENAI_API_KEY or a failed media-store
+    // open, one WARN each already logged — keeps the pre-enrichment
+    // behavior byte-identical: media messages with no text are silently
+    // skipped. Replay/mock paths never build an enricher (Rule P1:
+    // replay stays deterministic and network-free).
     let mut adapter = TeloxideAdapter::new(&token)
         .await
-        .context("failed to start the Telegram adapter")?;
+        .context("failed to start the Telegram adapter")?
+        .with_media_enricher(build_media_enricher(setup).await);
     let identity = adapter.bot_identity();
     info!(username = %identity.username, id = identity.id, "telegram bot identity resolved");
 

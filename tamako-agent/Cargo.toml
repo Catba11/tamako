@@ -24,6 +24,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Paused-time tests (`start_paused`) of the caption retry backoff
+# (decision 82 (d)); the same feature tamako-core tests use.
+tokio = { workspace = true, features = ["test-util"] }
 # The offline demo example replays the shipped fixture through the mock
 # adapter (examples/digest_demo.rs).
 tamako-adapter-mock.workspace = true

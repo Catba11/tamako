@@ -63,6 +63,19 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # embedding_model = "google/gemini-embedding-2"
 # embedding_llm_base_url = "https://openrouter.ai/api/v1"
 
+# Media captioning at intake (decision 82). Photos and static stickers are
+# captioned by a vision model as they arrive; the caption rides the message
+# text as a `<media>` element. Keyed by OPENAI_API_KEY, like the embeddings.
+# Per-group overridable (same keys under [groups.<chat_id>]), but the intake
+# enrichment resolves ONE process-wide provider from the global values at
+# cutover; per-group caption models are follow-up.
+#
+# ZDR NOTE: the default model minimax/minimax-m3 is served via OpenRouter
+# because the first-party MiniMax endpoint is NOT ZDR — the account's
+# ZDR-only policy routes to ZDR third-party providers through OpenRouter.
+# caption_model = "minimax/minimax-m3"
+# caption_llm_base_url = "https://openrouter.ai/api/v1"
+
 # Per-purpose endpoint overrides for mixed deployments. Example:
 # reply_llm_api      = "anthropic-compatible"
 # reply_llm_base_url = "https://opencode.ai/zen/go/v1/messages"

@@ -174,6 +174,15 @@ pub const EMBEDDING_MODEL_ENV_VAR: &str = "TAMAKO_EMBEDDING_MODEL";
 /// Global-only; refer to [`EMBEDDING_MODEL_ENV_VAR`].
 pub const EMBEDDING_BASE_URL_ENV_VAR: &str = "TAMAKO_EMBEDDING_BASE_URL";
 
+/// Environment override of the caption model (current-state.md
+/// decision 82 (c)). Global-only: one caption endpoint per deployment
+/// (the same standing as the embedding endpoint, decision 66).
+pub const CAPTION_MODEL_ENV_VAR: &str = "TAMAKO_CAPTION_MODEL";
+
+/// Environment override of the caption base URL (decision 82 (c)).
+/// Global-only; refer to [`CAPTION_MODEL_ENV_VAR`].
+pub const CAPTION_BASE_URL_ENV_VAR: &str = "TAMAKO_CAPTION_BASE_URL";
+
 /// API key env var of the anthropic-compatible family (specs.md
 /// Section 13: API keys come from the environment only).
 pub const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
@@ -209,6 +218,18 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "google/gemini-embedding-2";
 /// OpenRouter's openai-compatible endpoint. rig uses the base URL
 /// verbatim, so the request lands on `{base}/embeddings`.
 pub const DEFAULT_EMBEDDING_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// The default caption model (current-state.md decision 82 (c)):
+/// MiniMax M3, the vision model that captions media at intake, served
+/// via OpenRouter (the first-party MiniMax endpoint is NOT ZDR; the
+/// account's ZDR-only policy routes to a third-party ZDR provider).
+pub const DEFAULT_CAPTION_MODEL: &str = "minimax/minimax-m3";
+
+/// The default caption base URL (decision 82 (c)): OpenRouter's
+/// openai-compatible endpoint — the SAME default as
+/// [`DEFAULT_EMBEDDING_BASE_URL`]. rig uses the base URL verbatim, so
+/// the caption request lands on `{base}/chat/completions`.
+pub const DEFAULT_CAPTION_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// The pinned embedding dimension (decision 81). Decision 66 first
 /// pinned 4096 (qwen3-embedding-8b); decision 81 re-pins to 3072,
@@ -506,6 +527,12 @@ pub struct LlmConfigValues {
     /// The embedding base URL (`embedding_llm_base_url`; decision 66,
     /// global-only). `None` selects [`DEFAULT_EMBEDDING_BASE_URL`].
     pub embedding_llm_base_url: Option<String>,
+    /// The caption model (`caption_model`; decision 82 (c),
+    /// global-only). `None` selects [`DEFAULT_CAPTION_MODEL`].
+    pub caption_model: Option<String>,
+    /// The caption base URL (`caption_llm_base_url`; decision 82 (c),
+    /// global-only). `None` selects [`DEFAULT_CAPTION_BASE_URL`].
+    pub caption_llm_base_url: Option<String>,
 }
 
 impl LlmConfigValues {
@@ -556,7 +583,9 @@ impl LlmConfigValues {
 
 /// Reads an env var. The value is ASCII-trimmed; an empty or
 /// whitespace-only value counts as unset (decision 77, S5-L3).
-fn env_value(name: &str) -> Option<String> {
+/// `pub(crate)` for the caption provider (`crate::caption`), which
+/// reads `OPENAI_API_KEY` through the same idiom.
+pub(crate) fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim_ascii().to_string())
@@ -698,10 +727,13 @@ fn resolve_session_id(values: &LlmConfigValues) -> String {
 /// headers; the client `build()` inserts the API-key auth header when
 /// the map does not carry it, so the two never clash. Shared by
 /// [`EndpointClient::build`] (completions) and
-/// [`RigEmbeddingProvider::from_endpoint`] (embeddings): the session
-/// affinity carries over to both. A session id that is not a valid
-/// header value is `AgentError::ProviderConfig`.
-fn session_header_map(session_id: &str) -> Result<rig::http_client::HeaderMap, AgentError> {
+/// [`RigEmbeddingProvider::from_endpoint`] (embeddings) and
+/// [`crate::caption::RigCaptionProvider::from_endpoint`] (captions):
+/// the session affinity carries over to all three. A session id that
+/// is not a valid header value is `AgentError::ProviderConfig`.
+pub(crate) fn session_header_map(
+    session_id: &str,
+) -> Result<rig::http_client::HeaderMap, AgentError> {
     let mut headers = rig::http_client::HeaderMap::new();
     headers.insert(
         "x-opencode-session",
@@ -1001,6 +1033,71 @@ impl EmbeddingEndpoint {
             })
             .unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string());
         EmbeddingEndpoint {
+            base_url,
+            model,
+            session_id: resolve_session_id(values),
+        }
+    }
+}
+
+/// The resolved caption endpoint (current-state.md decision 82 (c)).
+/// Global-only: one caption endpoint per deployment, no per-purpose
+/// or per-group machinery (the same standing as
+/// [`EmbeddingEndpoint`]). Captions always use the openai-compatible
+/// family (`POST {base}/chat/completions` with an image-bearing
+/// message), so — unlike [`EndpointConfig`] — the family is fixed and
+/// the base URL is concrete (decision 82 (c) pins the default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptionEndpoint {
+    /// The base URL of the openai-compatible caption endpoint.
+    /// Never empty: resolution falls back to
+    /// [`DEFAULT_CAPTION_BASE_URL`].
+    pub base_url: String,
+    /// The caption model name. Never empty: resolution falls back
+    /// to [`DEFAULT_CAPTION_MODEL`].
+    pub model: String,
+    /// The resolved session id, sent as the `x-opencode-session`
+    /// header on every caption request (the same global value as
+    /// the completion endpoints; refer to [`EndpointConfig::session_id`]).
+    pub session_id: String,
+}
+
+impl CaptionEndpoint {
+    /// Resolves the caption endpoint from the config values and the
+    /// environment (the same env-wins idiom as
+    /// [`EmbeddingEndpoint::resolve`]):
+    ///
+    /// - Model: env `TAMAKO_CAPTION_MODEL` → config
+    ///   `caption_model` → [`DEFAULT_CAPTION_MODEL`].
+    /// - Base URL: env `TAMAKO_CAPTION_BASE_URL` → config
+    ///   `caption_llm_base_url` → [`DEFAULT_CAPTION_BASE_URL`].
+    /// - Session id: the global chain of [`LlmEndpoints::resolve`]
+    ///   (env `TAMAKO_LLM_SESSION_ID` → config `llm_session_id` →
+    ///   [`DEFAULT_SESSION_ID`]).
+    ///
+    /// Empty strings count as unset, in env and config alike. The
+    /// values are free-form strings (rig never validates model
+    /// names), so resolution is infallible.
+    pub fn resolve(values: &LlmConfigValues) -> Self {
+        let model = env_value(CAPTION_MODEL_ENV_VAR)
+            .or_else(|| {
+                values
+                    .caption_model
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| DEFAULT_CAPTION_MODEL.to_string());
+        let base_url = env_value(CAPTION_BASE_URL_ENV_VAR)
+            .or_else(|| {
+                values
+                    .caption_llm_base_url
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| DEFAULT_CAPTION_BASE_URL.to_string());
+        CaptionEndpoint {
             base_url,
             model,
             session_id: resolve_session_id(values),
@@ -1405,6 +1502,8 @@ mod tests {
         SUMMARY_STRUCTURED_OUTPUT_ENV_VAR,
         EMBEDDING_MODEL_ENV_VAR,
         EMBEDDING_BASE_URL_ENV_VAR,
+        CAPTION_MODEL_ENV_VAR,
+        CAPTION_BASE_URL_ENV_VAR,
         ANTHROPIC_API_KEY_ENV_VAR,
         OPENAI_API_KEY_ENV_VAR,
     ];
@@ -2123,6 +2222,67 @@ mod tests {
         };
         let endpoint = EmbeddingEndpoint::resolve(&values);
         assert_eq!(endpoint.model, "config-embedding-model");
+    }
+
+    // --- The caption endpoint (decision 82 (c)) ---
+
+    #[test]
+    fn caption_resolution_defaults_to_the_decision_82_values() {
+        let (_lock, _env) = EnvGuard::cleared();
+        let endpoint = CaptionEndpoint::resolve(&LlmConfigValues::default());
+        assert_eq!(
+            endpoint,
+            CaptionEndpoint {
+                base_url: DEFAULT_CAPTION_BASE_URL.to_string(),
+                model: DEFAULT_CAPTION_MODEL.to_string(),
+                session_id: DEFAULT_SESSION_ID.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn caption_resolution_env_wins_over_config() {
+        let (_lock, env) = EnvGuard::cleared();
+        let values = LlmConfigValues {
+            caption_model: Some("config-caption-model".to_string()),
+            caption_llm_base_url: Some("https://config.example/v1".to_string()),
+            llm_session_id: Some("config-session".to_string()),
+            ..LlmConfigValues::default()
+        };
+        // Config wins over the defaults.
+        let endpoint = CaptionEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, "config-caption-model");
+        assert_eq!(endpoint.base_url, "https://config.example/v1");
+        // The session id shares the global chain of the purposes.
+        assert_eq!(endpoint.session_id, "config-session");
+        // The env wins over the config.
+        env.set(CAPTION_MODEL_ENV_VAR, "env-caption-model");
+        env.set(CAPTION_BASE_URL_ENV_VAR, "https://env.example/v1");
+        let endpoint = CaptionEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, "env-caption-model");
+        assert_eq!(endpoint.base_url, "https://env.example/v1");
+    }
+
+    #[test]
+    fn empty_caption_values_count_as_unset() {
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(CAPTION_MODEL_ENV_VAR, "");
+        env.set(CAPTION_BASE_URL_ENV_VAR, "");
+        let values = LlmConfigValues {
+            caption_model: Some(String::new()),
+            caption_llm_base_url: Some(String::new()),
+            ..LlmConfigValues::default()
+        };
+        let endpoint = CaptionEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, DEFAULT_CAPTION_MODEL);
+        assert_eq!(endpoint.base_url, DEFAULT_CAPTION_BASE_URL);
+        // An empty env falls through to the config.
+        let values = LlmConfigValues {
+            caption_model: Some("config-caption-model".to_string()),
+            ..LlmConfigValues::default()
+        };
+        let endpoint = CaptionEndpoint::resolve(&values);
+        assert_eq!(endpoint.model, "config-caption-model");
     }
 
     #[test]

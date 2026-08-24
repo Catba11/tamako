@@ -35,6 +35,12 @@
 //!   over the cheap `summary_model` endpoint, with the digest
 //!   flat-label dialect as input (decision 61 divergence: the
 //!   summarizer does not read the XML dialogue dialect).
+//! - Media captioning (`caption`): media attachments are captioned at
+//!   intake by the vision model of decision 82 (c) over the
+//!   openai-compatible caption endpoint. The live implementation is
+//!   `RigCaptionProvider`, wrapped in the `RetryCaptionProvider`
+//!   retry/backoff decorator of decision 82 (d); the adapter drives
+//!   the `tamako_core::caption::CaptionProvider` contract.
 //!
 //! Gate and reply failures are `CoreError::Wake`: log, skip this wake,
 //! no crash (the next wake is the natural retry).
@@ -116,6 +122,7 @@
 //! where a batch was just upserted (`PHASE 2 HOOK` comment, Section 7.6
 //! step 5).
 
+pub mod caption;
 pub mod endpoint;
 pub mod extract;
 pub mod gate;
@@ -132,9 +139,10 @@ pub mod summary;
 pub mod validate;
 pub mod warmup;
 
+pub use caption::{RetryCaptionProvider, RigCaptionProvider, CAPTION_PROMPT};
 pub use endpoint::{
-    EndpointClient, EndpointConfig, LlmApi, LlmConfigValues, LlmEndpoints, LlmPurpose,
-    StructuredOutputMode,
+    CaptionEndpoint, EndpointClient, EndpointConfig, LlmApi, LlmConfigValues, LlmEndpoints,
+    LlmPurpose, StructuredOutputMode,
 };
 pub use extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,

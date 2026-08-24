@@ -29,10 +29,11 @@
 //!   `normalize_edited_message`, not `normalize_message`. See the cutover
 //!   note on that function.
 
+use tamako_core::context::MediaKindName;
 use tamako_core::event::{InboundEvent, MemberEvent, NormalizedMessage, ReactionEvent};
 use teloxide::types::{
     Chat, Me, Message, MessageEntityKind, MessageReactionCountUpdated, MessageReactionUpdated,
-    ReactionType, User,
+    PhotoSize, ReactionType, User,
 };
 use time::OffsetDateTime;
 
@@ -91,23 +92,37 @@ pub fn chat_id_string(chat: &Chat) -> String {
 /// stamps the edit date into the timestamp slot.
 pub fn normalize_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedMessage> {
     let text = msg.text()?;
+    Some(normalize_message_with_text(msg, bot, text.to_string()))
+}
 
+/// A message -> `NormalizedMessage` with an EXPLICIT text. The media
+/// enrichment path (decision 82: media captioning at intake) assembles
+/// the row text (member caption text + the rendered `<media>` element)
+/// asynchronously and stamps it in through this helper, while sender,
+/// reply, and mention resolution stay byte-identical to the text path
+/// of `normalize_message`. The timestamp is the SEND date; the edited
+/// variant (`normalize_edited_message_with_text`) stamps the edit date.
+pub fn normalize_message_with_text(
+    msg: &Message,
+    bot: &BotIdentity,
+    text: String,
+) -> NormalizedMessage {
     let (sender_id, sender_display_name, username) = resolve_sender(msg);
     let reply = msg.reply_to_message();
 
-    Some(NormalizedMessage {
+    NormalizedMessage {
         platform_msg_id: msg.id.0.to_string(),
         timestamp: unix_to_offset(msg.date.timestamp()),
         sender_id,
         sender_display_name,
         username,
-        text: text.to_string(),
+        text,
         reply_to_platform_msg_id: reply.map(|m| m.id.0.to_string()),
         mentions_bot: mentions_bot(msg, bot),
         is_reply_to_bot: reply
             .and_then(|m| m.from.as_ref())
             .is_some_and(|author| author.id.0 == bot.id),
-    })
+    }
 }
 
 /// An edited text message -> `NormalizedMessage`. Identical to
@@ -127,11 +142,176 @@ pub fn normalize_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedM
 /// no cleanup migration rewrites them. Readers of the log see mixed
 /// edit-timestamp semantics across the cutover.
 pub fn normalize_edited_message(msg: &Message, bot: &BotIdentity) -> Option<NormalizedMessage> {
-    let mut normalized = normalize_message(msg, bot)?;
+    let text = msg.text()?;
+    Some(normalize_edited_message_with_text(
+        msg,
+        bot,
+        text.to_string(),
+    ))
+}
+
+/// The explicit-text variant of `normalize_edited_message` for the media
+/// enrichment path (decision 82): identical field population, but the
+/// text arrives already assembled (member caption + placeholder `<media>`
+/// element — an edited media message is NEVER re-captioned, specs.md
+/// Section 15 open item) and the timestamp is the EDIT date.
+pub fn normalize_edited_message_with_text(
+    msg: &Message,
+    bot: &BotIdentity,
+    text: String,
+) -> NormalizedMessage {
+    let mut normalized = normalize_message_with_text(msg, bot, text);
     if let Some(edit_date) = msg.edit_date() {
         normalized.timestamp = unix_to_offset(edit_date.timestamp());
     }
-    Some(normalized)
+    normalized
+}
+
+/// The media classification of one message (decision 82). The pure half
+/// of media captioning at intake: `classify_media` extracts everything
+/// the async enricher (`crate::media`) needs — the media kind, the file
+/// identifiers for the Bot API download and the sticker cache, the
+/// sticker format flags (animated/video short-circuit to a placeholder
+/// WITHOUT a download, decision 82(h)), and the member caption text.
+///
+/// Rule A1: every field is an owned primitive (String/u32/bool); no
+/// teloxide type sits in the public surface, so this enum could cross
+/// the crate boundary unchanged. At cutover only the adapter's own
+/// enricher consumes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaClass {
+    /// A photo. `file_id`/`file_unique_id`/`width`/`height` describe the
+    /// CHOSEN `PhotoSize` (the selection rule of decision 82(b),
+    /// `select_photo_size`). `caption` is the member caption text.
+    Photo {
+        file_id: String,
+        file_unique_id: String,
+        width: u32,
+        height: u32,
+        caption: Option<String>,
+    },
+    /// A sticker. A sticker message has no member caption field in the
+    /// Bot API, so there is none here. `is_animated`/`is_video` are the
+    /// sticker format flags: either one short-circuits to a placeholder
+    /// element with NO download and NO caption call (decision 82(h)).
+    Sticker {
+        file_id: String,
+        file_unique_id: String,
+        is_animated: bool,
+        is_video: bool,
+    },
+    /// A video or a video note: placeholder only at cutover
+    /// (decision 82(h)); no file identifiers are extracted.
+    Video { caption: Option<String> },
+    /// An animation (GIF): placeholder only at cutover (decision 82(h)).
+    Animated { caption: Option<String> },
+}
+
+impl MediaClass {
+    /// The core-local media kind of the `<media>` element this class
+    /// renders (the `type` attribute of
+    /// `tamako_core::context::render_media_element`). An animated
+    /// sticker renders `animated`, a video sticker renders `video`.
+    pub fn kind(&self) -> MediaKindName {
+        match self {
+            MediaClass::Photo { .. } => MediaKindName::Image,
+            MediaClass::Sticker {
+                is_animated: true, ..
+            } => MediaKindName::Animated,
+            MediaClass::Sticker { is_video: true, .. } => MediaKindName::Video,
+            MediaClass::Sticker { .. } => MediaKindName::Sticker,
+            MediaClass::Video { .. } => MediaKindName::Video,
+            MediaClass::Animated { .. } => MediaKindName::Animated,
+        }
+    }
+
+    /// The member caption text the message carries, if any.
+    pub fn caption_text(&self) -> Option<&str> {
+        match self {
+            MediaClass::Photo { caption, .. }
+            | MediaClass::Video { caption }
+            | MediaClass::Animated { caption } => caption.as_deref(),
+            MediaClass::Sticker { .. } => None,
+        }
+    }
+}
+
+/// Classifies the media a message carries, if any. Pure: no async, no
+/// I/O (rule A1). Returns `None` for non-media messages (text, service,
+/// poll, ...) — the pure text/service dispatch handles those.
+///
+/// teloxide-core 0.13 models message content as `MessageKind::Common`
+/// whose `MessageCommon.media_kind` is the teloxide-internal `MediaKind`
+/// enum; the `Message` accessor methods used here (`photo()`,
+/// `sticker()`, `video()`, `video_note()`, `animation()`, `caption()`)
+/// unwrap that nesting. Note the member text of a media message lives in
+/// `Message::caption()`, NOT `Message::text()`.
+pub fn classify_media(msg: &Message) -> Option<MediaClass> {
+    if let Some(sizes) = msg.photo() {
+        let chosen = select_photo_size(sizes)?;
+        return Some(MediaClass::Photo {
+            file_id: chosen.file.id.0.clone(),
+            file_unique_id: chosen.file.unique_id.0.clone(),
+            width: chosen.width,
+            height: chosen.height,
+            caption: msg.caption().map(str::to_string),
+        });
+    }
+    if let Some(sticker) = msg.sticker() {
+        return Some(MediaClass::Sticker {
+            file_id: sticker.file.id.0.clone(),
+            file_unique_id: sticker.file.unique_id.0.clone(),
+            is_animated: sticker.flags.is_animated,
+            is_video: sticker.flags.is_video,
+        });
+    }
+    // Video notes are video placeholders (decision 82(h)). A video note
+    // message carries no caption.
+    if msg.video().is_some() || msg.video_note().is_some() {
+        return Some(MediaClass::Video {
+            caption: msg.caption().map(str::to_string),
+        });
+    }
+    if msg.animation().is_some() {
+        return Some(MediaClass::Animated {
+            caption: msg.caption().map(str::to_string),
+        });
+    }
+    None
+}
+
+/// The row-text assembly of decision 82(e): the member caption text (if
+/// any) THEN the rendered `<media>` element, joined by one space. A
+/// pure-media row text is ONLY the element. A whitespace-only caption
+/// counts as no caption. Pure. The `media_element` argument is the
+/// byte-exact output of `tamako_core::context::render_media_element`,
+/// produced at the async call site.
+pub fn assemble_media_text(caption_text: Option<&str>, media_element: &str) -> String {
+    match caption_text {
+        Some(text) if !text.trim().is_empty() => format!("{text} {media_element}"),
+        _ => media_element.to_string(),
+    }
+}
+
+/// The PhotoSize selection rule of decision 82(b): the size whose LONG
+/// edge (max(width, height)) is NEAREST to `tamako_vision::MAX_LONG_EDGE`
+/// FROM BELOW — the cap itself counts as below. When EVERY size exceeds
+/// the cap, pick the largest; when every size is below the cap, pick the
+/// largest (never upscale: the largest available is the closest to the
+/// cap without exceeding it). A long-edge tie breaks toward the larger
+/// area. `None` for an empty size list.
+fn select_photo_size(sizes: &[PhotoSize]) -> Option<&PhotoSize> {
+    let rank = |size: &PhotoSize| {
+        (
+            size.width.max(size.height),
+            u64::from(size.width) * u64::from(size.height),
+        )
+    };
+    sizes
+        .iter()
+        .filter(|size| size.width.max(size.height) <= tamako_vision::MAX_LONG_EDGE)
+        .max_by_key(|size| rank(size))
+        .or_else(|| sizes.iter().max_by_key(|size| rank(size)))
 }
 
 /// Service messages -> `MemberJoin` / `MemberLeave`. One event per user in
@@ -602,6 +782,296 @@ mod tests {
             }],
         }));
         assert!(normalize_message(&msg, &bot()).is_none());
+    }
+
+    // ---- Media classification (decision 82) ----
+
+    fn photo_size_json(index: usize, width: u32, height: u32) -> serde_json::Value {
+        json!({
+            "file_id": format!("file-{index}"),
+            "file_unique_id": format!("unique-{index}"),
+            "width": width,
+            "height": height,
+        })
+    }
+
+    fn photo_message(sizes: &[(u32, u32)], caption: Option<&str>) -> Message {
+        let photos: Vec<serde_json::Value> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, (width, height))| photo_size_json(index, *width, *height))
+            .collect();
+        let mut extra = json!({ "photo": photos });
+        if let Some(caption) = caption {
+            extra["caption"] = json!(caption);
+        }
+        message(extra)
+    }
+
+    fn sticker_message(is_animated: bool, is_video: bool) -> Message {
+        message(json!({
+            "sticker": {
+                "file_id": "sticker-file",
+                "file_unique_id": "sticker-unique",
+                "width": 512,
+                "height": 512,
+                "type": "regular",
+                "is_animated": is_animated,
+                "is_video": is_video,
+            },
+        }))
+    }
+
+    /// The classified photo fields of a message, or a panic.
+    fn classified_photo(msg: &Message) -> (String, String, u32, u32, Option<String>) {
+        match classify_media(msg) {
+            Some(MediaClass::Photo {
+                file_id,
+                file_unique_id,
+                width,
+                height,
+                caption,
+            }) => (file_id, file_unique_id, width, height, caption),
+            other => panic!("expected a photo classification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn photo_selection_picks_the_nearest_size_below_the_cap() {
+        // The decision 82(b) ladder: 90/320/800/1280/2560 -> 1280 (the
+        // nearest long edge to 2048 from below), never the 2560 upscale.
+        let msg = photo_message(
+            &[(90, 90), (320, 320), (800, 800), (1280, 1280), (2560, 2560)],
+            None,
+        );
+        let (file_id, file_unique_id, width, height, caption) = classified_photo(&msg);
+        assert_eq!((width, height), (1280, 1280));
+        assert_eq!(file_id, "file-3");
+        assert_eq!(file_unique_id, "unique-3");
+        assert_eq!(caption, None);
+    }
+
+    #[test]
+    fn photo_selection_with_every_size_above_the_cap_picks_the_largest() {
+        let msg = photo_message(&[(2560, 2560), (4096, 4096)], None);
+        let (_, _, width, height, _) = classified_photo(&msg);
+        assert_eq!((width, height), (4096, 4096));
+    }
+
+    #[test]
+    fn photo_selection_with_every_size_below_the_cap_picks_the_largest() {
+        // Never upscale: the largest available is the closest to the cap
+        // without exceeding it.
+        let msg = photo_message(&[(90, 90), (320, 320), (800, 800)], None);
+        let (_, _, width, height, _) = classified_photo(&msg);
+        assert_eq!((width, height), (800, 800));
+    }
+
+    #[test]
+    fn photo_selection_counts_the_cap_itself_as_below() {
+        let msg = photo_message(&[(1280, 1280), (2048, 2048), (2560, 2560)], None);
+        let (file_id, _, width, height, _) = classified_photo(&msg);
+        assert_eq!((width, height), (2048, 2048));
+        assert_eq!(file_id, "file-1");
+    }
+
+    #[test]
+    fn photo_selection_uses_the_long_edge_and_breaks_ties_by_area() {
+        // Portrait long edge counts; (2048, 512) and (2048, 1024) tie on
+        // the long edge and the larger area wins.
+        let msg = photo_message(&[(512, 2048), (2048, 1024)], None);
+        let (_, _, width, height, _) = classified_photo(&msg);
+        assert_eq!((width, height), (2048, 1024));
+    }
+
+    #[test]
+    fn a_photo_classification_carries_the_member_caption_text() {
+        // MessageKind::Photo carries the member text in caption(), NOT
+        // text().
+        let msg = photo_message(&[(100, 100)], Some("look at this"));
+        let (_, _, _, _, caption) = classified_photo(&msg);
+        assert_eq!(caption.as_deref(), Some("look at this"));
+        assert_eq!(
+            classify_media(&msg).expect("media").kind(),
+            MediaKindName::Image
+        );
+    }
+
+    #[test]
+    fn sticker_classifications_carry_the_format_flags() {
+        let msg = sticker_message(false, false);
+        match classify_media(&msg) {
+            Some(MediaClass::Sticker {
+                file_id,
+                file_unique_id,
+                is_animated,
+                is_video,
+            }) => {
+                assert_eq!(file_id, "sticker-file");
+                assert_eq!(file_unique_id, "sticker-unique");
+                assert!(!is_animated);
+                assert!(!is_video);
+            }
+            other => panic!("expected a sticker classification, got {other:?}"),
+        }
+        assert_eq!(
+            classify_media(&msg).expect("media").kind(),
+            MediaKindName::Sticker
+        );
+        assert_eq!(classify_media(&msg).expect("media").caption_text(), None);
+
+        let animated = sticker_message(true, false);
+        assert_eq!(
+            classify_media(&animated).expect("media").kind(),
+            MediaKindName::Animated
+        );
+        let video = sticker_message(false, true);
+        assert_eq!(
+            classify_media(&video).expect("media").kind(),
+            MediaKindName::Video
+        );
+    }
+
+    #[test]
+    fn video_and_animation_messages_classify_as_placeholders() {
+        let video = message(json!({
+            "video": {
+                "file_id": "video-file",
+                "file_unique_id": "video-unique",
+                "width": 640,
+                "height": 360,
+                "duration": 3,
+                // Option<Mime> with a custom deserializer: the key must
+                // be present (null) for the untagged MediaKind to match.
+                "mime_type": null,
+            },
+            "caption": "watch this",
+        }));
+        match classify_media(&video) {
+            Some(MediaClass::Video { caption }) => {
+                assert_eq!(caption.as_deref(), Some("watch this"))
+            }
+            other => panic!("expected a video classification, got {other:?}"),
+        }
+
+        let video_note = message(json!({
+            "video_note": {
+                "file_id": "note-file",
+                "file_unique_id": "note-unique",
+                "length": 240,
+                "duration": 5,
+            },
+        }));
+        assert_eq!(
+            classify_media(&video_note),
+            Some(MediaClass::Video { caption: None })
+        );
+
+        let animation = message(json!({
+            "animation": {
+                "file_id": "anim-file",
+                "file_unique_id": "anim-unique",
+                "width": 320,
+                "height": 240,
+                "duration": 2,
+                "mime_type": null,
+            },
+            "caption": "loop",
+        }));
+        match classify_media(&animation) {
+            Some(MediaClass::Animated { caption }) => {
+                assert_eq!(caption.as_deref(), Some("loop"))
+            }
+            other => panic!("expected an animation classification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_media_messages_do_not_classify() {
+        assert_eq!(classify_media(&text_message("hello", json!([]))), None);
+        let service = message(json!({
+            "new_chat_members": [user_json(10, "Carol", None, None)],
+        }));
+        assert_eq!(classify_media(&service), None);
+    }
+
+    #[test]
+    fn assemble_media_text_puts_the_member_caption_before_the_element() {
+        // Byte-exact through the core renderer (decision 82(e)).
+        let element =
+            tamako_core::context::render_media_element(MediaKindName::Image, "a cat on the sofa");
+        assert_eq!(
+            assemble_media_text(Some("look at this"), &element),
+            "look at this <media type=\"image\">a cat on the sofa</media>"
+        );
+    }
+
+    #[test]
+    fn assemble_media_text_of_a_pure_media_message_is_only_the_element() {
+        let element = tamako_core::context::render_media_element(MediaKindName::Sticker, "a wave");
+        assert_eq!(assemble_media_text(None, &element), element);
+        // A whitespace-only caption counts as no caption.
+        assert_eq!(assemble_media_text(Some("  "), &element), element);
+    }
+
+    #[test]
+    fn normalize_message_with_text_keeps_the_metadata_of_the_text_path() {
+        // The media path assembles the text externally; every other
+        // field resolves exactly like the text path.
+        let msg = message(json!({
+            "photo": [{
+                "file_id": "file-id",
+                "file_unique_id": "unique-id",
+                "width": 100,
+                "height": 100,
+            }],
+            "caption": "a photo",
+            "reply_to_message": {
+                "message_id": 99,
+                "from": user_json(7, "Bob", None, Some("bob")),
+                "chat": group_json(),
+                "date": DATE - 10,
+                "text": "the original",
+            },
+        }));
+        let text = assemble_media_text(
+            Some("a photo"),
+            &tamako_core::context::render_media_element(MediaKindName::Image, "a cat"),
+        );
+        let normalized = normalize_message_with_text(&msg, &bot(), text.clone());
+        assert_eq!(normalized.platform_msg_id, "1");
+        assert_eq!(normalized.sender_id, "42");
+        assert_eq!(normalized.sender_display_name, "Alice Smith");
+        assert_eq!(normalized.username, Some("alice".to_string()));
+        assert_eq!(normalized.text, text);
+        assert_eq!(normalized.timestamp, unix_to_offset(DATE));
+        assert_eq!(normalized.reply_to_platform_msg_id, Some("99".to_string()));
+        assert!(!normalized.mentions_bot);
+        assert!(!normalized.is_reply_to_bot);
+    }
+
+    #[test]
+    fn normalize_edited_message_with_text_stamps_the_edit_date() {
+        let msg = message(json!({
+            "photo": [{
+                "file_id": "file-id",
+                "file_unique_id": "unique-id",
+                "width": 100,
+                "height": 100,
+            }],
+            "caption": "new caption",
+            "edit_date": DATE + 5,
+        }));
+        let normalized = normalize_edited_message_with_text(
+            &msg,
+            &bot(),
+            "new caption <media type=\"image\"></media>".to_string(),
+        );
+        assert_eq!(normalized.timestamp, unix_to_offset(DATE + 5));
+        assert_eq!(
+            normalized.text,
+            "new caption <media type=\"image\"></media>"
+        );
     }
 
     #[test]
