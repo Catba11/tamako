@@ -60,7 +60,7 @@ Scope (re-sequenced 2026-08; current-state.md decisions 66–70):
 6. Deep recall: graph expansion per the rules of Section 8.2 of that document, the relevance gate, and the "who discussed X" pattern through a full-text sidecar on `edge_text`.
 7. Warmup trigger with silence detection, engagement tracking, and the soft backoff. The content strategy samples interest Concept nodes from the group's own graph, with a per-topic cooldown and the person-attached-interest framing rule (decision 69). Refer to `specs.md` Sections 8.4 and 8.5.
 8. Persona hot reload. Cache invalidation is an accepted, deliberate event. Rule C4 of `specs.md` applies.
-9. Metrics backend LAST: Grafana-compatible. Prometheus naming is frozen in `specs.md` Section 12 from day one; the sink (in-bot `/metrics` pull endpoint or OTLP push) is chosen at implementation time (decision 68). No billing or token accounting (operator ruling, decision 68).
+9. ~~Metrics backend LAST~~ PARKED (operator decision 2026-08-22): the Grafana-compatible sink is deferred to the Phase 3 backlog (Section 5). Prometheus naming stays frozen in `specs.md` Section 12; the `--status` counters carry observability until the sink lands. No billing or token accounting (operator ruling, decision 68).
 
 Phase 2 entry conditions (replacing the two-week soak as the gate): five-group continuous operation, and the K2 sunset (four clean weeks from 2026-08-15). The soak-based calibration plan is superseded by live observation (decision 66).
 
@@ -80,6 +80,7 @@ Ordered by expected value:
 4. `EditedMessage` retraction semantics: edits carry full intake semantics since schema v6 (decision 65: `edit_date` timestamps, text-aware dedup, invisible-edit drop). What remains open is retracting facts extracted from pre-edit text. Refer to `specs.md` Section 15.
 5. The `is_a` concept hierarchy.
 6. The Matrix adapter. The contract of `specs.md` Section 4 is the acceptance test.
+7. The metrics backend (parked from Phase 2 item 9 on 2026-08-22): Grafana-compatible sink over the frozen Section 12 names. `--status` counters carry observability until it lands.
 
 ## 6. Heavy items that decouple cleanly
 

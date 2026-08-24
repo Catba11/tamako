@@ -47,7 +47,9 @@ v0.0.1 (alpha).
     migration v11): the branch is the operator's self-use track —
     the switch lands there first, with main's thresholds now
     uncalibrated-provisional in the docs; merging back is an
-    operator decision after the recalibration window.
+    operator decision after the recalibration window. DEPLOYED
+    2026-08-22 (decisions 73–81 in one restart; v8/v9/v10/v11
+    applied on boot; the batch-API addendum fix included).
   - **M1 (digest pipeline end to end): COMPLETE.** The pipeline runs
     against the replayed log before any live traffic: batch assembly,
     skeleton skip, rig extraction with the `KnowledgeGraph` schema,
@@ -1729,6 +1731,20 @@ v0.0.1 (alpha).
     families (still OpenRouter, still OpenAI-compatible). Spec
     backfill: graph-spec Sections 7.4/7.6/7.7 (thresholds
     uncalibrated note), specs.md Sections 5.2 (v11), 13 (defaults).
+    ADDENDUM (2026-08-22, deployed): the first live run surfaced a
+    routing fact no doc showed — OpenRouter serves ARRAY (batched)
+    embedding input for this model ONLY from google-ai-studio
+    (excluded under the account's ZDR-only policy → the decision-73
+    batched call 404'd with the privacy-filter error), while
+    single-text input routes to the ZDR google-vertex endpoints
+    (verified empirically, repeatedly). Fix (00e090c):
+    `RigEmbeddingProvider` drops its `embed_texts` override — the
+    trait's default sequential per-text loop is the Gemini surface
+    (one POST per text, same timeout/rate-limit discipline);
+    `checked_batch_vectors` goes cfg(test)-only. Deployed
+    2026-08-22; the operator reports deep-recall quality and
+    latency are both good under the sequential loop. The threshold
+    recalibration window (0.92/0.80/0.85) starts with this deploy.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
