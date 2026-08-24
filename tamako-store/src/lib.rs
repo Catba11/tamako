@@ -5,10 +5,12 @@
 //! `tokio::task::spawn_blocking`. Refer to AGENT.md Section 6.2.
 
 mod error;
+mod media_store;
 mod schema;
 mod store;
 
 pub use error::{Result, StoreError};
+pub use media_store::MediaStore;
 pub use store::{
     read_group_status, register_sqlite_vec, ContextSummaryRow, DeadLetterRow, Direction, EventType,
     GroupStatus, InjectedMemoryRow, InsertOutcome, MergeAuditRow, MessageRow, NewMessage,

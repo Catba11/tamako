@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 tamako-core.workspace = true
+tamako-store.workspace = true
+tamako-vision.workspace = true
 teloxide.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -16,3 +18,6 @@ futures = "0.3"
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# Tempdir MediaStore for the media enrichment tests (media.rs).
+tempfile = "3"

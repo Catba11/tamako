@@ -21,7 +21,7 @@
 //! No production code changes; this file only proves the round-trip.
 
 use rig::client::CompletionClient as _;
-use rig::completion::message::{ImageDetail, ImageMediaType, Message, UserContent};
+use rig::completion::message::{ImageDetail, Message, UserContent};
 use rig::completion::CompletionModel as _;
 use rig::OneOrMany;
 

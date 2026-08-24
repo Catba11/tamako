@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::capability::{self, BotChatStatus};
+use crate::media::{self, MediaEnricher};
 use crate::normalize::{self, BotIdentity};
 
 /// One normalized inbound event with its source chat (rule A2). The live
@@ -55,6 +56,11 @@ pub struct TeloxideAdapter {
     /// The inbound update channel. The sender lives in the polling task;
     /// see the module docs for why a task owns the listener stream.
     updates: mpsc::Receiver<Result<Update, RequestError>>,
+    /// Media enrichment bundle (decision 82: media captioning at
+    /// intake). `None` (the default) keeps the pre-enrichment behavior
+    /// byte-identical: a media message without text is skipped by the
+    /// pure dispatch.
+    media_enricher: Option<MediaEnricher>,
 }
 
 impl TeloxideAdapter {
@@ -89,7 +95,19 @@ impl TeloxideAdapter {
             identity,
             pending: VecDeque::new(),
             updates: spawn_polling_task(bot),
+            media_enricher: None,
         })
+    }
+
+    /// Attaches the media enrichment bundle (decision 82). With `Some`,
+    /// a media-carrying message is downloaded, normalized, captioned,
+    /// and rendered into the row text as a `<media>` element inside
+    /// `next_group_event`; every failure degrades to a placeholder
+    /// element, never drops the message. `None` preserves today's exact
+    /// behavior (a photo/sticker with no text is silently skipped).
+    pub fn with_media_enricher(mut self, enricher: Option<MediaEnricher>) -> Self {
+        self.media_enricher = enricher;
+        self
     }
 
     /// The bot identity from `get_me` at startup.
@@ -149,13 +167,46 @@ impl TeloxideAdapter {
                     continue;
                 }
             };
-            let events = events_of_update(&update, &self.identity);
+            let events = match self.enrich_media_update(&update).await {
+                Some(events) => events,
+                None => events_of_update(&update, &self.identity),
+            };
             if events.is_empty() {
                 debug!(update_id = update.id.0, "update gave no events; skipping");
                 continue;
             }
             self.pending = events.into();
         }
+    }
+
+    /// The async media hook around the pure dispatch (decision 82: media
+    /// captioning at intake). When an enricher is configured AND the
+    /// update carries a classifiable media message, this
+    /// downloads/normalizes/captions the media and returns the enriched
+    /// event. Every other update returns None and falls through to the
+    /// pure `events_of_update` — which therefore stays sync and unit-
+    /// tested without network. A media message with NO enricher
+    /// configured also returns None: the pure dispatch then skips it
+    /// exactly as before. A non-text media message is never dropped once
+    /// an enricher is configured: failures render placeholders.
+    async fn enrich_media_update(&self, update: &Update) -> Option<Vec<GroupEvent>> {
+        let enricher = self.media_enricher.as_ref()?;
+        let (msg, edited) = match &update.kind {
+            UpdateKind::Message(msg) => (msg, false),
+            UpdateKind::EditedMessage(msg) => (msg, true),
+            _ => return None,
+        };
+        let class = normalize::classify_media(msg)?;
+        let chat_id = normalize::chat_id_string(&msg.chat);
+        let message =
+            media::enrich_media_message(&self.bot, &self.identity, enricher, msg, &class, edited)
+                .await;
+        let event = if edited {
+            InboundEvent::EditedMessage(message)
+        } else {
+            InboundEvent::Message(message)
+        };
+        Some(vec![GroupEvent { chat_id, event }])
     }
 }
 
@@ -356,6 +407,7 @@ fn outbound_result<T>(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     const BOT_ID: u64 = 777_000;
     const BOT_USERNAME: &str = "tamako_bot";
@@ -561,6 +613,7 @@ mod tests {
             identity: bot(),
             pending: VecDeque::new(),
             updates: rx,
+            media_enricher: None,
         };
         (adapter, tx)
     }
@@ -699,5 +752,77 @@ mod tests {
             .expect("no error")
             .expect("an event");
         assert!(matches!(event, InboundEvent::Message(_)));
+    }
+
+    #[tokio::test]
+    async fn a_media_message_enriches_through_the_async_hook() {
+        // An animated sticker short-circuits to a placeholder WITHOUT a
+        // download (decision 82(h)), so this exercises the full async
+        // routing of next_group_event without network. The dummy bot
+        // would fail any Bot API call, proving none happened.
+        let caption: Arc<dyn tamako_core::caption::CaptionProvider> = Arc::new(
+            tamako_core::caption::ScriptedCaption::failing("must not be called"),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enricher = MediaEnricher {
+            caption,
+            media_store: Arc::new(tamako_store::MediaStore::open(dir.path()).expect("media store")),
+        };
+        let (adapter, tx) = dummy_adapter();
+        let mut adapter = adapter.with_media_enricher(Some(enricher));
+        tx.send(Ok(update(json!({
+            "message": message_json(json!({
+                "sticker": {
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-unique",
+                    "width": 512,
+                    "height": 512,
+                    "type": "regular",
+                    "is_animated": true,
+                },
+            })),
+        }))))
+        .await
+        .expect("the channel is open");
+        let event = adapter
+            .next_group_event()
+            .await
+            .expect("no error")
+            .expect("an event");
+        assert_eq!(event.chat_id, GROUP_ID.to_string());
+        let InboundEvent::Message(message) = event.event else {
+            panic!("a message")
+        };
+        assert_eq!(message.text, r#"<media type="animated"></media>"#);
+    }
+
+    #[tokio::test]
+    async fn without_an_enricher_a_media_message_is_skipped_as_before() {
+        // The None behavior of today, byte-identical: a photo message
+        // with no text yields no event, and the next update is served.
+        let (mut adapter, tx) = dummy_adapter();
+        tx.send(Ok(update(json!({
+            "message": message_json(json!({
+                "photo": [{
+                    "file_id": "file-id",
+                    "file_unique_id": "unique-id",
+                    "width": 100,
+                    "height": 100,
+                }],
+            })),
+        }))))
+        .await
+        .expect("the channel is open");
+        tx.send(Ok(update(
+            json!({ "message": message_json(json!({ "text": "hello" })) }),
+        )))
+        .await
+        .expect("the channel is open");
+        let event = adapter
+            .next_group_event()
+            .await
+            .expect("no error")
+            .expect("an event");
+        assert!(matches!(event.event, InboundEvent::Message(_)));
     }
 }
