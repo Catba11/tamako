@@ -247,17 +247,27 @@ pub const EMBEDDING_DIMS: usize = 3072;
 /// retry of `complete_structured` each get their own window (both go
 /// through `EndpointClient::complete`).
 ///
-/// 300 s is generous on purpose. Live digests complete in ~20 s, but
+/// 900 s is generous on purpose. Live digests complete in ~20 s, but
 /// reasoning models burn reasoning tokens before any content, and with
 /// `max_tokens` up to 262144 a slow-but-progressing reasoning response
-/// legitimately runs for minutes. The timeout only guards against a
-/// STALLED completion (no response at all); at 15× the observed live
-/// digest latency it cannot false-positive on a healthy slow endpoint,
-/// while a hung connection is bounded to 5 minutes per attempt.
+/// legitimately runs for minutes; at peak hours a loaded endpoint
+/// stretches this further. The timeout only guards against a STALLED
+/// completion (no response at all); it cannot false-positive on a
+/// healthy slow endpoint, while a hung connection is bounded per
+/// attempt.
+///
+/// Raised 300 s -> 900 s (operator ruling, 2026-08-23): at peak hours a
+/// large digest batch against a loaded endpoint can legitimately exceed
+/// 5 minutes, and a false-positive timeout wastes the whole batch
+/// attempt. The bound is shared by every purpose (digest, gate, reply,
+/// summary, embedding, caption): a hung wake/reply call now also takes
+/// up to 15 minutes to be declared dead — accepted, since the wake
+/// failure discipline requeues and a reply that late was already
+/// worthless.
 ///
 /// There is deliberately no config key: the bound is a code constant.
 /// Tests inject a smaller value through `EndpointClient::with_timeout`.
-pub const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The API family of an endpoint (specs.md Section 13). The family
 /// selects the wire format only, not the vendor.
