@@ -303,6 +303,42 @@ pub struct MergeAuditRow {
     pub created_at: OffsetDateTime,
 }
 
+/// A row of the `related_pairs` table (migration v12, decision 83,
+/// specs.md Section 5.2): one row per `related` merge verdict — a
+/// "dotted edge". The pair is UNORDERED with `node_a_id < node_b_id`
+/// (the house `a_id < b_id` normalization, the same discipline as the
+/// merge candidate scan); UNIQUE(node_a_id, node_b_id) plus INSERT OR
+/// IGNORE make writes first-write-wins.
+///
+/// The table is write-only state awaiting a future digest-side
+/// promotion pass (decision 83(d)): NO recall, resolution, or status
+/// read touches it. The `status` column ('pending'/'promoted'/
+/// 'dismissed') ships with the table because the promotion pass's
+/// first query is `WHERE status='pending'`.
+///
+/// On `insert_related_pair` the `id`, `status`, and `created_at`
+/// fields of this struct are IGNORED (in fact the helper takes the
+/// four meaningful values as plain parameters): the id is the
+/// autoincrement rowid, status starts at the database default
+/// 'pending', and created_at is stamped from the Rust side (the
+/// house RFC 3339 TEXT idiom).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedPairRow {
+    pub id: i64,
+    /// The smaller node id of the unordered pair (a_id < b_id).
+    pub node_a_id: String,
+    /// The larger node id of the unordered pair.
+    pub node_b_id: String,
+    /// The LLM's or operator's justification of the `related` verdict.
+    pub reason: String,
+    /// Who confirmed: `llm:<model>` or `operator` (decision 74).
+    pub confirmed_by: String,
+    /// 'pending', 'promoted', or 'dismissed' (CHECK-constrained).
+    pub status: String,
+    /// RFC 3339 TEXT timestamp stamped from the Rust side.
+    pub created_at: String,
+}
+
 /// Registers the sqlite-vec (vec0) extension on a connection. Migration
 /// v7's node_embeddings table and every vec0 query need it; registration
 /// is PER-CONNECTION and never persisted, so every open path
@@ -1370,6 +1406,151 @@ impl Store {
         })
     }
 
+    /// Records one `related` merge verdict in `related_pairs` (migration
+    /// v12, decision 83(b)): the pair becomes a write-only "dotted edge"
+    /// awaiting the future digest-side promotion pass — NO graph edge is
+    /// created (the old `also_known_as` mapping was a semantic error:
+    /// alias edges BIND in entity resolution, so a merely-related pair
+    /// could merge by the back door).
+    ///
+    /// The pair is UNORDERED: it is normalized to the house
+    /// `a_id < b_id` discipline (string comparison, the same as the
+    /// merge candidate scan) before the write. INSERT OR IGNORE is
+    /// first-write-wins (the sticker-captions idiom): a re-confirmed
+    /// pair keeps its ORIGINAL row (reason, confirmed_by, timestamp).
+    ///
+    /// `status` is not a parameter: new rows start at the database
+    /// default 'pending' (the promotion pass's first query is
+    /// `WHERE status='pending'`). Takes no chat_id (the same
+    /// single-group contract as [`Store::insert_merge_audit`]): the
+    /// merge tool opens exactly one group per run.
+    pub fn insert_related_pair(
+        &self,
+        node_a_id: &str,
+        node_b_id: &str,
+        reason: &str,
+        confirmed_by: &str,
+    ) -> Result<()> {
+        // Unordered-pair normalization: the smaller id is always
+        // node_a_id, so (a, b) and (b, a) land on the same UNIQUE key.
+        let (a, b) = if node_a_id < node_b_id {
+            (node_a_id, node_b_id)
+        } else {
+            (node_b_id, node_a_id)
+        };
+        self.with_single_group_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO related_pairs
+                    (node_a_id, node_b_id, reason, confirmed_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![a, b, reason, confirmed_by, schema::now_rfc3339()?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Rewrites every `related_pairs` row referencing a merged-away
+    /// loser to the survivor, in ONE transaction (decision 83(c),
+    /// graph-spec Section 7.7 step 3): a `same` merge hard-deletes the
+    /// loser, and this pass runs in the same apply so the side table
+    /// never dangles a node id the promotion pass would have to reap.
+    ///
+    /// Semantics per loser row (other = the non-loser endpoint):
+    /// - SELF-PAIR DROP: if other IS the survivor (the pair itself
+    ///   merged), the rewrite would produce (survivor, survivor) — the
+    ///   row is dropped instead.
+    /// - DEDUP DROP: the normalized (survivor, other) pair is written
+    ///   INSERT OR IGNORE, so a PRE-EXISTING (survivor, other) row wins
+    ///   and the loser row is simply dropped — first-write-wins, the
+    ///   same contract as `insert_related_pair`.
+    /// - A surviving rewrite PRESERVES the original row's metadata
+    ///   (reason, confirmed_by, status, created_at): this is a rewrite
+    ///   of a merge consequence, not a fresh confirmation.
+    ///
+    /// Rows not referencing the loser are untouched. All changes commit
+    /// or roll back together.
+    pub fn rewrite_related_pairs_loser(&self, loser_id: &str, survivor_id: &str) -> Result<()> {
+        self.with_single_group_conn(|conn| {
+            let tx = conn.transaction()?;
+            let loser_rows: Vec<RelatedPairRow> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, node_a_id, node_b_id, reason, confirmed_by,
+                            status, created_at
+                     FROM related_pairs
+                     WHERE node_a_id = ?1 OR node_b_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![loser_id], related_pair_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            for row in &loser_rows {
+                let other = if row.node_a_id == loser_id {
+                    row.node_b_id.as_str()
+                } else {
+                    row.node_a_id.as_str()
+                };
+                // Self-pair after the merge: drop, never rewrite to
+                // (survivor, survivor).
+                if other == survivor_id {
+                    continue;
+                }
+                let (a, b) = if survivor_id < other {
+                    (survivor_id, other)
+                } else {
+                    (other, survivor_id)
+                };
+                // Rewrite, not a fresh confirmation: keep the original
+                // reason/confirmed_by/status/created_at. INSERT OR IGNORE
+                // dedups against an existing (survivor, other) row; the
+                // loser row is dropped below either way.
+                tx.execute(
+                    "INSERT OR IGNORE INTO related_pairs
+                        (node_a_id, node_b_id, reason, confirmed_by, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        a,
+                        b,
+                        row.reason,
+                        row.confirmed_by,
+                        row.status,
+                        row.created_at
+                    ],
+                )?;
+            }
+            // The loser is gone: every row referencing it was either
+            // rewritten above or deliberately dropped.
+            tx.execute(
+                "DELETE FROM related_pairs WHERE node_a_id = ?1 OR node_b_id = ?1",
+                rusqlite::params![loser_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// All `related_pairs` rows ordered by id. TEST-ONLY / inspect
+    /// surface: decision 83(d) rules the table write-only for every
+    /// production read path (no recall, no resolution, no status), so
+    /// the only consumers are tests, a possible future inspect mode, and
+    /// the eventual digest-side promotion pass (which will query
+    /// `WHERE status='pending'` directly). Deliberate full scan — the
+    /// table has no indexes beyond the primary key and the UNIQUE pair
+    /// constraint (migration v12 comment).
+    pub fn list_related_pairs(&self) -> Result<Vec<RelatedPairRow>> {
+        self.with_single_group_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, node_a_id, node_b_id, reason, confirmed_by,
+                        status, created_at
+                 FROM related_pairs ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], related_pair_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// Writes (or overwrites) the description text of one graph edge in
     /// the deep-recall sidecar (migration v10, decision 76c). INSERT OR
     /// REPLACE: a re-digest of an edge with changed text replaces the
@@ -1624,6 +1805,20 @@ fn merge_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeAuditRow> {
     })
 }
 
+/// Maps one row of a related_pairs SELECT to a `RelatedPairRow`.
+/// `list_related_pairs` and `rewrite_related_pairs_loser` share it.
+fn related_pair_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelatedPairRow> {
+    Ok(RelatedPairRow {
+        id: row.get("id")?,
+        node_a_id: row.get("node_a_id")?,
+        node_b_id: row.get("node_b_id")?,
+        reason: row.get("reason")?,
+        confirmed_by: row.get("confirmed_by")?,
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
 /// Maps one row of a dead_letter SELECT to a `DeadLetterRow`.
 /// `list_dead_letters` and `read_group_status` share it.
 fn dead_letter_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {
@@ -1804,6 +1999,7 @@ fn upsert_state(conn: &Connection, key: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::format_description::well_known::Rfc3339;
 
     fn temp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4744,5 +4940,283 @@ mod tests {
                 ("e-c".to_string(), "text c".to_string()),
             ]
         );
+    }
+
+    // --- related_pairs (migration v12, decision 83) ------------------
+
+    #[test]
+    fn migration_v12_creates_related_pairs_and_is_idempotent_on_reopen() {
+        let (dir, store) = embedding_store();
+        store
+            .with_conn("c1", |conn| {
+                // The side table exists after v12.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'related_pairs'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "related_pairs must exist");
+
+                // The exact columns, in declaration order.
+                let columns: Vec<String> = conn
+                    .prepare("SELECT name FROM pragma_table_info('related_pairs')")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(
+                    columns,
+                    vec![
+                        "id",
+                        "node_a_id",
+                        "node_b_id",
+                        "reason",
+                        "confirmed_by",
+                        "status",
+                        "created_at"
+                    ]
+                );
+
+                // The UNIQUE(node_a_id, node_b_id) constraint exists.
+                let unique_pair: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pragma_index_list('related_pairs')
+                         WHERE \"unique\" = 1
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(unique_pair, "the UNIQUE pair constraint must exist");
+
+                // v12 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 12)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v12 must be recorded in schema_migrations");
+                Ok(())
+            })
+            .expect("v12 assertions");
+
+        // Reopen through a NEW Store instance: migrations are a no-op
+        // and v12 stays recorded exactly once.
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen");
+        store2
+            .with_conn("c1", |conn| {
+                let v12_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 12",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(v12_rows, 1, "v12 recorded exactly once");
+                Ok(())
+            })
+            .expect("reopen assertions");
+    }
+
+    #[test]
+    fn related_pair_insert_and_list_round_trip() {
+        let (_dir, store) = embedding_store();
+
+        store
+            .insert_related_pair("n-a", "n-b", "often co-occur", "llm:test-model")
+            .expect("insert first");
+        store
+            .insert_related_pair("n-c", "n-d", "same topic", "operator")
+            .expect("insert second");
+
+        let rows = store.list_related_pairs().expect("list");
+        assert_eq!(rows.len(), 2);
+
+        // Ordered by id; the id autoincrements.
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[1].id, 2);
+
+        let first = &rows[0];
+        assert_eq!(first.node_a_id, "n-a");
+        assert_eq!(first.node_b_id, "n-b");
+        assert_eq!(first.reason, "often co-occur");
+        assert_eq!(first.confirmed_by, "llm:test-model");
+        // New rows start 'pending' (the database default); created_at is
+        // a non-empty RFC 3339 stamp from the Rust side.
+        assert_eq!(first.status, "pending");
+        assert!(!first.created_at.is_empty());
+        assert!(
+            OffsetDateTime::parse(&first.created_at, &Rfc3339).is_ok(),
+            "created_at must be RFC 3339, got {:?}",
+            first.created_at
+        );
+    }
+
+    #[test]
+    fn related_pair_insert_normalizes_the_unordered_pair() {
+        let (_dir, store) = embedding_store();
+
+        // Inserted in reverse order, the house a_id < b_id
+        // normalization stores the smaller id as node_a_id.
+        store
+            .insert_related_pair("b-id", "a-id", "r", "operator")
+            .expect("insert reversed");
+        let rows = store.list_related_pairs().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_a_id, "a-id");
+        assert_eq!(rows[0].node_b_id, "b-id");
+
+        // The reversed insert of an ALREADY normalized pair is the same
+        // UNIQUE key: first-write-wins, still one row.
+        store
+            .insert_related_pair("a-id", "b-id", "different reason", "llm:m")
+            .expect("re-insert normalized");
+        let rows = store.list_related_pairs().expect("list");
+        assert_eq!(rows.len(), 1, "both orderings share the UNIQUE key");
+    }
+
+    #[test]
+    fn related_pair_insert_or_ignore_is_first_write_wins() {
+        let (_dir, store) = embedding_store();
+
+        store
+            .insert_related_pair("n-a", "n-b", "first reason", "llm:first")
+            .expect("first insert");
+        store
+            .insert_related_pair("n-a", "n-b", "second reason", "operator")
+            .expect("second insert is ignored");
+
+        let rows = store.list_related_pairs().expect("list");
+        assert_eq!(rows.len(), 1, "a re-confirmed pair keeps one row");
+        // First-write-wins: the ORIGINAL row (reason, confirmed_by) is
+        // kept.
+        assert_eq!(rows[0].reason, "first reason");
+        assert_eq!(rows[0].confirmed_by, "llm:first");
+    }
+
+    #[test]
+    fn related_pairs_status_check_rejects_an_out_of_set_status() {
+        let (_dir, store) = embedding_store();
+        store
+            .insert_related_pair("n-a", "n-b", "r", "operator")
+            .expect("insert");
+
+        // The promotion pass will flip rows to 'promoted'/'dismissed';
+        // anything outside the CHECK set must fail loudly.
+        let err = store
+            .with_conn("c1", |conn| {
+                conn.execute("UPDATE related_pairs SET status = 'bogus'", [])?;
+                Ok(())
+            })
+            .expect_err("a status outside the CHECK set must fail");
+        assert!(
+            matches!(
+                &err,
+                StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation
+            ),
+            "expected a CHECK constraint violation, got {err}"
+        );
+        // The row is untouched.
+        let rows = store.list_related_pairs().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "pending");
+    }
+
+    #[test]
+    fn rewrite_related_pairs_loser_rewrites_dedups_and_drops_self_pairs() {
+        let (_dir, store) = embedding_store();
+
+        // The graph around the merge: loser "b-l" merges into survivor
+        // "a-s". The ids are chosen so the string order is explicit:
+        // a-s < a-x < a-y < b-l < b-p < b-q.
+        store
+            .insert_related_pair("b-l", "a-x", "loser-x reason", "llm:m1")
+            .expect("loser-x");
+        store
+            .insert_related_pair("b-l", "a-y", "loser-y reason", "llm:m2")
+            .expect("loser-y");
+        // Pre-existing (survivor, Y) row: the rewrite must DEDUP into it,
+        // keeping THIS row's original metadata.
+        store
+            .insert_related_pair("a-s", "a-y", "survivor-y original", "operator")
+            .expect("survivor-y pre-existing");
+        // The (loser, survivor) pair itself becomes a self-pair after
+        // the merge: it drops, no (survivor, survivor) row appears.
+        store
+            .insert_related_pair("b-l", "a-s", "self-pair reason", "llm:m3")
+            .expect("loser-survivor");
+        // An unrelated pair must be untouched.
+        store
+            .insert_related_pair("b-p", "b-q", "untouched reason", "llm:m4")
+            .expect("untouched");
+
+        // Give the loser-x row a non-default status and a known
+        // timestamp, then verify the rewrite PRESERVES both (a rewrite
+        // is not a fresh confirmation).
+        let original_x = store.list_related_pairs().expect("list")[0].clone();
+        store
+            .with_conn("c1", |conn| {
+                conn.execute(
+                    "UPDATE related_pairs SET status = 'dismissed',
+                            created_at = '2026-01-02T03:04:05Z'
+                     WHERE id = ?1",
+                    rusqlite::params![original_x.id],
+                )?;
+                Ok(())
+            })
+            .expect("stamp loser-x metadata");
+        let stamped_x_created_at = "2026-01-02T03:04:05Z".to_string();
+
+        store
+            .rewrite_related_pairs_loser("b-l", "a-s")
+            .expect("rewrite");
+
+        let rows = store.list_related_pairs().expect("list");
+        // (survivor, X) rewritten; (survivor, Y) deduped (one row);
+        // the self-pair dropped; (P, Q) untouched: 3 rows total.
+        assert_eq!(rows.len(), 3, "rows after rewrite: {rows:?}");
+
+        // NO row references the loser anymore.
+        assert!(
+            rows.iter()
+                .all(|r| r.node_a_id != "b-l" && r.node_b_id != "b-l"),
+            "no dangling loser id: {rows:?}"
+        );
+        // No self-pair row.
+        assert!(
+            rows.iter()
+                .all(|r| !(r.node_a_id == "a-s" && r.node_b_id == "a-s")),
+            "no (survivor, survivor) row: {rows:?}"
+        );
+
+        // (survivor, X): rewritten pair, normalized a-s < a-x, with the
+        // ORIGINAL metadata preserved.
+        let sx = rows
+            .iter()
+            .find(|r| r.node_a_id == "a-s" && r.node_b_id == "a-x")
+            .expect("rewritten (survivor, X)");
+        assert_eq!(sx.reason, "loser-x reason");
+        assert_eq!(sx.confirmed_by, "llm:m1");
+        assert_eq!(sx.status, "dismissed");
+        assert_eq!(sx.created_at, stamped_x_created_at);
+
+        // (survivor, Y): collapsed into the PRE-EXISTING row — its
+        // original metadata won (first-write-wins), the loser row's
+        // reason is gone.
+        let sy: Vec<_> = rows
+            .iter()
+            .filter(|r| r.node_a_id == "a-s" && r.node_b_id == "a-y")
+            .collect();
+        assert_eq!(sy.len(), 1, "exactly one (survivor, Y) row");
+        assert_eq!(sy[0].reason, "survivor-y original");
+        assert_eq!(sy[0].confirmed_by, "operator");
+        assert_eq!(sy[0].status, "pending");
+
+        // (P, Q) untouched.
+        let pq = rows
+            .iter()
+            .find(|r| r.node_a_id == "b-p" && r.node_b_id == "b-q")
+            .expect("(P, Q) untouched");
+        assert_eq!(pq.reason, "untouched reason");
     }
 }
