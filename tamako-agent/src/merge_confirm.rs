@@ -2,7 +2,8 @@
 //! (current-state.md decision 74, graph-spec Section 7.7). The merge
 //! tool asks an LLM whether two candidate graph nodes are the same
 //! real-world entity; the verdict is THREE-WAY: `same` merges,
-//! `related` creates an `also_known_as` edge, `different` skips.
+//! `related` records the pair in the `related_pairs` table for later
+//! review and creates NO graph edge, `different` skips.
 //!
 //! The seam mirrors the decision-73 resolution confirmer of
 //! `resolve.rs`: one structured completion on the DIGEST endpoint (the
@@ -41,8 +42,8 @@ pub enum MergeVerdict {
     /// The same real-world entity: the merge tool merges the pair.
     Same,
     /// NOT the same entity but closely related (cross-language
-    /// synonyms included): the merge tool links the pair with an
-    /// `also_known_as` edge.
+    /// synonyms included): the merge tool records the pair for later
+    /// review and creates NO graph edge.
     Related,
     /// Unrelated: the merge tool skips the pair.
     Different,
@@ -55,8 +56,9 @@ pub enum MergeVerdict {
 /// Anthropic structured-output path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct MergeConfirmation {
-    /// The three-way verdict: "same" merges, "related" links the pair
-    /// with an also_known_as edge, "different" skips.
+    /// The three-way verdict: "same" merges, "related" records the
+    /// pair for later review and creates no graph edge, "different"
+    /// skips.
     pub verdict: MergeVerdict,
     /// One short reason for the decision.
     pub reason: String,
@@ -92,7 +94,7 @@ Output shape (field names exactly as written): {\"verdict\":\"same\"|\"related\"
 
 Verdicts:
 1. \"same\": both nodes ARE the same real-world entity. The merge tool merges them into one node. Surface forms differ freely: a nickname or an abbreviation of one entity is the same entity.
-2. \"related\": NOT the same entity, but closely related. The merge tool links the two nodes with an also_known_as edge and keeps both. Cross-language synonyms are \"related\", never \"same\": an English term and its Chinese translation name the same concept, but they stay two nodes joined by an also_known_as edge.
+2. \"related\": NOT the same entity, but closely related. The merge tool records the pair for later review and creates NO graph edge: both nodes stay separate. Cross-language synonyms are \"related\", never \"same\": an English term and its Chinese translation name the same concept, but they stay two separate, unlinked nodes recorded as a related pair.
 3. \"different\": unrelated. The merge tool skips the pair.
 
 Rules:
@@ -367,11 +369,18 @@ mod tests {
         assert!(
             MERGE_CONFIRMATION_PREAMBLE.contains("a wrong merge is worse than a duplicate node")
         );
-        // The cross-language ruling of decision 74: cross-language
-        // synonyms are "related" and link with an also_known_as edge
-        // (the graph-spec Section 7.1 CAUTION's answer).
+        // The cross-language ruling of decision 74, updated by
+        // decision 83(e): cross-language synonyms are "related", and a
+        // related pair is recorded for later review with NO graph edge
+        // (graph-spec Section 7.7 step 2). Regression pins: the old
+        // also_known_as claim must not come back.
         assert!(MERGE_CONFIRMATION_PREAMBLE.contains("Cross-language synonyms are \"related\""));
-        assert!(MERGE_CONFIRMATION_PREAMBLE.contains("also_known_as"));
+        assert!(MERGE_CONFIRMATION_PREAMBLE
+            .contains("records the pair for later review and creates NO graph edge"));
+        assert!(
+            !MERGE_CONFIRMATION_PREAMBLE.contains("links the two nodes with an also_known_as edge")
+        );
+        assert!(!MERGE_CONFIRMATION_PREAMBLE.contains("joined by an also_known_as edge"));
         // Decision 77 (H6b): the untrusted-data framing of the tagged
         // node fields.
         assert!(MERGE_CONFIRMATION_PREAMBLE

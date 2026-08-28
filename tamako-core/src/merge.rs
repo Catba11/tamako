@@ -61,8 +61,11 @@ pub enum MergeError {
 }
 
 /// The three-way verdict of one candidate-pair confirmation (decision
-/// 74 point 1): `same` merges, `related` links the pair with an
-/// `also_known_as` edge, `different` skips. The wire strings are
+/// 74 point 1): `same` merges, `related` records the pair in the
+/// `related_pairs` side table (decision 83(b): NO graph edge — the old
+/// `also_known_as` mapping was a semantic error; alias edges BIND in
+/// entity resolution, so a merely-related pair could merge by the back
+/// door), `different` skips. The wire strings are
 /// `same`/`related`/`different` (the LLM confirmation schema and the
 /// `merge_audit.verdict` CHECK constraint share them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +576,12 @@ fn audit_row(
 /// 'related'/'different' rows stay a single insert as before: no
 /// snapshot exists for them.
 ///
+/// Decision 83: a 'related' verdict creates NO graph edge — it inserts
+/// the `related_pairs` side-table row (write-only state awaiting the
+/// promotion pass) plus the audit row (83(b)); a 'same' merge rewrites
+/// the loser's `related_pairs` rows to the survivor in the same apply,
+/// best-effort like the other sidecar passes (83(c)).
+///
 /// Decision 75 (c): the 'same' merge rides the resolved single-value
 /// registry, so the invariant pass closes the re-point hole on the
 /// survivor (the invariant holds globally, not just at the digest
@@ -707,19 +716,55 @@ async fn apply_one<M: MemoryBackend>(
                     warn!(chat_id, loser_id = %action.loser_id, %error, "merge apply: edge_texts scan failed; reconciliation will prune the orphans");
                 }
             }
+            // Decision 83(c): every related_pairs row referencing the
+            // loser is rewritten to the survivor in the SAME apply pass
+            // — `rewrite_related_pairs_loser` does it in one
+            // transaction: INSERT OR IGNORE of the normalized
+            // (survivor, other) pair dedups against a pre-existing row
+            // (first-write-wins), a self-pair (the related pair itself
+            // merged) drops, and the loser's rows delete. The same
+            // best-effort sidecar discipline as the tombstones above:
+            // the merge itself already committed, so a failure is a
+            // WARN, never an action failure — dangling related_pairs
+            // node ids would otherwise need reaping by the promotion
+            // pass.
+            let loser = action.loser_id.clone();
+            let survivor = action.survivor_id.clone();
+            if let Err(error) = store_call(store, move |store| {
+                store.rewrite_related_pairs_loser(&loser, &survivor)
+            })
+            .await
+            {
+                warn!(chat_id, loser_id = %action.loser_id, survivor_id = %action.survivor_id, %error, "merge apply: related_pairs loser rewrite failed; dangling node ids await the promotion pass");
+            }
             Ok(audit_id)
         }
         MergeVerdict::Related => {
-            // The edge runs survivor -> loser: the survivor is the
-            // canonical entity, and the entity is the SOURCE of its
-            // also_known_as edge (Section 7.4 step 5). One direction is
-            // enough — the read paths match alias edges both ways.
-            memory
-                .link_also_known_as(chat_id, &action.survivor_id, &action.loser_id)
-                .await?;
+            // Decision 83(b): NO graph edge — the old
+            // `link_also_known_as` call was the back-door merge bug
+            // (alias edges BIND in entity resolution, so a
+            // merely-related pair could merge later). The pair lands
+            // in the `related_pairs` side table instead: write-only
+            // state awaiting the digest-side promotion pass (decision
+            // 83(d)). The candidate's a_id/b_id are the canonical
+            // unordered pair of the scan; `insert_related_pair`
+            // normalizes anyway and first-write-wins on a repeat.
+            // The insert propagates with `?` — the same discipline as
+            // the audit insert below: a 'related' verdict whose state
+            // row failed to land is an action failure.
+            let node_a = action.candidate.a_id.clone();
+            let node_b = action.candidate.b_id.clone();
+            let reason = action.reason.clone();
+            let confirmed_by_owned = confirmed_by.to_string();
+            store_call(store, move |store| {
+                store.insert_related_pair(&node_a, &node_b, &reason, &confirmed_by_owned)
+            })
+            .await?;
             // specs.md Section 5.2: one append-only audit row per
             // merge-tool action, ALL three verdicts — the audit is the
-            // record of the confirmation itself. 'related' carries no
+            // record of the confirmation EVENT; the related_pairs row
+            // is the queryable STATE of the dotted edge (decision
+            // 83(b): different jobs, both kept). 'related' carries no
             // snapshot: single insert.
             let row = audit_row(action, confirmed_by, None);
             store_call(store, move |store| store.insert_merge_audit(&row)).await
@@ -734,11 +779,13 @@ async fn apply_one<M: MemoryBackend>(
 }
 
 /// Executes a confirmed plan (decision 74 point 3: only `--apply`
-/// calls this). Per action: `same` merges the loser into the survivor
-/// and tombstones its sidecar rows; `related` links the pair with
-/// `also_known_as`; `different` mutates nothing. EVERY action appends
-/// its audit row (specs.md Section 5.2). `confirmed_by` is
-/// `llm:<model>` or `operator` (decision 74 / migration v9).
+/// calls this). Per action: `same` merges the loser into the survivor,
+/// tombstones its sidecar rows, and rewrites its `related_pairs` rows
+/// to the survivor (decision 83(c)); `related` records the pair in
+/// `related_pairs` and creates NO graph edge (decision 83(b));
+/// `different` mutates nothing. EVERY action appends its audit row
+/// (specs.md Section 5.2). `confirmed_by` is `llm:<model>` or
+/// `operator` (decision 74 / migration v9).
 ///
 /// Decision 75 (c): `single_value_predicates` is the resolved
 /// per-group registry; every 'same' merge runs the invariant pass on
@@ -1548,11 +1595,27 @@ mod tests {
             .expect("ids")
             .contains(&fixture.rustlang.id));
 
-        // The 'related' verdict linked the pair (survivor -> loser).
-        assert!(memory
+        // Decision 83(b): the 'related' verdict creates NO graph edge
+        // — the old also_known_as link was the back-door merge bug.
+        // The pair lands in the related_pairs side table instead.
+        assert!(!memory
             .are_linked(CHAT, &fixture.cat.id, &fixture.katze.id)
             .await
             .expect("linked"));
+        let related = store.list_related_pairs().expect("related pairs");
+        assert_eq!(related.len(), 1, "exactly one related_pairs row");
+        let row = &related[0];
+        // The unordered pair normalized to node_a_id < node_b_id.
+        let (a, b) = if fixture.cat.id < fixture.katze.id {
+            (&fixture.cat.id, &fixture.katze.id)
+        } else {
+            (&fixture.katze.id, &fixture.cat.id)
+        };
+        assert_eq!(row.node_a_id, *a);
+        assert_eq!(row.node_b_id, *b);
+        assert_eq!(row.reason, "cross-language synonym");
+        assert_eq!(row.confirmed_by, "llm:test-model");
+        assert_eq!(row.status, "pending");
 
         // The 'different' verdict mutated nothing.
         assert!(memory
@@ -1636,16 +1699,259 @@ mod tests {
             1,
             "the related action still applied"
         );
-        assert!(memory
+        // Decision 83(b): the applied 'related' action wrote a
+        // related_pairs row, NOT a graph edge.
+        assert!(!memory
             .are_linked(CHAT, &fixture.cat.id, &fixture.katze.id)
             .await
             .expect("linked"));
+        assert_eq!(
+            store.list_related_pairs().expect("related pairs").len(),
+            1,
+            "the related action still applied"
+        );
         // The failed merge left the graph untouched.
         assert!(memory
             .node_content(CHAT, &fixture.rustlang.id)
             .await
             .expect("content")
             .is_some());
+    }
+
+    /// Hand-builds one plan action. The decision-83(c) loser-rewrite
+    /// tests drive TWO sequential applies with hand-chosen verdicts
+    /// (a 'related' apply, then a 'same' apply of one endpoint), so
+    /// the plan stage's ScriptedConfirmer rigging is unnecessary.
+    fn plan_action(
+        a: &MemoryNode,
+        b: &MemoryNode,
+        verdict: MergeVerdict,
+        reason: &str,
+        survivor: &MemoryNode,
+        loser: &MemoryNode,
+    ) -> MergePlanAction {
+        MergePlanAction {
+            candidate: MergeCandidate {
+                a_id: a.id.clone(),
+                b_id: b.id.clone(),
+                a_name: a.name.clone(),
+                b_name: b.name.clone(),
+                a_description: String::new(),
+                b_description: String::new(),
+                kind: a.node_type,
+                score: 0.9,
+            },
+            verdict,
+            reason: reason.to_string(),
+            survivor_id: survivor.id.clone(),
+            loser_id: loser.id.clone(),
+        }
+    }
+
+    /// The house unordered-pair normalization (`a_id < b_id`), for the
+    /// related_pairs assertions.
+    fn normalized_pair<'a>(x: &'a str, y: &'a str) -> (&'a str, &'a str) {
+        if x < y {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    }
+
+    /// The three-node seed of the decision-83(c) rewrite tests: Alpha,
+    /// Beta, Gamma concepts, no edges, no vec rows (apply never scans).
+    async fn three_node_seed() -> (
+        tempfile::TempDir,
+        Arc<Store>,
+        LbugBackend,
+        MemoryNode,
+        MemoryNode,
+        MemoryNode,
+    ) {
+        let at = base();
+        let alpha = node("Alpha", NodeType::Concept, "a", at);
+        let beta = node("Beta", NodeType::Concept, "b", at);
+        let gamma = node("Gamma", NodeType::Concept, "g", at);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        store.open_group(CHAT).expect("open group");
+        let memory = LbugBackend::new(dir.path());
+        memory
+            .upsert_batch(
+                CHAT,
+                &MemoryBatch {
+                    batch_id: identifiers::batch_id(1, 10),
+                    nodes: vec![alpha.clone(), beta.clone(), gamma.clone()],
+                    edges: vec![],
+                },
+            )
+            .await
+            .expect("seed graph");
+        (dir, store, memory, alpha, beta, gamma)
+    }
+
+    #[tokio::test]
+    async fn apply_same_rewrites_a_related_pair_to_the_survivor() {
+        // Decision 83(c): a related_pairs row whose LOSER endpoint is
+        // merged away rewrites to the survivor in the same apply —
+        // the metadata (reason/confirmed_by/status) is preserved (a
+        // rewrite of a merge consequence, not a fresh confirmation)
+        // and no row references the loser afterwards.
+        let (_dir, store, memory, alpha, beta, gamma) = three_node_seed().await;
+
+        // First apply: the 'related' verdict on (Alpha, Beta).
+        let plan = MergePlan {
+            actions: vec![plan_action(
+                &alpha,
+                &beta,
+                MergeVerdict::Related,
+                "often co-occur",
+                &alpha,
+                &beta,
+            )],
+            skipped: vec![],
+        };
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "llm:test-model", &[]).await;
+        assert!(report.failures.is_empty());
+        assert_eq!(store.list_related_pairs().expect("pairs").len(), 1);
+
+        // Second apply: Beta (loser) merges into Gamma (survivor).
+        let plan = MergePlan {
+            actions: vec![plan_action(
+                &beta,
+                &gamma,
+                MergeVerdict::Same,
+                "duplicate",
+                &gamma,
+                &beta,
+            )],
+            skipped: vec![],
+        };
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
+        assert!(report.failures.is_empty());
+
+        let rows = store.list_related_pairs().expect("pairs");
+        assert_eq!(rows.len(), 1, "the row was rewritten, not duplicated");
+        let (a, b) = normalized_pair(&alpha.id, &gamma.id);
+        assert_eq!(rows[0].node_a_id, a);
+        assert_eq!(rows[0].node_b_id, b);
+        assert_eq!(rows[0].reason, "often co-occur", "metadata preserved");
+        assert_eq!(rows[0].confirmed_by, "llm:test-model");
+        assert_eq!(rows[0].status, "pending");
+        assert!(
+            rows.iter()
+                .all(|row| row.node_a_id != beta.id && row.node_b_id != beta.id),
+            "no dangling loser id"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_same_drops_a_related_self_pair() {
+        // Decision 83(c): the related pair ITSELF merges — the rewrite
+        // would produce (survivor, survivor), so the row drops.
+        let (_dir, store, memory, alpha, beta, _gamma) = three_node_seed().await;
+
+        let plan = MergePlan {
+            actions: vec![plan_action(
+                &alpha,
+                &beta,
+                MergeVerdict::Related,
+                "often co-occur",
+                &alpha,
+                &beta,
+            )],
+            skipped: vec![],
+        };
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "llm:test-model", &[]).await;
+        assert!(report.failures.is_empty());
+        assert_eq!(store.list_related_pairs().expect("pairs").len(), 1);
+
+        // Alpha (loser) merges into Beta (survivor): the (Alpha, Beta)
+        // row would rewrite to (Beta, Beta) — a self-pair, dropped.
+        let plan = MergePlan {
+            actions: vec![plan_action(
+                &alpha,
+                &beta,
+                MergeVerdict::Same,
+                "actually the same",
+                &beta,
+                &alpha,
+            )],
+            skipped: vec![],
+        };
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
+        assert!(report.failures.is_empty());
+
+        assert!(
+            store.list_related_pairs().expect("pairs").is_empty(),
+            "the self-pair dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_same_dedups_a_rewritten_related_pair_against_the_existing_row() {
+        // Decision 83(c): the rewritten (survivor, other) pair lands
+        // INSERT OR IGNORE — a PRE-EXISTING row for the collapsed pair
+        // wins (first-write-wins) and the loser row simply drops.
+        let (_dir, store, memory, alpha, beta, gamma) = three_node_seed().await;
+
+        // First apply: related on (Alpha, Beta) AND related on
+        // (Alpha, Gamma). Merging Beta into Gamma collapses the first
+        // row onto the second.
+        let plan = MergePlan {
+            actions: vec![
+                plan_action(
+                    &alpha,
+                    &beta,
+                    MergeVerdict::Related,
+                    "alpha-beta pair",
+                    &alpha,
+                    &beta,
+                ),
+                plan_action(
+                    &alpha,
+                    &gamma,
+                    MergeVerdict::Related,
+                    "alpha-gamma pair",
+                    &alpha,
+                    &gamma,
+                ),
+            ],
+            skipped: vec![],
+        };
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "llm:test-model", &[]).await;
+        assert!(report.failures.is_empty());
+        assert_eq!(store.list_related_pairs().expect("pairs").len(), 2);
+
+        // Second apply: Beta (loser) merges into Gamma (survivor).
+        let plan = MergePlan {
+            actions: vec![plan_action(
+                &beta,
+                &gamma,
+                MergeVerdict::Same,
+                "duplicate",
+                &gamma,
+                &beta,
+            )],
+            skipped: vec![],
+        };
+        let report = apply_merge_plan(&store, &memory, CHAT, &plan, "operator", &[]).await;
+        assert!(report.failures.is_empty());
+
+        let rows = store.list_related_pairs().expect("pairs");
+        assert_eq!(rows.len(), 1, "INSERT OR IGNORE deduped the collapse");
+        let (a, b) = normalized_pair(&alpha.id, &gamma.id);
+        assert_eq!(rows[0].node_a_id, a);
+        assert_eq!(rows[0].node_b_id, b);
+        assert_eq!(
+            rows[0].reason, "alpha-gamma pair",
+            "the pre-existing row wins (first-write-wins)"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.node_a_id != beta.id && row.node_b_id != beta.id),
+            "the loser is gone from every row"
+        );
     }
 
     #[tokio::test]

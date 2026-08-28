@@ -348,6 +348,47 @@ CREATE VIRTUAL TABLE node_embeddings USING vec0(
 DELETE FROM pending_embeddings WHERE status = 'done';
 ",
     ),
+    (
+        12,
+        "\
+-- Related-pair side table (decision 83, specs.md Section 5.2,
+-- graph-spec Section 7.7 step 6). The merge tool's 'related' verdict
+-- no longer creates an also_known_as edge: alias edges BIND in entity
+-- resolution (graph-spec Section 7.4 steps 2/5), so a merely-related
+-- pair could merge by the back door — a semantic error. The pair
+-- lands here instead as write-only 'dotted edge' state, one row per
+-- 'related' verdict, awaiting a future digest-side promotion pass
+-- that grounds a real relationship edge from full batch text and
+-- flips the row to 'promoted' (operator dismissal flips 'dismissed').
+--
+-- The status column ships NOW (operator ruling): the promotion
+-- pass's first query is WHERE status='pending'; adding the column
+-- later would force a migration right before that pass for no
+-- benefit. The pair is UNORDERED, normalized node_a_id < node_b_id
+-- (the same discipline as the merge candidate scan) with
+-- UNIQUE(node_a_id, node_b_id); writes are INSERT OR IGNORE,
+-- first-write-wins — a re-confirmed pair keeps its original row.
+-- Timestamps are RFC 3339 TEXT written from the Rust side, the house
+-- idiom. A 'same' merge rewrites the loser's rows to the survivor in
+-- the same apply (Store::rewrite_related_pairs_loser, decision 83(c)).
+--
+-- NO read path touches this table — not recall, not resolution, not
+-- status (decision 83(d)) — so no indexes beyond the primary key and
+-- the UNIQUE pair constraint; the promotion pass's status='pending'
+-- scan is rare and the table grows one row per reviewed verdict.
+CREATE TABLE related_pairs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_a_id    TEXT NOT NULL,
+    node_b_id    TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    confirmed_by TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','promoted','dismissed')),
+    created_at   TEXT NOT NULL,
+    UNIQUE(node_a_id, node_b_id)
+);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
