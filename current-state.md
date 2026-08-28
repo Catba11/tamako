@@ -1911,6 +1911,76 @@ v0.0.1 (alpha).
     for now); the dual-use OPENAI_API_KEY WARN mirror for the
     caption endpoint.
 
+83. (operator-ruled 2026-08-25) The merge tool's `related`
+    verdict stops creating `also_known_as` graph edges; the pair
+    goes to a NEW `related_pairs` side table (per-group store.db,
+    migration v12). The old mapping was a semantic error:
+    `also_known_as` means ALIAS and the entity-resolution read
+    paths (Section 7.4 steps 2/5) bind through it, so a `related`
+    verdict on two merely-associated nodes ("Rust" / "cargo")
+    could later bind one to the other — a wrong merge by the back
+    door, worse than a duplicate. The merge confirmation prompt
+    saw only name+kind+description of an isolated pair: no edge
+    context, so ANY relationship name it picked would be a guess;
+    grounding relationships is the digest's job (it reads full
+    batch text), the merge tool's job is identity. Design points,
+    all ruled or accepted in session:
+    (a) TABLE (migration v12, additive): `related_pairs(id
+    INTEGER PRIMARY KEY AUTOINCREMENT, node_a_id TEXT NOT NULL,
+    node_b_id TEXT NOT NULL, reason TEXT NOT NULL, confirmed_by
+    TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK
+    (status IN ('pending','promoted','dismissed')), created_at
+    TEXT NOT NULL, UNIQUE(node_a_id, node_b_id))`. The pair is
+    unordered with the house `a_id < b_id` normalization (the
+    same discipline as the merge candidate scan). INSERT OR
+    IGNORE, first-write-wins (the sticker-captions idiom): a
+    re-confirmed pair keeps its original row. The status column
+    ships NOW (operator ruling): the future promotion pass's
+    first query is `WHERE status='pending'`; adding the column
+    later would force a migration right before that pass for no
+    benefit.
+    (b) MERGE-APPLY: the `Related` branch stops calling
+    `link_also_known_as`; it inserts the `related_pairs` row AND
+    still appends the `merge_audit` row (specs.md Section 5.2:
+    all three verdicts are audited — the audit is the record of
+    the confirmation EVENT, the new table is the queryable STATE
+    of current dotted edges; different jobs, both kept).
+    (c) LOSER REWRITE in the SAME merge-apply pass (operator
+    ruling): when a `same` verdict deletes the loser node, any
+    `related_pairs` rows referencing the loser are rewritten to
+    the survivor in the same apply — INSERT OR IGNORE of
+    (survivor, other) dedups against existing rows, self-pairs
+    (both endpoints merge into the survivor) drop, then the
+    loser's rows delete. Cheap now, avoids dangling node ids the
+    promotion pass would otherwise have to reap.
+    (d) READ PATHS UNTOUCHED: no recall, resolution, or status
+    query reads `related_pairs`. It is write-only state awaiting
+    the promotion pass.
+    (e) PROMPT: `MERGE_CONFIRMATION_PREAMBLE` stops claiming
+    `related` "links the two nodes with an also_known_as edge"
+    (now a lie) — it records the pair for later review and
+    creates NO graph edge. The content pin tests
+    (merge_confirm.rs) update with it. The `same`/`related`
+    boundary rule is unchanged (doubt resolves to `related` — now
+    even safer, since `related` is non-committal).
+    (f) ACCEPTED REGRESSION (safe direction): cross-language
+    synonyms — ruled `related`, never `same`, by the decision-74
+    prompt — lose their entity-resolution alias binding; an
+    English term and its Chinese translation become two unlinked
+    nodes plus one dotted pair. No wrong bindings occur (the safe
+    direction); the future promotion pass (or a prompt re-tune
+    that judges true synonyms `same`) is the planned recovery.
+    (g) FUTURE PROMOTION PASS (the table's payoff, NOT this
+    block): a digest-side step takes `status='pending'` pairs,
+    shows the digest model the pair WITH full batch text, and
+    lets it ground a real relationship edge (digest's open
+    relationship vocabulary, not a fixed enum); on success the
+    edge lands in the graph and the row flips to `'promoted'`.
+    Operator dismissal flips to `'dismissed'`. Spec backfill:
+    graph-spec Section 7.7 step 2 (the related behavior), specs.md
+    Section 5.2 (the new table beside merge_audit), the tamako-store
+    row of Section 2.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
