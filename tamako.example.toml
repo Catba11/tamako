@@ -31,6 +31,12 @@ llm_base_url = "https://opencode.ai/zen/go/v1"
 # provider prompt cache (verified 2026-08-10: 2304/2309 prompt tokens
 # cached with the header vs 0 without). Global-only; the env var
 # TAMAKO_LLM_SESSION_ID wins; the default is "tamako".
+#
+# Decision 84: this key is the session-affinity PREFIX. Every LLM call
+# sends BOTH `x-opencode-session` and `x-session-id`; when a group is
+# spawned, a per-(group, purpose) random suffix is appended
+# (`{prefix}-{suffix}`) and persisted in the group's store, so provider
+# affinity survives restarts.
 # llm_session_id = "tamako"
 
 # ------------------------------------------------------------- Models ----

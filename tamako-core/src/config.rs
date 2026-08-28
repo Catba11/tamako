@@ -13,7 +13,7 @@
 //! wake_msg_count = 3
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// The shared default base URL of the openai-compatible OpenRouter
@@ -524,6 +524,14 @@ pub struct TriggerConfigToml {
     /// The forced-wake cooldown in seconds (decision 79 (c)); 0
     /// disables. Refer to `TriggerConfig::forced_wake_cooldown`.
     pub forced_wake_cooldown_secs: Option<u64>,
+    /// Unknown keys land here (decision 84 (e)) and are WARNed about at
+    /// load, never applied. `flatten` keeps forward compatibility: a
+    /// newer config's keys don't hard-fail an older binary (no
+    /// `deny_unknown_fields`). Private: construction inside the crate
+    /// uses `..Default::default()`, and no external crate builds this
+    /// struct literally. `BTreeMap` keeps the WARN order deterministic.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 impl TriggerConfigToml {
@@ -803,6 +811,38 @@ fn validate_warmup_overlay(
     Ok(())
 }
 
+/// The decision-84 (e) collection of the unknown keys of a parsed
+/// configuration as `(table, key)` pairs — `"global"` for the global
+/// table, `"groups.<chat_id>"` for a group table. This is the pure,
+/// directly assertable seam under the `warn!` emission of
+/// `BotConfig::from_toml_str`: serde's `flatten` catch-all computes
+/// the unknown set (no hand-maintained key list to drift), the
+/// `BTreeMap` catch-all plus the sorted group ids keep the output
+/// order deterministic.
+fn unknown_keys(parsed: &BotConfigToml) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(overlay) = &parsed.global {
+        out.extend(
+            overlay
+                .unknown
+                .keys()
+                .map(|key| ("global".to_string(), key.clone())),
+        );
+    }
+    // Sorted group ids keep the reported order deterministic.
+    let mut groups: Vec<&String> = parsed.groups.keys().collect();
+    groups.sort();
+    for group in groups {
+        out.extend(
+            parsed.groups[group]
+                .unknown
+                .keys()
+                .map(|key| (format!("groups.{group}"), key.clone())),
+        );
+    }
+    out
+}
+
 /// The root configuration of the bot.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BotConfig {
@@ -835,9 +875,19 @@ impl BotConfig {
     /// Parses the TOML configuration file. The file has a `[global]`
     /// section and one `[groups.<chat_id>]` table per group override.
     /// A global-only key under a group table is a LOUD error
-    /// (decision 77, S6-F7) naming the key and the group.
+    /// (decision 77, S6-F7) naming the key and the group. An unknown
+    /// key is a curated WARN, never an error (decision 84 (e)).
     pub fn from_toml_str(text: &str) -> Result<BotConfig, ConfigError> {
         let parsed: BotConfigToml = toml::from_str(text)?;
+        // Decision 84 (e): one curated WARN per unknown key, global
+        // table and per-group tables alike — the key applies NOTHING
+        // (the motivating typo keys `digest_max_chars_words` /
+        // `digest_max_chars_bytes` were silently ignored). Warn-only,
+        // never deny_unknown_fields: forward compatibility means a
+        // newer config's keys must not hard-fail an older binary.
+        for (table, key) in unknown_keys(&parsed) {
+            tracing::warn!(key = %key, table = %table, "unknown config key, ignored");
+        }
         // Sorted group ids keep the reported error deterministic.
         let mut groups: Vec<&String> = parsed.groups.keys().collect();
         groups.sort();
@@ -1775,5 +1825,123 @@ caption_llm_base_url = "https://group-captions.example/v1"
         let plain = config.for_group("-200");
         assert_eq!(plain.caption_model, "minimax/minimax-m3");
         assert_eq!(plain.caption_llm_base_url, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn unknown_keys_load_warn_collect_and_apply_nothing() {
+        // Decision 84 (e): a typo key under [global] LOADS fine (warn-
+        // only, no deny_unknown_fields — forward compatibility), lands
+        // in the unknown collection, and applies NOTHING: the real
+        // field keeps its default.
+        let text = r#"
+[global]
+wake_msg_count = 10
+digest_max_chars_words = 1000
+
+[groups."-100"]
+wake_floor_secs = 60
+digest_max_chars_bytes = 4096
+"#;
+        let config = BotConfig::from_toml_str(text).expect("a typo key must load, warn-only");
+        // The known keys apply; the typo keys change nothing.
+        assert_eq!(config.global.wake_msg_count, 10);
+        assert_eq!(config.global.digest_max_words, 2500);
+        assert_eq!(config.for_group("-100").wake_floor, Duration::from_secs(60));
+        assert_eq!(config.for_group("-100").digest_max_bytes, 20 * 1024);
+        // The collection names the table and the key, one pair each,
+        // deterministically ordered.
+        let parsed: BotConfigToml = toml::from_str(text).expect("the TOML parses");
+        assert_eq!(
+            unknown_keys(&parsed),
+            vec![
+                ("global".to_string(), "digest_max_chars_words".to_string()),
+                (
+                    "groups.-100".to_string(),
+                    "digest_max_chars_bytes".to_string()
+                ),
+            ]
+        );
+        // The same unknown set sits in the group overlay that
+        // `BotConfig` stores.
+        assert!(config.overrides["-100"]
+            .unknown
+            .contains_key("digest_max_chars_bytes"));
+        assert!(!config.overrides["-100"]
+            .unknown
+            .contains_key("wake_floor_secs"));
+    }
+
+    #[test]
+    fn known_keys_never_land_in_the_unknown_collection() {
+        // Every key of the motivating TOML is known: the collection is
+        // empty, so no WARN fires (known keys never warn).
+        for text in [EXAMPLE_TOML, "[global]\n", "\n"] {
+            let parsed: BotConfigToml = toml::from_str(text).expect("the TOML parses");
+            assert!(
+                unknown_keys(&parsed).is_empty(),
+                "no unknown keys in {text:?}"
+            );
+        }
+        // A config setting several known keys across global and groups.
+        let text = r#"
+[global]
+warmup = false
+deep_recall = false
+vector_match_threshold = 0.95
+single_value_predicates = ["works_at"]
+
+[groups."-100777"]
+gate_context = true
+forced_wake_cooldown_secs = 5
+"#;
+        let parsed: BotConfigToml = toml::from_str(text).expect("the TOML parses");
+        assert!(unknown_keys(&parsed).is_empty());
+        assert!(BotConfig::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn the_motivating_typo_keys_are_flagged_and_ignored() {
+        // Decision 84 (e) regression: the live tamako.toml carried
+        // `digest_max_chars_words`/`digest_max_chars_bytes`, SILENTLY
+        // ignored (the real keys are `digest_max_words`/
+        // `digest_max_bytes`). Both typo keys now surface in the
+        // unknown collection (one curated WARN each at load) while the
+        // real fields keep their Section 8.2 defaults.
+        let text = r#"
+[global]
+digest_max_chars_words = 1000
+digest_max_chars_bytes = 4096
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the typo config loads");
+        assert_eq!(config.global.digest_max_words, 2500);
+        assert_eq!(config.global.digest_max_bytes, 20 * 1024);
+        let parsed: BotConfigToml = toml::from_str(text).expect("the TOML parses");
+        assert_eq!(
+            unknown_keys(&parsed),
+            vec![
+                ("global".to_string(), "digest_max_chars_bytes".to_string()),
+                ("global".to_string(), "digest_max_chars_words".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_keys_do_not_break_serialization() {
+        // The flatten catch-all must not break the Serialize derive: a
+        // config without unknown keys serializes exactly as before (the
+        // catch-all emits nothing), and a config WITH unknown keys
+        // round-trips them through the unknown map.
+        let parsed: BotConfigToml = toml::from_str(EXAMPLE_TOML).expect("the example TOML parses");
+        let serialized = toml::to_string(&parsed).expect("the config serializes");
+        assert!(
+            !serialized.contains("unknown"),
+            "the catch-all emits nothing when empty: {serialized}"
+        );
+        let with_typo: BotConfigToml = toml::from_str("[global]\nfuture_key = 1\n")
+            .expect("a future key parses (forward compatibility)");
+        assert_eq!(
+            unknown_keys(&with_typo),
+            vec![("global".to_string(), "future_key".to_string())]
+        );
     }
 }

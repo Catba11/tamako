@@ -9,6 +9,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
+# Session-key minting (decision 84): rand mints the 12 random bytes of
+# the per-(group, purpose) session-id suffix; base64 URL_SAFE_NO_PAD
+# encodes them to exactly 16 base64url chars.
+base64.workspace = true
+rand.workspace = true
 # Embedding sidecar (decision 66): sqlite-vec FFI bindings, pinned
 # because the vec0 constructor/KNN idiom is version-sensitive. The crate
 # has zero runtime deps (rusqlite is a dev-dep of the crate itself) and

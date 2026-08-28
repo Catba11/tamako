@@ -142,7 +142,7 @@ pub mod warmup;
 pub use caption::{RetryCaptionProvider, RigCaptionProvider, CAPTION_PROMPT};
 pub use endpoint::{
     CaptionEndpoint, EndpointClient, EndpointConfig, LlmApi, LlmConfigValues, LlmEndpoints,
-    LlmPurpose, StructuredOutputMode,
+    LlmPurpose, StructuredOutputMode, CAPTION_SESSION_PURPOSE, EMBEDDING_SESSION_PURPOSE,
 };
 pub use extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,
