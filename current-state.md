@@ -1981,6 +1981,80 @@ v0.0.1 (alpha).
     Section 5.2 (the new table beside merge_audit), the tamako-store
     row of Section 2.
 
+84. (operator-ruled 2026-08-25) Reply-path cache affinity: dual
+    session headers + per-(group, purpose) persisted session ids +
+    unknown-config-key warnings. A review engagement (2026-08-25)
+    traced the production reply-model cache hit rate (~zero) to
+    three compounding causes: (i) Tamako's only affinity lever was
+    the `x-opencode-session` header — an Opencode Go gateway
+    convention that OpenRouter (the actual production gateway, via
+    env base-url overrides) does not honor; OpenRouter sticky
+    routing keys on `x-session-id` / a `session_id` body field;
+    (ii) OpenRouter's default conversation hash (first system +
+    first non-system message) drifts at every digest because the
+    summary block sits at context item index 1; (iii) quiet-group
+    wake cadence (~21–39 min) exceeds every provider's default
+    cache TTL (3–10 min) — NOT addressed by this decision; the
+    header fix is prerequisite to observing anything. Design
+    points, all ruled in session:
+    (a) DUAL HEADERS: every LLM call now sends BOTH
+    `x-opencode-session` (Opencode Go affinity, decision 57/71
+    option B) and `x-session-id` (OpenRouter sticky routing).
+    Dual-send is harmless — each gateway reads its own key — and
+    avoids fragile base-url sniffing. The `session_id` BODY field
+    is skipped at cutover (rig 0.41 additional-params plumbing for
+    no observed benefit beyond the header).
+    (b) PER-(GROUP, PURPOSE) AFFINITY KEYS (operator ruling,
+    supersedes the decision-71 global-only discipline): the
+    session id of one (group, purpose) pair is
+    `{TAMAKO_LLM_SESSION_ID | llm_session_id | "tamako"}-{16-char
+    random base64url suffix}`. The suffix is generated once per
+    (group, purpose) and PERSISTED — a new
+    `llm_session_keys(chat_id TEXT NOT NULL, purpose TEXT NOT
+    NULL, session_suffix TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, purpose))` table in the per-group
+    store.db (migration v13, additive). A restart reuses the same
+    suffix, so provider-side affinity survives restarts. The
+    purposes are the four completion purposes (digest, gate,
+    reply, summary) plus `caption` and `embedding` — the endpoint
+    layer's session plumbing already carries to all three client
+    kinds (completion, embedding, caption).
+    (c) RESOLUTION POINT: the suffix is minted lazily at the
+    per-group service-build site (the binary's group spawn /
+    per-group pipeline construction), NOT in
+    `LlmEndpoints::resolve` (which is group-agnostic and shared).
+    The store's `get_state`-style get-or-mint helper
+    (`get_or_insert_session_suffix`) is atomic under the group
+    lock (decision 47/77 serialization already serializes per-group
+    store access).
+    (d) `llm_session_id` STAYS global-only as the PREFIX (the
+    config.rs `global_only_key` hard-error is unchanged): what is
+    now per-group is the suffix, not the operator-facing key. The
+    per-group override ban of specs.md Section 13 keeps its force
+    — one deployment, one operator-chosen prefix; the per-(group,
+    purpose) disambiguation is machine-generated, not
+    operator-facing.
+    (e) UNKNOWN-CONFIG-KEY WARNINGS (the same block; the review
+    found `digest_max_chars_words`/`digest_max_chars_bytes` in the
+    live tamako.toml are silently ignored — the real keys are
+    `digest_max_words`/`digest_max_bytes`): config load now WARNs
+    on any TOML key that matches no known field, global table and
+    per-group tables alike. Warn-only, NOT deny_unknown_fields —
+    forward compatibility (an older binary reading a newer
+    config) and no startup hard-fail on a typo. One WARN per
+    unknown key at startup, curated (decision 53 discipline).
+    (f) ACCEPTED: quiet-group TTL misses (cause iii) remain — the
+    header fix makes provider affinity POSSIBLE; whether the
+    upstream TTL still cold-starts quiet groups is observable only
+    after this lands (the endpoint.rs DEBUG usage line logs
+    cached vs written tokens per call). A future lever
+    (Anthropic 1h TTL opt-in, wake-cadence tuning) is out of
+    scope here.
+    Spec backfill: specs.md Section 13 (the dual-header +
+    per-(group, purpose) session-id rule, the `llm_session_id`
+    global-only-prefix wording, the unknown-key WARN), Section 5.2
+    (the `llm_session_keys` table), Section 12 (the WARN line).
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
