@@ -40,9 +40,9 @@ use tamako_agent::merge_confirm::EndpointMergeConfirmer;
 use tamako_agent::recall::DeepRecallConfig;
 use tamako_agent::resolve::{EndpointResolutionConfirmer, VectorResolutionConfig};
 use tamako_agent::{
-    AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, PipelineConfig,
-    RetryCaptionProvider, RigCaptionProvider, RigExtractor, RigGate, RigRelevanceGate,
-    RigReplyGenerator, RigSummary, RigWarmupGenerator, ShallowRecall,
+    AgentDigestPipeline, AgentError, EndpointConfig, LlmConfigValues, LlmEndpoints, LlmPurpose,
+    PipelineConfig, RetryCaptionProvider, RigCaptionProvider, RigExtractor, RigGate,
+    RigRelevanceGate, RigReplyGenerator, RigSummary, RigWarmupGenerator, ShallowRecall,
 };
 use tamako_core::actor::{
     spawn_group_actor, GroupActorHandle, GroupActorParams, DEFAULT_INBOX_CAPACITY,
@@ -592,6 +592,60 @@ fn resolve_endpoints(config: &TriggerConfig) -> Result<LlmEndpoints> {
         .context("failed to resolve the LLM endpoints (specs.md Section 13)")
 }
 
+/// Decision 84 (b)/(c): mints the per-(group, purpose) session-affinity
+/// suffix LAZILY at the per-group service-build site — here, NOT in
+/// `LlmEndpoints::resolve` (group-agnostic; group-less callers like
+/// `--status` keep the bare prefix) — and joins it onto each purpose's
+/// resolved prefix: the full session id is `{prefix}-{suffix}`, sent as
+/// BOTH the `x-opencode-session` and the `x-session-id` header
+/// (decision 84 (a)). `Store::get_or_insert_session_suffix` is the ONLY
+/// mint (the binary never generates a suffix): the suffix persists in
+/// `llm_session_keys` and is NEVER rotated, so provider-side affinity
+/// (OpenRouter sticky routing) survives restarts.
+///
+/// Scope: the four COMPLETION purposes only. The embedding and caption
+/// providers are built ONCE, process-wide, from the global config (ONE
+/// `Arc` per process, decision 73) — there is no per-group construction
+/// site for them at cutover, so they keep the bare prefix (refer to
+/// [`build_embedding_provider`]).
+///
+/// Synchronous like the whole store crate: async call sites run the
+/// whole helper (all four mints, one blocking task) on the blocking
+/// pool (AGENT.md Section 6.2). A mint failure propagates like the
+/// neighboring `resolve_endpoints` error: a broken suffix mint means a
+/// broken store, which is fatal for serving the group anyway — the
+/// spawn site fails loudly, never silently falling back to the bare
+/// prefix (an unpersisted id would re-pin the group to a fresh provider
+/// session on every restart).
+fn apply_session_suffixes(
+    store: &Arc<Store>,
+    chat_id: &str,
+    endpoints: LlmEndpoints,
+) -> Result<LlmEndpoints> {
+    let mint = |purpose: LlmPurpose| -> Result<String> {
+        store
+            .get_or_insert_session_suffix(chat_id, purpose.as_str())
+            .with_context(|| {
+                format!(
+                    "failed to mint the {} session-affinity suffix of group {chat_id} (decision 84 (b))",
+                    purpose.as_str()
+                )
+            })
+    };
+    Ok(LlmEndpoints {
+        digest: endpoints
+            .digest
+            .with_session_suffix(&mint(LlmPurpose::Digest)?),
+        gate: endpoints.gate.with_session_suffix(&mint(LlmPurpose::Gate)?),
+        reply: endpoints
+            .reply
+            .with_session_suffix(&mint(LlmPurpose::Reply)?),
+        summary: endpoints
+            .summary
+            .with_session_suffix(&mint(LlmPurpose::Summary)?),
+    })
+}
+
 /// Builds the digest pipeline (specs.md Section 10) for the resolved
 /// digest endpoint. `Ok(None)` means digests are disabled for this run:
 /// the replay still works, the digest trigger stays a stub. A missing
@@ -940,6 +994,18 @@ impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
 /// degrade mirrors the per-purpose builders: a missing `OPENAI_API_KEY`
 /// logs one WARN inside `RigEmbeddingProvider::build` and the result is
 /// `None` (the worker is not spawned; the pre-screen stays inert).
+/// Decision 84 (b) scope limitation: this provider is built ONCE,
+/// process-wide, from the GLOBAL config (ONE `Arc` per process,
+/// decision 73, shared by the digest pre-screen, the wake recall, and
+/// the embedding worker) — there is NO per-group construction site at
+/// cutover, so the embedding endpoint sends the BARE session-id prefix
+/// on both affinity headers. The per-(group, purpose) suffix threading
+/// of [`apply_session_suffixes`] covers the four completion purposes
+/// only (the reply-path cache decision 84 measured); per-group
+/// embedding affinity would require restructuring this deliberately
+/// shared provider into per-group instances — follow-up, deliberately
+/// not done (the same holds for the caption provider of
+/// [`build_caption_provider`]).
 fn build_embedding_provider(
     setup: &SharedSetup,
 ) -> Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>> {
@@ -994,7 +1060,11 @@ fn build_embedding_provider(
 /// media messages behave as before Block 2 (silently skipped when no
 /// text). The rig provider rides inside [`RetryCaptionProvider`], the
 /// decorator carrying the decision-82 (d) retry policy (three attempts,
-/// 30 s/60 s backoff).
+/// 30 s/60 s backoff). Decision 84 (b) scope limitation (the same as
+/// [`build_embedding_provider`]): process-wide construction means the
+/// caption endpoint sends the BARE session-id prefix at cutover; the
+/// per-(group, purpose) suffix covers the four completion purposes
+/// only.
 fn build_caption_provider(
     setup: &SharedSetup,
 ) -> Option<Arc<dyn tamako_core::caption::CaptionProvider>> {
@@ -1192,6 +1262,22 @@ async fn run_replay(
     // The endpoints, the digest pipeline, and the wake services are
     // built after the chat_id is known and before the actor spawns.
     let endpoints = resolve_endpoints(&group_config)?;
+    // Decision 84 (b)/(c): the SAME mint-and-apply as the live spawn
+    // site, for uniformity. Replay already writes state through this
+    // store (replay convergence is a write-path property), so the
+    // local mint breaks no replay discipline; the network-free rule is
+    // untouched (the scripted providers never send the headers — the
+    // suffix is cosmetic here). First-write-wins persistence keeps the
+    // suffix stable across replay runs of one data root.
+    let endpoints = {
+        let suffix_store = Arc::clone(&store);
+        let suffix_chat_id = chat_id.clone();
+        tokio::task::spawn_blocking(move || {
+            apply_session_suffixes(&suffix_store, &suffix_chat_id, endpoints)
+        })
+        .await
+        .context("the session-affinity suffix mint task failed")??
+    };
     // Decision 73: NO embedding provider in replay (same discipline as
     // the decision-66 worker below): replay runs the mock adapter and
     // must stay deterministic and network-free, so the pipeline's
@@ -2818,6 +2904,34 @@ async fn run_live(
                                     break;
                                 }
                             };
+                            // Decision 84 (b)/(c): mint the per-(group,
+                            // purpose) session-affinity suffixes at the
+                            // per-group build site (the group lock is
+                            // already held) and join them onto the
+                            // resolved prefixes. The synchronous store
+                            // mints ride the blocking pool (AGENT.md
+                            // Section 6.2); a mint failure is fatal,
+                            // the same standing as the resolve error
+                            // above.
+                            let suffix_store = Arc::clone(&setup.store);
+                            let suffix_chat_id = chat_id.clone();
+                            let endpoints = match tokio::task::spawn_blocking(move || {
+                                apply_session_suffixes(&suffix_store, &suffix_chat_id, endpoints)
+                            })
+                            .await
+                            {
+                                Ok(Ok(endpoints)) => endpoints,
+                                Ok(Err(error)) => {
+                                    fatal = Some(error);
+                                    break;
+                                }
+                                Err(join_error) => {
+                                    fatal = Some(anyhow::Error::new(join_error).context(
+                                        "the session-affinity suffix mint task failed",
+                                    ));
+                                    break;
+                                }
+                            };
                             let digest =
                                 match build_digest_pipeline(&setup.store, &setup.memory, &endpoints.digest, setup.store.data_root(), &chat_id, embedding_provider.clone(), &group_config) {
                                     Ok(digest) => digest,
@@ -3614,6 +3728,89 @@ mod tests {
         assert_eq!(
             values.embedding_llm_base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    /// A resolved endpoint with a fixed session-id prefix, for the
+    /// decision-84 suffix tests. Constructed directly (no
+    /// `LlmEndpoints::resolve`) so the tests stay hermetic against the
+    /// operator's TAMAKO_* environment.
+    fn prefix_endpoint(prefix: &str) -> EndpointConfig {
+        EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: None,
+            model: "test-model".to_string(),
+            structured_output: tamako_agent::StructuredOutputMode::default(),
+            session_id: prefix.to_string(),
+        }
+    }
+
+    /// Four endpoints sharing one prefix, the `resolve` output shape.
+    fn prefix_endpoints(prefix: &str) -> LlmEndpoints {
+        LlmEndpoints {
+            digest: prefix_endpoint(prefix),
+            gate: prefix_endpoint(prefix),
+            reply: prefix_endpoint(prefix),
+            summary: prefix_endpoint(prefix),
+        }
+    }
+
+    #[test]
+    fn session_suffixes_join_the_prefix_per_purpose() {
+        // Decision 84 (b): every completion purpose gets its OWN suffix
+        // joined as `{prefix}-{suffix}`; the purpose strings come from
+        // tamako-agent (LlmPurpose::as_str), never hardcoded here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        store.open_group("g1").expect("open group");
+        let endpoints =
+            apply_session_suffixes(&store, "g1", prefix_endpoints("tamako")).expect("mint");
+        for (purpose, endpoint) in [
+            (LlmPurpose::Digest, &endpoints.digest),
+            (LlmPurpose::Gate, &endpoints.gate),
+            (LlmPurpose::Reply, &endpoints.reply),
+            (LlmPurpose::Summary, &endpoints.summary),
+        ] {
+            let suffix = endpoint
+                .session_id
+                .strip_prefix("tamako-")
+                .expect("the suffix joins onto the prefix");
+            assert_eq!(suffix.len(), 16, "12 random bytes, base64url");
+            let stored = store
+                .get_or_insert_session_suffix("g1", purpose.as_str())
+                .expect("the minted suffix is persisted");
+            assert_eq!(suffix, stored, "purpose {}", purpose.as_str());
+        }
+        // Four purposes, four DISTINCT suffixes.
+        let ids = [
+            &endpoints.digest.session_id,
+            &endpoints.gate.session_id,
+            &endpoints.reply.session_id,
+            &endpoints.summary.session_id,
+        ];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn session_suffixes_are_sticky_per_group() {
+        // Decision 84 (b): the mint is persisted, so a rebuild (the
+        // restart case) re-applies the SAME suffixes; another group
+        // mints its own.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::new(dir.path().to_path_buf()));
+        store.open_group("g1").expect("open group g1");
+        store.open_group("g2").expect("open group g2");
+        let first =
+            apply_session_suffixes(&store, "g1", prefix_endpoints("tamako")).expect("first mint");
+        let second =
+            apply_session_suffixes(&store, "g1", prefix_endpoints("tamako")).expect("re-mint");
+        assert_eq!(first, second, "the suffixes survive a rebuild");
+        let other =
+            apply_session_suffixes(&store, "g2", prefix_endpoints("tamako")).expect("other group");
+        assert_ne!(
+            first.reply.session_id, other.reply.session_id,
+            "the affinity key is per-(group, purpose)"
         );
     }
 

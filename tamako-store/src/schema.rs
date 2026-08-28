@@ -389,6 +389,35 @@ CREATE TABLE related_pairs (
 );
 ",
     ),
+    (
+        13,
+        "\
+-- Per-(group, purpose) LLM session-id suffix (decision 84, specs.md
+-- Sections 5.2 and 13). A review engagement traced the reply model's
+-- ~zero cache hit rate partly to affinity ids that never survived a
+-- restart: every LLM call now sends DUAL session headers
+-- (`x-opencode-session` for Opencode Go, `x-session-id` for OpenRouter
+-- sticky routing) carrying `{prefix}-{suffix}`, and the 16-char random
+-- base64url suffix lives here so provider-side affinity survives
+-- restarts. The suffix is minted lazily on first use
+-- (Store::get_or_insert_session_suffix) and NEVER rotated — rotation
+-- would reset the provider's sticky-routing bucket the row exists to
+-- pin. The composite key (chat_id, purpose) IS the dedup, so no extra
+-- index; the purposes are digest/gate/reply/summary/caption/embedding,
+-- and one group's reply traffic never shares an affinity bucket with
+-- another purpose or another group. Writes are first-write-wins
+-- (INSERT OR IGNORE + re-SELECT): a concurrent mint keeps the existing
+-- row. created_at is RFC 3339 TEXT written from the Rust side, the
+-- house idiom.
+CREATE TABLE llm_session_keys (
+    chat_id        TEXT NOT NULL,
+    purpose        TEXT NOT NULL,
+    session_suffix TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (chat_id, purpose)
+);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.

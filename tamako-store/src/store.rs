@@ -736,6 +736,76 @@ impl Store {
         })
     }
 
+    // --- llm_session_keys (migration v13, decision 84; specs.md Sections 5.2/13) ---
+
+    /// Get-or-mint of the per-(group, purpose) LLM session-id suffix
+    /// (decision 84(b)). Every LLM call sends the dual session headers
+    /// (`x-opencode-session` + `x-session-id`) carrying
+    /// `{prefix}-{suffix}`; the suffix minted here is the persisted
+    /// half, so provider-side affinity (OpenRouter sticky routing)
+    /// survives restarts.
+    ///
+    /// Semantics: on a hit the stored suffix is returned verbatim. On a
+    /// miss 12 random bytes are minted and base64url-encoded without
+    /// padding (exactly 16 chars), then INSERTed with an RFC 3339
+    /// `created_at` stamp. A PRIMARY-KEY conflict (a concurrent mint —
+    /// theoretical under the decision-47/77 group serialization that
+    /// already serializes per-group store access) is FIRST-WRITE-WINS:
+    /// the insert is `INSERT OR IGNORE` and the loser re-SELECTs the
+    /// existing row, so all callers converge on one suffix. The suffix
+    /// is NEVER rotated (decision 84(b)); there is deliberately no
+    /// update path. The whole get-or-mint runs in one transaction, so
+    /// it is atomic under the group lock.
+    ///
+    /// Takes a chat_id (the `with_conn` accessor, like `get_state`):
+    /// the table is keyed by chat_id within the shared store. The
+    /// `purpose` is one of digest/gate/reply/summary/caption/embedding;
+    /// the store does not validate it — the enum lives in the caller
+    /// (tamako-core), the same discipline as the state-table keys.
+    pub fn get_or_insert_session_suffix(&self, chat_id: &str, purpose: &str) -> Result<String> {
+        use base64::Engine;
+        use rand::RngCore;
+
+        self.with_conn(chat_id, |conn| {
+            let tx = conn.transaction()?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT session_suffix FROM llm_session_keys
+                     WHERE chat_id = ?1 AND purpose = ?2",
+                    rusqlite::params![chat_id, purpose],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let suffix = match existing {
+                Some(suffix) => suffix,
+                None => {
+                    // 12 random bytes encode to exactly 16 base64url
+                    // chars with no padding (12 * 8 / 6 = 16).
+                    let mut bytes = [0u8; 12];
+                    rand::rng().fill_bytes(&mut bytes);
+                    let minted = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+                    tx.execute(
+                        "INSERT OR IGNORE INTO llm_session_keys
+                            (chat_id, purpose, session_suffix, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![chat_id, purpose, minted, schema::now_rfc3339()?],
+                    )?;
+                    // First-write-wins: a concurrent mint already owns
+                    // the row, so re-SELECT and return the STORED value
+                    // — not necessarily the bytes minted just above.
+                    tx.query_row(
+                        "SELECT session_suffix FROM llm_session_keys
+                         WHERE chat_id = ?1 AND purpose = ?2",
+                        rusqlite::params![chat_id, purpose],
+                        |row| row.get(0),
+                    )?
+                }
+            };
+            tx.commit()?;
+            Ok(suffix)
+        })
+    }
+
     // --- injected_memories (specs.md Sections 5.2 and 9.3; anti-defer list) ---
 
     /// Records one injected recall item. `content` holds the rendered
@@ -5218,5 +5288,166 @@ mod tests {
             .find(|r| r.node_a_id == "b-p" && r.node_b_id == "b-q")
             .expect("(P, Q) untouched");
         assert_eq!(pq.reason, "untouched reason");
+    }
+
+    // --- llm_session_keys (migration v13, decision 84) ---------------
+
+    #[test]
+    fn migration_v13_creates_llm_session_keys_and_is_idempotent_on_reopen() {
+        let (dir, store) = embedding_store();
+        store
+            .with_conn("c1", |conn| {
+                // The table exists after v13.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'llm_session_keys'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "llm_session_keys must exist");
+
+                // The exact columns and their PRIMARY-KEY positions, in
+                // declaration order: the composite (chat_id, purpose) PK.
+                let columns: Vec<(String, i64)> = conn
+                    .prepare("SELECT name, pk FROM pragma_table_info('llm_session_keys')")?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(
+                    columns,
+                    vec![
+                        ("chat_id".to_string(), 1),
+                        ("purpose".to_string(), 2),
+                        ("session_suffix".to_string(), 0),
+                        ("created_at".to_string(), 0),
+                    ],
+                    "exact columns and composite (chat_id, purpose) PK"
+                );
+
+                // v13 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 13)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v13 must be recorded in schema_migrations");
+                Ok(())
+            })
+            .expect("v13 assertions");
+
+        // Reopen through a NEW Store instance: migrations are a no-op
+        // and v13 stays recorded exactly once.
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen");
+        store2
+            .with_conn("c1", |conn| {
+                let v13_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 13",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(v13_rows, 1, "v13 recorded exactly once");
+                Ok(())
+            })
+            .expect("reopen assertions");
+    }
+
+    #[test]
+    fn session_suffix_get_or_mint_round_trip() {
+        let (_dir, store) = temp_store();
+
+        // First call mints: exactly 16 base64url chars, no padding.
+        let first = store
+            .get_or_insert_session_suffix("c1", "reply")
+            .expect("mint");
+        assert_eq!(first.len(), 16, "12 bytes encode to 16 chars");
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "base64url alphabet only: {first:?}"
+        );
+
+        // Second call returns the SAME suffix — persisted, not re-minted.
+        let second = store
+            .get_or_insert_session_suffix("c1", "reply")
+            .expect("get");
+        assert_eq!(first, second, "the minted suffix is stable");
+    }
+
+    #[test]
+    fn session_suffix_rows_are_independent_per_purpose_and_chat() {
+        let (_dir, store) = temp_store();
+
+        let c1_reply = store
+            .get_or_insert_session_suffix("c1", "reply")
+            .expect("c1 reply");
+        let c1_digest = store
+            .get_or_insert_session_suffix("c1", "digest")
+            .expect("c1 digest");
+        let c2_reply = store
+            .get_or_insert_session_suffix("c2", "reply")
+            .expect("c2 reply");
+
+        // Different purpose → a different ROW in c1's store; different
+        // chat_id → a different group's store.db entirely. The values
+        // are independent mints, so they differ (2^-96 collision odds).
+        assert_ne!(c1_reply, c1_digest, "per-purpose independence");
+        assert_ne!(c1_reply, c2_reply, "per-group independence");
+
+        // Two (chat, purpose) rows coexist in c1's store.db.
+        store
+            .with_conn("c1", |conn| {
+                let rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM llm_session_keys WHERE chat_id = 'c1'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(rows, 2, "two purposes, two rows");
+                Ok(())
+            })
+            .expect("row count");
+    }
+
+    #[test]
+    fn session_suffix_persists_across_reopen() {
+        let (dir, store) = temp_store();
+        let minted = store
+            .get_or_insert_session_suffix("c1", "reply")
+            .expect("mint");
+        drop(store);
+
+        // A restart reuses the stored suffix: provider-side affinity
+        // survives (decision 84(b)).
+        let store2 = Store::new(dir.path().to_path_buf());
+        let reopened = store2
+            .get_or_insert_session_suffix("c1", "reply")
+            .expect("get after reopen");
+        assert_eq!(minted, reopened, "the suffix survives a restart");
+    }
+
+    #[test]
+    fn session_suffixes_are_distinct_across_the_six_purposes() {
+        let (_dir, store) = temp_store();
+
+        // Mint one suffix per decision-84 purpose; 96 bits of entropy
+        // per mint makes a collision a non-event.
+        let purposes = ["digest", "gate", "reply", "summary", "caption", "embedding"];
+        let suffixes: std::collections::HashSet<String> = purposes
+            .iter()
+            .map(|purpose| {
+                store
+                    .get_or_insert_session_suffix("c1", purpose)
+                    .expect("mint")
+            })
+            .collect();
+        assert_eq!(
+            suffixes.len(),
+            purposes.len(),
+            "every purpose mints a distinct suffix"
+        );
     }
 }

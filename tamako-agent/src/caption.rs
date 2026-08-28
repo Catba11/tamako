@@ -76,8 +76,9 @@ fn build_caption_message(data_uri: &str) -> Message {
 /// completion surface (decision 82 (c)): the SAME
 /// `openai::CompletionsClient` family the endpoint layer builds,
 /// with `completion_model(endpoint.model)`. The
-/// `x-opencode-session` default header carries over via
-/// [`session_header_map`]. Retry/backoff is NOT this type's concern
+/// `x-opencode-session` and `x-session-id` default headers carry
+/// over via [`session_header_map`] (decision 84 (a)).
+/// Retry/backoff is NOT this type's concern
 /// — [`RetryCaptionProvider`] carries the decision-82 (d) policy.
 pub struct RigCaptionProvider {
     model: openai::completion::CompletionModel,

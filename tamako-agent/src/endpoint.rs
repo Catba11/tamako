@@ -43,9 +43,12 @@
 //!   `ClientBuilder::http_headers(HeaderMap)` replaces the client's
 //!   default headers; `Client::post`/`get`/`post_sse` merge them into
 //!   every request, and `build()` inserts the API-key auth header only
-//!   when the map does not already carry it. The `x-opencode-session`
-//!   header of the resolved `session_id` uses exactly this (the
-//!   Opencode Go gateway's session-affinity key).
+//!   when the map does not already carry it. The session-affinity
+//!   headers of the resolved `session_id` use exactly this (decision
+//!   84 (a): every request carries BOTH `x-opencode-session`, the
+//!   Opencode Go gateway's session-affinity key, AND `x-session-id`,
+//!   OpenRouter's sticky-routing key; dual-send is harmless — each
+//!   gateway reads its own key).
 //! - CANNOT: Anthropic JSON-object mode. The Anthropic Messages API has
 //!   no json_object response format. On the anthropic-compatible family
 //!   the `json_object` mode cannot be expressed; it degrades to
@@ -139,14 +142,32 @@ pub const SUMMARY_LLM_API_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_API";
 /// [`SUMMARY_LLM_API_ENV_VAR`].
 pub const SUMMARY_LLM_BASE_URL_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_BASE_URL";
 
-/// Environment override of the session id of the endpoint, sent as the
-/// `x-opencode-session` header (Opencode Go gateway session affinity;
-/// provider prompt-cache affinity). Global-only.
+/// Environment override of the session-id PREFIX (decision 84 (d)):
+/// `llm_session_id` stays global-only as the operator-chosen prefix.
+/// The full header value is `{prefix}-{suffix}`, where the suffix is
+/// the persisted per-(group, purpose) mint (decision 84 (b); refer to
+/// [`EndpointConfig::with_session_suffix`]). BOTH affinity headers
+/// carry the full value: `x-opencode-session` (Opencode Go gateway
+/// session affinity) and `x-session-id` (OpenRouter sticky routing)
+/// — decision 84 (a).
 pub const LLM_SESSION_ID_ENV_VAR: &str = "TAMAKO_LLM_SESSION_ID";
 
-/// The default session id (reported for spec backfill with
-/// `llm_session_id`). One sticky id per deployment.
+/// The default session-id PREFIX (reported for spec backfill with
+/// `llm_session_id`). Decision 84 (b)/(d): one deployment, one
+/// operator-chosen prefix; the per-(group, purpose) disambiguation
+/// suffix is machine-generated and persisted.
 pub const DEFAULT_SESSION_ID: &str = "tamako";
+
+/// The session-affinity purpose string of the caption endpoint
+/// (decision 84 (b)): the six purposes are the four completion
+/// purposes ([`LlmPurpose::as_str`]) plus `caption` and `embedding`.
+/// The binary keys the store's `get_or_insert_session_suffix` with
+/// this value; do NOT hardcode the string there.
+pub const CAPTION_SESSION_PURPOSE: &str = "caption";
+
+/// The session-affinity purpose string of the embedding endpoint
+/// (decision 84 (b)); refer to [`CAPTION_SESSION_PURPOSE`].
+pub const EMBEDDING_SESSION_PURPOSE: &str = "embedding";
 
 /// Global environment override of the structured-output mode
 /// (`schema` | `json_object` | `prompt_only`). The per-purpose env vars
@@ -471,11 +492,31 @@ pub struct EndpointConfig {
     /// The structured-output mode of the purpose
     /// ([`StructuredOutputMode`], module docs). Default `schema`.
     pub structured_output: StructuredOutputMode,
-    /// The resolved session id, sent as the `x-opencode-session`
-    /// header on every request of the client (global-only; the same
-    /// value in every purpose). Never empty: resolution falls
-    /// back to [`DEFAULT_SESSION_ID`].
+    /// The resolved session id, sent as BOTH the `x-opencode-session`
+    /// and the `x-session-id` header on every request of the client
+    /// (decision 84 (a)). [`LlmEndpoints::resolve`] yields the
+    /// global-only PREFIX; [`EndpointConfig::with_session_suffix`]
+    /// then joins the per-(group, purpose) suffix to
+    /// `{prefix}-{suffix}` (decision 84 (b)). Never empty: resolution
+    /// falls back to [`DEFAULT_SESSION_ID`].
     pub session_id: String,
+}
+
+impl EndpointConfig {
+    /// Applies the per-(group, purpose) affinity suffix (decision
+    /// 84 (b)): the session id becomes `{prefix}-{suffix}`. Called by
+    /// the binary at the per-group service-build site after
+    /// `resolve` (which is group-agnostic and yields the PREFIX).
+    /// Group-less callers (`--status`, resolve-only paths) never call
+    /// this; their session id stays the bare prefix.
+    ///
+    /// The suffix is the persisted per-(group, purpose) mint of
+    /// decision 84 (b); the caller obtains it from the store (this
+    /// layer stays store-agnostic).
+    pub fn with_session_suffix(mut self, suffix: &str) -> Self {
+        self.session_id = format!("{}-{suffix}", self.session_id);
+        self
+    }
 }
 
 /// Plain config-file values for endpoint resolution (specs.md
@@ -488,8 +529,8 @@ pub struct LlmConfigValues {
     pub llm_api: Option<String>,
     /// Global base URL (`llm_base_url`).
     pub llm_base_url: Option<String>,
-    /// Global session id (`llm_session_id`; global-only, no
-    /// per-purpose variant).
+    /// Global session-id PREFIX (`llm_session_id`; decision 84 (d):
+    /// global-only, no per-purpose or per-group variant).
     pub llm_session_id: Option<String>,
     /// Digest model (`digest_model`).
     pub digest_model: Option<String>,
@@ -638,9 +679,13 @@ impl LlmEndpoints {
     ///   `structured_output` → default `schema`. An unparsable string
     ///   (env or config) is `AgentError::ProviderConfig`, never a
     ///   silent default.
-    /// - Session id (global-only, the same value in every purpose):
-    ///   env `TAMAKO_LLM_SESSION_ID` → global config
+    /// - Session id: the global-only affinity PREFIX of decision
+    ///   84 (d): env `TAMAKO_LLM_SESSION_ID` → global config
     ///   `llm_session_id` → default [`DEFAULT_SESSION_ID`].
+    ///   Resolution is group-agnostic and yields the PREFIX; the
+    ///   per-(group, purpose) suffix of decision 84 (b) is applied
+    ///   afterward via [`EndpointConfig::with_session_suffix`] at the
+    ///   per-group build site (decision 84 (c)).
     ///
     /// Empty strings count as unset, in env and config alike.
     pub fn resolve(values: &LlmConfigValues) -> Result<Self, AgentError> {
@@ -715,10 +760,12 @@ impl LlmEndpoints {
     }
 }
 
-/// Resolves the global session id (module docs): env
-/// `TAMAKO_LLM_SESSION_ID` → global config `llm_session_id` →
-/// [`DEFAULT_SESSION_ID`]. Empty strings count as unset, so the
-/// resolved value is never empty.
+/// Resolves the global session-id PREFIX (module docs, decision
+/// 84 (d)): env `TAMAKO_LLM_SESSION_ID` → global config
+/// `llm_session_id` → [`DEFAULT_SESSION_ID`]. Empty strings count as
+/// unset, so the resolved value is never empty. The per-(group,
+/// purpose) suffix of decision 84 (b) is NOT this function's concern:
+/// the caller applies it after `resolve` via `with_session_suffix`.
 fn resolve_session_id(values: &LlmConfigValues) -> String {
     env_value(LLM_SESSION_ID_ENV_VAR)
         .or_else(|| {
@@ -732,25 +779,35 @@ fn resolve_session_id(values: &LlmConfigValues) -> String {
 }
 
 /// Builds the default-header map carrying the gateway
-/// session-affinity header (module docs): `x-opencode-session` with
-/// the resolved session id. The map REPLACES the client's default
-/// headers; the client `build()` inserts the API-key auth header when
-/// the map does not carry it, so the two never clash. Shared by
+/// session-affinity headers (module docs, decision 84 (a)): BOTH
+/// `x-opencode-session` (the Opencode Go gateway's session-affinity
+/// key) AND `x-session-id` (OpenRouter's sticky-routing key), each
+/// with the same resolved session id. Dual-send is harmless — each
+/// gateway reads its own key — and avoids fragile base-url sniffing.
+/// The map REPLACES the client's default headers; the client
+/// `build()` inserts the API-key auth header when the map does not
+/// carry it, so the two never clash. Shared by
 /// [`EndpointClient::build`] (completions) and
 /// [`RigEmbeddingProvider::from_endpoint`] (embeddings) and
 /// [`crate::caption::RigCaptionProvider::from_endpoint`] (captions):
-/// the session affinity carries over to all three. A session id that
-/// is not a valid header value is `AgentError::ProviderConfig`.
+/// the session affinity carries over to all three (decision 84 (b):
+/// "the endpoint layer's session plumbing already carries to all
+/// three client kinds"). A session id that is not a valid header
+/// value is `AgentError::ProviderConfig`.
 pub(crate) fn session_header_map(
     session_id: &str,
 ) -> Result<rig::http_client::HeaderMap, AgentError> {
     let mut headers = rig::http_client::HeaderMap::new();
-    headers.insert(
-        "x-opencode-session",
-        rig::http_client::HeaderValue::from_str(session_id).map_err(|error| {
-            AgentError::ProviderConfig(format!("invalid llm_session_id {session_id:?}: {error}"))
-        })?,
-    );
+    for key in ["x-opencode-session", "x-session-id"] {
+        headers.insert(
+            key,
+            rig::http_client::HeaderValue::from_str(session_id).map_err(|error| {
+                AgentError::ProviderConfig(format!(
+                    "invalid llm_session_id {session_id:?}: {error}"
+                ))
+            })?,
+        );
+    }
     Ok(headers)
 }
 
@@ -802,10 +859,11 @@ impl EndpointClient {
     /// `OPENAI_BASE_URL` env vars therefore do NOT apply; see the module
     /// docs.
     ///
-    /// The resolved `session_id` becomes the `x-opencode-session`
-    /// default header of the client (module docs): it is sent on every
-    /// request of both API families. A session id that is not a valid
-    /// header value is `AgentError::ProviderConfig`.
+    /// The resolved `session_id` becomes the `x-opencode-session` and
+    /// `x-session-id` default headers of the client (module docs,
+    /// decision 84 (a)): both are sent on every request of both API
+    /// families. A session id that is not a valid header value is
+    /// `AgentError::ProviderConfig`.
     pub fn build(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         let key_var = endpoint.api.api_key_env_var();
         let api_key = env_value(key_var).ok_or_else(|| {
@@ -987,7 +1045,8 @@ impl EndpointClient {
 
 /// The resolved embedding endpoint (current-state.md decision 66).
 /// Global-only: one embedding endpoint per deployment, no per-purpose
-/// or per-group machinery (the same standing as the session id).
+/// or per-group machinery (the same standing as the session-id
+/// PREFIX of decision 84 (d)).
 /// Embeddings always use the openai-compatible family
 /// (`POST {base}/embeddings`), so — unlike [`EndpointConfig`] — the
 /// family is fixed and the base URL is concrete (decision 66 pins the
@@ -1001,9 +1060,13 @@ pub struct EmbeddingEndpoint {
     /// The embedding model name. Never empty: resolution falls back
     /// to [`DEFAULT_EMBEDDING_MODEL`].
     pub model: String,
-    /// The resolved session id, sent as the `x-opencode-session`
-    /// header on every embedding request (the same global value as
-    /// the completion endpoints; refer to [`EndpointConfig::session_id`]).
+    /// The resolved session id, sent as BOTH the `x-opencode-session`
+    /// and the `x-session-id` header on every embedding request
+    /// (decision 84 (a)). [`EmbeddingEndpoint::resolve`] yields the
+    /// global-only PREFIX;
+    /// [`EmbeddingEndpoint::with_session_suffix`] then joins the
+    /// per-(group, purpose) suffix to `{prefix}-{suffix}` (decision
+    /// 84 (b); refer to [`EndpointConfig::session_id`]).
     pub session_id: String,
 }
 
@@ -1016,9 +1079,11 @@ impl EmbeddingEndpoint {
     ///   `embedding_model` → [`DEFAULT_EMBEDDING_MODEL`].
     /// - Base URL: env `TAMAKO_EMBEDDING_BASE_URL` → config
     ///   `embedding_llm_base_url` → [`DEFAULT_EMBEDDING_BASE_URL`].
-    /// - Session id: the global chain of [`LlmEndpoints::resolve`]
-    ///   (env `TAMAKO_LLM_SESSION_ID` → config `llm_session_id` →
-    ///   [`DEFAULT_SESSION_ID`]).
+    /// - Session id: the global PREFIX chain of
+    ///   [`LlmEndpoints::resolve`] (env `TAMAKO_LLM_SESSION_ID` →
+    ///   config `llm_session_id` → [`DEFAULT_SESSION_ID`]); the
+    ///   per-(group, purpose) suffix of decision 84 (b) is applied
+    ///   afterward via [`EmbeddingEndpoint::with_session_suffix`].
     ///
     /// Empty strings count as unset, in env and config alike. The
     /// values are free-form strings (rig never validates model
@@ -1048,6 +1113,17 @@ impl EmbeddingEndpoint {
             session_id: resolve_session_id(values),
         }
     }
+
+    /// Applies the per-(group, purpose) affinity suffix (decision
+    /// 84 (b)): the session id becomes `{prefix}-{suffix}`. The same
+    /// contract as [`EndpointConfig::with_session_suffix`]: called by
+    /// the binary at the per-group service-build site after
+    /// `resolve`; the suffix is the persisted store mint (this layer
+    /// stays store-agnostic); group-less callers never call it.
+    pub fn with_session_suffix(mut self, suffix: &str) -> Self {
+        self.session_id = format!("{}-{suffix}", self.session_id);
+        self
+    }
 }
 
 /// The resolved caption endpoint (current-state.md decision 82 (c)).
@@ -1066,9 +1142,13 @@ pub struct CaptionEndpoint {
     /// The caption model name. Never empty: resolution falls back
     /// to [`DEFAULT_CAPTION_MODEL`].
     pub model: String,
-    /// The resolved session id, sent as the `x-opencode-session`
-    /// header on every caption request (the same global value as
-    /// the completion endpoints; refer to [`EndpointConfig::session_id`]).
+    /// The resolved session id, sent as BOTH the `x-opencode-session`
+    /// and the `x-session-id` header on every caption request
+    /// (decision 84 (a)). [`CaptionEndpoint::resolve`] yields the
+    /// global-only PREFIX; [`CaptionEndpoint::with_session_suffix`]
+    /// then joins the per-(group, purpose) suffix to
+    /// `{prefix}-{suffix}` (decision 84 (b); refer to
+    /// [`EndpointConfig::session_id`]).
     pub session_id: String,
 }
 
@@ -1081,9 +1161,11 @@ impl CaptionEndpoint {
     ///   `caption_model` → [`DEFAULT_CAPTION_MODEL`].
     /// - Base URL: env `TAMAKO_CAPTION_BASE_URL` → config
     ///   `caption_llm_base_url` → [`DEFAULT_CAPTION_BASE_URL`].
-    /// - Session id: the global chain of [`LlmEndpoints::resolve`]
-    ///   (env `TAMAKO_LLM_SESSION_ID` → config `llm_session_id` →
-    ///   [`DEFAULT_SESSION_ID`]).
+    /// - Session id: the global PREFIX chain of
+    ///   [`LlmEndpoints::resolve`] (env `TAMAKO_LLM_SESSION_ID` →
+    ///   config `llm_session_id` → [`DEFAULT_SESSION_ID`]); the
+    ///   per-(group, purpose) suffix of decision 84 (b) is applied
+    ///   afterward via [`CaptionEndpoint::with_session_suffix`].
     ///
     /// Empty strings count as unset, in env and config alike. The
     /// values are free-form strings (rig never validates model
@@ -1112,6 +1194,17 @@ impl CaptionEndpoint {
             model,
             session_id: resolve_session_id(values),
         }
+    }
+
+    /// Applies the per-(group, purpose) affinity suffix (decision
+    /// 84 (b)): the session id becomes `{prefix}-{suffix}`. The same
+    /// contract as [`EndpointConfig::with_session_suffix`]: called by
+    /// the binary at the per-group service-build site after
+    /// `resolve`; the suffix is the persisted store mint (this layer
+    /// stays store-agnostic); group-less callers never call it.
+    pub fn with_session_suffix(mut self, suffix: &str) -> Self {
+        self.session_id = format!("{}-{suffix}", self.session_id);
+        self
     }
 }
 
@@ -1171,8 +1264,9 @@ pub trait EmbeddingProvider: Send + Sync {
 /// [`openai::CompletionsClient`] family the endpoint layer builds for
 /// openai-compatible completions, extended with
 /// `embedding_model_with_ndims(model, EMBEDDING_DIMS)`. The
-/// `x-opencode-session` default header carries over via
-/// [`session_header_map`]. Refer to [`EmbeddingProvider`] for the
+/// `x-opencode-session` and `x-session-id` default headers carry over
+/// via [`session_header_map`] (decision 84 (a)). Refer to
+/// [`EmbeddingProvider`] for the
 /// MissingUsage watch item this type contains.
 pub struct RigEmbeddingProvider {
     model: openai::GenericEmbeddingModel<openai::OpenAICompletionsExt>,
@@ -2535,13 +2629,15 @@ mod tests {
         EndpointClient::build(&endpoint).expect("openai client")
     }
 
-    // --- The session id (`x-opencode-session` header) ---
+    // --- The session id (`x-opencode-session` + `x-session-id`
+    // headers, decision 84 (a)) ---
 
     #[test]
     fn session_id_resolution_follows_the_precedence_chain() {
         let (_lock, env) = EnvGuard::cleared();
-        // Default: "tamako", the same value in every purpose
-        // (global-only).
+        // Default: "tamako", the same PREFIX in every purpose
+        // (global-only, decision 84 (d)); resolve is group-agnostic,
+        // so no suffix is joined here.
         let endpoints = LlmEndpoints::resolve(&LlmConfigValues::default()).unwrap();
         for endpoint in [
             &endpoints.digest,
@@ -2604,8 +2700,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_header_map_carries_both_affinity_headers_with_the_same_value() {
+        // Decision 84 (a): Opencode Go reads x-opencode-session,
+        // OpenRouter reads x-session-id; both carry the same id.
+        let headers = session_header_map("test-session-xyz").expect("a valid header value");
+        assert_eq!(
+            headers
+                .get("x-opencode-session")
+                .expect("the x-opencode-session header"),
+            "test-session-xyz"
+        );
+        assert_eq!(
+            headers
+                .get("x-session-id")
+                .expect("the x-session-id header"),
+            "test-session-xyz"
+        );
+    }
+
+    #[test]
+    fn an_invalid_session_id_is_rejected_for_the_header_map() {
+        // The same validation gates BOTH affinity headers: the map
+        // build fails before either is emitted.
+        match session_header_map("bad\nsession") {
+            Err(AgentError::ProviderConfig(_)) => {}
+            other => panic!("expected ProviderConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_session_suffix_joins_prefix_and_suffix_on_all_three_endpoint_kinds() {
+        // Decision 84 (b): resolve yields the bare prefix;
+        // with_session_suffix joins `{prefix}-{suffix}`.
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: None,
+            model: "any-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            session_id: "tamako".to_string(),
+        }
+        .with_session_suffix("abc123");
+        assert_eq!(endpoint.session_id, "tamako-abc123");
+        let embedding = EmbeddingEndpoint {
+            base_url: "http://localhost:9998/v1".to_string(),
+            model: "any-embedding-model".to_string(),
+            session_id: "tamako".to_string(),
+        }
+        .with_session_suffix("abc123");
+        assert_eq!(embedding.session_id, "tamako-abc123");
+        let caption = CaptionEndpoint {
+            base_url: "http://localhost:9997/v1".to_string(),
+            model: "any-caption-model".to_string(),
+            session_id: "tamako".to_string(),
+        }
+        .with_session_suffix("abc123");
+        assert_eq!(caption.session_id, "tamako-abc123");
+    }
+
+    #[test]
+    fn the_session_affinity_purpose_strings_match_the_spec() {
+        // Decision 84 (b): the binary keys the store's
+        // get_or_insert_session_suffix with these six strings; this
+        // pin keeps the store keys aligned with the spec's purposes.
+        assert_eq!(LlmPurpose::Digest.as_str(), "digest");
+        assert_eq!(LlmPurpose::Gate.as_str(), "gate");
+        assert_eq!(LlmPurpose::Reply.as_str(), "reply");
+        assert_eq!(LlmPurpose::Summary.as_str(), "summary");
+        assert_eq!(CAPTION_SESSION_PURPOSE, "caption");
+        assert_eq!(EMBEDDING_SESSION_PURPOSE, "embedding");
+    }
+
     /// Wire-level proof: the session id of the endpoint config reaches
-    /// the server as the `x-opencode-session` header. A local
+    /// the server as BOTH the `x-opencode-session` and the
+    /// `x-session-id` header (decision 84 (a)). A local
     /// TcpListener accepts ONE connection, captures the request head,
     /// and answers a minimal OpenAI chat-completion response; no
     /// external network.
@@ -2691,6 +2859,11 @@ mod tests {
             head.lines()
                 .any(|line| { line.eq_ignore_ascii_case("x-opencode-session: test-session-xyz") }),
             "the request carried x-opencode-session: test-session-xyz, head:\n{head}"
+        );
+        assert!(
+            head.lines()
+                .any(|line| { line.eq_ignore_ascii_case("x-session-id: test-session-xyz") }),
+            "the request carried x-session-id: test-session-xyz, head:\n{head}"
         );
         server.join().expect("the server thread joins");
     }
