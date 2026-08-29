@@ -149,7 +149,7 @@ use tamako_persona::CONTEXT_FORMAT_GLOSS;
 use tamako_store::{Store, StoreError};
 use time::macros::format_description;
 
-use crate::endpoint::{EndpointClient, EndpointConfig};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 // Decision 72: the shared context-view section shape (header and
 // empty marker) is defined ONCE next to the participation gate, so
@@ -601,7 +601,9 @@ impl RigRelevanceGate {
         injection_cap: u32,
     ) -> Result<Self, AgentError> {
         Ok(RigRelevanceGate::new(
-            EndpointClient::build(endpoint)?,
+            // The relevance gate runs on the `gate` purpose (the doc
+            // comment above); stamp it for the curated usage line.
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Gate.as_str()),
             RECALL_DEFAULT_MAX_TOKENS,
             injection_cap,
         ))

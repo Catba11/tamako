@@ -17,7 +17,7 @@ use tamako_core::wake::{
     filter_reply_parrot_lines, GateMessage, ReplyFilterOutcome, ReplyGenerator, ReplyRequest,
 };
 
-use crate::endpoint::{EndpointClient, EndpointConfig};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 
 /// The default max tokens of the reply. A pet reply is short: one chat
@@ -189,7 +189,7 @@ impl RigReplyGenerator {
     /// `AgentError::ProviderConfig` when the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigReplyGenerator::new(
-            EndpointClient::build(endpoint)?,
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Reply.as_str()),
             REPLY_DEFAULT_MAX_TOKENS,
         ))
     }

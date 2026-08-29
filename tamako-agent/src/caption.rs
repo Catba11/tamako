@@ -39,10 +39,18 @@ use rig::OneOrMany;
 use tamako_core::caption::{CaptionError, CaptionProvider};
 use tamako_core::context::MediaKindName;
 
-use crate::endpoint::{
-    env_value, session_header_map, CaptionEndpoint, ENDPOINT_TIMEOUT, OPENAI_API_KEY_ENV_VAR,
-};
+use crate::endpoint::{env_value, session_header_map, CaptionEndpoint, OPENAI_API_KEY_ENV_VAR};
 use crate::extract::AgentError;
+
+/// The PER-ATTEMPT timeout of one caption call (decision 82 (d), M1
+/// review fix): captioning is a short-output task, so 120 s is a
+/// generous bound — far below the 900 s ENDPOINT_TIMEOUT the
+/// completion purposes inherit. With the RetryCaptionProvider's 3
+/// attempts + 30 s/60 s backoff and the ~60 s download bound, one
+/// media message's worst-case intake stall is ~8.5 min (bounded),
+/// not ~46.5 min. Applied per attempt; retry/backoff is the
+/// decorator's concern, unchanged.
+pub const CAPTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The fixed caption prompt template of decision 82 (c): faithful
 /// description; describe people only as "a person" — never guess an
@@ -151,18 +159,21 @@ impl CaptionProvider for RigCaptionProvider {
                 .model
                 .completion_request(build_caption_message(jpeg_data_uri))
                 .build();
-            // The per-attempt bound of H4b (ENDPOINT_TIMEOUT),
-            // mirrored from completions and embeddings: a stalled
-            // caption is bounded; a slow-but-progressing response is
-            // untouched. Retrying a timed-out attempt is
-            // RetryCaptionProvider's concern, not this layer's.
-            let response = tokio::time::timeout(ENDPOINT_TIMEOUT, self.model.completion(request))
-                .await
-                .map_err(|_| {
-                    CaptionError::Provider(format!(
-                        "endpoint timeout after {ENDPOINT_TIMEOUT:?}: no caption response from the endpoint"
-                    ))
-                })?
+            // The caption-specific per-attempt bound
+            // (CAPTION_ATTEMPT_TIMEOUT, the M1 review fix): a stalled
+            // caption is bounded well below the long-output
+            // completion purposes' ENDPOINT_TIMEOUT; a
+            // slow-but-progressing response under 120 s is untouched.
+            // Retrying a timed-out attempt is RetryCaptionProvider's
+            // concern, not this layer's.
+            let response =
+                tokio::time::timeout(CAPTION_ATTEMPT_TIMEOUT, self.model.completion(request))
+                    .await
+                    .map_err(|_| {
+                        CaptionError::Provider(format!(
+                            "endpoint timeout after {CAPTION_ATTEMPT_TIMEOUT:?}: no caption response from the endpoint"
+                        ))
+                    })?
                 .map_err(|error| {
                     CaptionError::Provider(format!("caption completion failed: {error}"))
                 })?;
@@ -398,6 +409,36 @@ mod tests {
                 "image_url": { "url": DATA_URI, "detail": "auto" }
             })
         );
+    }
+
+    // --- CAPTION_ATTEMPT_TIMEOUT (decision 82 (d), M1 review fix) ---
+
+    #[test]
+    fn caption_attempt_timeout_is_the_m1_per_attempt_bound() {
+        // The pin: one caption attempt is bounded at 120 s. The
+        // timeout ERROR PATH itself is not unit-testable without a
+        // live model (the timeout wraps `model.completion(request)`;
+        // a refused local endpoint fails fast as "caption completion
+        // failed", never as the timeout), so the constant pin plus
+        // the call-site use of CAPTION_ATTEMPT_TIMEOUT carries the
+        // fix. The error message interpolates this same constant, so
+        // it reports "endpoint timeout after 120s".
+        assert_eq!(CAPTION_ATTEMPT_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(
+            format!("endpoint timeout after {CAPTION_ATTEMPT_TIMEOUT:?}: no caption response from the endpoint"),
+            "endpoint timeout after 120s: no caption response from the endpoint"
+        );
+    }
+
+    #[test]
+    fn caption_attempt_timeout_is_deliberately_below_the_shared_endpoint_bound() {
+        // The caption path bounds EACH ATTEMPT tighter than the
+        // long-output completion purposes: captioning is a
+        // short-output task, so inheriting the 900 s ENDPOINT_TIMEOUT
+        // would let one media message stall the serial intake loop
+        // ~46.5 min across the retry wrapper's 3 attempts + backoff.
+        use crate::endpoint::ENDPOINT_TIMEOUT;
+        assert!(CAPTION_ATTEMPT_TIMEOUT < ENDPOINT_TIMEOUT);
     }
 
     // --- RigCaptionProvider construction ---

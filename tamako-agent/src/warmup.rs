@@ -17,7 +17,7 @@ use tamako_core::actor::CoreError;
 use tamako_core::wake::{filter_reply_parrot_lines, ReplyFilterOutcome};
 use tamako_core::warmup::{WarmupGenerator, WarmupRequest};
 
-use crate::endpoint::{EndpointClient, EndpointConfig};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 use crate::reply::{context_messages_to_rig, REPLY_DEFAULT_MAX_TOKENS};
 
@@ -117,7 +117,9 @@ impl RigWarmupGenerator {
     /// key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigWarmupGenerator::new(
-            EndpointClient::build(endpoint)?,
+            // The warmup is a reply-purpose call (the doc comment
+            // above); stamp it for the curated usage line.
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Reply.as_str()),
             REPLY_DEFAULT_MAX_TOKENS,
         ))
     }

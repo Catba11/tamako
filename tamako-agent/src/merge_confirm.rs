@@ -21,7 +21,7 @@ use std::sync::{Mutex, PoisonError};
 
 use rig::completion::Message;
 
-use crate::endpoint::{EndpointClient, EndpointConfig};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 
 /// The default max tokens of the merge confirmation response. The
@@ -169,7 +169,7 @@ impl EndpointMergeConfirmer {
     /// `AgentError::ProviderConfig` when the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(EndpointMergeConfirmer::new(
-            EndpointClient::build(endpoint)?,
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Digest.as_str()),
             MERGE_CONFIRMATION_MAX_TOKENS,
         ))
     }
