@@ -14,6 +14,7 @@
 //! adapter awaits the next item from the channel directly.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -115,6 +116,15 @@ impl TeloxideAdapter {
         &self.identity
     }
 
+    /// The media download source for the enrichment pipeline (decision
+    /// 82), cloning the Bot handle (teloxide's `Bot` is a cheap
+    /// Arc-backed clone, so the downloader shares the adapter's API
+    /// URL and client). Rule A1: the binary builds its `MediaEnricher`
+    /// from this downloader; no teloxide type crosses the boundary.
+    pub fn media_downloader(&self) -> Arc<dyn media::MediaDownloader> {
+        Arc::new(media::TeloxideDownloader::new(self.bot.clone()))
+    }
+
     /// The bot's membership status in one chat, through `get_chat_member`.
     ///
     /// Reaction updates arrive only for administrators (specs.md Section
@@ -199,8 +209,7 @@ impl TeloxideAdapter {
         let class = normalize::classify_media(msg)?;
         let chat_id = normalize::chat_id_string(&msg.chat);
         let message =
-            media::enrich_media_message(&self.bot, &self.identity, enricher, msg, &class, edited)
-                .await;
+            media::enrich_media_message(&self.identity, enricher, msg, &class, edited).await;
         let event = if edited {
             InboundEvent::EditedMessage(message)
         } else {
@@ -758,17 +767,19 @@ mod tests {
     async fn a_media_message_enriches_through_the_async_hook() {
         // An animated sticker short-circuits to a placeholder WITHOUT a
         // download (decision 82(h)), so this exercises the full async
-        // routing of next_group_event without network. The dummy bot
-        // would fail any Bot API call, proving none happened.
+        // routing of next_group_event without network. The downloader
+        // (over a dummy-token Bot) would fail any Bot API call, proving
+        // none happened.
         let caption: Arc<dyn tamako_core::caption::CaptionProvider> = Arc::new(
             tamako_core::caption::ScriptedCaption::failing("must not be called"),
         );
         let dir = tempfile::tempdir().expect("tempdir");
+        let (adapter, tx) = dummy_adapter();
         let enricher = MediaEnricher {
             caption,
             media_store: Arc::new(tamako_store::MediaStore::open(dir.path()).expect("media store")),
+            downloader: adapter.media_downloader(),
         };
-        let (adapter, tx) = dummy_adapter();
         let mut adapter = adapter.with_media_enricher(Some(enricher));
         tx.send(Ok(update(json!({
             "message": message_json(json!({

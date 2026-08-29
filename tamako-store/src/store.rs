@@ -3802,14 +3802,16 @@ mod tests {
             .expect("reopen assertions");
     }
 
-    /// Builds a v10-shaped store.db by hand: MIGRATIONS 1..=10 applied
-    /// in order (leaving a COSINE float[4096] node_embeddings table +
-    /// the queue), schema_migrations stamped at 1..=10, so
-    /// Store::open_group runs ONLY migration v11.
-    fn v10_shaped_db(dir: &std::path::Path) {
+    /// Builds a store.db at schema shape N by hand: MIGRATIONS 1..=N
+    /// applied in order and stamped in schema_migrations, so a later
+    /// Store::open_group runs ONLY migrations > N. Returns the open
+    /// connection so the caller can seed shape-appropriate marker rows
+    /// before dropping it. vec0 registration mirrors open_group: the
+    /// module must resolve before any migration >= v7 runs.
+    fn shaped_db_up_to(dir: &std::path::Path, up_to_version: u32) -> Connection {
         let group = dir.join("c1");
         std::fs::create_dir_all(&group).expect("group dir");
-        let conn = Connection::open(group.join("store.db")).expect("open v10 db");
+        let conn = Connection::open(group.join("store.db")).expect("open shaped db");
         register_sqlite_vec(&conn).expect("register vec0");
         conn.execute_batch(
             "CREATE TABLE schema_migrations (
@@ -3818,7 +3820,10 @@ mod tests {
             );",
         )
         .expect("schema_migrations");
-        for (version, sql) in schema::MIGRATIONS.iter().filter(|(v, _)| *v <= 10) {
+        for (version, sql) in schema::MIGRATIONS
+            .iter()
+            .filter(|(v, _)| *v <= up_to_version)
+        {
             conn.execute_batch(sql).expect("migration DDL");
             conn.execute(
                 "INSERT INTO schema_migrations (version, applied_at)
@@ -3827,6 +3832,15 @@ mod tests {
             )
             .expect("stamp version");
         }
+        conn
+    }
+
+    /// Builds a v10-shaped store.db by hand: MIGRATIONS 1..=10 applied
+    /// in order (leaving a COSINE float[4096] node_embeddings table +
+    /// the queue), schema_migrations stamped at 1..=10, so
+    /// Store::open_group runs ONLY migration v11.
+    fn v10_shaped_db(dir: &std::path::Path) {
+        let conn = shaped_db_up_to(dir, 10);
 
         // Queue rows in every status: a pending claim, a failed row,
         // and two done-journal rows (decision 66 journal).
@@ -3857,6 +3871,41 @@ mod tests {
             [blob],
         )
         .expect("vec row");
+    }
+
+    /// Builds a v11-shaped store.db (MIGRATIONS 1..=11) with one
+    /// merge_audit marker row: v12 is expected to be ADDITIVE, so the
+    /// v11-era tables and this row must survive the v12 run untouched.
+    /// merge_audit is a v9 table that neither v10, v11, nor v12
+    /// touches — a cheap tripwire against a future non-additive edit.
+    fn v11_shaped_db(dir: &std::path::Path) {
+        let conn = shaped_db_up_to(dir, 11);
+        conn.execute(
+            "INSERT INTO merge_audit
+                (loser_id, survivor_id, loser_kind, loser_name, loser_description,
+                 verdict, reason, confirmed_by, edges_moved, self_loops_dropped,
+                 edges_deduped, snapshot, rolled_back, created_at)
+             VALUES ('n-loser', 'n-survivor', 'entity', 'Loser', NULL,
+                     'different', 'v11 marker row', 'operator', 0, 0, 0,
+                     NULL, 0, '2026-08-16T00:00:00Z')",
+            [],
+        )
+        .expect("merge_audit marker row");
+    }
+
+    /// Builds a v12-shaped store.db (MIGRATIONS 1..=12) with one
+    /// related_pairs marker row: v13 is expected to be ADDITIVE, so the
+    /// v12 table and this row must survive the v13 run untouched.
+    fn v12_shaped_db(dir: &std::path::Path) {
+        let conn = shaped_db_up_to(dir, 12);
+        conn.execute(
+            "INSERT INTO related_pairs
+                (node_a_id, node_b_id, reason, confirmed_by, status, created_at)
+             VALUES ('n-a', 'n-b', 'v12 marker row', 'operator', 'pending',
+                     '2026-08-16T00:00:00Z')",
+            [],
+        )
+        .expect("related_pairs marker row");
     }
 
     #[test]
@@ -5088,6 +5137,94 @@ mod tests {
     }
 
     #[test]
+    fn migration_v12_creates_related_pairs_on_a_v11_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        v11_shaped_db(dir.path());
+
+        // Open through the real path: v12 runs on top of the v11 shape.
+        let store = Store::new(dir.path().to_path_buf());
+        store
+            .open_group("c1")
+            .expect("open_group runs v12 on the v11 shape");
+
+        store
+            .with_conn("c1", |conn| {
+                // The side table exists after v12.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'related_pairs'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "related_pairs must exist on a v11-shaped db");
+
+                // The exact columns, in declaration order.
+                let columns: Vec<String> = conn
+                    .prepare("SELECT name FROM pragma_table_info('related_pairs')")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(
+                    columns,
+                    vec![
+                        "id",
+                        "node_a_id",
+                        "node_b_id",
+                        "reason",
+                        "confirmed_by",
+                        "status",
+                        "created_at"
+                    ]
+                );
+
+                // The UNIQUE(node_a_id, node_b_id) constraint exists.
+                let unique_pair: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pragma_index_list('related_pairs')
+                         WHERE \"unique\" = 1
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(unique_pair, "the UNIQUE pair constraint must exist");
+
+                // v12 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 12)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v12 must be recorded in schema_migrations");
+
+                // v12 is ADDITIVE: the v11-era tables survive and the
+                // merge_audit marker row seeded at v11 is still there —
+                // a tripwire against a future non-additive v12 edit.
+                let node_embeddings_exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'node_embeddings'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    node_embeddings_exists,
+                    "v11 node_embeddings must survive v12"
+                );
+                let marker_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM merge_audit
+                     WHERE reason = 'v11 marker row'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(marker_rows, 1, "the v11 marker row must survive v12");
+                Ok(())
+            })
+            .expect("v12-on-v11 assertions");
+    }
+
+    #[test]
     fn related_pair_insert_and_list_round_trip() {
         let (_dir, store) = embedding_store();
 
@@ -5356,6 +5493,81 @@ mod tests {
     }
 
     #[test]
+    fn migration_v13_creates_llm_session_keys_on_a_v12_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        v12_shaped_db(dir.path());
+
+        // Open through the real path: v13 runs on top of the v12 shape.
+        let store = Store::new(dir.path().to_path_buf());
+        store
+            .open_group("c1")
+            .expect("open_group runs v13 on the v12 shape");
+
+        store
+            .with_conn("c1", |conn| {
+                // The table exists after v13.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'llm_session_keys'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "llm_session_keys must exist on a v12-shaped db");
+
+                // The exact columns and their PRIMARY-KEY positions, in
+                // declaration order: the composite (chat_id, purpose) PK.
+                let columns: Vec<(String, i64)> = conn
+                    .prepare("SELECT name, pk FROM pragma_table_info('llm_session_keys')")?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(
+                    columns,
+                    vec![
+                        ("chat_id".to_string(), 1),
+                        ("purpose".to_string(), 2),
+                        ("session_suffix".to_string(), 0),
+                        ("created_at".to_string(), 0),
+                    ],
+                    "exact columns and composite (chat_id, purpose) PK"
+                );
+
+                // v13 is recorded.
+                let applied: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 13)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(applied, "v13 must be recorded in schema_migrations");
+
+                // v13 is ADDITIVE: the v12 related_pairs table survives
+                // and the marker row seeded at v12 is still there — a
+                // tripwire against a future non-additive v13 edit.
+                let related_pairs_exists: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'related_pairs'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(related_pairs_exists, "v12 related_pairs must survive v13");
+                let marker_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM related_pairs
+                     WHERE reason = 'v12 marker row'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(marker_rows, 1, "the v12 marker row must survive v13");
+                Ok(())
+            })
+            .expect("v13-on-v12 assertions");
+    }
+
+    #[test]
     fn session_suffix_get_or_mint_round_trip() {
         let (_dir, store) = temp_store();
 
@@ -5449,5 +5661,131 @@ mod tests {
             purposes.len(),
             "every purpose mints a distinct suffix"
         );
+    }
+
+    #[test]
+    fn session_suffix_get_or_mint_never_overwrites_an_existing_row() {
+        let (_dir, store) = temp_store();
+        store.open_group("c1").expect("open group");
+
+        // Seed the row directly via SQL — bypassing the helper, exactly
+        // the state a racing FIRST writer leaves behind. The helper's
+        // SELECT must hit this row and return it verbatim, never mint
+        // over it (the suffix is never rotated, decision 84(b)).
+        store
+            .with_conn("c1", |conn| {
+                conn.execute(
+                    "INSERT INTO llm_session_keys
+                        (chat_id, purpose, session_suffix, created_at)
+                     VALUES ('c1', 'reply', 'manual-seed-0000', '2026-08-20T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("seed row");
+
+        let got = store
+            .get_or_insert_session_suffix("c1", "reply")
+            .expect("get-or-mint on an existing row");
+        assert_eq!(
+            got, "manual-seed-0000",
+            "an existing row is returned, never overwritten"
+        );
+
+        store
+            .with_conn("c1", |conn| {
+                let rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM llm_session_keys
+                     WHERE chat_id = 'c1' AND purpose = 'reply'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(rows, 1, "still exactly one row");
+                Ok(())
+            })
+            .expect("row count");
+    }
+
+    /// One racing-mint loop: after the barrier releases both threads,
+    /// mint `rounds` suffixes on ("c1", "reply") and collect them. A
+    /// transient lock error is retried: under WAL a deferred
+    /// transaction that SELECTs before the rival commits can get
+    /// SQLITE_BUSY_SNAPSHOT on its write upgrade, which busy_timeout
+    /// deliberately does NOT wait out — the retry re-enters the helper,
+    /// whose SELECT then hits the committed winner row. The budget is
+    /// generous (100 attempts with a 1 ms sleep) because the test suite
+    /// runs these threads alongside other tests on a loaded machine.
+    fn racing_mints(store: &Store, barrier: &std::sync::Barrier, rounds: usize) -> Vec<String> {
+        barrier.wait();
+        let mut minted = Vec::new();
+        for _ in 0..rounds {
+            let mut attempts = 0;
+            loop {
+                match store.get_or_insert_session_suffix("c1", "reply") {
+                    Ok(suffix) => {
+                        minted.push(suffix);
+                        break;
+                    }
+                    Err(err) => {
+                        attempts += 1;
+                        assert!(
+                            attempts < 100,
+                            "mint keeps failing after {attempts} attempts: {err}"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+        minted
+    }
+
+    #[test]
+    fn session_suffix_concurrent_mints_converge_first_write_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Two INDEPENDENT Store instances on the SAME group store.db —
+        // two connections, so the race is real (one shared Store would
+        // serialize both mints behind the connection-map mutex). Both
+        // are pre-opened so the barrier-synchronized race below is
+        // purely the get-or-mint, not migration/open contention.
+        let store_a = Store::new(dir.path().to_path_buf());
+        store_a.open_group("c1").expect("open A");
+        let store_b = Store::new(dir.path().to_path_buf());
+        store_b.open_group("c1").expect("open B");
+
+        let barrier = std::sync::Barrier::new(2);
+        const ROUNDS: usize = 25;
+        let (mints_a, mints_b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| racing_mints(&store_a, &barrier, ROUNDS));
+            let b = scope.spawn(|| racing_mints(&store_b, &barrier, ROUNDS));
+            (
+                a.join().expect("thread A panicked"),
+                b.join().expect("thread B panicked"),
+            )
+        });
+
+        // First-write-wins convergence: EVERY mint by EITHER store
+        // returned the one winner's suffix — never a second value.
+        let winner = &mints_a[0];
+        assert_eq!(winner.len(), 16, "the winner is a normal mint");
+        assert!(
+            mints_a.iter().chain(mints_b.iter()).all(|s| s == winner),
+            "all 2 * {ROUNDS} racing mints converge on one suffix"
+        );
+
+        // And the table holds exactly one row for the raced key.
+        store_a
+            .with_conn("c1", |conn| {
+                let rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM llm_session_keys
+                     WHERE chat_id = 'c1' AND purpose = 'reply'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(rows, 1, "first-write-wins: exactly one row");
+                Ok(())
+            })
+            .expect("row count");
     }
 }
