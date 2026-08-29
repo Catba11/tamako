@@ -37,7 +37,7 @@ use tamako_store::Store;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::endpoint::{EndpointClient, EndpointConfig};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::{AgentError, MentionBinding};
 use crate::graph::{ExtractedNode, ExtractedNodeType, KnowledgeGraph};
 use crate::validate::{RelationshipName, FALLBACK_RELATIONSHIP_NAME};
@@ -254,7 +254,7 @@ impl EndpointResolutionConfirmer {
     /// `AgentError::ProviderConfig` when the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(EndpointResolutionConfirmer::new(
-            EndpointClient::build(endpoint)?,
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Digest.as_str()),
             CONFIRMATION_MAX_TOKENS,
         ))
     }

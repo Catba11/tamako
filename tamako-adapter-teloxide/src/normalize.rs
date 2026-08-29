@@ -422,8 +422,18 @@ fn resolve_sender(msg: &Message) -> (String, String, Option<String>) {
 /// `@<bot username>` (case-insensitive), or a `text_mention` entity that
 /// carries the bot's user id. `Message::parse_entities` converts the UTF-16
 /// entity offsets to UTF-8; do not slice the text with raw offsets.
+///
+/// A media message carries its member text (and its entities) in the
+/// CAPTION, not `text()` (M4 review fix): an @bot mention in a photo
+/// caption must trigger the mention rules exactly like a text mention, so
+/// when there is no text we fall back to `Message::parse_caption_entities`.
+/// Text wins when both are present (a Telegram message never carries both;
+/// the guard is defensive).
 fn mentions_bot(msg: &Message, bot: &BotIdentity) -> bool {
-    let Some(entities) = msg.parse_entities() else {
+    let entities = msg
+        .parse_entities()
+        .or_else(|| msg.parse_caption_entities());
+    let Some(entities) = entities else {
         return false;
     };
     entities.iter().any(|entity| match entity.kind() {
@@ -652,6 +662,93 @@ mod tests {
                 .expect("a text message")
                 .mentions_bot
         );
+    }
+
+    /// A photo message with a caption and caption entities. Telegram
+    /// entity offsets are UTF-16 code units; every fixture caption here
+    /// is BMP-only, so char counts ARE the UTF-16 offsets.
+    fn captioned_photo_message(caption: &str, caption_entities: serde_json::Value) -> Message {
+        message(json!({
+            "photo": [{
+                "file_id": "file-id",
+                "file_unique_id": "unique-id",
+                "width": 100,
+                "height": 100,
+            }],
+            "caption": caption,
+            "caption_entities": caption_entities,
+        }))
+    }
+
+    #[test]
+    fn caption_mention_of_the_bot_username_sets_mentions_bot() {
+        // M4 fix: a media message's member text lives in caption(), so an
+        // @bot mention in a photo caption must set mentions_bot exactly
+        // like a text mention. Routed through normalize_message_with_text
+        // (the media enrichment path) to prove the normalized row gets it
+        // end to end. "look @tamako_bot": the mention starts at UTF-16
+        // offset 5 and spans 11 units.
+        let msg = captioned_photo_message(
+            "look @tamako_bot",
+            json!([{ "type": "mention", "offset": 5, "length": 11 }]),
+        );
+        let normalized = normalize_message_with_text(
+            &msg,
+            &bot(),
+            assemble_media_text(
+                Some("look @tamako_bot"),
+                &tamako_core::context::render_media_element(MediaKindName::Image, "a cat"),
+            ),
+        );
+        assert!(normalized.mentions_bot);
+    }
+
+    #[test]
+    fn caption_text_mention_of_the_bot_id_sets_mentions_bot() {
+        // The text_mention arm also works via caption entities.
+        let msg = captioned_photo_message(
+            "look Tamako",
+            json!([{ "type": "text_mention", "offset": 5, "length": 6, "user": bot_user_json() }]),
+        );
+        assert!(mentions_bot(&msg, &bot()));
+    }
+
+    #[test]
+    fn a_caption_without_a_bot_mention_does_not_set_mentions_bot() {
+        // No caption entities at all.
+        let msg = photo_message(&[(100, 100)], Some("look at this"));
+        assert!(!mentions_bot(&msg, &bot()));
+        // A caption entity mentioning someone else.
+        let msg = captioned_photo_message(
+            "look @someone_else",
+            json!([{ "type": "mention", "offset": 5, "length": 13 }]),
+        );
+        assert!(!mentions_bot(&msg, &bot()));
+    }
+
+    #[test]
+    fn text_wins_over_the_caption_when_both_are_present() {
+        // Defensive case: a Telegram message never carries BOTH text and
+        // caption, but the fixture can. mentions_bot consults
+        // parse_entities FIRST and only falls back to
+        // parse_caption_entities when there is no text — so text wins.
+        // Pinned: text mentions, caption does not -> true...
+        let msg = message(json!({
+            "text": "hi @tamako_bot",
+            "entities": [{ "type": "mention", "offset": 3, "length": 11 }],
+            "caption": "no mention here",
+            "caption_entities": [],
+        }));
+        assert!(mentions_bot(&msg, &bot()));
+        // ...and text does NOT mention while the caption DOES -> false:
+        // the caption is never consulted once parse_entities returns Some.
+        let msg = message(json!({
+            "text": "no mention here",
+            "entities": [],
+            "caption": "look @tamako_bot",
+            "caption_entities": [{ "type": "mention", "offset": 5, "length": 11 }],
+        }));
+        assert!(!mentions_bot(&msg, &bot()));
     }
 
     fn replying_message(replied_from: serde_json::Value) -> Message {

@@ -12,7 +12,7 @@
 
 use rig::completion::Message;
 
-use crate::endpoint::{EndpointClient, EndpointConfig, LlmConfigValues, LlmEndpoints};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmConfigValues, LlmEndpoints, LlmPurpose};
 use crate::extract::{AgentError, ExtractionInput, KnowledgeExtractor};
 use crate::graph::KnowledgeGraph;
 use crate::prompt::{render_extraction_prompt, EXTRACTION_PREAMBLE};
@@ -91,7 +91,7 @@ impl RigExtractor {
     /// API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigExtractor::new(
-            EndpointClient::build(endpoint)?,
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Digest.as_str()),
             DEFAULT_MAX_TOKENS,
         ))
     }

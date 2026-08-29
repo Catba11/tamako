@@ -811,6 +811,16 @@ pub(crate) fn session_header_map(
     Ok(headers)
 }
 
+/// The purpose value of an [`EndpointClient`] that no purpose-named
+/// wrapper stamped (module docs, decision 53). `EndpointClient::build`
+/// has no purpose signal — [`EndpointConfig`] is purpose-agnostic — so
+/// the field starts here and the purpose-named `from_endpoint`
+/// wrappers (extractor, gate, reply, summary, recall, warmup, and the
+/// two confirmers) override it through
+/// [`EndpointClient::with_purpose`]. Direct `build` callers (tests)
+/// keep this value; their usage lines stay honest rather than guessed.
+const UNSCOPED_PURPOSE: &str = "unscoped";
+
 /// The rig completion model handle of one family. rig 0.41 has two
 /// distinct model types; the enum hides the split.
 enum EndpointModel {
@@ -822,6 +832,16 @@ enum EndpointModel {
 /// per-family rig model types behind one async `complete` call.
 pub struct EndpointClient {
     model: EndpointModel,
+    /// The LLM purpose the client serves ([`LlmPurpose::as_str`]:
+    /// "digest"/"gate"/"reply"/"summary"). Carried into the curated
+    /// per-call usage INFO line (decision 53). `build` sets
+    /// [`UNSCOPED_PURPOSE`]; the purpose-named wrappers stamp the real
+    /// purpose through [`EndpointClient::with_purpose`].
+    purpose: &'static str,
+    /// The resolved model name (a copy of [`EndpointConfig::model`]),
+    /// carried into the per-call usage INFO line so the operator can
+    /// attribute provider cache behavior to a model.
+    model_name: String,
     /// The resolved structured-output mode of the endpoint (module
     /// docs). `complete` interprets its `output_schema` per this mode.
     structured_output: StructuredOutputMode,
@@ -842,6 +862,8 @@ impl std::fmt::Debug for EndpointClient {
         };
         f.debug_struct("EndpointClient")
             .field("family", &family)
+            .field("purpose", &self.purpose)
+            .field("model_name", &self.model_name)
             .field("structured_output", &self.structured_output)
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
@@ -888,6 +910,10 @@ impl EndpointClient {
                     .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
                 Ok(EndpointClient {
                     model: EndpointModel::Anthropic(client.completion_model(&endpoint.model)),
+                    // No purpose signal at this layer; the purpose-named
+                    // wrappers stamp it via `with_purpose`.
+                    purpose: UNSCOPED_PURPOSE,
+                    model_name: endpoint.model.clone(),
                     structured_output: endpoint.structured_output,
                     timeout: ENDPOINT_TIMEOUT,
                 })
@@ -907,6 +933,10 @@ impl EndpointClient {
                     .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
                 Ok(EndpointClient {
                     model: EndpointModel::OpenAi(client.completion_model(&endpoint.model)),
+                    // No purpose signal at this layer; the purpose-named
+                    // wrappers stamp it via `with_purpose`.
+                    purpose: UNSCOPED_PURPOSE,
+                    model_name: endpoint.model.clone(),
                     structured_output: endpoint.structured_output,
                     timeout: ENDPOINT_TIMEOUT,
                 })
@@ -920,6 +950,17 @@ impl EndpointClient {
     #[cfg(test)]
     pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Stamps the LLM purpose of the client for the curated per-call
+    /// usage INFO line (decision 53). Called by the purpose-named
+    /// `from_endpoint` wrappers (extractor, gate, reply, summary,
+    /// recall, warmup, and the two confirmers) with their
+    /// [`LlmPurpose::as_str`]; a client built directly keeps
+    /// [`UNSCOPED_PURPOSE`].
+    pub(crate) fn with_purpose(mut self, purpose: &'static str) -> Self {
+        self.purpose = purpose;
         self
     }
 
@@ -970,6 +1011,8 @@ impl EndpointClient {
             EndpointModel::Anthropic(model) => {
                 complete_with(
                     model,
+                    self.purpose,
+                    &self.model_name,
                     preamble,
                     messages,
                     output_schema,
@@ -982,6 +1025,8 @@ impl EndpointClient {
             EndpointModel::OpenAi(model) => {
                 complete_with(
                     model,
+                    self.purpose,
+                    &self.model_name,
                     preamble,
                     messages,
                     output_schema,
@@ -1395,15 +1440,24 @@ fn checked_batch_vectors(vecs: Vec<Vec<f64>>) -> Result<Vec<Vec<f32>>, AgentErro
 }
 
 /// The shared completion flow of both families. The request shape is
-/// identical; only the rig model type differs. `json_object` adds the
+/// identical; only the rig model type differs. `purpose` and
+/// `model_name` label the curated per-call usage INFO line (decision
+/// 53); the caller (`EndpointClient::complete`) passes its stamped
+/// purpose and resolved model name. `json_object` adds the
 /// OpenAI `json_object` response format via `additional_params`
 /// (expressible on the chat-completions path only; the caller sets it
 /// for the OpenAI family only). `timeout` bounds the send: a stalled
 /// completion (no response within the window) is an
 /// `AgentError::Extraction` whose message starts with
 /// `endpoint timeout after` (H4b).
+// The request shape mirrors `EndpointClient::complete` plus the two
+// usage-line labels; bundling them into an args struct would only
+// shuffle the same fields (the codebase's standing allow idiom).
+#[allow(clippy::too_many_arguments)]
 async fn complete_with<M>(
     model: &M,
+    purpose: &str,
+    model_name: &str,
     preamble: Option<String>,
     messages: Vec<Message>,
     output_schema: Option<schemars::Schema>,
@@ -1451,10 +1505,14 @@ where
             ))
         })?
         .map_err(|error| AgentError::Extraction(error.to_string()))?;
-    // Per-call usage at DEBUG (decision 57): the cache fields expose
-    // the provider prompt-cache behavior of the session-affinity
-    // header. The curated INFO lines (decision 53) stay untouched.
-    tracing::debug!(
+    // The curated per-call usage line (decision 53), at INFO so the
+    // operator can observe the provider prompt-cache behavior of the
+    // session-affinity header (decision 84) without recompiling log
+    // filters. One line per completion call: purpose + model + the
+    // cached/written/input/output token counts.
+    tracing::info!(
+        purpose,
+        model = model_name,
         input_tokens = response.usage.input_tokens,
         cached_input_tokens = response.usage.cached_input_tokens,
         cache_creation_input_tokens = response.usage.cache_creation_input_tokens,
@@ -2265,6 +2323,35 @@ mod tests {
         let client = EndpointClient::build(&endpoint).expect("openai client");
         // H4b: no config key; production always uses the constant.
         assert_eq!(client.timeout, ENDPOINT_TIMEOUT);
+    }
+
+    #[test]
+    fn the_client_carries_the_model_name_and_a_stamped_purpose() {
+        // The curated per-call usage INFO line (decision 53) reads its
+        // purpose and model fields off the client. Client construction
+        // performs no I/O; no network call here.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some("http://localhost:9998/v1".to_string()),
+            model: "local-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            session_id: DEFAULT_SESSION_ID.to_string(),
+        };
+        let client = EndpointClient::build(&endpoint).expect("openai client");
+        // `build` copies the resolved model name and, lacking a purpose
+        // signal on EndpointConfig, starts unscoped.
+        assert_eq!(client.model_name, "local-model");
+        assert_eq!(client.purpose, UNSCOPED_PURPOSE);
+        // A purpose-named wrapper stamps the purpose (LlmPurpose::as_str
+        // values are 'static, so no allocation).
+        let client = client.with_purpose(LlmPurpose::Reply.as_str());
+        assert_eq!(client.purpose, "reply");
+        // Both dims are printable in test failures and logs.
+        let debug = format!("{client:?}");
+        assert!(debug.contains("local-model"));
+        assert!(debug.contains("reply"));
     }
 
     // --- The embedding endpoint (decision 66) ---

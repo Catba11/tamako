@@ -26,7 +26,7 @@ use tamako_core::actor::CoreError;
 use tamako_core::wake::{GateDecision, GateInput, GateMessage, ParticipationGate};
 use tamako_persona::CONTEXT_FORMAT_GLOSS;
 
-use crate::endpoint::{EndpointClient, EndpointConfig};
+use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 
 /// The default max tokens of the gate response. The output is one small
@@ -255,7 +255,7 @@ impl RigGate {
     /// the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigGate::new(
-            EndpointClient::build(endpoint)?,
+            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Gate.as_str()),
             GATE_DEFAULT_MAX_TOKENS,
         ))
     }
