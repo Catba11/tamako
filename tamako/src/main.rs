@@ -592,6 +592,32 @@ fn resolve_endpoints(config: &TriggerConfig) -> Result<LlmEndpoints> {
         .context("failed to resolve the LLM endpoints (specs.md Section 13)")
 }
 
+/// The four per-purpose session-affinity suffixes minted by
+/// [`Store::get_or_insert_session_suffix`] (decision 84 (b)), one field
+/// per completion purpose. The minting (the I/O) is
+/// [`apply_session_suffixes`]'s concern; the struct is the input of the
+/// pure splice below, so the per-purpose routing is unit-testable
+/// without a store.
+struct SessionSuffixes {
+    digest: String,
+    gate: String,
+    reply: String,
+    summary: String,
+}
+
+/// The pure splice of decision 84 (b): given the resolved (prefix)
+/// endpoints and the four per-purpose persisted suffixes, the full
+/// session id of each purpose is `{prefix}-{suffix}`. Pure — the
+/// minting (the I/O) is [`apply_session_suffixes`]'s concern.
+fn splice_session_suffixes(endpoints: LlmEndpoints, suffixes: &SessionSuffixes) -> LlmEndpoints {
+    LlmEndpoints {
+        digest: endpoints.digest.with_session_suffix(&suffixes.digest),
+        gate: endpoints.gate.with_session_suffix(&suffixes.gate),
+        reply: endpoints.reply.with_session_suffix(&suffixes.reply),
+        summary: endpoints.summary.with_session_suffix(&suffixes.summary),
+    }
+}
+
 /// Decision 84 (b)/(c): mints the per-(group, purpose) session-affinity
 /// suffix LAZILY at the per-group service-build site — here, NOT in
 /// `LlmEndpoints::resolve` (group-agnostic; group-less callers like
@@ -632,18 +658,13 @@ fn apply_session_suffixes(
                 )
             })
     };
-    Ok(LlmEndpoints {
-        digest: endpoints
-            .digest
-            .with_session_suffix(&mint(LlmPurpose::Digest)?),
-        gate: endpoints.gate.with_session_suffix(&mint(LlmPurpose::Gate)?),
-        reply: endpoints
-            .reply
-            .with_session_suffix(&mint(LlmPurpose::Reply)?),
-        summary: endpoints
-            .summary
-            .with_session_suffix(&mint(LlmPurpose::Summary)?),
-    })
+    let suffixes = SessionSuffixes {
+        digest: mint(LlmPurpose::Digest)?,
+        gate: mint(LlmPurpose::Gate)?,
+        reply: mint(LlmPurpose::Reply)?,
+        summary: mint(LlmPurpose::Summary)?,
+    };
+    Ok(splice_session_suffixes(endpoints, &suffixes))
 }
 
 /// Builds the digest pipeline (specs.md Section 10) for the resolved
@@ -1076,8 +1097,11 @@ fn build_caption_provider(
 }
 
 /// Builds the [`MediaEnricher`] of decision 82 for the live adapter:
-/// the caption provider of [`build_caption_provider`] plus the global
-/// sticker-caption cache (`{data_root}/media.db`, decision 82 (f)).
+/// the caption provider of [`build_caption_provider`], the global
+/// sticker-caption cache (`{data_root}/media.db`, decision 82 (f)),
+/// and the media download source (the adapter's
+/// [`TeloxideAdapter::media_downloader`], a clone of its Bot handle —
+/// Rule A1 keeps every teloxide type inside the adapter crate).
 /// `Some` only when BOTH halves are available; `None` keeps the
 /// pre-enrichment behavior byte-identical (a media message with no
 /// text is skipped). The degrade doctrine mirrors the embedding
@@ -1093,7 +1117,10 @@ fn build_caption_provider(
 /// `placeholder_media_total`) as structured tracing fields through
 /// this wired path. Surfacing them through `--status` is follow-up
 /// work owned by the primary agent.
-async fn build_media_enricher(setup: &SharedSetup) -> Option<MediaEnricher> {
+async fn build_media_enricher(
+    setup: &SharedSetup,
+    downloader: Arc<dyn tamako_adapter_teloxide::MediaDownloader>,
+) -> Option<MediaEnricher> {
     let data_root = setup.store.data_root().to_path_buf();
     let opened = tokio::task::spawn_blocking(move || MediaStore::open(&data_root)).await;
     let media_store = match opened {
@@ -1111,6 +1138,7 @@ async fn build_media_enricher(setup: &SharedSetup) -> Option<MediaEnricher> {
     Some(MediaEnricher {
         caption,
         media_store,
+        downloader,
     })
 }
 
@@ -2782,10 +2810,14 @@ async fn run_live(
     // behavior byte-identical: media messages with no text are silently
     // skipped. Replay/mock paths never build an enricher (Rule P1:
     // replay stays deterministic and network-free).
-    let mut adapter = TeloxideAdapter::new(&token)
+    let adapter = TeloxideAdapter::new(&token)
         .await
-        .context("failed to start the Telegram adapter")?
-        .with_media_enricher(build_media_enricher(setup).await);
+        .context("failed to start the Telegram adapter")?;
+    // The enricher's download source is the adapter's Bot handle (a
+    // cheap clone), handed over as a MediaDownloader so no teloxide
+    // type crosses the boundary (Rule A1).
+    let downloader = adapter.media_downloader();
+    let mut adapter = adapter.with_media_enricher(build_media_enricher(setup, downloader).await);
     let identity = adapter.bot_identity();
     info!(username = %identity.username, id = identity.id, "telegram bot identity resolved");
 
@@ -3753,6 +3785,71 @@ mod tests {
             reply: prefix_endpoint(prefix),
             summary: prefix_endpoint(prefix),
         }
+    }
+
+    #[test]
+    fn splice_joins_each_suffix_onto_the_right_purpose() {
+        // The pure half of decision 84 (b): each purpose's endpoint gets
+        // ITS OWN suffix joined as `{prefix}-{suffix}` — the per-purpose
+        // routing is the correctness point (a crossed wire here would
+        // silently re-pin purposes to each other's provider sessions).
+        // Distinct models pin that the splice returns the RIGHT endpoint
+        // per purpose, not just the right session id.
+        let endpoints = LlmEndpoints {
+            digest: EndpointConfig {
+                model: "digest-model".to_string(),
+                ..prefix_endpoint("tamako")
+            },
+            gate: EndpointConfig {
+                model: "gate-model".to_string(),
+                ..prefix_endpoint("tamako")
+            },
+            reply: EndpointConfig {
+                model: "reply-model".to_string(),
+                ..prefix_endpoint("tamako")
+            },
+            summary: EndpointConfig {
+                model: "summary-model".to_string(),
+                ..prefix_endpoint("tamako")
+            },
+        };
+        let suffixes = SessionSuffixes {
+            digest: "digest-suffix".to_string(),
+            gate: "gate-suffix".to_string(),
+            reply: "reply-suffix".to_string(),
+            summary: "summary-suffix".to_string(),
+        };
+        let spliced = splice_session_suffixes(endpoints, &suffixes);
+        for (endpoint, model, session_id) in [
+            (&spliced.digest, "digest-model", "tamako-digest-suffix"),
+            (&spliced.gate, "gate-model", "tamako-gate-suffix"),
+            (&spliced.reply, "reply-model", "tamako-reply-suffix"),
+            (&spliced.summary, "summary-model", "tamako-summary-suffix"),
+        ] {
+            assert_eq!(endpoint.model, model, "the purpose keeps its endpoint");
+            assert_eq!(endpoint.session_id, session_id, "the prefix-suffix join");
+        }
+    }
+
+    #[test]
+    fn apply_session_suffixes_fails_loudly_when_the_mint_fails() {
+        // Decision 84 (b): a broken suffix mint means a broken store,
+        // which is FATAL for serving the group — never a silent fallback
+        // to the bare prefix (an unpersisted id would re-pin the group
+        // to a fresh provider session on every restart). The store below
+        // is broken deterministically: its data_root is a FILE, so
+        // opening the group db (and with it the mint) always fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_root_file = dir.path().join("not-a-directory");
+        std::fs::write(&data_root_file, b"").expect("a data_root that cannot hold group dbs");
+        let store = Arc::new(Store::new(data_root_file));
+        let err = apply_session_suffixes(&store, "g1", prefix_endpoints("tamako"))
+            .expect_err("a mint failure is fatal, never a bare-prefix fallback");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to mint the digest session-affinity suffix of group g1"),
+            "the mint context names the purpose and group, got: {chain}"
+        );
     }
 
     #[test]

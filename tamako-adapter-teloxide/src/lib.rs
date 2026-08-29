@@ -16,5 +16,5 @@ pub mod normalize;
 
 pub use adapter::{GroupEvent, TeloxideAdapter};
 pub use capability::BotChatStatus;
-pub use media::MediaEnricher;
+pub use media::{MediaDownloader, MediaEnricher};
 pub use normalize::BotIdentity;

@@ -21,3 +21,7 @@ serde_json.workspace = true
 
 # Tempdir MediaStore for the media enrichment tests (media.rs).
 tempfile = "3"
+
+# In-code image fixtures for the media enrichment seam tests (media.rs):
+# encodes a tiny valid image the normalize step accepts, offline.
+image.workspace = true
