@@ -30,6 +30,12 @@ pub struct ReloadNotice {
     /// The rendered preamble, bit-identical to what a startup render of
     /// the same file would produce (Rule C4).
     pub preamble: String,
+    /// The rendered decision-86 reply suffix body (the `<system>` string
+    /// of `tamako_persona::render_suffix`; EMPTY when the file has no
+    /// `suffix`). Rides the same reload broadcast as the preamble but is
+    /// consumed by the reply generator's shared slot, NOT the actor
+    /// context — the suffix is never part of the cache anchor.
+    pub suffix: String,
 }
 
 /// The outcome of reading and rendering the persona file once.
@@ -62,6 +68,7 @@ pub fn evaluate_persona_file(path: &Path, current_preamble: &str) -> PersonaFile
     PersonaFileOutcome::Applied(ReloadNotice {
         persona_name: persona.name,
         preamble,
+        suffix: tamako_persona::render_suffix(&persona.suffix),
     })
 }
 
