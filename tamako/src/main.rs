@@ -825,6 +825,7 @@ fn build_summary_provider(endpoint: &EndpointConfig) -> Result<Option<Arc<dyn Su
 /// mirroring the digest pipeline's enqueue degrade (decision 66).
 /// `deep_recall = false` never opens the dedicated store and never
 /// calls `with_deep_recall`: the byte-identical pre-76 shallow path.
+#[allow(clippy::too_many_arguments)] // the decision-86 suffix slot joins the per-group wiring
 fn build_wake_services(
     store: &Arc<Store>,
     memory: &Arc<LbugBackend>,
@@ -833,10 +834,15 @@ fn build_wake_services(
     chat_id: &str,
     embedding_provider: Option<Arc<dyn tamako_core::embedding::EmbeddingProvider>>,
     trigger_config: &TriggerConfig,
+    // Decision 86: the shared rendered-suffix slot, wired into the reply
+    // generator (the ONLY purpose that carries a suffix). Read at
+    // request-assembly time; rewritten by the persona hot reload.
+    suffix: Arc<RwLock<String>>,
 ) -> Result<Option<WakeServices>> {
     match (
         RigGate::from_endpoint(&endpoints.gate),
-        RigReplyGenerator::from_endpoint(&endpoints.reply),
+        RigReplyGenerator::from_endpoint(&endpoints.reply)
+            .map(|generator| generator.with_suffix_slot(suffix)),
     ) {
         (Ok(gate), Ok(reply)) => {
             // specs.md Section 9 step 2 (M5): the shallow recall worker
@@ -1191,6 +1197,14 @@ fn spawn_embedding_worker(
 struct SharedSetup {
     bot_config: BotConfig,
     preamble: Arc<RwLock<String>>,
+    /// The rendered decision-86 reply suffix body (the `<system>` string
+    /// of `tamako_persona::render_suffix`), behind the same hot-reload
+    /// lock discipline as `preamble` (decision 80): the persona watcher
+    /// rewrites it on each accepted reload, and the reply generator reads
+    /// it at request-assembly time. NEVER persisted — the suffix is not
+    /// part of the context or the cache anchor (decision 86 (d)). EMPTY
+    /// string means no suffix (byte-identical pre-86 behavior).
+    suffix: Arc<RwLock<String>>,
     bot_name: String,
     store: Arc<Store>,
     memory: Arc<LbugBackend>,
@@ -1210,11 +1224,17 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     };
     let preamble = PetPreambleRenderer.render_preamble(&persona);
     info!(persona = %persona.name, preamble_len = preamble.len(), "persona preamble rendered");
+    // Decision 86: the reply suffix body is rendered once here (the
+    // startup value of the shared slot) and re-rendered by the persona
+    // watcher on each reload. It rides the SAME hot-reload discipline as
+    // the preamble but is NEVER persisted and never part of the anchor.
+    let suffix = tamako_persona::render_suffix(&persona.suffix);
     Ok(SharedSetup {
         bot_config,
         // Decision 80: updatable in live mode; the startup render is the
         // initial value.
         preamble: Arc::new(RwLock::new(preamble)),
+        suffix: Arc::new(RwLock::new(suffix)),
         bot_name: persona.name,
         store: Arc::new(Store::new(cli.data_root.clone())),
         memory: Arc::new(LbugBackend::new(cli.data_root.clone())),
@@ -1330,6 +1350,10 @@ async fn run_replay(
         &chat_id,
         None,
         &group_config,
+        // Decision 86: replay carries the suffix too (the persona file is
+        // the state; replay reads the startup render). The mock adapter
+        // path never sends it.
+        Arc::clone(&setup.suffix),
     )?;
     // The Rule C3 summarizer (decision 62). A missing family API key
     // degrades to the old C3 behavior (drop without a summary) with one
@@ -2985,6 +3009,9 @@ async fn run_live(
                                 // shallow-only.
                                 embedding_provider.clone(),
                                 &group_config,
+                                // Decision 86: the shared rendered-suffix
+                                // slot, hot-reloaded by the persona watcher.
+                                Arc::clone(&setup.suffix),
                             ) {
                                 Ok(wake) => wake,
                                 Err(error) => {
@@ -3113,6 +3140,14 @@ async fn run_live(
                     .preamble
                     .write()
                     .unwrap_or_else(PoisonError::into_inner) = notice.preamble.clone();
+                // Decision 86 (h): the reply suffix slot reloads with the
+                // SAME broadcast. The reply generator reads it at the next
+                // request-assembly; the suffix is never persisted and never
+                // part of the context, so this invalidates no cache anchor.
+                *setup
+                    .suffix
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = notice.suffix.clone();
                 let skipped = persona_watch::broadcast_preamble(&actors, &notice.preamble);
                 // ONE curated INFO line per applied reload (decision-53
                 // addition, the decision-78 warmup line's class): a

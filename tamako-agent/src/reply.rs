@@ -7,7 +7,7 @@
 //! core context messages to rig completion messages.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rig::completion::Message;
 
@@ -107,6 +107,39 @@ pub fn render_reply_instruction(target: &GateMessage) -> String {
     )
 }
 
+/// Assembles the rig message list of one reply call (decision 86): the
+/// context messages, then the ephemeral reply instruction, then — only
+/// when the rendered suffix is non-empty — the suffix as ONE system-role
+/// message STRICTLY LAST.
+///
+/// The suffix (`tamako_persona::render_suffix` output, a
+/// `<system>...</system>` body) is the lost-in-the-middle mitigation of
+/// decision 86: it lands after the newest context message AND after the
+/// reply instruction, in the highest-attention region, "the referee's
+/// last word before the generation" (decision 86 (b): the model always
+/// generates an assistant message, so a trailing system message does not
+/// become the turn to answer). It is read from the persona snapshot at
+/// assembly time — never persisted, never part of the context or the
+/// cache anchor (decision 86 (d)). An empty `suffix` appends NOTHING, so
+/// the message list is byte-identical to the pre-86 layout (the C4
+/// property at the tail).
+///
+/// Split out of `RigReplyGenerator::generate` so the ordering is
+/// unit-testable without a network (the completion itself needs a live
+/// endpoint; the message assembly does not).
+fn assemble_reply_messages(request: &ReplyRequest, suffix: &str) -> (Option<String>, Vec<Message>) {
+    let (preamble, mut messages) = context_messages_to_rig(&request.messages);
+    // The trailing ephemeral instruction names the target. It is part of
+    // the reply call only, never of the live context.
+    messages.push(Message::user(render_reply_instruction(&request.target)));
+    // Decision 86 (a): a REAL system-role message (role authority is the
+    // point), strictly last.
+    if !suffix.is_empty() {
+        messages.push(Message::system(suffix));
+    }
+    (preamble, messages)
+}
+
 /// Reads one attribute value out of the rendered `<msg>` item. The
 /// grammar of `tamako_core::context::render_human_content` is fixed:
 /// attributes are space-separated `key="value"` pairs and values are
@@ -164,6 +197,14 @@ pub fn trimmed_reply_or_error(text: &str) -> Result<ReplyFilterOutcome, CoreErro
 pub struct RigReplyGenerator {
     client: EndpointClient,
     max_tokens: u64,
+    /// The rendered decision-86 suffix body (the `<system>...</system>`
+    /// string of `tamako_persona::render_suffix`), behind a shared lock
+    /// so the decision-80 persona hot reload swaps it in place. EMPTY
+    /// string means no suffix: no trailing system message is appended
+    /// (byte-identical pre-86 behavior). Never persisted — it is read at
+    /// request-assembly time and appended STRICTLY LAST, past the cached
+    /// prefix, so an edit invalidates nothing (decision 86 (d)).
+    suffix: Arc<RwLock<String>>,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -179,9 +220,15 @@ impl std::fmt::Debug for RigReplyGenerator {
 }
 
 impl RigReplyGenerator {
-    /// Builds the generator from an endpoint client.
+    /// Builds the generator from an endpoint client. The suffix slot
+    /// starts EMPTY (no suffix message) until [`with_suffix_slot`] wires
+    /// the shared persona-snapshot lock.
     pub fn new(client: EndpointClient, max_tokens: u64) -> Self {
-        RigReplyGenerator { client, max_tokens }
+        RigReplyGenerator {
+            client,
+            max_tokens,
+            suffix: Arc::new(RwLock::new(String::new())),
+        }
     }
 
     /// Builds the generator for one resolved endpoint (the `reply`
@@ -193,6 +240,17 @@ impl RigReplyGenerator {
             REPLY_DEFAULT_MAX_TOKENS,
         ))
     }
+
+    /// Wires the shared decision-86 suffix slot (the binary's persona
+    /// snapshot; the live persona watcher rewrites it on each accepted
+    /// reload, decision 80). The generator reads the current rendered
+    /// body at every `generate` — an edit takes effect on the next call
+    /// with no context/anchor change. The default empty slot means tests
+    /// and suffix-less deployments behave byte-identically to pre-86.
+    pub fn with_suffix_slot(mut self, suffix: Arc<RwLock<String>>) -> Self {
+        self.suffix = suffix;
+        self
+    }
 }
 
 impl ReplyGenerator for RigReplyGenerator {
@@ -202,10 +260,12 @@ impl ReplyGenerator for RigReplyGenerator {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let (preamble, mut messages) = context_messages_to_rig(&request.messages);
-            // The trailing ephemeral instruction names the target. It
-            // is part of the reply call only, never of the live context.
-            messages.push(Message::user(render_reply_instruction(&request.target)));
+            let suffix = self
+                .suffix
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let (preamble, messages) = assemble_reply_messages(request, &suffix);
             let text = self
                 .client
                 .complete(
@@ -310,6 +370,7 @@ impl ReplyGenerator for ScriptedReplyGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tamako_persona::render_suffix;
 
     fn context_message(role: ContextRole, content: &str) -> ContextMessage {
         ContextMessage {
@@ -412,6 +473,58 @@ mod tests {
         let (preamble, rig_messages) = context_messages_to_rig(&messages);
         assert_eq!(preamble, None);
         assert_eq!(rig_messages.len(), 1);
+    }
+
+    #[test]
+    fn the_suffix_is_the_strictly_last_system_message() {
+        // Decision 86 (a)/(b): ONE system-role message, STRICTLY LAST —
+        // after the newest context message AND the reply instruction.
+        let suffix = render_suffix(&["rule one".to_owned(), "rule two".to_owned()]);
+        let (preamble, messages) = assemble_reply_messages(&sample_request(), &suffix);
+        // The preamble still extracts as item 0.
+        assert_eq!(preamble.as_deref(), Some("You are the group pet."));
+        let last = messages.last().expect("a last message");
+        // The last message is system-role and carries the verbatim body.
+        match last {
+            Message::System { content } => {
+                assert!(content.starts_with("<system>"));
+                assert!(content.contains("<rule1>\nrule one\n</rule1>"));
+                assert!(content.contains("<rule2>\nrule two\n</rule2>"));
+            }
+            other => panic!("the suffix must be a system message, got {other:?}"),
+        }
+        // The newest context message and the reply instruction precede it:
+        // the second-to-last is the user-role reply instruction, and the
+        // newest context <msg> ("[Bob 13:02] ...") comes before that.
+        let roles: Vec<&str> = messages.iter().map(|m| role_and_text(m).0).collect();
+        assert_eq!(roles.last(), Some(&"system"));
+        assert_eq!(
+            roles[roles.len() - 2],
+            "user",
+            "the reply instruction is second-to-last"
+        );
+        let rendered: Vec<(&str, String)> = messages.iter().map(role_and_text).collect();
+        let newest_context = rendered
+            .iter()
+            .position(|(_, text)| text.contains("[Bob 13:02]"))
+            .expect("the newest context message");
+        assert!(
+            newest_context < messages.len() - 1,
+            "the newest context message precedes the suffix"
+        );
+    }
+
+    #[test]
+    fn an_empty_suffix_appends_no_message() {
+        // Decision 86 (f): an absent/empty suffix appends NO message — the
+        // message list is byte-identical to the pre-86 layout (the C4
+        // property at the tail). The last message is the reply instruction.
+        let (_, with_empty) = assemble_reply_messages(&sample_request(), "");
+        let rendered: Vec<(&str, String)> = with_empty.iter().map(role_and_text).collect();
+        // 3 context messages + the reply instruction; NO trailing system.
+        assert_eq!(rendered.len(), 4);
+        assert_eq!(rendered.last().map(|(role, _)| *role), Some("user"));
+        assert!(!rendered.iter().any(|(role, _)| *role == "system"));
     }
 
     #[test]

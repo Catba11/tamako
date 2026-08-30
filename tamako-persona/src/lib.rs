@@ -115,6 +115,53 @@ pub struct PersonaConfig {
     /// short by operator judgment, not by enforcement.
     #[serde(default, rename = "example")]
     pub examples: Vec<PersonaExample>,
+    /// High-importance guardrail instructions appended as ONE system-role
+    /// message STRICTLY LAST in the reply request's message list
+    /// (decision 86) — the lost-in-the-middle mitigation. One string per
+    /// rule; the body renders as a `<system>` element wrapping numbered
+    /// `<rule1>`, `<rule2>`, ... elements (see [`render_suffix`]).
+    ///
+    /// Entry content is VERBATIM like `system_prefix` (decision 86 (e)):
+    /// the persona file is trusted config, so multi-line markdown, code
+    /// fences, and special characters pass through raw.
+    ///
+    /// The suffix is NOT part of the cache anchor (decision 86 (d)): it
+    /// is appended at request-assembly time, past the cached prefix, so
+    /// editing it invalidates NOTHING — it is the zero-cache-cost
+    /// hot-tuning knob, the complement of preamble edits. It feeds ONLY
+    /// the reply request (decision 86 (g)). Absent or empty appends no
+    /// message (byte-identical pre-86 behavior). Every entry is paid in
+    /// prompt tokens on every wake — but as a TAIL message it is never
+    /// part of the cached prefix, so the cost is the per-wake token count
+    /// only, with no anchor invalidation.
+    #[serde(default)]
+    pub suffix: Vec<String>,
+}
+
+/// Renders the suffix body of decision 86: a `<system>` element wrapping
+/// one NUMBERED `<rule1>`, `<rule2>`, ... element per entry (1-indexed),
+/// so every rule has its own boundary and the model cannot run adjacent
+/// sections together. Entry content renders VERBATIM (trusted config,
+/// decision 86 (e)).
+///
+/// Returns an EMPTY string when `entries` is empty — the caller then
+/// appends NO message at all (byte-identical pre-86 behavior, the C4
+/// property at the tail). Pure; the reply assembly path appends the
+/// non-empty body as ONE system-role message, strictly last (decision
+/// 86 (a)/(b)).
+pub fn render_suffix(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<system>\n");
+    for (index, entry) in entries.iter().enumerate() {
+        let n = index + 1;
+        out.push_str(&format!("<rule{n}>\n"));
+        out.push_str(entry);
+        out.push_str(&format!("\n</rule{n}>\n"));
+    }
+    out.push_str("</system>");
+    out
 }
 
 /// One few-shot dialogue example (decision 85). The persona file is
@@ -152,6 +199,7 @@ impl Default for PersonaConfig {
             speaking_style: Vec::new(),
             behavioral_rules: Vec::new(),
             examples: Vec::new(),
+            suffix: Vec::new(),
         }
     }
 }
@@ -314,6 +362,7 @@ behavioral_rules = [
                 "you can stay silent".to_owned(),
             ],
             examples: Vec::new(),
+            suffix: Vec::new(),
         }
     }
 
@@ -582,6 +631,65 @@ identity = "a small cat"
         // and render the bit-identical pre-85 preamble.
         let config = PersonaConfig::from_toml_str(FULL_TOML).expect("the pre-85 TOML loads");
         assert!(config.examples.is_empty());
+    }
+
+    #[test]
+    fn render_suffix_wraps_numbered_rules_in_a_system_element() {
+        // Decision 86 (c): a `<system>` element wrapping one NUMBERED
+        // `<rule1>`, `<rule2>`, ... element per entry (1-indexed), so each
+        // rule has its own boundary.
+        let body = render_suffix(&[
+            "first rule".to_owned(),
+            "second rule".to_owned(),
+            "third rule".to_owned(),
+        ]);
+        assert_eq!(
+            body,
+            "<system>\n<rule1>\nfirst rule\n</rule1>\n<rule2>\nsecond rule\n</rule2>\n<rule3>\nthird rule\n</rule3>\n</system>"
+        );
+    }
+
+    #[test]
+    fn render_suffix_preserves_verbatim_multi_line_content() {
+        // Decision 86 (e): entry content is VERBATIM — multi-line markdown,
+        // code fences, raw angle brackets, and special characters pass
+        // through unescaped (the persona file is trusted config).
+        let entry =
+            "Never break character.\n\n```\nno <xml> here & raw \"quotes\"\n```\n- 绝不退缩";
+        let body = render_suffix(&[entry.to_owned()]);
+        assert!(body.contains(entry), "the entry renders verbatim: {body}");
+        assert!(body.starts_with("<system>\n<rule1>\n"));
+        assert!(body.ends_with("\n</rule1>\n</system>"));
+    }
+
+    #[test]
+    fn render_suffix_of_an_empty_vec_renders_nothing() {
+        // Decision 86 (f): absent or empty appends NO message — the caller
+        // sees an empty body and skips the message entirely (byte-identical
+        // pre-86 behavior, the C4 property at the tail).
+        assert_eq!(render_suffix(&[]), "");
+    }
+
+    #[test]
+    fn suffix_serde_round_trip() {
+        // The `suffix` array parses and serializes losslessly.
+        let mut config = sample_config();
+        config.suffix = vec!["rule one".to_owned(), "rule two\nmultiline".to_owned()];
+        let text = toml::to_string(&config).expect("serialize");
+        assert!(text.contains("suffix"), "the wire key is `suffix`: {text}");
+        let parsed = PersonaConfig::from_toml_str(&text).expect("parse");
+        assert_eq!(parsed, config);
+        assert_eq!(parsed.suffix.len(), 2);
+    }
+
+    #[test]
+    fn a_persona_toml_without_the_suffix_key_parses() {
+        // Backward compatibility: a persona file written before decision 86
+        // has no `suffix` key; it must still parse (serde default) to an
+        // empty suffix (which renders nothing).
+        let config = PersonaConfig::from_toml_str(FULL_TOML).expect("the pre-86 TOML loads");
+        assert!(config.suffix.is_empty());
+        assert_eq!(render_suffix(&config.suffix), "");
     }
 
     #[test]
