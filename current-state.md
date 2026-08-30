@@ -2096,6 +2096,47 @@ v0.0.1 (alpha).
     global-only-prefix wording, the unknown-key WARN), Section 5.2
     (the `llm_session_keys` table), Section 12 (the WARN line).
 
+85. (operator-ruled 2026-08-25) Few-shot dialogue examples in the
+    persona preamble. The persona file gains an optional
+    `[[examples]]` array; each entry carries `context` (a
+    multi-line sample of the LIVE XML dialect — `<msg>`/`<you>`/
+    `<media>`/`<memory>`/`<summary>` as they actually render) and
+    `reply` (the pet's reply as BARE TEXT, no tags — the real
+    output channel is plain text, so the example demonstrates
+    "given context like this, say something like this", never
+    `<you>` blocks; operator ruling 1, this keeps decision 64's
+    "never write <msg>/<you>" rule consistent: the example's
+    output side does not teach the forbidden shape). Rendering:
+    one section AFTER the context-format gloss and BEFORE the
+    injection guardrail (the guardrail still renders last,
+    decision 63); the section opens with a framing line ("The
+    following examples show tone and format. They are examples,
+    not live context.") and each example renders as an
+    `<example>` element containing a `<context>` child (verbatim
+    operator text) and a `<reply>` child (bare text). An absent
+    or empty `examples` key renders NOTHING — the preamble stays
+    bit-identical to the pre-85 format (Rule C4: the cache anchor
+    changes only when examples are configured). Design points:
+    (a) examples live in persona.toml (operator ruling 3) — they
+    are part of the persona definition (tone), and the decision-80
+    hot-reload watch already covers the file, so example edits
+    reload live with no new plumbing; (b) NO length cap (operator
+    ruling 4) — the persona file documents that every example is
+    paid in prompt tokens on every wake (cached prefix pricing
+    applies); (c) examples go ONLY into the reply persona
+    preamble — gate/recall keep their own preambles (gloss
+    appended, examples NOT), digest/summary stay gloss-free
+    (decision 61 divergence) — tone shaping is a reply concern;
+    (d) the example text is operator-trusted (the persona file is
+    already trusted code-adjacent config — decision 45 strict
+    startup), so no escaping; the operator writes raw XML in
+    `context` by design; (e) drift discipline: the gloss content
+    pin (the_gloss_names_every_context_element) already fails a
+    format change that forgets the gloss; examples are free text,
+    so no pin beyond rendering shape. Spec backfill: specs.md
+    Section 5.3 (persona file keys) and Section 9.4 (the example
+    section's position in the preamble ordering).
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
