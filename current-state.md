@@ -2136,6 +2136,45 @@ v0.0.1 (alpha).
     so no pin beyond rendering shape. Spec backfill: specs.md
     Section 5.3 (persona file keys) and Section 9.4 (the example
     section's position in the preamble ordering).
+86. (operator-ruled 2026-08-25) A suffix system message appended
+    STRICTLY LAST in the reply request's message list — the
+    lost-in-the-middle mitigation: the preamble sits at the top
+    (strong attention) but its guardrails decay across thousands
+    of `<msg>` items; a tail system message lands in the
+    highest-attention region as "the referee's last word before
+    the generation". Design points (all operator-ruled):
+    (a) a REAL system-role message, not a user-role disguise —
+    role authority is the point; (b) STRICTLY last in the
+    message list (after the newest context message) — the model
+    always generates an assistant message, so a trailing system
+    message does not become "the turn to answer"; (c) ONE system
+    message with per-section XML markup (the SillyTavern tried-
+    and-true layout): the body renders as a `<system>` element
+    wrapping one NUMBERED `<rule1>`, `<rule2>`, ... element per
+    configured entry — numbered tags give every rule its own
+    boundary so the model cannot run adjacent sections together;
+    (d) the suffix is NOT part of the cache anchor — it sits
+    past the cached prefix (preamble + history), so editing it
+    invalidates NOTHING: it is the zero-cache-cost hot-tuning
+    knob for high-importance guardrail instructions, the exact
+    complement of preamble edits (which rebuild every group's
+    anchor); (e) entry content is VERBATIM like `system_prefix`
+    (the persona file is trusted config — multi-line markdown,
+    code fences, and special characters pass through raw; TOML
+    literal strings `'''...'''` carry them); (f) the TOML key is
+    `suffix` (a `Vec<String>`, one string per rule), symmetric
+    with `system_prefix` (prefix at the head, suffix at the
+    tail); absent or empty appends NO message — byte-identical
+    behaviour to the pre-86 layout (the C4 property at the
+    tail); (g) reply ONLY — gate/recall/digest/summary are
+    short-context structured tasks with no lost-in-the-middle
+    problem (same scoping as decision 85 examples); (h) rides
+    the decision-80 hot reload (the persona file watch broadcasts
+    the new render; in-flight calls keep their snapshot);
+    (i) tests pin the message ordering: the suffix is the LAST
+    message, the newest `<msg>` precedes it, and gate/recall
+    requests carry no suffix. Spec backfill: specs.md Section
+    5.3 (the `suffix` key) and Section 9.4 (the tail message).
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
