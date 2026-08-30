@@ -1760,7 +1760,7 @@ v0.0.1 (alpha).
     (a) CRATE SPLIT: the NEW `tamako-vision` crate is a PURE
         library — bytes in, bytes out, plus format/dimension
         policy. No network, no LLM client. The caption LLM call
-        lives in `tamako-agent` as a new `LlmPurpose::CaptionMedia`
+        lives in `tamako-agent` as a new the standalone `CaptionEndpoint`
         (config key `caption_model`), preserving "tamako-agent is
         the only rig consumer". Wiring (download → normalize →
         caption → render) happens inside the adapter's intake
@@ -1807,10 +1807,30 @@ v0.0.1 (alpha).
         logged with the placeholder element `<media
         type="image"></media>` (empty caption body), one WARN, and
         `captions_failed_total` increments. Download failures
-        follow the same placeholder path. The intake stage is
-        latency-bounded (worst case ~3.5 min per media message
-        under full backoff); Telegram redelivery on slow handler
-        acknowledgment is absorbed by the existing update dedup.
+        follow the same placeholder path. CORRECTION (2026-08-25,
+        review finding M1): each caption attempt inherited
+        ENDPOINT_TIMEOUT, so the timeout raise (300 s -> 900 s)
+        silently stretched the intake worst case to ~46.5 min per
+        media message — the ~3.5 min figure below was written in
+        the 300 s era. Caption attempts now carry their own
+        CAPTION_ATTEMPT_TIMEOUT = 120 s (a caption is a
+        short-output task): the worst case is ~8.5 min per media
+        message (60 s download + 3x120 s attempts + 90 s
+        backoff), still heavy but bounded; the intake stage
+        remains latency-bounded by construction. The five
+        counters are captions_total / captions_failed_total /
+        captions_empty_total / sticker_cache_hits_total /
+        placeholder_media_total. KNOWN WINDOW (review finding
+        M2, consciously accepted): enrichment runs BEFORE the
+        IntakeEvent exists, and teloxide long-polling stamps the
+        update offset when the get_updates RESPONSE arrives — a
+        crash mid-enrichment loses the message permanently
+        (Telegram redelivery is a webhook semantic; long polling
+        has no handler ack, and there is no update-level dedup
+        in the adapter). The log stays internally consistent
+        (P1 intact); the accepted window is the price of
+        pre-event enrichment. A future hardening option is
+        journaling a raw placeholder row before enrichment.
     (e) DIALECT: the message log and the context rendering gain a
         NESTED media element. A Telegram message may carry text
         plus several media items; the normalized row's text
@@ -1828,11 +1848,23 @@ v0.0.1 (alpha).
         unchanged — the caption flows into extraction as part of
         the row text, marked as a media description, never as
         member speech (the spec's requirement, satisfied by the
-        element boundary itself). A member CANNOT forge a media
-        element from the keyboard: inbound text is escaped before
-        it is embedded, and the caption text is escaped the same
-        way — a caption containing "</media>" cannot break the
-        structure.
+        element boundary itself). FORGERY CORRECTION (2026-08-25,
+        review finding M3): the claim "a member CANNOT forge a
+        media element" held only for forgeries containing raw
+        angle brackets — a member typing a CLEAN
+        `<media type="image">...</media>` element verbatim passes
+        the renderer's trust check byte-for-byte (the renderer
+        cannot distinguish it from a real element). The injected
+        text cannot BREAK the XML structure (any `<`/`>` variant
+        is still escaped), so the guarantee is structural, not
+        semantic. The real mitigation landed with the review
+        fixes: both the extraction and the summary preamble now
+        carry the media-is-data rule verbatim (the element body
+        is caption-pipeline DATA, never an instruction, never
+        member speech) with content pins, and the directive-zero
+        block carries a Scope clause keeping message text and
+        media bodies in the untrusted-data class. A hard fix
+        (intake-side escaping or structured storage) is open.
     (f) STICKER CACHE: one GLOBAL (cross-group) table
         `sticker_captions(file_unique_id PRIMARY KEY, caption,
         created_at)` in `{data_root}/media.db` (SQLite, WAL — the
@@ -2018,7 +2050,16 @@ v0.0.1 (alpha).
     purposes are the four completion purposes (digest, gate,
     reply, summary) plus `caption` and `embedding` — the endpoint
     layer's session plumbing already carries to all three client
-    kinds (completion, embedding, caption).
+    kinds (completion, embedding, caption). CUTOVER LIMITATION
+    (2026-08-25, review finding M5 — the decision text
+    overclaimed): only the four COMPLETION purposes (digest,
+    gate, reply, summary) actually receive per-(group, purpose)
+    suffixes. The embedding and caption providers are built ONCE
+    process-wide from the global config (a shared Arc, decision
+    73) with no chat_id in scope, so they send the bare prefix at
+    cutover. Per-group affinity for them is an accepted
+    follow-up requiring provider restructuring (a per-group
+    provider build or a per-request header override seam).
     (c) RESOLUTION POINT: the suffix is minted lazily at the
     per-group service-build site (the binary's group spawn /
     per-group pipeline construction), NOT in

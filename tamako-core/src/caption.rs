@@ -2,7 +2,7 @@
 //! 82).
 //!
 //! The live implementation belongs in the tamako-agent crate over the
-//! endpoint layer (`LlmPurpose::CaptionMedia`); tamako-core defines the
+//! endpoint layer (the standalone `CaptionEndpoint`); tamako-core defines the
 //! contract so the adapter can drive captioning without a dependency on
 //! the agent crate (no dependency cycles, AGENT.md Section 4). Same
 //! pattern as `summary.rs`, `digest.rs`, and `embedding.rs`. The
@@ -44,7 +44,7 @@ pub enum CaptionError {
 }
 
 /// The media captioner of decision 82. Implemented in tamako-agent over
-/// the endpoint layer (`LlmPurpose::CaptionMedia`); scripted double for
+/// the endpoint layer (the standalone `CaptionEndpoint`); scripted double for
 /// hermetic tests.
 ///
 /// `jpeg_data_uri` is the `data:image/jpeg;base64,...` string produced

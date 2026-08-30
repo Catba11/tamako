@@ -107,7 +107,7 @@ Environment variables:
 | `TAMAKO_SUMMARY_MODEL` | Summary-model override (the segmented C3 summarizer). Default `claude-haiku-4-5`. |
 | `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
 | `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
-| `TAMAKO_LLM_SESSION_ID` | Session id sent as the `x-opencode-session` header on every request (gateway session affinity / provider prompt-cache affinity). Global-only: one session id per deployment, no per-purpose or per-group variant. Default `tamako`. |
+| `TAMAKO_LLM_SESSION_ID` | Session-affinity PREFIX sent as BOTH the `x-opencode-session` and `x-session-id` headers on every request (decision 84: Opencode Go honors the first, OpenRouter sticky routing honors the second). The header value is `{prefix}-{suffix}`: the prefix is this key (global-only, default `tamako`), the suffix is a per-(group, purpose) random 16-char string persisted in the group's store (`llm_session_keys`), so provider affinity survives restarts. |
 | `TAMAKO_EMBEDDING_MODEL` | Embedding-model override for the vector sidecar. Default `qwen/qwen3-embedding-8b`. Global only. |
 | `TAMAKO_EMBEDDING_BASE_URL` | Embedding-endpoint base-URL override. Default `https://openrouter.ai/api/v1`. Global only. |
 | `TAMAKO_STRUCTURED_OUTPUT` | Structured-output mode, global fallback: `schema` (default), `json_object`, `prompt_only`. |
@@ -191,7 +191,7 @@ The merge modes are the offline graph-repair tool (current-state.md decision 74,
 ```sh
 # Scan the vector index for duplicate candidates, confirm each pair once
 # on the digest endpoint (verdicts: same merges, related links
-# also_known_as, different skips), print the plan, and write it to
+# table, different skips; decision 83), print the plan, and write it to
 # {data-root}/{chat_id}/merge_plan.json. DRY RUN (read-only store).
 cargo run -- --merge-tool -1001234567890 --data-root ./data --config tamako.toml
 
