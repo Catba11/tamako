@@ -30,10 +30,10 @@ use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 
 /// The default max tokens of the summary response. The output is one
-/// small JSON object (one field); 262144 tokens is a generous bound
+/// small JSON object (one field); 102400 tokens is a generous bound
 /// (same bound as digest, gate, and recall — reasoning-burn headroom
 /// under `prompt_only`).
-pub const SUMMARY_DEFAULT_MAX_TOKENS: u64 = 262144;
+pub const SUMMARY_DEFAULT_MAX_TOKENS: u64 = 102400;
 
 /// The structured summary output. One field: the summary text of the
 /// removed chunk.
@@ -160,7 +160,7 @@ impl RigSummary {
     /// `AgentError::ProviderConfig` when the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigSummary::new(
-            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Summary.as_str()),
+            EndpointClient::build_for_purpose(endpoint, LlmPurpose::Summary)?,
             SUMMARY_DEFAULT_MAX_TOKENS,
         ))
     }

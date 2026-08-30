@@ -119,7 +119,7 @@ impl RigWarmupGenerator {
         Ok(RigWarmupGenerator::new(
             // The warmup is a reply-purpose call (the doc comment
             // above); stamp it for the curated usage line.
-            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Reply.as_str()),
+            EndpointClient::build_for_purpose(endpoint, LlmPurpose::Reply)?,
             REPLY_DEFAULT_MAX_TOKENS,
         ))
     }
