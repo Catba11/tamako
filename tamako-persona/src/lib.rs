@@ -101,6 +101,10 @@ pub struct PersonaConfig {
     /// They feed ONLY the reply persona preamble (decision 85 (c)): the
     /// gate and recall preambles append the gloss but not the examples.
     ///
+    /// The TOML key is `[[example]]` — ONE block per example (operator
+    /// naming ruling: the block IS one example, so the key is
+    /// singular). serde renames the field to `example`.
+    ///
     /// Absent or empty renders NOTHING — the preamble stays bit-identical
     /// to the pre-85 format (Rule C4: the cache anchor changes only when
     /// examples are configured).
@@ -109,7 +113,7 @@ pub struct PersonaConfig {
     /// is paid in prompt tokens on EVERY wake (cached-prefix pricing
     /// applies). The persona file documents this cost; keep the list
     /// short by operator judgment, not by enforcement.
-    #[serde(default)]
+    #[serde(default, rename = "example")]
     pub examples: Vec<PersonaExample>,
 }
 
@@ -557,9 +561,14 @@ identity = "a small cat"
 
     #[test]
     fn examples_serde_round_trip() {
-        // The `[[examples]]` array parses and serializes losslessly.
+        // The `[[example]]` array (singular key, one block per example)
+        // parses and serializes losslessly.
         let config = config_with_examples();
         let text = toml::to_string(&config).expect("serialize");
+        assert!(
+            text.contains("[[example]]"),
+            "the wire key is the singular: {text}"
+        );
         let parsed = PersonaConfig::from_toml_str(&text).expect("parse");
         assert_eq!(parsed, config);
         assert_eq!(parsed.examples.len(), 2);
