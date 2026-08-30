@@ -157,9 +157,9 @@ use crate::extract::AgentError;
 use crate::gate::{CONTEXT_VIEW_EMPTY, CONTEXT_VIEW_HEADER};
 
 /// The default max tokens of the relevance-gate response. The output is
-/// one small JSON object (two fields); 262144 tokens is a generous bound
+/// one small JSON object (two fields); 102400 tokens is a generous bound
 /// (same bound as the participation gate).
-pub const RECALL_DEFAULT_MAX_TOKENS: u64 = 262144;
+pub const RECALL_DEFAULT_MAX_TOKENS: u64 = 102400;
 
 /// The bound of the alphanumeric candidate-term list of one wake. The
 /// terms feed the entry resolution; 20 terms is a documented bound
@@ -603,7 +603,7 @@ impl RigRelevanceGate {
         Ok(RigRelevanceGate::new(
             // The relevance gate runs on the `gate` purpose (the doc
             // comment above); stamp it for the curated usage line.
-            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Gate.as_str()),
+            EndpointClient::build_for_purpose(endpoint, LlmPurpose::Gate)?,
             RECALL_DEFAULT_MAX_TOKENS,
             injection_cap,
         ))

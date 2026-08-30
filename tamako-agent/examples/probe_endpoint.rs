@@ -65,7 +65,7 @@ const GRAPH_PROMPT: &str = "Extract the knowledge graph of this chat batch.\n\
 
 /// The `max_tokens` of the `graph_schema` mode: the graph plus the
 /// endpoint's reasoning budget needs more headroom than the pet probe.
-const GRAPH_MAX_TOKENS: u32 = 262144;
+const GRAPH_MAX_TOKENS: u32 = 102400;
 
 /// The local validation target: what the extraction expects back.
 #[derive(Debug, Deserialize)]

@@ -30,8 +30,8 @@ use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
 
 /// The default max tokens of the gate response. The output is one small
-/// JSON object (three fields); 262144 tokens is a generous bound.
-pub const GATE_DEFAULT_MAX_TOKENS: u64 = 262144;
+/// JSON object (three fields); 65536 tokens is a generous bound.
+pub const GATE_DEFAULT_MAX_TOKENS: u64 = 65536;
 
 /// The structured gate output (Section 9.6). `target_msg_id` is the
 /// raw-log row id of the message the reply should target.
@@ -255,7 +255,7 @@ impl RigGate {
     /// the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigGate::new(
-            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Gate.as_str()),
+            EndpointClient::build_for_purpose(endpoint, LlmPurpose::Gate)?,
             GATE_DEFAULT_MAX_TOKENS,
         ))
     }

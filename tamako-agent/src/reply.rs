@@ -236,7 +236,7 @@ impl RigReplyGenerator {
     /// `AgentError::ProviderConfig` when the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(RigReplyGenerator::new(
-            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Reply.as_str()),
+            EndpointClient::build_for_purpose(endpoint, LlmPurpose::Reply)?,
             REPLY_DEFAULT_MAX_TOKENS,
         ))
     }

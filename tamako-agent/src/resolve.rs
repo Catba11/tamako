@@ -254,7 +254,7 @@ impl EndpointResolutionConfirmer {
     /// `AgentError::ProviderConfig` when the family API key is missing.
     pub fn from_endpoint(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
         Ok(EndpointResolutionConfirmer::new(
-            EndpointClient::build(endpoint)?.with_purpose(LlmPurpose::Digest.as_str()),
+            EndpointClient::build_for_purpose(endpoint, LlmPurpose::Digest)?,
             CONFIRMATION_MAX_TOKENS,
         ))
     }

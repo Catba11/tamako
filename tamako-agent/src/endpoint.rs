@@ -130,6 +130,28 @@ pub const REPLY_MODEL_ENV_VAR: &str = "TAMAKO_REPLY_MODEL";
 /// reported for spec backfill with the `summary_*` keys).
 pub const SUMMARY_MODEL_ENV_VAR: &str = "TAMAKO_SUMMARY_MODEL";
 
+/// Per-purpose API-key override of the digest purpose (decision 87,
+/// ENVIRONMENT-ONLY — no TOML key: secrets never enter the config file,
+/// the specs.md Section 13 invariant "API keys come from the environment
+/// only" is preserved and extended). Resolution chain: this var → the
+/// family var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) → a missing-key
+/// `ProviderConfig` error. An empty string counts as unset and falls
+/// through to the family key (the `env_value` discipline). The use case:
+/// pointing one purpose at a DIFFERENT provider of the SAME API family.
+pub const DIGEST_LLM_API_KEY_ENV_VAR: &str = "TAMAKO_DIGEST_LLM_API_KEY";
+
+/// Per-purpose API-key override of the gate purpose (decision 87). Refer
+/// to [`DIGEST_LLM_API_KEY_ENV_VAR`].
+pub const GATE_LLM_API_KEY_ENV_VAR: &str = "TAMAKO_GATE_LLM_API_KEY";
+
+/// Per-purpose API-key override of the reply purpose (decision 87).
+/// Refer to [`DIGEST_LLM_API_KEY_ENV_VAR`].
+pub const REPLY_LLM_API_KEY_ENV_VAR: &str = "TAMAKO_REPLY_LLM_API_KEY";
+
+/// Per-purpose API-key override of the summary purpose (decision 87).
+/// Refer to [`DIGEST_LLM_API_KEY_ENV_VAR`].
+pub const SUMMARY_LLM_API_KEY_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_API_KEY";
+
 /// Environment override of the summary API family (specs.md Section 13,
 /// reported for spec backfill with the `summary_*` keys). The summary
 /// purpose alone has per-purpose api/base URL env vars (the S3
@@ -270,7 +292,7 @@ pub const EMBEDDING_DIMS: usize = 3072;
 ///
 /// 900 s is generous on purpose. Live digests complete in ~20 s, but
 /// reasoning models burn reasoning tokens before any content, and with
-/// `max_tokens` up to 262144 a slow-but-progressing reasoning response
+/// `max_tokens` up to 102400 a slow-but-progressing reasoning response
 /// legitimately runs for minutes; at peak hours a loaded endpoint
 /// stretches this further. The timeout only guards against a STALLED
 /// completion (no response at all); it cannot false-positive on a
@@ -454,6 +476,19 @@ impl LlmPurpose {
             LlmPurpose::Gate => GATE_STRUCTURED_OUTPUT_ENV_VAR,
             LlmPurpose::Reply => REPLY_STRUCTURED_OUTPUT_ENV_VAR,
             LlmPurpose::Summary => SUMMARY_STRUCTURED_OUTPUT_ENV_VAR,
+        }
+    }
+
+    /// The per-purpose API-key env var of decision 87 (ENVIRONMENT-ONLY;
+    /// no TOML key). Resolution chain in [`EndpointClient::build`]: this
+    /// var → the family var ([`LlmApi::api_key_env_var`]) → a missing-key
+    /// `ProviderConfig` error naming both. Empty counts as unset.
+    fn api_key_env_var(&self) -> &'static str {
+        match self {
+            LlmPurpose::Digest => DIGEST_LLM_API_KEY_ENV_VAR,
+            LlmPurpose::Gate => GATE_LLM_API_KEY_ENV_VAR,
+            LlmPurpose::Reply => REPLY_LLM_API_KEY_ENV_VAR,
+            LlmPurpose::Summary => SUMMARY_LLM_API_KEY_ENV_VAR,
         }
     }
 
@@ -816,10 +851,50 @@ pub(crate) fn session_header_map(
 /// has no purpose signal — [`EndpointConfig`] is purpose-agnostic — so
 /// the field starts here and the purpose-named `from_endpoint`
 /// wrappers (extractor, gate, reply, summary, recall, warmup, and the
-/// two confirmers) override it through
-/// [`EndpointClient::with_purpose`]. Direct `build` callers (tests)
+/// two confirmers) stamp it through
+/// [`EndpointClient::build_for_purpose`]. Direct `build` callers (tests)
 /// keep this value; their usage lines stay honest rather than guessed.
 const UNSCOPED_PURPOSE: &str = "unscoped";
+
+/// Resolves the API key of one completion endpoint (decision 87).
+///
+/// The chain, when a `purpose` is known (the purpose-named `from_endpoint`
+/// wrappers): the purpose env var ([`LlmPurpose::api_key_env_var`]) → the
+/// family env var ([`LlmApi::api_key_env_var`]: `ANTHROPIC_API_KEY` /
+/// `OPENAI_API_KEY`) → a missing-key `ProviderConfig` naming BOTH vars
+/// tried. When `purpose` is `None` (the purpose-agnostic
+/// [`EndpointClient::build`] path, e.g. tests) the family var alone
+/// applies. An empty string counts as unset and falls through (the
+/// [`env_value`] discipline). ENVIRONMENT-ONLY: no TOML key exists
+/// (specs.md Section 13 — secrets never enter the config file).
+///
+/// Embedding and caption providers do NOT use this chain — they keep the
+/// family key (process-wide, the decision-84 M5 follow-up).
+fn resolve_api_key(
+    endpoint: &EndpointConfig,
+    purpose: Option<LlmPurpose>,
+) -> Result<String, AgentError> {
+    let family_var = endpoint.api.api_key_env_var();
+    if let Some(purpose) = purpose {
+        let purpose_var = purpose.api_key_env_var();
+        if let Some(key) = env_value(purpose_var) {
+            return Ok(key);
+        }
+        return env_value(family_var).ok_or_else(|| {
+            AgentError::ProviderConfig(format!(
+                "missing API key: set {purpose_var} or {family_var} for {} endpoints (purpose: {})",
+                endpoint.api,
+                purpose.as_str()
+            ))
+        });
+    }
+    env_value(family_var).ok_or_else(|| {
+        AgentError::ProviderConfig(format!(
+            "missing API key: set {family_var} for {} endpoints",
+            endpoint.api
+        ))
+    })
+}
 
 /// The rig completion model handle of one family. rig 0.41 has two
 /// distinct model types; the enum hides the split.
@@ -836,7 +911,7 @@ pub struct EndpointClient {
     /// "digest"/"gate"/"reply"/"summary"). Carried into the curated
     /// per-call usage INFO line (decision 53). `build` sets
     /// [`UNSCOPED_PURPOSE`]; the purpose-named wrappers stamp the real
-    /// purpose through [`EndpointClient::with_purpose`].
+    /// purpose through [`EndpointClient::build_for_purpose`].
     purpose: &'static str,
     /// The resolved model name (a copy of [`EndpointConfig::model`]),
     /// carried into the per-call usage INFO line so the operator can
@@ -887,16 +962,40 @@ impl EndpointClient {
     /// families. A session id that is not a valid header value is
     /// `AgentError::ProviderConfig`.
     pub fn build(endpoint: &EndpointConfig) -> Result<Self, AgentError> {
-        let key_var = endpoint.api.api_key_env_var();
-        let api_key = env_value(key_var).ok_or_else(|| {
-            AgentError::ProviderConfig(format!(
-                "missing API key: set {key_var} for {} endpoints",
-                endpoint.api
-            ))
-        })?;
+        // The purpose-agnostic path (direct `build` callers, tests): no
+        // per-purpose override applies, so the key is the family key and
+        // the client starts UNSCOPED. The purpose-aware construction is
+        // [`EndpointClient::build_for_purpose`].
+        Self::build_with_key(endpoint, None)
+    }
+
+    /// Builds a client for one PURPOSE's endpoint (decision 87): the API
+    /// key resolves purpose env var → family env var → missing-key
+    /// `ProviderConfig`, and the client is stamped with the purpose (so
+    /// the per-call usage INFO line is honest). This is the construction
+    /// the purpose-named `from_endpoint` wrappers use; it subsumes
+    /// [`EndpointClient::build`] plus the purpose stamping.
+    pub fn build_for_purpose(
+        endpoint: &EndpointConfig,
+        purpose: LlmPurpose,
+    ) -> Result<Self, AgentError> {
+        Self::build_with_key(endpoint, Some(purpose))
+    }
+
+    /// The shared construction. `purpose` selects the decision-87 key
+    /// chain (purpose env → family env); `None` resolves the family key
+    /// directly (the purpose-agnostic `build` path). The returned client
+    /// carries the purpose's `as_str()` stamp, or [`UNSCOPED_PURPOSE`]
+    /// when purpose-less.
+    fn build_with_key(
+        endpoint: &EndpointConfig,
+        purpose: Option<LlmPurpose>,
+    ) -> Result<Self, AgentError> {
+        let api_key = resolve_api_key(endpoint, purpose)?;
         // The gateway session-affinity header (module docs); refer to
         // `session_header_map`.
         let headers = session_header_map(&endpoint.session_id)?;
+        let purpose_str = purpose.map_or(UNSCOPED_PURPOSE, |p| p.as_str());
         match endpoint.api {
             LlmApi::AnthropicCompatible => {
                 let mut builder = anthropic::Client::builder()
@@ -910,9 +1009,7 @@ impl EndpointClient {
                     .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
                 Ok(EndpointClient {
                     model: EndpointModel::Anthropic(client.completion_model(&endpoint.model)),
-                    // No purpose signal at this layer; the purpose-named
-                    // wrappers stamp it via `with_purpose`.
-                    purpose: UNSCOPED_PURPOSE,
+                    purpose: purpose_str,
                     model_name: endpoint.model.clone(),
                     structured_output: endpoint.structured_output,
                     timeout: ENDPOINT_TIMEOUT,
@@ -933,9 +1030,7 @@ impl EndpointClient {
                     .map_err(|error| AgentError::ProviderConfig(error.to_string()))?;
                 Ok(EndpointClient {
                     model: EndpointModel::OpenAi(client.completion_model(&endpoint.model)),
-                    // No purpose signal at this layer; the purpose-named
-                    // wrappers stamp it via `with_purpose`.
-                    purpose: UNSCOPED_PURPOSE,
+                    purpose: purpose_str,
                     model_name: endpoint.model.clone(),
                     structured_output: endpoint.structured_output,
                     timeout: ENDPOINT_TIMEOUT,
@@ -950,17 +1045,6 @@ impl EndpointClient {
     #[cfg(test)]
     pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    /// Stamps the LLM purpose of the client for the curated per-call
-    /// usage INFO line (decision 53). Called by the purpose-named
-    /// `from_endpoint` wrappers (extractor, gate, reply, summary,
-    /// recall, warmup, and the two confirmers) with their
-    /// [`LlmPurpose::as_str`]; a client built directly keeps
-    /// [`UNSCOPED_PURPOSE`].
-    pub(crate) fn with_purpose(mut self, purpose: &'static str) -> Self {
-        self.purpose = purpose;
         self
     }
 
@@ -1668,6 +1752,11 @@ mod tests {
         CAPTION_BASE_URL_ENV_VAR,
         ANTHROPIC_API_KEY_ENV_VAR,
         OPENAI_API_KEY_ENV_VAR,
+        // Decision 87: the per-purpose API-key overrides.
+        DIGEST_LLM_API_KEY_ENV_VAR,
+        GATE_LLM_API_KEY_ENV_VAR,
+        REPLY_LLM_API_KEY_ENV_VAR,
+        SUMMARY_LLM_API_KEY_ENV_VAR,
     ];
 
     /// Saves, clears, and restores env vars. Hermetic env handling.
@@ -2109,6 +2198,134 @@ mod tests {
         }
     }
 
+    /// An openai-compatible endpoint fixture for the decision-87 key
+    /// resolution tests (no network: construction performs no I/O).
+    fn openai_endpoint() -> EndpointConfig {
+        EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some("http://localhost:9998/v1".to_string()),
+            model: "local-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            session_id: "test-session".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_purpose_key_wins_over_the_family_key() {
+        // Decision 87: the purpose env var takes precedence over the
+        // family var. Both set → construction succeeds using the purpose
+        // key. We cannot read the key back off the rig client, so we pin
+        // the SELECTION by setting ONLY the purpose key to a valid value
+        // and the family key to a value that would also work — then prove
+        // below (the fallback test) that the family key alone is used
+        // when the purpose key is absent. The winning proof: with ONLY
+        // the purpose key set (family unset), construction must succeed.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(REPLY_LLM_API_KEY_ENV_VAR, "reply-purpose-key");
+        env.set(OPENAI_API_KEY_ENV_VAR, "family-key");
+        EndpointClient::build_for_purpose(&openai_endpoint(), LlmPurpose::Reply)
+            .expect("purpose key + family key present: construction succeeds");
+    }
+
+    #[test]
+    fn the_purpose_key_alone_suffices_without_the_family_key() {
+        // Decision 87: the purpose env var is tried FIRST — with the
+        // family var UNSET, a present purpose key still builds (this is
+        // the case that proves the purpose var is consulted at all).
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(GATE_LLM_API_KEY_ENV_VAR, "gate-purpose-key");
+        EndpointClient::build_for_purpose(&openai_endpoint(), LlmPurpose::Gate)
+            .expect("the purpose key alone builds the client");
+    }
+
+    #[test]
+    fn the_family_key_is_the_fallback_when_the_purpose_key_is_absent() {
+        // Decision 87: no purpose key → the family key is used.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "family-key");
+        EndpointClient::build_for_purpose(&openai_endpoint(), LlmPurpose::Digest)
+            .expect("the family key is the fallback");
+    }
+
+    #[test]
+    fn an_empty_purpose_key_falls_through_to_the_family_key() {
+        // Decision 87: an empty purpose key counts as unset (the
+        // `env_value` discipline) and falls through to the family key.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(SUMMARY_LLM_API_KEY_ENV_VAR, "");
+        env.set(OPENAI_API_KEY_ENV_VAR, "family-key");
+        EndpointClient::build_for_purpose(&openai_endpoint(), LlmPurpose::Summary)
+            .expect("empty purpose key falls through to the family key");
+    }
+
+    #[test]
+    fn a_missing_purpose_and_family_key_errors_naming_both_vars() {
+        // Decision 87: neither set → ProviderConfig naming BOTH the
+        // purpose var and the family var that were tried.
+        let (_lock, _env) = EnvGuard::cleared();
+        match EndpointClient::build_for_purpose(&openai_endpoint(), LlmPurpose::Reply) {
+            Err(AgentError::ProviderConfig(message)) => {
+                assert!(
+                    message.contains(REPLY_LLM_API_KEY_ENV_VAR),
+                    "the error names the purpose var {REPLY_LLM_API_KEY_ENV_VAR}: {message}"
+                );
+                assert!(
+                    message.contains(OPENAI_API_KEY_ENV_VAR),
+                    "the error names the family var {OPENAI_API_KEY_ENV_VAR}: {message}"
+                );
+            }
+            other => panic!("expected ProviderConfig naming both vars, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_purpose_resolves_its_own_key_var() {
+        // Decision 87: each of the four purposes consults its OWN env var.
+        // Set only one purpose's key at a time (family unset); construction
+        // for that purpose must succeed, and the helper maps each purpose
+        // to the right var name.
+        for (purpose, var) in [
+            (LlmPurpose::Digest, DIGEST_LLM_API_KEY_ENV_VAR),
+            (LlmPurpose::Gate, GATE_LLM_API_KEY_ENV_VAR),
+            (LlmPurpose::Reply, REPLY_LLM_API_KEY_ENV_VAR),
+            (LlmPurpose::Summary, SUMMARY_LLM_API_KEY_ENV_VAR),
+        ] {
+            let (_lock, env) = EnvGuard::cleared();
+            env.set(var, "the-purpose-key");
+            EndpointClient::build_for_purpose(&openai_endpoint(), purpose).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "purpose {} should build from {var}: {error}",
+                        purpose.as_str()
+                    )
+                },
+            );
+            // The helper maps the purpose to exactly this var.
+            assert_eq!(purpose.api_key_env_var(), var);
+        }
+    }
+
+    #[test]
+    fn the_purpose_agnostic_build_uses_the_family_key_only() {
+        // Decision 87, the unchanged `build` path (direct callers, tests):
+        // a purpose key set WITHOUT the family key does NOT reach the
+        // purpose-agnostic `build` — it still wants the family key.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(REPLY_LLM_API_KEY_ENV_VAR, "reply-purpose-key");
+        match EndpointClient::build(&openai_endpoint()) {
+            Err(AgentError::ProviderConfig(message)) => {
+                assert!(message.contains(OPENAI_API_KEY_ENV_VAR));
+            }
+            other => panic!(
+                "build without a family key must fail even with a purpose key set, got {other:?}"
+            ),
+        }
+        // With the family key present, `build` succeeds.
+        env.set(OPENAI_API_KEY_ENV_VAR, "family-key");
+        EndpointClient::build(&openai_endpoint())
+            .expect("family key builds the purpose-agnostic client");
+    }
+
     #[test]
     fn mode_parse_accepts_the_three_spec_strings() {
         use std::str::FromStr as _;
@@ -2344,10 +2561,12 @@ mod tests {
         // signal on EndpointConfig, starts unscoped.
         assert_eq!(client.model_name, "local-model");
         assert_eq!(client.purpose, UNSCOPED_PURPOSE);
-        // A purpose-named wrapper stamps the purpose (LlmPurpose::as_str
-        // values are 'static, so no allocation).
-        let client = client.with_purpose(LlmPurpose::Reply.as_str());
+        // The purpose-named construction (decision 87) stamps the purpose
+        // AND resolves the key — the production path of the wrappers.
+        let client = EndpointClient::build_for_purpose(&endpoint, LlmPurpose::Reply)
+            .expect("build_for_purpose");
         assert_eq!(client.purpose, "reply");
+        assert_eq!(client.model_name, "local-model");
         // Both dims are printable in test failures and logs.
         let debug = format!("{client:?}");
         assert!(debug.contains("local-model"));
