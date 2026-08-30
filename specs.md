@@ -354,7 +354,7 @@ LLM access resolves from the per-group effective configuration (global defaults 
 
 A purpose (`digest`, `gate`, `reply`, `summary`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
 
-API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well.
+API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well. Decision 87: each completion purpose may override the family key with `TAMAKO_{DIGEST|GATE|REPLY|SUMMARY}_LLM_API_KEY` (purpose env → family env → missing-key error) — the enabler for pointing one purpose at a different provider of the same API family. The override is environment-only by the same invariant (no TOML key exists). An empty string counts as unset and falls through to the family key. Embedding and caption providers keep the family key (they are process-wide; the decision-84 M5 follow-up).
 
 ## 14. Deferred items
 
