@@ -2175,6 +2175,22 @@ v0.0.1 (alpha).
     message, the newest `<msg>` precedes it, and gate/recall
     requests carry no suffix. Spec backfill: specs.md Section
     5.3 (the `suffix` key) and Section 9.4 (the tail message).
+87. (operator-ruled 2026-08-25) Per-purpose API-key overrides,
+    ENVIRONMENT-ONLY: each completion purpose gains
+    `TAMAKO_{DIGEST|GATE|REPLY|SUMMARY}_LLM_API_KEY`, resolving
+    purpose env → family env (`ANTHROPIC_API_KEY` /
+    `OPENAI_API_KEY`) → ProviderConfig. NO TOML key (operator
+    ruling: secrets never enter the config file — the existing
+    specs.md Section 13 invariant "API keys come from the
+    environment only" is preserved and extended, not broken).
+    The use case: pointing one purpose at a DIFFERENT provider
+    of the SAME API family (e.g. gate → a self-hosted vLLM and
+    reply → DeepSeek, both `openai-compatible`) — per-family
+    keys forced them to share; per-purpose keys unforce it.
+    Out of scope: embedding/caption providers (process-wide,
+    the decision-84 M5 follow-up) keep the family key. Empty
+    string counts as unset (falls through to the family key),
+    matching the existing env-value discipline.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 
