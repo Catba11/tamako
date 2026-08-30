@@ -8,18 +8,19 @@ document records the current implementation.
 
 ## 1. Workspace layout
 
-A Cargo workspace at the repository root with eight crates. Shared
+A Cargo workspace at the repository root with nine crates. Shared
 dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
 | `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 50 |
 | `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 170 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v6), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the read-only status query. | 38 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v13), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 38 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63). | 18 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
-| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions. | 53 (+1 ignored live test) |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions, and the decision-82 media enrichment stage (download → `tamako-vision` normalize → caption → `<media>` elements embedded before the IntakeEvent exists). | 53 (+1 ignored live test) |
+| `tamako-vision` | The pure media-normalization crate (decision 82): bytes in, normalized JPEG/data-URI out; no I/O, no async, no LLM. | 10 |
 | `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker, the Rule C3 summarizer (decision 62). | 167 (+3 ignored live tests) |
 
 Total: 523 tests (+4 ignored live tests). Build, test,
@@ -488,9 +489,9 @@ default. The global-only `llm_session_id` (env
 gateway's session-affinity key for the provider prompt cache — sent on
 every request of both families via rig's `ClientBuilder::http_headers`;
 every successful completion logs the rig usage fields (including
-`cached_input_tokens`) at DEBUG. `EndpointClient` hides the two rig model types behind one
+`cached_input_tokens`) at INFO (promoted from DEBUG in the 2026-08-25 review batch so cache behavior is observable without log-filter surgery). `EndpointClient` hides the two rig model types behind one
 async `complete` call. Decision 65: every completion attempt is
-bounded by a 300 s per-attempt timeout (`ENDPOINT_TIMEOUT` — a code
+bounded by a 900 s per-attempt timeout (`ENDPOINT_TIMEOUT` — a code
 constant with a cfg(test) override, no config key; elapsed maps to
 `AgentError::Extraction` with a stable prefix so caller failure
 semantics apply unchanged), and json_object mode attaches
