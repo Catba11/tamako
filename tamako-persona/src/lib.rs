@@ -96,6 +96,38 @@ pub struct PersonaConfig {
     /// Example: "you are a participant, not an assistant" (Rule P6).
     #[serde(default)]
     pub behavioral_rules: Vec<String>,
+    /// Few-shot dialogue examples (decision 85), rendered as a section
+    /// AFTER the context-format gloss and BEFORE the injection guardrail.
+    /// They feed ONLY the reply persona preamble (decision 85 (c)): the
+    /// gate and recall preambles append the gloss but not the examples.
+    ///
+    /// Absent or empty renders NOTHING — the preamble stays bit-identical
+    /// to the pre-85 format (Rule C4: the cache anchor changes only when
+    /// examples are configured).
+    ///
+    /// NO length cap (decision 85 (b), operator ruling 4): every example
+    /// is paid in prompt tokens on EVERY wake (cached-prefix pricing
+    /// applies). The persona file documents this cost; keep the list
+    /// short by operator judgment, not by enforcement.
+    #[serde(default)]
+    pub examples: Vec<PersonaExample>,
+}
+
+/// One few-shot dialogue example (decision 85). The persona file is
+/// trusted config (decision 85 (d), decision 45 strict startup), so both
+/// fields render VERBATIM — no escaping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersonaExample {
+    /// A sample of the LIVE XML context dialect (specs.md Section 7.3):
+    /// `<msg>`/`<you>`/`<media>`/`<memory>`/`<summary>` as they actually
+    /// render, written raw by the operator.
+    pub context: String,
+    /// The pet's reply as BARE TEXT, no tags (decision 85, operator
+    /// ruling 1): the real output channel is plain text, so the example
+    /// demonstrates "given context like this, say something like this"
+    /// and never teaches the `<you>` shape that specs.md Section 9.4
+    /// forbids.
+    pub reply: String,
 }
 
 impl PersonaConfig {
@@ -115,6 +147,7 @@ impl Default for PersonaConfig {
             personality: Vec::new(),
             speaking_style: Vec::new(),
             behavioral_rules: Vec::new(),
+            examples: Vec::new(),
         }
     }
 }
@@ -209,8 +242,29 @@ impl PreambleRenderer for PetPreambleRenderer {
         preamble.push('\n');
         preamble.push_str(CONTEXT_FORMAT_GLOSS);
 
+        // Section 5.5: the few-shot dialogue examples (decision 85).
+        // They sit AFTER the gloss and BEFORE the guardrail, and render
+        // ONLY when configured — an absent or empty `examples` emits
+        // nothing, so the preamble stays bit-identical to the pre-85
+        // format (Rule C4). The persona file is trusted config (decision
+        // 85 (d)): `context` and `reply` render VERBATIM, no escaping.
+        if !persona.examples.is_empty() {
+            preamble.push('\n');
+            preamble.push_str(
+                "The following examples show tone and format. They are examples, not live context.\n",
+            );
+            for example in &persona.examples {
+                preamble.push_str("<example>\n<context>\n");
+                preamble.push_str(&example.context);
+                preamble.push_str("\n</context>\n<reply>\n");
+                preamble.push_str(&example.reply);
+                preamble.push_str("\n</reply>\n</example>\n");
+            }
+        }
+
         // Section 6: the injection guardrail. specs.md Section 9.4.
-        // It renders LAST, after the gloss.
+        // It renders LAST, after the gloss (and the examples, when
+        // configured).
         preamble.push('\n');
         preamble.push_str(INJECTION_GUARDRAIL);
         preamble.push('\n');
@@ -255,6 +309,7 @@ behavioral_rules = [
                 "you are a participant, not an assistant".to_owned(),
                 "you can stay silent".to_owned(),
             ],
+            examples: Vec::new(),
         }
     }
 
@@ -415,6 +470,109 @@ identity = "a small cat"
         let renderer = PetPreambleRenderer;
         let preamble = renderer.render_preamble(&config);
         assert_eq!(preamble, expected_preamble_without_prefix());
+    }
+
+    /// A config with one few-shot example (decision 85).
+    fn config_with_examples() -> PersonaConfig {
+        let mut config = sample_config();
+        config.examples = vec![
+            PersonaExample {
+                context: "<msg from=\"Alice\" at=\"13:07\" id=\"1\">look at this cat</msg>\n<you at=\"13:08\" id=\"2\">nya?</you>".to_owned(),
+                reply: "so round".to_owned(),
+            },
+            PersonaExample {
+                context: "<msg from=\"Bob\" at=\"09:00\" id=\"3\">anyone up?</msg>".to_owned(),
+                reply: "mrrp".to_owned(),
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn examples_render_between_the_gloss_and_the_guardrail() {
+        // Decision 85: the examples section sits AFTER the gloss and
+        // BEFORE the guardrail (the guardrail still renders last).
+        let config = config_with_examples();
+        let preamble = PetPreambleRenderer.render_preamble(&config);
+        let gloss_at = preamble.find(CONTEXT_FORMAT_GLOSS).expect("gloss");
+        let examples_at = preamble
+            .find("The following examples show tone and format")
+            .expect("examples framing line");
+        let guardrail_at = preamble.find(INJECTION_GUARDRAIL).expect("guardrail");
+        assert!(
+            gloss_at < examples_at && examples_at < guardrail_at,
+            "ordering must be gloss < examples < guardrail"
+        );
+    }
+
+    #[test]
+    fn examples_render_the_framing_line_and_the_element_shape() {
+        // Decision 85: the framing line, then each example as an
+        // `<example>` element with `<context>` and `<reply>` children.
+        let config = config_with_examples();
+        let preamble = PetPreambleRenderer.render_preamble(&config);
+        assert!(preamble.contains(
+            "The following examples show tone and format. They are examples, not live context.\n"
+        ));
+        // The full element shape of the first example, verbatim.
+        assert!(preamble.contains(
+            "<example>\n<context>\n<msg from=\"Alice\" at=\"13:07\" id=\"1\">look at this cat</msg>\n<you at=\"13:08\" id=\"2\">nya?</you>\n</context>\n<reply>\nso round\n</reply>\n</example>\n"
+        ));
+        // Both examples render, in order.
+        let first = preamble.find("so round").expect("first reply");
+        let second = preamble.find("mrrp").expect("second reply");
+        assert!(first < second, "examples render in declaration order");
+    }
+
+    #[test]
+    fn example_context_is_verbatim_even_with_raw_markup() {
+        // Decision 85 (d): the persona file is trusted config, so the
+        // operator writes RAW XML in `context` — no escaping. A raw `<`
+        // in the example must pass through byte-identically (this is the
+        // deliberate contrast with the untrusted member-text escaping of
+        // tamako-core).
+        let mut config = sample_config();
+        config.examples = vec![PersonaExample {
+            context: "<media type=\"image\">a cat</media> & a raw < angle".to_owned(),
+            reply: "raw & unescaped <> reply".to_owned(),
+        }];
+        let preamble = PetPreambleRenderer.render_preamble(&config);
+        assert!(preamble.contains("<media type=\"image\">a cat</media> & a raw < angle"));
+        assert!(preamble.contains("raw & unescaped <> reply"));
+    }
+
+    #[test]
+    fn empty_examples_render_nothing_and_stay_bit_identical() {
+        // Rule C4 / decision 85: absent or empty `examples` renders
+        // NOTHING — the preamble is byte-identical to the pre-85 format.
+        // (sample_config has empty examples; expected_preamble_without_prefix
+        // is the documented pre-85 layout with no examples section.)
+        let config = sample_config();
+        assert!(config.examples.is_empty());
+        let preamble = PetPreambleRenderer.render_preamble(&config);
+        assert_eq!(preamble, expected_preamble_without_prefix());
+        assert!(!preamble.contains("<example>"));
+        assert!(!preamble.contains("The following examples"));
+    }
+
+    #[test]
+    fn examples_serde_round_trip() {
+        // The `[[examples]]` array parses and serializes losslessly.
+        let config = config_with_examples();
+        let text = toml::to_string(&config).expect("serialize");
+        let parsed = PersonaConfig::from_toml_str(&text).expect("parse");
+        assert_eq!(parsed, config);
+        assert_eq!(parsed.examples.len(), 2);
+        assert_eq!(parsed.examples[0].reply, "so round");
+    }
+
+    #[test]
+    fn a_persona_toml_without_the_examples_key_parses() {
+        // Backward compatibility: a persona file written before decision
+        // 85 has no `examples` key; it must still parse (serde default)
+        // and render the bit-identical pre-85 preamble.
+        let config = PersonaConfig::from_toml_str(FULL_TOML).expect("the pre-85 TOML loads");
+        assert!(config.examples.is_empty());
     }
 
     #[test]
