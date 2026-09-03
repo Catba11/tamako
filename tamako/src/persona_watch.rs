@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tamako_core::actor::{ActorCommand, GroupActorHandle};
-use tamako_persona::{load_persona, PetPreambleRenderer, PreambleRenderer as _};
+use tamako_persona::{load_persona, PetPreambleRenderer, PreambleRenderer as _, SuffixMode};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -31,10 +31,7 @@ pub struct ReloadNotice {
     /// the same file would produce (Rule C4).
     pub preamble: String,
     /// The rendered decision-86 reply suffix body (the `<system>` string
-    /// of `tamako_persona::render_suffix`; EMPTY when the file has no
-    /// `suffix`). Rides the same reload broadcast as the preamble but is
-    /// consumed by the reply generator's shared slot, NOT the actor
-    /// context — the suffix is never part of the cache anchor.
+    /// of `tamako_persona::render_suffix`), rewritten on each reload.
     pub suffix: String,
 }
 
@@ -56,12 +53,16 @@ pub enum PersonaFileOutcome {
 /// reload — the file at `path` either parses and renders or the current
 /// preamble stays. Pure of I/O beyond the one file read; the testable
 /// core of the watcher.
-pub fn evaluate_persona_file(path: &Path, current_preamble: &str) -> PersonaFileOutcome {
+pub fn evaluate_persona_file(
+    path: &Path,
+    current_preamble: &str,
+    suffix_mode: SuffixMode,
+) -> PersonaFileOutcome {
     let persona = match load_persona(path) {
         Ok(persona) => persona,
         Err(error) => return PersonaFileOutcome::Invalid(error.to_string()),
     };
-    let preamble = PetPreambleRenderer.render_preamble(&persona);
+    let preamble = PetPreambleRenderer.render_preamble_for_mode(&persona, suffix_mode);
     if preamble == current_preamble {
         return PersonaFileOutcome::Identical;
     }
@@ -145,6 +146,7 @@ async fn drain_until_quiet<T>(
 pub fn spawn_persona_watcher(
     data_root: PathBuf,
     current_preamble: String,
+    suffix_mode: SuffixMode,
     reload_tx: mpsc::Sender<ReloadNotice>,
 ) -> Option<RecommendedWatcher> {
     let persona_path = data_root.join("persona.toml");
@@ -187,7 +189,7 @@ pub fn spawn_persona_watcher(
                 // The channel closed mid-burst: the watcher is gone.
                 return;
             }
-            match evaluate_persona_file(&persona_path, &current) {
+            match evaluate_persona_file(&persona_path, &current, suffix_mode) {
                 // specs.md Section 5.3 strictness on reload: a malformed
                 // or unreadable file keeps the CURRENT preamble; the
                 // watcher keeps running.
@@ -268,7 +270,7 @@ mod tests {
         let path = write_persona(dir.path(), &valid_persona("Alpha"));
         let expected =
             PetPreambleRenderer.render_preamble(&load_persona(&path).expect("the file parses"));
-        let outcome = evaluate_persona_file(&path, "the stale preamble");
+        let outcome = evaluate_persona_file(&path, "the stale preamble", SuffixMode::System);
         let PersonaFileOutcome::Applied(notice) = outcome else {
             panic!("a changed valid file applies");
         };
@@ -284,7 +286,7 @@ mod tests {
         let path = write_persona(dir.path(), &valid_persona("Alpha"));
         let current =
             PetPreambleRenderer.render_preamble(&load_persona(&path).expect("the file parses"));
-        let outcome = evaluate_persona_file(&path, &current);
+        let outcome = evaluate_persona_file(&path, &current, SuffixMode::System);
         assert!(
             matches!(outcome, PersonaFileOutcome::Identical),
             "a byte-identical render is no reload"
@@ -295,7 +297,7 @@ mod tests {
     fn evaluate_persona_file_rejects_malformed_toml() {
         let dir = tempfile::tempdir().expect("a temporary data root");
         let path = write_persona(dir.path(), "not toml [");
-        let outcome = evaluate_persona_file(&path, "the current preamble");
+        let outcome = evaluate_persona_file(&path, "the current preamble", SuffixMode::System);
         let PersonaFileOutcome::Invalid(error) = outcome else {
             panic!("malformed TOML is invalid");
         };
@@ -310,7 +312,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary data root");
         // Mid-rename save tolerance: the file can be gone at evaluation.
         let path = dir.path().join("persona.toml");
-        let outcome = evaluate_persona_file(&path, "the current preamble");
+        let outcome = evaluate_persona_file(&path, "the current preamble", SuffixMode::System);
         assert!(
             matches!(outcome, PersonaFileOutcome::Invalid(_)),
             "a missing file is invalid, not a crash"
@@ -430,8 +432,13 @@ mod tests {
         let current = PetPreambleRenderer
             .render_preamble(&load_persona(&persona_path).expect("the file parses"));
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
-        let _watcher = spawn_persona_watcher(dir.path().to_path_buf(), current, reload_tx)
-            .expect("the watcher spawns over the temporary directory");
+        let _watcher = spawn_persona_watcher(
+            dir.path().to_path_buf(),
+            current,
+            SuffixMode::System,
+            reload_tx,
+        )
+        .expect("the watcher spawns over the temporary directory");
 
         // A save burst: five rapid rewrites — ONE notice (the debounce).
         for _ in 0..5 {
