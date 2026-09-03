@@ -333,11 +333,13 @@ Global defaults. Every item is overridable per group. Config load WARNs on any T
 | `deep_recall` | true | 9.1 |
 | `recall_candidate_cap` | 40 per wake | 9.1 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
+| `suffix_mode` | `system` | 9.4 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
 
 | Key | Default | Notes |
 |---|---|---|
+| `suffix_mode` | `system` | Decision 88: suffix placement mode in reply requests. `system` (Decision 86 default: separate system message strictly last) or `append` (appended into the final user instruction with an authoritative preamble contract). Environment override: `TAMAKO_SUFFIX_MODE`. |
 | `llm_api` | `anthropic-compatible` | API family: `anthropic-compatible` or `openai-compatible`. The family selects the wire format only, not the vendor. Environment override: `TAMAKO_LLM_API`. |
 | `llm_base_url` | The canonical URL of the selected family | Base URL of the endpoint. Any endpoint that speaks the family format works: first-party, proxy, aggregator, self-hosted. Environment override: `TAMAKO_LLM_BASE_URL`. |
 | `digest_model` | `claude-haiku-4-5` | Extraction (Section 10). Environment override: `TAMAKO_DIGEST_MODEL`. |
