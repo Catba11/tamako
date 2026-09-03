@@ -841,8 +841,11 @@ fn build_wake_services(
 ) -> Result<Option<WakeServices>> {
     match (
         RigGate::from_endpoint(&endpoints.gate),
-        RigReplyGenerator::from_endpoint(&endpoints.reply)
-            .map(|generator| generator.with_suffix_slot(suffix)),
+        RigReplyGenerator::from_endpoint(&endpoints.reply).map(|generator| {
+            generator
+                .with_suffix_slot(suffix)
+                .with_suffix_mode(trigger_config.suffix_mode)
+        }),
     ) {
         (Ok(gate), Ok(reply)) => {
             // specs.md Section 9 step 2 (M5): the shallow recall worker
@@ -1222,7 +1225,8 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
         (Mode::Live, false) => load_persona_strict(&cli.data_root)?,
         _ => load_persona_with_fallback(&cli.data_root),
     };
-    let preamble = PetPreambleRenderer.render_preamble(&persona);
+    let preamble =
+        PetPreambleRenderer.render_preamble_for_mode(&persona, bot_config.global.suffix_mode);
     info!(persona = %persona.name, preamble_len = preamble.len(), "persona preamble rendered");
     // Decision 86: the reply suffix body is rendered once here (the
     // startup value of the shared slot) and re-rendered by the persona
@@ -2883,6 +2887,7 @@ async fn run_live(
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone(),
+        setup.bot_config.global.suffix_mode,
         reload_tx,
     );
     // Decision 77 (H5): one held group lock per served group, dropped

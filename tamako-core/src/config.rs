@@ -16,6 +16,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+pub use tamako_persona::SuffixMode;
+
 /// The shared default base URL of the openai-compatible OpenRouter
 /// endpoints (embedding, decision 66; captioning, decision 82 (c)).
 const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -311,6 +313,11 @@ pub struct TriggerConfig {
     /// 10 s; 0 disables. The TOML key is `u64` seconds, which cannot be
     /// negative — the type IS the validation.
     pub forced_wake_cooldown: Duration,
+    /// The placement mode of the decision-86 suffix in reply requests:
+    /// `system` (the Decision 86 default: separate system message strictly last)
+    /// or `append` (appended into the final user instruction with an authoritative
+    /// preamble contract).
+    pub suffix_mode: SuffixMode,
 }
 
 impl Default for TriggerConfig {
@@ -378,6 +385,7 @@ impl Default for TriggerConfig {
             warmup_topic_cooldown_days: 3,
             monologue_limit: 2,
             forced_wake_cooldown: Duration::from_secs(10),
+            suffix_mode: SuffixMode::System,
         }
     }
 }
@@ -524,6 +532,10 @@ pub struct TriggerConfigToml {
     /// The forced-wake cooldown in seconds (decision 79 (c)); 0
     /// disables. Refer to `TriggerConfig::forced_wake_cooldown`.
     pub forced_wake_cooldown_secs: Option<u64>,
+    /// The placement mode of the decision-86 suffix. Refer to
+    /// `TriggerConfig::suffix_mode`.
+    #[serde(alias = "suffix-mode")]
+    pub suffix_mode: Option<SuffixMode>,
     /// Unknown keys land here (decision 84 (e)) and are WARNed about at
     /// load, never applied. `flatten` keeps forward compatibility: a
     /// newer config's keys don't hard-fail an older binary (no
@@ -741,6 +753,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.forced_wake_cooldown_secs {
             base.forced_wake_cooldown = Duration::from_secs(value);
+        }
+        if let Some(value) = self.suffix_mode {
+            base.suffix_mode = value;
         }
     }
 }
@@ -1943,5 +1958,29 @@ digest_max_chars_bytes = 4096
             unknown_keys(&with_typo),
             vec![("global".to_string(), "future_key".to_string())]
         );
+    }
+
+    #[test]
+    fn suffix_mode_defaults_to_system() {
+        let config = TriggerConfig::default();
+        assert_eq!(config.suffix_mode, SuffixMode::System);
+    }
+
+    #[test]
+    fn suffix_mode_parses_from_toml_and_overrides_per_group() {
+        let toml = r#"
+[global]
+suffix_mode = "append"
+
+[groups."-100123"]
+suffix-mode = "system"
+
+[groups."-100456"]
+# Uses global
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        assert_eq!(config.global.suffix_mode, SuffixMode::Append);
+        assert_eq!(config.for_group("-100123").suffix_mode, SuffixMode::System);
+        assert_eq!(config.for_group("-100456").suffix_mode, SuffixMode::Append);
     }
 }
