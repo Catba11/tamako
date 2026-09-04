@@ -474,18 +474,28 @@ async fn main() -> ExitCode {
 /// Loads the bot configuration. No path, or a path that does not exist,
 /// gives the global defaults of specs.md Section 13.
 fn load_bot_config(path: Option<&Path>) -> Result<BotConfig> {
-    let Some(path) = path else {
-        return Ok(BotConfig::default());
+    let mut config = match path {
+        Some(path) if path.exists() => {
+            let text = std::fs::read_to_string(path).with_context(|| {
+                format!("failed to read the configuration file {}", path.display())
+            })?;
+            let config = BotConfig::from_toml_str(&text).with_context(|| {
+                format!("failed to parse the configuration file {}", path.display())
+            })?;
+            info!(path = %path.display(), "bot configuration loaded");
+            config
+        }
+        Some(path) => {
+            warn!(path = %path.display(), "configuration file not found; using the global defaults");
+            BotConfig::default()
+        }
+        None => BotConfig::default(),
     };
-    if !path.exists() {
-        warn!(path = %path.display(), "configuration file not found; using the global defaults");
-        return Ok(BotConfig::default());
-    }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read the configuration file {}", path.display()))?;
-    let config = BotConfig::from_toml_str(&text)
-        .with_context(|| format!("failed to parse the configuration file {}", path.display()))?;
-    info!(path = %path.display(), "bot configuration loaded");
+    // Decision 90: the trigger-key environment overrides
+    // (TAMAKO_SUFFIX_MODE, TAMAKO_TIMEZONE) replace the GLOBAL values —
+    // they apply over the file-less defaults too, and per-group TOML
+    // still wins over them.
+    config.apply_trigger_env_overrides()?;
     Ok(config)
 }
 
@@ -845,6 +855,7 @@ fn build_wake_services(
             generator
                 .with_suffix_slot(suffix)
                 .with_suffix_mode(trigger_config.suffix_mode)
+                .with_timezone(trigger_config.timezone)
         }),
     ) {
         (Ok(gate), Ok(reply)) => {

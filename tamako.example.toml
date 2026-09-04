@@ -112,6 +112,10 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # recall_injection_cap = 5
 # reply_quote_threshold = 10    # quote the reply target only beyond this (6.2)
 # gate_context = true           # the gates see the shared context view (9.6)
+# suffix_mode = "system"          # suffix placement (9.4, decision 88): "system" (separate trailing
+#                                 # system message) or "append" (merged into the final user instruction)
+# timezone = "Asia/Shanghai"        # decision 90: the reply-suffix <now> current-time line; an IANA
+#                                 # name or a fixed "+08:00" offset; unset = no time line
 
 # ------------------------------------------------------- Memory (P2) ----
 # vector_resolution = true          # step-3 vector pre-screen (graph 7.4)

@@ -65,6 +65,10 @@ rand = "0.9"
 # `local-offset` feature backs the warmup trigger's host-local
 # active-hours window (specs.md Section 8.4, decision 78).
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
+# IANA timezone database for the decision-90 reply-suffix time line
+# (tamako-persona only). Integrates with the `time` crate above — the
+# project does NOT adopt chrono for this.
+time-tz = "2"
 
 # LLM client for the digest extraction (tamako-agent only). rig entered in
 # Phase 1 (AGENT.md Section 3). rig-core 0.41 has no Extractor type:

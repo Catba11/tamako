@@ -16,7 +16,7 @@ use tamako_core::context::{ContextMessage, ContextRole};
 use tamako_core::wake::{
     filter_reply_parrot_lines, GateMessage, ReplyFilterOutcome, ReplyGenerator, ReplyRequest,
 };
-use tamako_persona::SuffixMode;
+use tamako_persona::{ResolvedTimezone, SuffixMode};
 
 use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
@@ -124,7 +124,15 @@ pub fn render_reply_instruction(target: &GateMessage) -> String {
 
 /// Assembles the rig message list of one reply call (decision 86): the
 /// context messages, then the ephemeral reply instruction, then — only
-/// when the rendered suffix is non-empty — the suffix according to `mode`.
+/// when the effective suffix is non-empty — the suffix according to
+/// `mode`.
+///
+/// Decision 90: with `timezone` set, the code-owned `<now>` element is
+/// rendered per request from `now` and spliced in as the FIRST child of
+/// `<system>` (ahead of every operator rule). An EMPTY persona suffix
+/// with a zone set still produces a suffix message (the `<now>` block
+/// alone). With NO zone the suffix passes through untouched — the
+/// layout is byte-identical to pre-90.
 ///
 /// In `SuffixMode::System` (decision 86 default), the suffix lands as ONE
 /// system-role message STRICTLY LAST.
@@ -135,22 +143,35 @@ fn assemble_reply_messages(
     request: &ReplyRequest,
     suffix: &str,
     mode: SuffixMode,
+    now: time::OffsetDateTime,
+    timezone: Option<&ResolvedTimezone>,
 ) -> (Option<String>, Vec<Message>) {
     let (preamble, mut messages) = context_messages_to_rig(&request.messages);
     let base_instruction = render_reply_instruction(&request.target);
 
+    // Decision 90: the <now> element is composed into the suffix body
+    // BEFORE the mode match, so both modes treat the result as one
+    // effective suffix.
+    let effective = match timezone {
+        Some(zone) => tamako_persona::splice_now_element(
+            suffix,
+            &tamako_persona::render_now_element(&now, zone),
+        ),
+        None => suffix.to_owned(),
+    };
+
     match mode {
         SuffixMode::System => {
             messages.push(Message::user(base_instruction));
-            if !suffix.is_empty() {
-                messages.push(Message::system(suffix));
+            if !effective.is_empty() {
+                messages.push(Message::system(effective));
             }
         }
         SuffixMode::Append => {
-            if suffix.is_empty() {
+            if effective.is_empty() {
                 messages.push(Message::user(base_instruction));
             } else {
-                let merged = format!("{base_instruction}\n\n{suffix}");
+                let merged = format!("{base_instruction}\n\n{effective}");
                 messages.push(Message::user(merged));
             }
         }
@@ -226,6 +247,11 @@ pub struct RigReplyGenerator {
     suffix: Arc<RwLock<String>>,
     /// The placement mode for the decision-86 suffix.
     suffix_mode: SuffixMode,
+    /// The decision-90 reply-suffix current-time zone. `None` renders
+    /// no <now> element (byte-identical pre-90 behavior). Read at
+    /// request-assembly time; NOT hot-reloadable (it is a tamako.toml
+    /// key, not persona content).
+    timezone: Option<ResolvedTimezone>,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -237,6 +263,7 @@ impl std::fmt::Debug for RigReplyGenerator {
             .field("client", &self.client)
             .field("max_tokens", &self.max_tokens)
             .field("suffix_mode", &self.suffix_mode)
+            .field("timezone", &self.timezone)
             .finish_non_exhaustive()
     }
 }
@@ -251,6 +278,7 @@ impl RigReplyGenerator {
             max_tokens,
             suffix: Arc::new(RwLock::new(String::new())),
             suffix_mode: SuffixMode::System,
+            timezone: None,
         }
     }
 
@@ -280,6 +308,16 @@ impl RigReplyGenerator {
         self.suffix_mode = mode;
         self
     }
+
+    /// Configures the decision-90 current-time zone. When set, every
+    /// reply request's suffix gains the code-owned <now> element as the
+    /// FIRST child of <system> (ahead of every operator rule), rendered
+    /// per request past the cached prefix — the decision-86 (d)
+    /// cache-anchor property is preserved.
+    pub fn with_timezone(mut self, timezone: Option<ResolvedTimezone>) -> Self {
+        self.timezone = timezone;
+        self
+    }
 }
 
 impl ReplyGenerator for RigReplyGenerator {
@@ -294,7 +332,13 @@ impl ReplyGenerator for RigReplyGenerator {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            let (preamble, messages) = assemble_reply_messages(request, &suffix, self.suffix_mode);
+            let (preamble, messages) = assemble_reply_messages(
+                request,
+                &suffix,
+                self.suffix_mode,
+                time::OffsetDateTime::now_utc(),
+                self.timezone.as_ref(),
+            );
             let text = self
                 .client
                 .complete(
@@ -509,8 +553,13 @@ mod tests {
         // Decision 86 (a)/(b): ONE system-role message, STRICTLY LAST —
         // after the newest context message AND the reply instruction.
         let suffix = render_suffix(&["rule one".to_owned(), "rule two".to_owned()]);
-        let (preamble, messages) =
-            assemble_reply_messages(&sample_request(), &suffix, SuffixMode::System);
+        let (preamble, messages) = assemble_reply_messages(
+            &sample_request(),
+            &suffix,
+            SuffixMode::System,
+            time::macros::datetime!(2026-09-04 13:35 UTC),
+            None,
+        );
         // The preamble still extracts as item 0.
         assert_eq!(preamble.as_deref(), Some("You are the group pet."));
         let last = messages.last().expect("a last message");
@@ -547,8 +596,13 @@ mod tests {
     #[test]
     fn append_mode_merges_suffix_into_last_user_message() {
         let suffix = render_suffix(&["rule one".to_owned()]);
-        let (preamble, messages) =
-            assemble_reply_messages(&sample_request(), &suffix, SuffixMode::Append);
+        let (preamble, messages) = assemble_reply_messages(
+            &sample_request(),
+            &suffix,
+            SuffixMode::Append,
+            time::macros::datetime!(2026-09-04 13:35 UTC),
+            None,
+        );
         assert_eq!(preamble.as_deref(), Some("You are the group pet."));
         let rendered: Vec<(&str, String)> = messages.iter().map(role_and_text).collect();
         // 3 context messages + 1 user message (with merged suffix); NO trailing system.
@@ -566,13 +620,154 @@ mod tests {
         // message list is byte-identical to the pre-86 layout (the C4
         // property at the tail). The last message is the reply instruction.
         for mode in [SuffixMode::System, SuffixMode::Append] {
-            let (_, with_empty) = assemble_reply_messages(&sample_request(), "", mode);
+            let (_, with_empty) = assemble_reply_messages(
+                &sample_request(),
+                "",
+                mode,
+                time::macros::datetime!(2026-09-04 13:35 UTC),
+                None,
+            );
             let rendered: Vec<(&str, String)> = with_empty.iter().map(role_and_text).collect();
             // 3 context messages + the reply instruction; NO trailing system.
             assert_eq!(rendered.len(), 4);
             assert_eq!(rendered.last().map(|(role, _)| *role), Some("user"));
             assert!(!rendered.iter().any(|(role, _)| *role == "system"));
         }
+    }
+
+    #[test]
+    fn the_now_element_is_the_first_child_of_the_suffix_system_block() {
+        // Decision 90: the code-owned <now> element lands as the FIRST
+        // child of <system>, ahead of every operator rule. 13:35 UTC is
+        // 21:35 in Asia/Shanghai (UTC+08:00, no DST).
+        let suffix = render_suffix(&["rule one".to_owned(), "rule two".to_owned()]);
+        let zone = ResolvedTimezone::from_config_value("Asia/Shanghai").expect("a known zone");
+        let (_, messages) = assemble_reply_messages(
+            &sample_request(),
+            &suffix,
+            SuffixMode::System,
+            time::macros::datetime!(2026-09-04 13:35 UTC),
+            Some(&zone),
+        );
+        let last = messages.last().expect("a last message");
+        match last {
+            Message::System { content } => {
+                assert!(content.contains(
+                    "<system>\n<now>Current time: Friday 2026-09-04 21:35 (Asia/Shanghai, UTC+08:00).</now>\n<rule1>"
+                ));
+            }
+            other => panic!("the suffix must be a system message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_suffix_with_a_timezone_still_produces_the_now_message() {
+        // Decision 90: an EMPTY persona suffix with a zone set still
+        // produces a suffix message — the <now> block alone, wrapped in
+        // <system> by splice_now_element. Pre-90 an empty suffix
+        // appended NO message at all.
+        let zone = ResolvedTimezone::from_config_value("Asia/Shanghai").expect("a known zone");
+        let now = time::macros::datetime!(2026-09-04 13:35 UTC);
+
+        // System mode: ONE trailing system-role message carrying the
+        // <now> block and NO operator rule.
+        let (_, messages) =
+            assemble_reply_messages(&sample_request(), "", SuffixMode::System, now, Some(&zone));
+        let last = messages.last().expect("a last message");
+        match last {
+            Message::System { content } => {
+                assert!(content.contains(
+                    "<system>\n<now>Current time: Friday 2026-09-04 21:35 (Asia/Shanghai, UTC+08:00).</now>\n</system>"
+                ));
+                assert!(!content.contains("<rule1>"));
+            }
+            other => panic!("the now block must be a system message, got {other:?}"),
+        }
+
+        // Append mode: the <system>/<now> block rides inside the merged
+        // user message, AFTER the reply instruction; NO trailing system.
+        let (_, messages) =
+            assemble_reply_messages(&sample_request(), "", SuffixMode::Append, now, Some(&zone));
+        let rendered: Vec<(&str, String)> = messages.iter().map(role_and_text).collect();
+        let (last_role, last_text) = rendered.last().unwrap();
+        assert_eq!(*last_role, "user");
+        let block_at = last_text.find("<system>\n<now>").expect("the now block");
+        assert!(
+            last_text[..block_at].contains("Reply to THIS message"),
+            "the instruction precedes the now block"
+        );
+        assert!(!last_text.contains("<rule1>"));
+        assert!(!rendered.iter().any(|(role, _)| *role == "system"));
+    }
+
+    #[test]
+    fn no_timezone_keeps_the_pre90_layout_byte_identical() {
+        // Decision 90 with NO zone: the None arm passes the suffix
+        // through untouched, so the message list is byte-identical to
+        // the pre-90 layout in both modes.
+        let now = time::macros::datetime!(2026-09-04 13:35 UTC);
+        let request = sample_request();
+        let instruction = render_reply_instruction(&request.target);
+        let base: Vec<(&str, String)> = vec![
+            ("user", "[Alice 13:01] hungry".to_string()),
+            ("assistant", "the cafe on main street".to_string()),
+            ("user", "[Bob 13:02] what should we eat?".to_string()),
+            ("user", instruction.clone()),
+        ];
+
+        // An EMPTY suffix with no zone: the pre-86 layout, both modes.
+        for mode in [SuffixMode::System, SuffixMode::Append] {
+            let (_, messages) = assemble_reply_messages(&request, "", mode, now, None);
+            let rendered: Vec<(&str, String)> = messages.iter().map(role_and_text).collect();
+            assert_eq!(rendered, base, "empty suffix, mode {mode:?}");
+        }
+
+        // A non-empty suffix with no zone: the pre-90 layout, and NO
+        // <now> element anywhere.
+        let suffix = render_suffix(&["rule one".to_owned()]);
+        let mut system_expected = base.clone();
+        system_expected.push(("system", suffix.clone()));
+        let mut append_expected = base;
+        append_expected.pop();
+        append_expected.push(("user", format!("{instruction}\n\n{suffix}")));
+        for (mode, expected) in [
+            (SuffixMode::System, system_expected),
+            (SuffixMode::Append, append_expected),
+        ] {
+            let (_, messages) = assemble_reply_messages(&request, &suffix, mode, now, None);
+            let rendered: Vec<(&str, String)> = messages.iter().map(role_and_text).collect();
+            assert_eq!(rendered, expected, "non-empty suffix, mode {mode:?}");
+            assert!(!rendered.iter().any(|(_, text)| text.contains("<now>")));
+        }
+    }
+
+    #[test]
+    fn append_mode_places_now_inside_the_merged_user_message() {
+        // Decision 90 in Append mode: ONE trailing user message carries
+        // the reply instruction, then the <system> block whose FIRST
+        // child is <now>, ahead of every operator rule.
+        let suffix = render_suffix(&["rule one".to_owned()]);
+        let zone = ResolvedTimezone::from_config_value("Asia/Shanghai").expect("a known zone");
+        let (_, messages) = assemble_reply_messages(
+            &sample_request(),
+            &suffix,
+            SuffixMode::Append,
+            time::macros::datetime!(2026-09-04 13:35 UTC),
+            Some(&zone),
+        );
+        let rendered: Vec<(&str, String)> = messages.iter().map(role_and_text).collect();
+        // 3 context messages + 1 merged user message; NO trailing system.
+        assert_eq!(rendered.len(), 4);
+        let (last_role, last_text) = rendered.last().unwrap();
+        assert_eq!(*last_role, "user");
+        let instruction_at = last_text
+            .find("Reply to THIS message")
+            .expect("the instruction");
+        let now_at = last_text.find("<now>").expect("the now element");
+        let rule_at = last_text.find("<rule1>").expect("the first rule");
+        assert!(instruction_at < now_at, "the instruction precedes <now>");
+        assert!(now_at < rule_at, "<now> precedes every operator rule");
+        assert!(!rendered.iter().any(|(role, _)| *role == "system"));
     }
 
     #[test]

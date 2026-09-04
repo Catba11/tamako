@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-pub use tamako_persona::SuffixMode;
+pub use tamako_persona::{ResolvedTimezone, SuffixMode};
 
 /// The shared default base URL of the openai-compatible OpenRouter
 /// endpoints (embedding, decision 66; captioning, decision 82 (c)).
@@ -318,6 +318,17 @@ pub struct TriggerConfig {
     /// or `append` (appended into the final user instruction with an authoritative
     /// preamble contract).
     pub suffix_mode: SuffixMode,
+    /// specs.md Section 13 (decision 90): the reply-suffix current-time
+    /// timezone — an IANA zone name (`Asia/Shanghai`; DST-aware via the
+    /// time-tz database) or a fixed `±HH:MM` offset (`+08:00`). The key
+    /// is BOTH the zone and the switch: unset (or an empty string, the
+    /// decision-87 discipline) means NO `<now>` time line in the reply
+    /// suffix — byte-identical pre-90 behavior. An unknown zone name is
+    /// a hard startup error (decision 45). Overridable per group, with
+    /// the accepted Option asymmetry: a group can SET or REPLACE the
+    /// zone but CANNOT disable a globally-set zone (an empty group
+    /// value parses as unset, which keeps the global value).
+    pub timezone: Option<ResolvedTimezone>,
 }
 
 impl Default for TriggerConfig {
@@ -386,6 +397,7 @@ impl Default for TriggerConfig {
             monologue_limit: 2,
             forced_wake_cooldown: Duration::from_secs(10),
             suffix_mode: SuffixMode::System,
+            timezone: None,
         }
     }
 }
@@ -536,6 +548,13 @@ pub struct TriggerConfigToml {
     /// `TriggerConfig::suffix_mode`.
     #[serde(alias = "suffix-mode")]
     pub suffix_mode: Option<SuffixMode>,
+    /// The decision-90 reply-suffix current-time timezone. Refer to
+    /// `TriggerConfig::timezone`. A single word, no alias. The empty
+    /// string parses as UNSET (the decision-87 discipline; see
+    /// [`empty_string_is_unset`]) — a plain `Option<ResolvedTimezone>`
+    /// would hard-error on it.
+    #[serde(default, deserialize_with = "empty_string_is_unset")]
+    pub timezone: Option<ResolvedTimezone>,
     /// Unknown keys land here (decision 84 (e)) and are WARNed about at
     /// load, never applied. `flatten` keeps forward compatibility: a
     /// newer config's keys don't hard-fail an older binary (no
@@ -544,6 +563,26 @@ pub struct TriggerConfigToml {
     /// struct literally. `BTreeMap` keeps the WARN order deterministic.
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
+}
+
+/// The decision-87 "empty string counts as unset" discipline for the
+/// decision-90 `timezone` key: `timezone = ""` deserializes to `None`
+/// (no time line) instead of erroring — a plain
+/// `Option<ResolvedTimezone>` would HARD-ERROR on the empty string
+/// because `ResolvedTimezone::from_config_value` rejects it. Every
+/// other value delegates to `ResolvedTimezone`'s own parsing, so an
+/// unknown zone name stays a hard startup error (decision 45).
+fn empty_string_is_unset<'de, D>(deserializer: D) -> Result<Option<ResolvedTimezone>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match <Option<String> as serde::Deserialize>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(value) if value.trim().is_empty() => Ok(None),
+        Some(value) => ResolvedTimezone::from_config_value(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 impl TriggerConfigToml {
@@ -757,6 +796,12 @@ impl TriggerConfigToml {
         if let Some(value) = self.suffix_mode {
             base.suffix_mode = value;
         }
+        // Decision 90: an overlay can SET or REPLACE the zone but never
+        // disable it — an empty group value already parsed as `None`
+        // (decision 87), which keeps the base value here.
+        if let Some(value) = self.timezone {
+            base.timezone = Some(value);
+        }
     }
 }
 
@@ -787,6 +832,20 @@ pub enum ConfigError {
         /// The group context: " under [groups.-1001]", or "" under
         /// [global].
         group_context: String,
+        /// The offending value.
+        value: String,
+        /// Why the value is invalid.
+        reason: String,
+    },
+    /// A trigger-key environment override (decision 90) —
+    /// `TAMAKO_SUFFIX_MODE` or `TAMAKO_TIMEZONE` — carries a value that
+    /// is neither valid nor empty (an empty value counts as unset,
+    /// decision 87). Loud at startup (specs.md Section 5.3), never a
+    /// silent fallback.
+    #[error("invalid value for environment variable {var}: {value:?} — {reason}")]
+    InvalidEnvValue {
+        /// The offending variable name.
+        var: &'static str,
         /// The offending value.
         value: String,
         /// Why the value is invalid.
@@ -856,6 +915,24 @@ fn unknown_keys(parsed: &BotConfigToml) -> Vec<(String, String)> {
         );
     }
     out
+}
+
+/// Reads one trigger-key environment override of decision 90
+/// (`TAMAKO_SUFFIX_MODE`, `TAMAKO_TIMEZONE`). A missing variable and an
+/// empty-after-trim value both count as UNSET (the decision-87
+/// discipline); a non-Unicode value is a hard error (specs.md
+/// Section 5.3 strict startup).
+fn trigger_env_value(var: &'static str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(var) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEnvValue {
+            var,
+            value: "<not valid Unicode>".to_string(),
+            reason: "the value is not valid Unicode".to_string(),
+        }),
+    }
 }
 
 /// The root configuration of the bot.
@@ -934,6 +1011,38 @@ impl BotConfig {
             global,
             overrides: parsed.groups,
         })
+    }
+
+    /// Decision 90: applies the trigger-key environment overrides to the
+    /// GLOBAL config — `TAMAKO_SUFFIX_MODE` (system|append) and
+    /// `TAMAKO_TIMEZONE` (fixed ±HH:MM offset or IANA name). Per-group
+    /// TOML still wins (specific beats general): the env value replaces
+    /// the global value only. Empty string counts as unset (decision 87).
+    /// An invalid value is a hard error (Section 5.3 strict startup).
+    pub fn apply_trigger_env_overrides(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = trigger_env_value("TAMAKO_SUFFIX_MODE")? {
+            self.global.suffix_mode = match value.as_str() {
+                "system" => SuffixMode::System,
+                "append" => SuffixMode::Append,
+                _ => {
+                    return Err(ConfigError::InvalidEnvValue {
+                        var: "TAMAKO_SUFFIX_MODE",
+                        value,
+                        reason: "expected 'system' or 'append' (specs.md Section 13)".to_string(),
+                    });
+                }
+            };
+        }
+        if let Some(value) = trigger_env_value("TAMAKO_TIMEZONE")? {
+            self.global.timezone = Some(ResolvedTimezone::from_config_value(&value).map_err(
+                |error| ConfigError::InvalidEnvValue {
+                    var: "TAMAKO_TIMEZONE",
+                    value,
+                    reason: error.to_string(),
+                },
+            )?);
+        }
+        Ok(())
     }
 }
 
@@ -1982,5 +2091,283 @@ suffix-mode = "system"
         assert_eq!(config.global.suffix_mode, SuffixMode::Append);
         assert_eq!(config.for_group("-100123").suffix_mode, SuffixMode::System);
         assert_eq!(config.for_group("-100456").suffix_mode, SuffixMode::Append);
+    }
+
+    /// Serializes the tests that mutate the process env vars of the
+    /// decision-90 trigger-key overrides. Env mutation is
+    /// process-global; the lock keeps the tests hermetic against each
+    /// other. Local copy of the tamako-agent `env_lock` pattern
+    /// (src/endpoint.rs) — no cross-crate import.
+    mod env_guard {
+        /// The process-global env mutex.
+        pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    }
+
+    /// The env vars of the decision-90 trigger-key overrides. Tests
+    /// remove them up front and restore them on drop.
+    const TRIGGER_ENV_VARS: &[&str] = &["TAMAKO_SUFFIX_MODE", "TAMAKO_TIMEZONE"];
+
+    /// Saves, clears, and restores the trigger-key env vars. Hermetic
+    /// env handling.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn cleared() -> (std::sync::MutexGuard<'static, ()>, Self) {
+            let lock = env_guard::ENV_LOCK.lock().unwrap();
+            let guard = EnvGuard {
+                saved: TRIGGER_ENV_VARS
+                    .iter()
+                    .map(|name| (*name, std::env::var(name).ok()))
+                    .collect(),
+            };
+            for name in TRIGGER_ENV_VARS {
+                std::env::remove_var(name);
+            }
+            (lock, guard)
+        }
+
+        fn set(&self, name: &str, value: &str) {
+            std::env::set_var(name, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timezone_defaults_to_unset() {
+        let config = TriggerConfig::default();
+        // Unset means NO time line — byte-identical pre-90 behavior.
+        assert_eq!(config.timezone, None);
+    }
+
+    #[test]
+    fn timezone_parses_from_toml_and_overrides_per_group() {
+        let toml = r#"
+[global]
+timezone = "Asia/Shanghai"
+
+[groups."-100123"]
+timezone = "+08:00"
+
+[groups."-100456"]
+# Uses global
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        let shanghai = ResolvedTimezone::from_config_value("Asia/Shanghai").unwrap();
+        let fixed = ResolvedTimezone::from_config_value("+08:00").unwrap();
+        assert_eq!(config.global.timezone, Some(shanghai));
+        assert_eq!(config.for_group("-100123").timezone, Some(fixed));
+        assert_eq!(config.for_group("-100456").timezone, Some(shanghai));
+    }
+
+    #[test]
+    fn an_empty_timezone_string_counts_as_unset() {
+        // The decision-87 discipline (decision 90): `timezone = ""`
+        // parses as UNSET — no hard error, no time line — in the
+        // global table and in a group table alike.
+        let toml = r#"
+[global]
+timezone = ""
+
+[groups."-100123"]
+timezone = ""
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        assert_eq!(config.global.timezone, None);
+        assert_eq!(config.for_group("-100123").timezone, None);
+    }
+
+    #[test]
+    fn a_group_cannot_disable_a_global_timezone() {
+        // The accepted Option asymmetry of decision 90: an empty group
+        // value parses as unset, and unset KEEPS the global value.
+        let toml = r#"
+[global]
+timezone = "Asia/Shanghai"
+
+[groups."-100123"]
+timezone = ""
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        let shanghai = ResolvedTimezone::from_config_value("Asia/Shanghai").unwrap();
+        assert_eq!(config.for_group("-100123").timezone, Some(shanghai));
+    }
+
+    #[test]
+    fn an_unknown_timezone_is_a_hard_parse_error() {
+        // Decision 45 / specs.md Section 5.3 strict startup: an unknown
+        // zone name fails the parse, never a silent fallback.
+        let toml = r#"
+[global]
+timezone = "Mars/Olympus_Mons"
+"#;
+        match BotConfig::from_toml_str(toml) {
+            Err(ConfigError::Parse(_)) => {}
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suffix_mode_env_replaces_global() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_SUFFIX_MODE", "append");
+        let toml = r#"
+[global]
+suffix_mode = "system"
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        assert_eq!(config.global.suffix_mode, SuffixMode::Append);
+    }
+
+    #[test]
+    fn suffix_mode_env_loses_to_per_group_toml() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_SUFFIX_MODE", "append");
+        let toml = r#"
+[global]
+suffix_mode = "system"
+
+[groups."-100123"]
+suffix_mode = "system"
+
+[groups."-100456"]
+# Uses global
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        // The env value replaced the GLOBAL value...
+        assert_eq!(config.global.suffix_mode, SuffixMode::Append);
+        // ...but per-group TOML still wins (specific beats general)...
+        assert_eq!(config.for_group("-100123").suffix_mode, SuffixMode::System);
+        // ...and a group without an override inherits the env value.
+        assert_eq!(config.for_group("-100456").suffix_mode, SuffixMode::Append);
+    }
+
+    #[test]
+    fn an_empty_suffix_mode_env_counts_as_unset() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_SUFFIX_MODE", "  ");
+        let toml = r#"
+[global]
+suffix_mode = "append"
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        // Empty-after-trim env = unset (decision 87): the TOML value
+        // survives.
+        assert_eq!(config.global.suffix_mode, SuffixMode::Append);
+    }
+
+    #[test]
+    fn an_invalid_suffix_mode_env_is_a_hard_error() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_SUFFIX_MODE", "prepend");
+        let mut config = BotConfig::default();
+        match config.apply_trigger_env_overrides() {
+            Err(ConfigError::InvalidEnvValue { var, value, .. }) => {
+                assert_eq!(var, "TAMAKO_SUFFIX_MODE");
+                assert_eq!(value, "prepend");
+            }
+            other => panic!("expected InvalidEnvValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timezone_env_replaces_global() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_TIMEZONE", "Europe/Berlin");
+        let toml = r#"
+[global]
+timezone = "Asia/Shanghai"
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        let berlin = ResolvedTimezone::from_config_value("Europe/Berlin").unwrap();
+        assert_eq!(config.global.timezone, Some(berlin));
+    }
+
+    #[test]
+    fn timezone_env_loses_to_per_group_toml() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_TIMEZONE", "Europe/Berlin");
+        let toml = r#"
+[global]
+timezone = "Asia/Shanghai"
+
+[groups."-100123"]
+timezone = "+08:00"
+
+[groups."-100456"]
+# Uses global
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        let berlin = ResolvedTimezone::from_config_value("Europe/Berlin").unwrap();
+        let fixed = ResolvedTimezone::from_config_value("+08:00").unwrap();
+        // The env value replaced the GLOBAL value...
+        assert_eq!(config.global.timezone, Some(berlin));
+        // ...but per-group TOML still wins (specific beats general)...
+        assert_eq!(config.for_group("-100123").timezone, Some(fixed));
+        // ...and a group without an override inherits the env value.
+        assert_eq!(config.for_group("-100456").timezone, Some(berlin));
+    }
+
+    #[test]
+    fn an_empty_timezone_env_counts_as_unset() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_TIMEZONE", "");
+        // Empty env = unset (decision 87): a TOML value survives...
+        let toml = r#"
+[global]
+timezone = "Asia/Shanghai"
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        let shanghai = ResolvedTimezone::from_config_value("Asia/Shanghai").unwrap();
+        assert_eq!(config.global.timezone, Some(shanghai));
+        // ...and an unset global stays unset.
+        let mut config = BotConfig::default();
+        config
+            .apply_trigger_env_overrides()
+            .expect("env overrides apply");
+        assert_eq!(config.global.timezone, None);
+    }
+
+    #[test]
+    fn an_invalid_timezone_env_is_a_hard_error() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_TIMEZONE", "Mars/Olympus_Mons");
+        let mut config = BotConfig::default();
+        match config.apply_trigger_env_overrides() {
+            Err(ConfigError::InvalidEnvValue { var, value, .. }) => {
+                assert_eq!(var, "TAMAKO_TIMEZONE");
+                assert_eq!(value, "Mars/Olympus_Mons");
+            }
+            other => panic!("expected InvalidEnvValue, got {other:?}"),
+        }
     }
 }
