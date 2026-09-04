@@ -2221,6 +2221,30 @@ v0.0.1 (alpha).
     AGENT.md Section 3 rode along: the scope guard now names the
     Phase 3 deferred set.
 
+90. (2026-09-04) Reply-suffix current-time line and the `timezone`
+    config key (specs.md Section 13). The model saw only UTC `HH:MM`
+    message attributes (Section 7.3) — no date, no zone, no "now".
+    Decision: a CODE-OWNED `<now>` element, rendered per request at
+    assembly time as the FIRST child of the suffix `<system>` block
+    (ahead of every operator `<ruleN>`), riding the decision-86
+    strictly-last channel — a per-request tail invalidates no cache
+    anchor, so the 86 (d) property is preserved. Persona suffix
+    entries stay verbatim (86 (e)): NO placeholder template layer —
+    the line is mechanism, not persona content. The `timezone` key
+    (TriggerConfig, global + per-group, like `suffix_mode`) is BOTH
+    the zone and the switch: unset (or empty string, the decision-87
+    discipline) means no time line — byte-identical pre-90 behavior.
+    Values: an IANA name (`Asia/Shanghai`; DST-aware via the new
+    time-tz dependency — the workspace keeps the `time` crate, NOT
+    chrono) or a fixed `±HH:MM` offset; an unknown name is a hard
+    startup error (decision 45). Scope: reply only (86 (g)) — gate,
+    digest, and summary get no time line. The same change
+    IMPLEMENTS the documented-but-missing `TAMAKO_SUFFIX_MODE` env
+    override (a specs.md Section 13 vs config.rs gap) and adds
+    `TAMAKO_TIMEZONE`; precedence for both: per-group TOML > env >
+    global TOML > default. Follow-up (not scheduled): render the
+    Section 7.3 context `at=` attributes in the configured zone.
+
 ## 4. Known gaps carried into Phase 1 (after M6)
 
 Deliberately not done, in priority order:
