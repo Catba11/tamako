@@ -42,14 +42,18 @@ v0.0.1 (alpha).
   (decision 80: live-only debounced watcher, inbox-serialized
   in-memory item-0 swap, born-current late spawns). Next: metrics
   (roadmap item 9) — the last Phase 2 item.
-  - **Branch `catball-self-use` carries decision 81** (embedding
-    model switch to `google/gemini-embedding-2` @ 3072 native dims,
-    migration v11): the branch is the operator's self-use track —
-    the switch lands there first, with main's thresholds now
-    uncalibrated-provisional in the docs; merging back is an
-    operator decision after the recalibration window. DEPLOYED
-    2026-08-22 (decisions 73–81 in one restart; v8/v9/v10/v11
-    applied on boot; the batch-API addendum fix included).
+  - **Decisions 81–88 landed on main 2026-09-04** (decision 89
+    merge-back): the embedding model switch (`google/gemini-embedding-2`
+    @ 3072 native dims, migration v11), media captioning,
+    related_pairs, dual session headers, preamble examples, the
+    tail suffix, per-purpose API keys, and suffix_mode are all on
+    main. The branch keeps only the self-use prompt set of
+    decision 55 plus its 2026-08 addition (the digest/summary
+    directive block); the branch topology is now "main plus six
+    private patches" and merges back by a small rebase. The
+    decision-81 deploy note stands: DEPLOYED 2026-08-22
+    (decisions 73–81 in one restart; v8/v9/v10/v11 applied on
+    boot; the batch-API addendum fix included).
   - **M1 (digest pipeline end to end): COMPLETE.** The pipeline runs
     against the replayed log before any live traffic: batch assembly,
     skeleton skip, rig extraction with the `KnowledgeGraph` schema,
@@ -2191,6 +2195,31 @@ v0.0.1 (alpha).
     the decision-84 M5 follow-up) keep the family key. Empty
     string counts as unset (falls through to the family key),
     matching the existing env-value discipline.
+
+89. (2026-09-04) Merge-back of `catball-self-use`: the branch was
+    rebased into a two-tier stack — the 34 main-bound commits
+    (decisions 81–88, fixes, tests; decision 88 itself is recorded
+    in specs.md Sections 5.3/9.4/13 and the Section 2 crate rows,
+    no Section 3 entry) followed by the self-use prompt set at the
+    tip — and main fast-forwarded to the boundary commit. Three
+    mixed commits were split hunk-level: the gate-calibration test
+    flip of the decision-81 batch stays branch-side (main keeps the
+    50-percent bound of the pre-rebalance preamble, decision 55),
+    the directive_zero Scope clause and its two pin tests of the
+    review-batch-1 commit stay branch-side (the media-is-data
+    rules, their content pins, the caption timeout, and the
+    usage-purpose stamping land), and the Section 10.1 bullet of
+    the review-engagement backfill keeps only its media-is-data
+    half here. Verified at the boundary: build/clippy/fmt clean,
+    1025 tests green; at the branch tip: 1027 green (the +2 are
+    the directive pins) with the tree byte-identical to the
+    pre-rebase tip. The self-use boundary of decision 55 is
+    unchanged; the branch adds exactly one member to it (the
+    digest/summary directive block, 2026-08-25). Accepted
+    follow-up: per-purpose preamble overlay keys in the persona
+    file, to shrink the private patch set to configuration only.
+    AGENT.md Section 3 rode along: the scope guard now names the
+    Phase 3 deferred set.
 
 ## 4. Known gaps carried into Phase 1 (after M6)
 

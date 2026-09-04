@@ -20,11 +20,11 @@ Rules in these documents have identifiers (example: R3, P5, C2). Reference these
 
 ## 3. Current phase and scope guard
 
-The repository is **code-complete for Phase 1**; the two-week test-group soak runs on live groups. Refer to `dev-roadmap.md` Section 3 and to `current-state.md` for the exact state.
+The repository is **past Phase 1** (v0.0.1) and **mid-Phase 2**: the embedding sidecar, the vector pre-screen, the merge tool, fact validity with the manual invalidation command, deep recall, the warmup trigger, persona hot reload, media captioning, and the decisions 81–88 batch are all on main. Refer to `dev-roadmap.md` Section 4 and to `current-state.md` for the exact state.
 
-- rig.rs and teloxide are permitted. They entered in Phase 1.
-- Do not add vector search or embeddings. They enter in Phase 2.
-- Do not implement warmup, deep recall, or fact invalidation. They enter in Phase 2. Shallow recall (exact alias match) with the full injection protocol is in scope. Refer to `dev-roadmap.md` Section 3 item 7.
+- rig.rs, teloxide, and sqlite-vec are permitted. They entered in Phases 1–2.
+- Do not build the Phase 3 deferred set (`dev-roadmap.md` Section 5): negation detection with the `supersedes` edge, the dead-letter repair tool, edit retraction semantics, the `is_a` concept hierarchy, the Matrix adapter, `SendMedia`, and the metrics backend (parked by the operator, 2026-08-22).
+- The operator's self-use prompt tuning lives on the `catball-self-use` branch by deliberate divergence (current-state.md decisions 55 and 89). Do not port it to main.
 - If a task seems to require a deferred item, stop and report. The phase split is deliberate.
 
 ## 4. Workspace layout
