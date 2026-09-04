@@ -1,9 +1,12 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-04 — decision 90 (the reply-suffix
-`<now>` time line and the `timezone` key) and the decision-91
-documentation repair round. Phase 2 items 1–8 shipped; the metrics
-backend (item 9) is parked. Phase 1 shipped as v0.0.1 (alpha).
+A living document. Update it at every milestone. Last update: 2026-09-04 — decision 92 (the
+documentation-process round: README tightening, the AGENT.md
+synchronization discipline, the Section 2 test-count stamp, MSRV
+enforcement), after decision 91 (documentation repair) and decision
+90 (the reply-suffix `<now>` time line and the `timezone` key).
+Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
+Phase 1 shipped as v0.0.1 (alpha).
 
 ## 1. Where we are
 
@@ -225,6 +228,11 @@ backend (item 9) is parked. Phase 1 shipped as v0.0.1 (alpha).
   `[groups.<chat_id>]` tables of the config file).
 
 ## 2. What exists and is tested
+
+Test counts below are a snapshot, verified 2026-09-04 @ `7e127b2`
+(1052 on main, 1054 on `catball-self-use`). They drift between
+audits — re-stamp when re-verified, not on every feature commit
+(decision 92).
 
 | Crate | Content | Tests |
 |---|---|---|
@@ -2226,6 +2234,47 @@ backend (item 9) is parked. Phase 1 shipped as v0.0.1 (alpha).
     band (was the pre-74 "below 50%"). Deferred from the audit:
     the Section 2 per-crate test-count column policy, the README
     structure question, and the remaining low-value warnings.
+
+92. (2026-09-04) Documentation-process round: README tightening, a
+    written synchronization discipline, the Section 2 test-count
+    stamp, and MSRV enforcement. Decision 91's audit showed the
+    drift root cause was structural: the sync discipline was oral,
+    and exactly the surfaces no written rule covered drifted
+    (README env table, example.toml, the roadmap status header,
+    the AGENT.md crate table) while the covered one (specs.md
+    Section 13) had zero missing content. (a) README.md is
+    tightened in place — the split into a front-door README plus
+    docs/operator-guide.md was rejected: it relocates the
+    restatement without shrinking it, and the readers are the
+    operator and agents, not newcomers. Changes: a Contents
+    block, a two-sentence status line, subheader groups in the
+    environment table, the endpoint-portability and embeddings
+    paragraphs compressed to pointers (specs.md Section 13 owns
+    the details — restatement REMOVED, not moved), and the
+    "Expected behavior" wall bullets split into sub-bullets.
+    (b) AGENT.md gains Section 6.5: the two oral rules are
+    written (a numbered decision entry per behavioral change;
+    the documentation commit lands before the code commit), a
+    change-type → surfaces table lists the sync targets, and a
+    grep backstop catches what the table misses;
+    Definition-of-done item 4 makes it binding. (c) Section 2
+    test counts become a stamped snapshot (verified date + hash):
+    silent staleness becomes a labeled approximation; the stamp
+    re-verifies at audit time, not per commit. (d) MSRV is
+    enforced and verified. The README claimed "rustc ≥ 1.85
+    (teloxide requirement)" with nothing behind it;
+    `cargo +1.85 check` proves the resolved tree needs much
+    newer: takecell 0.1.2 (via teloxide-core 0.13) requires
+    1.96; time 0.3.55, image 0.25.10, and serde_with 3.21
+    require 1.88. The workspace declares `rust-version = "1.96"`
+    (`[workspace.package]` plus per-crate opt-in), verified by a
+    full `cargo +1.96 check --workspace`, and the README claim
+    follows. Deferred (accepted as-is): the multi-hundred-char
+    Section 2 rows (Markdown table rows are single physical
+    lines; grep-verified anchors are the workaround) and the
+    example.toml commentary nits. Deferred to the operator: the
+    backup-branch and stray-data-directory deletions (an operator
+    snapshot first).
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 

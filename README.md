@@ -2,7 +2,17 @@
 
 Tamako is a Telegram group-pet bot with persistent memory. It lives in chat groups, speaks rarely, and remembers facts about group members in a per-group graph database. It is a pet, not an assistant: one global persona, per-group private memories, and a scarce-attention behavior model.
 
-Status: Phase 2 in progress (v0.1.0). Phase 1 shipped as v0.0.1. The bot intakes messages, stores reactions, digests conversations into long-term memory, and SPEAKS: it answers mentions and replies directly, and it joins conversations when the participation gate says yes. It also REMEMBERS out loud: a wake with relevant graph memories injects them as one `<memory>...</memory>` assistant-role item before the participation decision. The context the models see is an XML rendering (`<msg>`/`<you>` items) with a code-owned format gloss in the preamble. Refer to `current-state.md`.
+Status: Phase 2 in progress (v0.1.0); Phase 1 shipped as v0.0.1. The bot intakes messages, digests conversations into long-term memory, speaks through the participation gate, and injects relevant memories into its decisions. Refer to `current-state.md` for the exact state.
+
+## Contents
+
+- [Documents](#documents)
+- [Prerequisites](#prerequisites)
+- [Build and verify](#build-and-verify)
+- [Offline demo (no tokens needed)](#offline-demo-no-tokens-needed)
+- [Live bring-up (Telegram)](#live-bring-up-telegram)
+- [Operator commands](#operator-commands)
+- [Verification commands](#verification-commands)
 
 ## Documents
 
@@ -17,7 +27,7 @@ Status: Phase 2 in progress (v0.1.0). Phase 1 shipped as v0.0.1. The bot intakes
 
 ## Prerequisites
 
-- Rust toolchain, rustc ≥ 1.85 (teloxide requirement).
+- Rust toolchain, rustc ≥ 1.96 (dependency-tree requirement; enforced by the workspace `rust-version`, decision 92).
 - A C/C++ toolchain with CMake. The `lbug` crate compiles or downloads the LadybugDB core; refer to `docs/adr-0001-ladybugdb-binding.md`.
 - For live operation: a Telegram bot token and an LLM API key.
 
@@ -97,33 +107,38 @@ Environment variables:
 
 | Variable | Purpose |
 |---|---|
+| **Endpoint family** | |
 | `TELOXIDE_TOKEN` | Telegram bot token. Required for `--live`. |
 | `TELOXIDE_API_URL` | Optional custom Bot API server URL. |
 | `ANTHROPIC_API_KEY` | LLM key for anthropic-compatible endpoints. Without it, digests, summaries, and speech are disabled for the run. |
 | `OPENAI_API_KEY` | LLM key for openai-compatible endpoints. |
+| `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
+| `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
+| `TAMAKO_LLM_SESSION_ID` | Session-affinity PREFIX sent as BOTH the `x-opencode-session` and `x-session-id` headers on every request (decision 84: Opencode Go honors the first, OpenRouter sticky routing honors the second). The header value is `{prefix}-{suffix}`: the prefix is this key (global-only, default `tamako`), the suffix is a per-(group, purpose) random 16-char string persisted in the group's store (`llm_session_keys`), so provider affinity survives restarts. |
+| **Per-purpose model and key overrides** | |
 | `TAMAKO_DIGEST_MODEL` | Extraction model override. Default `claude-haiku-4-5`. |
 | `TAMAKO_GATE_MODEL` | Participation-gate model override. Default `claude-haiku-4-5`. |
 | `TAMAKO_REPLY_MODEL` | Reply-generation model override. Default `claude-sonnet-4-5`. |
 | `TAMAKO_SUMMARY_MODEL` | Summary-model override (the segmented C3 summarizer). Default `claude-haiku-4-5`. |
-| `TAMAKO_LLM_API` | Endpoint family override: `anthropic-compatible` or `openai-compatible`. Wins over the config file. |
-| `TAMAKO_LLM_BASE_URL` | Endpoint base-URL override. Wins over the config file. |
-| `TAMAKO_LLM_SESSION_ID` | Session-affinity PREFIX sent as BOTH the `x-opencode-session` and `x-session-id` headers on every request (decision 84: Opencode Go honors the first, OpenRouter sticky routing honors the second). The header value is `{prefix}-{suffix}`: the prefix is this key (global-only, default `tamako`), the suffix is a per-(group, purpose) random 16-char string persisted in the group's store (`llm_session_keys`), so provider affinity survives restarts. |
+| `TAMAKO_DIGEST_LLM_API_KEY`, `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`, `TAMAKO_SUMMARY_LLM_API_KEY` | Per-purpose LLM-key overrides of the family key (decision 87), env-only — no TOML key. Unset or empty falls through to the family key. |
+| **Embeddings and media captions** | |
 | `TAMAKO_EMBEDDING_MODEL` | Embedding-model override for the vector sidecar. Default `google/gemini-embedding-2`. Global only. |
 | `TAMAKO_EMBEDDING_BASE_URL` | Embedding-endpoint base-URL override. Default `https://openrouter.ai/api/v1`. Global only. |
 | `TAMAKO_CAPTION_MODEL` | Media-caption model override. Default `minimax/minimax-m3`. Global only. |
 | `TAMAKO_CAPTION_BASE_URL` | Media-caption endpoint base-URL override. Default `https://openrouter.ai/api/v1`. Global only. |
+| **Structured output** | |
 | `TAMAKO_STRUCTURED_OUTPUT` | Structured-output mode, global fallback: `schema` (default), `json_object`, `prompt_only`. |
 | `TAMAKO_DIGEST_STRUCTURED_OUTPUT` | Structured-output mode override of the digest (extraction) purpose. |
 | `TAMAKO_GATE_STRUCTURED_OUTPUT` | Structured-output mode override of the gate purpose. |
 | `TAMAKO_REPLY_STRUCTURED_OUTPUT` | Structured-output mode override of the reply purpose. |
 | `TAMAKO_SUMMARY_STRUCTURED_OUTPUT` | Structured-output mode override of the summary purpose. |
+| **Reply suffix** | |
 | `TAMAKO_SUFFIX_MODE` | Reply-suffix placement, global fallback: `system` (default) or `append` (decisions 88/90). Overrides the global value only; per-group TOML wins. |
 | `TAMAKO_TIMEZONE` | Timezone of the reply-suffix `<now>` time line: IANA name or fixed `±HH:MM`; unset/empty disables the line (decision 90). Overrides the global value only; per-group TOML wins. |
-| `TAMAKO_DIGEST_LLM_API_KEY`, `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`, `TAMAKO_SUMMARY_LLM_API_KEY` | Per-purpose LLM-key overrides of the family key (decision 87), env-only — no TOML key. Unset or empty falls through to the family key. |
 
-Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families above; "compatible" describes the wire format, never the vendor. The config file keys `llm_api` and `llm_base_url` select an arbitrary anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), and a purpose (`digest`, `gate`, `reply`, `summary`) may override them individually (`digest_llm_api`, `digest_llm_base_url`, and likewise for `gate_`, `reply_`, and `summary_`). The summary purpose alone also has per-purpose env overrides `TAMAKO_SUMMARY_LLM_API` / `TAMAKO_SUMMARY_LLM_BASE_URL`, which beat the global env overrides. The same pattern applies to the structured-output mode: `structured_output` globally and `digest_structured_output` / `gate_structured_output` / `reply_structured_output` / `summary_structured_output` per purpose (values `schema`, `json_object`, `prompt_only`; default `schema`; an unknown value is a hard startup error). Structured-output precedence: purpose env → global env → purpose config → global config → default `schema`. API keys come from the environment only, never from the config file.
+Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families; "compatible" describes the wire format, never the vendor. The config keys `llm_api` / `llm_base_url` select any anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), each purpose (`digest`, `gate`, `reply`, `summary`) may override them individually, and the same pattern applies to the structured-output mode. Section 13 owns the full key set, the per-purpose env overrides, and the precedence rules. API keys come from the environment only, never from the config file.
 
-Embeddings (specs.md Section 13, schema v7): the vector sidecar embeds Person/Alias/Concept names and descriptions through an openai-compatible `/v1/embeddings` endpoint — the default pair is OpenRouter + `google/gemini-embedding-2` (zero data retention), keyed by `OPENAI_API_KEY`. The digest pipeline enqueues changed nodes after the graph commit; a background worker (30 s cadence, live mode only) drains the queue, and a startup reconciliation pass backfills or repairs the index, so the sidecar is always rebuildable derived data. A missing key degrades embeddings to a startup warning; the digest pipeline is unaffected. Note the dual-use: embeddings read the SAME `OPENAI_API_KEY` as openai-compatible completions, so when the completions endpoint points elsewhere (e.g. Opencode Go) while embeddings keep the default OpenRouter base URL, the key must be valid for OpenRouter — startup logs one WARN in that configuration (decision 77); point `embedding_llm_base_url` (or `TAMAKO_EMBEDDING_BASE_URL`) at your provider to co-locate them.
+Embeddings (specs.md Section 13, schema v7): the vector sidecar embeds Person/Alias/Concept names and descriptions through an openai-compatible `/v1/embeddings` endpoint — by default OpenRouter + `google/gemini-embedding-2`, keyed by `OPENAI_API_KEY`. The sidecar is rebuildable derived data; a missing key degrades embeddings to a startup warning, and the digest pipeline is unaffected. Note the dual-use: embeddings read the SAME `OPENAI_API_KEY` as openai-compatible completions — when the completions endpoint points elsewhere (e.g. Opencode Go), the key must still be valid for the embedding endpoint; startup logs one WARN in that configuration (decision 77).
 
 ### Recipe: Opencode Go
 
@@ -147,13 +162,27 @@ Recommended `structured_output` for Opencode Go: `schema`, the default — endpo
 ### 5. Expected behavior right now
 
 - Startup logs the bot identity and the configured groups.
-- Startup runs a capability check: one `getChatMember` call per configured group. An administrator group logs at INFO: `bot is an administrator of this group; full functionality (reaction collection active).` A non-administrator group logs one WARN per run: `the bot is not an administrator of this group: Telegram delivers reaction updates to administrators only, so reaction collection is OFF for this group. Everything else works normally. To enable reactions, make the bot a group administrator. Note: privacy mode OFF alone suffices for reading all group messages; if privacy mode is still ON (the BotFather default) the bot receives only commands and replies to itself, which is normal platform behavior.` If the check fails (the bot may not be a member yet), an INFO line explains that the status is re-checked when the first event of the group arrives.
+- Startup runs a capability check: one `getChatMember` call per configured group.
+  - An administrator group logs one INFO line: `bot is an administrator of this group; full functionality (reaction collection active).`
+  - A non-administrator group logs one WARN per run: reaction collection is OFF (Telegram delivers reaction updates to administrators only); everything else works normally. The WARN text also covers the privacy-mode interaction of Section 1.
+  - If the check fails (the bot may not be a member yet), an INFO line explains that the status is re-checked when the first event of the group arrives.
 - The first message in a configured group creates `{data-root}/{chat_id}/store.db` and `memory.lbug`.
 - Every message lands in the raw log before any other processing. Reactions land in the `reactions` table; reaction collection is active only in groups where the bot is an administrator.
 - Digest triggers fire on their thresholds; extraction writes entities and facts into the graph. At digest completion the chunk the context drops is LLM-summarized first, and the context keeps the two newest `<summary range="first-last">...</summary>` items; after 3 consecutive summarization failures the chunk drops unsummarized with one ERROR line (circuit breaker). Watch the logs for batch outcomes.
-- The bot speaks: it answers mentions and replies to itself directly, and it joins the conversation when the participation gate says yes. A reply is a Telegram reply-to of its target only when the target is stale (more than `reply_quote_threshold` (default 10) newer human messages) or the wake was forced; a recent target gets a plain standalone message. Every reply lands in the raw log before it is sent. Two consecutive bot messages engage the monologue lock; any human message unlocks. Without an LLM key for the configured endpoint family the bot stays silent (the wake procedure logs one warning at startup).
-- The bot remembers: every wake runs a recall over the group graph — exact alias matches and the people of the new messages, plus deep recall (the default): vector entry over the node embeddings, two-hop graph expansion, and edge-description text search, all still gated by the conservative relevance gate. The gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one `<memory>...</memory>` assistant-role item — visible to the participation gate and the reply model, and present even when the bot stays silent. Injected memories are deduplicated per edge across wakes and removed at digest time; a multi-edge injection is stored as one row per edge but appears as one item in the context (collapse at rebuild). Set `deep_recall = false` to restore the shallow path (direct neighbors only, no fuzzy scans).
-- The bot starts conversations on its own (warmup, specs.md Sections 8.4/8.5/9.7): during `warmup_active_hours` (default "08:00-23:00", host-local) it may send up to `warmup_quota` (default 1, valid range 1–3, a random slot per host-local day; the schedule persists across restarts) self-initiated messages per day. It speaks only after `warmup_silence_secs` (default 14400 = 4 h) of group silence, never while muted, and only when the group's memory graph holds an eligible topic — a Concept node sampled with weight edge-count × recency-decay, skipping topics used in the last `warmup_topic_cooldown_days` (default 3) days and topics mentioned in the latest 50 messages; a group with no eligible topic stays silent. The message is a plain standalone message (no reply quote, no ping) generated with the reply model; an interest tied to one member is asked as an open group question, never "X likes Y". Engagement is a human reply or a reaction within `warmup_reaction_window_secs` (default 1800 = 30 min); reactions only reach the bot in administrator groups, so non-administrator groups measure replies only. Ignored warmups back off (2× spacing per ignored warmup, effective quota floored at 1 so the pet always keeps one daily chance, resetting on engagement). `warmup = false` disables warmups entirely. The counters `warmups_total` / `warmup_engaged_total` show in `--status`.
+- The bot speaks: it answers mentions and replies to itself directly, and it joins the conversation when the participation gate says yes.
+  - A reply is a Telegram reply-to of its target only when the target is stale (more than `reply_quote_threshold`, default 10, newer human messages) or the wake was forced; a recent target gets a plain standalone message.
+  - Every reply lands in the raw log before it is sent. Two consecutive bot messages engage the monologue lock; any human message unlocks.
+  - Without an LLM key for the configured endpoint family the bot stays silent (the wake procedure logs one warning at startup).
+- The bot remembers: every wake runs a recall over the group graph — exact alias matches and the people of the new messages, plus deep recall (the default): vector entry over the node embeddings, two-hop graph expansion, and edge-description text search, all gated by the conservative relevance gate.
+  - The gate selects at most `recall_injection_cap` (default 5) memories; a non-empty selection enters the context as one `<memory>...</memory>` assistant-role item — visible to the gate and the reply model, present even when the bot stays silent.
+  - Injected memories are deduplicated per edge across wakes and removed at digest time; a multi-edge injection appears as one context item (collapse at rebuild).
+  - Set `deep_recall = false` to restore the shallow path (direct neighbors only, no fuzzy scans).
+- The bot starts conversations on its own (warmup, specs.md Sections 8.4/8.5/9.7):
+  - Quota: up to `warmup_quota` (default 1, valid range 1–3) self-initiated messages per host-local day, at a random slot inside `warmup_active_hours` (default "08:00-23:00"); the schedule persists across restarts.
+  - Conditions: only after `warmup_silence_secs` (default 14400 = 4 h) of group silence, never while muted, and only when the memory graph holds an eligible topic — a Concept node sampled with weight edge-count × recency-decay, skipping topics used in the last `warmup_topic_cooldown_days` (default 3) days or mentioned in the latest 50 messages; a group with no eligible topic stays silent.
+  - The message is a plain standalone message (no reply quote, no ping) generated with the reply model; an interest tied to one member is asked as an open group question, never "X likes Y".
+  - Engagement: a human reply or a reaction within `warmup_reaction_window_secs` (default 1800 = 30 min); reactions only reach the bot in administrator groups, so non-administrator groups measure replies only. Ignored warmups back off (2× spacing per ignored warmup, effective quota floored at 1, resetting on engagement).
+  - `warmup = false` disables warmups entirely. The counters `warmups_total` / `warmup_engaged_total` show in `--status`.
 - Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
 
 ### 6. Watching the pet

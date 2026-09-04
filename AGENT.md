@@ -80,8 +80,28 @@ A task is done when all four commands pass.
 - Library crates return typed errors (`thiserror`). The binary crate uses `anyhow`.
 - A failed digest batch must not block later batches. Refer to `specs.md` Section 10.3.
 
+### 6.5 Documentation synchronization
+
+Two rules that were oral until decision 92: every behavioral change carries a numbered decision entry in `current-state.md` Section 3, and the documentation commit lands BEFORE the code commit (docs-first).
+
+A change that touches one of these surfaces updates ALL of the listed documents in the same change (or its paired docs commit):
+
+| Change type | Surfaces to update |
+|---|---|
+| Environment variable (add, rename, default change) | `specs.md` Section 13; the `README.md` environment table |
+| TOML key (add, rename, default change) | `specs.md` Section 13; `tamako.example.toml` |
+| CLI flag or operator-facing output string | The owning `specs.md` section; `README.md` Operator commands; the USAGE/help text |
+| Phase or delivery status | `current-state.md` Section 1; the `dev-roadmap.md` status header; the `README.md` status line; Section 3 of this file |
+| Crate added or dependency boundary changed | Section 4 of this file; `current-state.md` Section 2; `Cargo.toml` |
+| Observable behavior | The `current-state.md` Section 3 decision entry; the owning `specs.md` section |
+
+Backstop before committing such a change: `grep -n <token> README.md tamako.example.toml specs.md current-state.md dev-roadmap.md AGENT.md` and review every hit.
+
+`README.md` restates reference content only where bring-up usability wins (the environment table). Everywhere else, compress and point to the owning document (decision 92).
+
 ## 7. Definition of done
 
 1. The four commands of Section 5 pass.
 2. New behavior has tests. The current phase scope and exit criteria live in `dev-roadmap.md` and `current-state.md`; do not build deferred items (Section 3).
 3. Deviations from the governing documents are reported in the pull request description or the task result, not hidden in code.
+4. The documentation synchronization of Section 6.5 is done (decision 92).
