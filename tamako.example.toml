@@ -7,10 +7,10 @@
 # `tamako.toml` is gitignored. Never commit real group ids or endpoints.
 #
 # Precedence, highest first (specs.md Section 13):
-#   1. environment variables (TAMAKO_*)
-#   2. per-purpose keys in this file
-#   3. global keys in this file
-#   4. built-in defaults
+#   LLM keys (llm_api, llm_base_url, the *_model keys, structured_output):
+#     env (TAMAKO_*) > per-group keys in this file > global keys > built-in defaults.
+#   Trigger keys (suffix_mode, timezone; decisions 88/90):
+#     per-group keys > env (TAMAKO_*, applies to the global values only) > global keys > built-in defaults.
 
 [global]
 # ---------------------------------------------------------------- LLM ----
@@ -88,7 +88,8 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 
 # Structured-output mode per endpoint: "schema" | "json_object" | "prompt_only"
 # (default "schema"). Per-purpose overrides: digest_structured_output /
-# gate_structured_output / reply_structured_output; env wins as always.
+# gate_structured_output / reply_structured_output /
+# summary_structured_output; env wins as always.
 # "json_object" applies on the OpenAI family only; on Anthropic it
 # degrades to prompt-only (the Messages API has no json_object format).
 # Structured-output support is PER MODEL on Opencode Go: the mimo

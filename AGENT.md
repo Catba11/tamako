@@ -23,7 +23,7 @@ Rules in these documents have identifiers (example: R3, P5, C2). Reference these
 The repository is **past Phase 1** (v0.0.1) and **mid-Phase 2**: the embedding sidecar, the vector pre-screen, the merge tool, fact validity with the manual invalidation command, deep recall, the warmup trigger, persona hot reload, media captioning, and the decisions 81–88 batch are all on main. Refer to `dev-roadmap.md` Section 4 and to `current-state.md` for the exact state.
 
 - rig.rs, teloxide, and sqlite-vec are permitted. They entered in Phases 1–2.
-- Do not build the Phase 3 deferred set (`dev-roadmap.md` Section 5): negation detection with the `supersedes` edge, the dead-letter repair tool, edit retraction semantics, the `is_a` concept hierarchy, the Matrix adapter, `SendMedia`, and the metrics backend (parked by the operator, 2026-08-22).
+- Do not build the Phase 3 deferred set (`dev-roadmap.md` Section 5): negation detection with the `supersedes` edge, the dead-letter repair tool, edit retraction semantics, the `is_a` concept hierarchy, the Matrix adapter, and the metrics backend (parked by the operator, 2026-08-22). `SendMedia` also stays deferred: it returns `Unsupported` until Phase 3 (current-state.md Section 5, M3 row).
 - The operator's self-use prompt tuning lives on the `catball-self-use` branch by deliberate divergence (current-state.md decisions 55 and 89). Do not port it to main.
 - If a task seems to require a deferred item, stop and report. The phase split is deliberate.
 
@@ -40,15 +40,16 @@ The workspace is a Cargo workspace at the repository root. Crates:
 | `tamako-persona` | Global persona configuration and preamble rendering. |
 | `tamako-adapter-mock` | Mock platform adapter and the replay fixture for tests. |
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide). Pure normalization plus polling intake and outbound actions. |
+| `tamako-vision` | Pure media normalization for intake captioning (decision 82): byte-level allowlist sniffing, JPEG/PNG/WebP dimension extraction, resize and re-encode to the 2048-px JPEG cap, base64 data-URI output. No LLM, no I/O. |
 | `tamako-agent` | All LLM concerns: the extraction call (rig) and the digest pipeline. The only crate that depends on rig. |
 
-Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, `tamako-memory`, and `tamako-persona` (the shared context-format gloss). No cycles.
+Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, `tamako-memory`, and `tamako-persona` (the shared context-format gloss). `tamako-vision` is a pure leaf: `tamako-adapter-teloxide` (the intake enrichment stage) and the `tamako-agent` caption tests depend on it; `tamako-core` deliberately does not. No cycles.
 
 ## 5. Commands
 
 - Build: `cargo build --workspace`
 - Test: `cargo test --workspace`
-- Lint: `cargo clippy --workspace -- -D warnings`
+- Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format: `cargo fmt --all`
 
 A task is done when all four commands pass.

@@ -1,7 +1,7 @@
 # Development Roadmap for the Tamako Group-Pet Bot
 
 Version: 0.2
-Status: Phase 1 complete (v0.0.1). Phase 2 planned (current-state.md decisions 66–71).
+Status: Phase 1 complete (v0.0.1). Phase 2 items 1–8 delivered (current-state.md decisions 66–80; scope re-sequencing decisions 66–70). Item 9, the metrics backend, is parked (2026-08-22).
 Companion documents: `specs.md`, `proposed-graph-database-specs.md`
 
 ## 1. Phasing strategy
@@ -52,9 +52,9 @@ Known accepted defect: concept fragmentation from the missing vector pre-screen.
 
 Scope (re-sequenced 2026-08; current-state.md decisions 66–70):
 
-1. Embedding sidecar: sqlite-vec in `store.db`, name and description embeddings for Person, Alias, and Concept. Writes go through a `pending_embeddings` queue drained by a rate-limited worker — NOT through the digest transaction (decision 66). Provider: `qwen/qwen3-embedding-8b` via OpenRouter, 4096 dimensions pinned. The first startup backfills every existing node. Refer to `proposed-graph-database-specs.md` Section 7.6.
-2. Vector pre-screen in entity resolution, step 3 with the PROVISIONAL thresholds 0.92 and 0.80, plus the budget-capped LLM confirmation call for the middle band. Calibration happens against live five-group operation, not a soak. Refer to Section 7.4 of that document.
-3. Merge tool for the fragmented Phase 1 graph: candidate pairs from the vector index, one three-way LLM confirmation per pair (same → merge, related → `also_known_as`, different → skip), edge re-pointing, hard-delete tombstone with a rollback snapshot in `merge_audit` (schema v9), dry-run by default, offline operation (current-state.md decision 74).
+1. Embedding sidecar: sqlite-vec in `store.db`, name and description embeddings for Person, Alias, and Concept. Writes go through a `pending_embeddings` queue drained by a rate-limited worker — NOT through the digest transaction (decision 66). Provider: `qwen/qwen3-embedding-8b` via OpenRouter, 4096 dimensions pinned (superseded by decision 81: `google/gemini-embedding-2`, native 3072 dims). The first startup backfills every existing node. Refer to `proposed-graph-database-specs.md` Section 7.6.
+2. Vector pre-screen in entity resolution, step 3 with the PROVISIONAL thresholds 0.92 and 0.80, plus the budget-capped LLM confirmation call for the middle band. Calibration happens against live six-group operation, not a soak. Refer to Section 7.4 of that document.
+3. Merge tool for the fragmented Phase 1 graph: candidate pairs from the vector index, one three-way LLM confirmation per pair (same → merge, related → `also_known_as` (superseded by decision 83: a `related` verdict writes a `related_pairs` table row, schema v12), different → skip), edge re-pointing, hard-delete tombstone with a rollback snapshot in `merge_audit` (schema v9), dry-run by default, offline operation (current-state.md decision 74).
 4. Fact validity: the predicate registry, single-value invalidation in one transaction. No data migration is required; the schema columns exist since Phase 1. Refer to Section 7.5 of that document.
 5. Manual invalidation command for the owner. Refer to `specs.md` Section 14.
 6. Deep recall: graph expansion per the rules of Section 8.2 of that document, the relevance gate, and the "who discussed X" pattern through a full-text sidecar on `edge_text`.
@@ -122,4 +122,4 @@ Within Phase 1, the build order is:
 5. Shallow recall with the full injection protocol.
 6. Two-week test-group soak, then Phase 2 planning with real calibration data.
 
-The thresholds 0.92 and 0.80, the relevance gate, and the participation gate are calibrated against live five-group operation; the original soak-calibration plan was superseded (decision 66). Refer to the open items of both specifications.
+The thresholds 0.92 and 0.80, the relevance gate, and the participation gate are calibrated against live six-group operation; the original soak-calibration plan was superseded (decision 66). Refer to the open items of both specifications.
