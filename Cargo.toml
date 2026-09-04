@@ -14,6 +14,12 @@ members = [
     "tamako-vision",
 ]
 
+[workspace.package]
+# Verified lower bound (decision 92): takecell 0.1.2 via
+# teloxide-core 0.13 requires 1.96; cargo +1.96 check --workspace
+# passes. The README prerequisites line mirrors this value.
+rust-version = "1.96"
+
 [workspace.dependencies]
 # Async runtime. Rule of AGENT.md Section 6.2: synchronous storage calls
 # run inside tokio::task::spawn_blocking.
