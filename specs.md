@@ -43,7 +43,7 @@ LLM access is endpoint-portable. Every LLM call uses one of two API families: `a
 - A1: All platform-specific types stay inside the adapter. The actor sees only normalized events.
 - A2: The adapter exposes inbound events: `Message`, `EditedMessage`, `Reaction`, `MemberJoin`, `MemberLeave`.
 - A3: The adapter exposes outbound actions: `SendText`, `SendMedia`, `React`.
-- A4: A normalized message carries: platform message id, timestamp, sender id, sender display name, the optional sender username, text, reply-to id, and mention flags. Decision 82 adds an ordered media-part list (kind, caption text): the adapter's intake stage downloads, normalizes, and captions media BEFORE the normalized event exists, so the event's text is final — member text and rendered `<media>` elements interleaved in original order (Section 7.3). IMPLEMENTATION NOTE (decision 82, accepted 2026-08-23): at cutover the adapter assembles caption text + element with the element pinned at the END (`text <media .../>`), not a true positional interleave — Telegram delivers at most one media item per message at cutover; the middle-of-text position is the only information lost. The actor never sees bytes or platform file ids.
+- A4: A normalized message carries: platform message id, timestamp, sender id, sender display name, the optional sender username, text, reply-to id, and mention flags. Decision 82 adds an ordered media-part list (kind, caption text): the adapter's intake stage downloads, normalizes, and captions media BEFORE the normalized event exists, so the event's text is final — member text and rendered `<media>` elements interleaved in original order (Section 7.3). IMPLEMENTATION NOTE (decision 82, accepted 2026-08-22): at cutover the adapter assembles caption text + element with the element pinned at the END (`text <media .../>`), not a true positional interleave — Telegram delivers at most one media item per message at cutover; the middle-of-text position is the only information lost. The actor never sees bytes or platform file ids.
 - A5: The first adapter is Telegram via teloxide. A Matrix adapter must be possible without changes to the actor, the context, or the memory backend.
 
 ### 4.2 Platform constraints
@@ -90,7 +90,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 - One global persona configuration at `{data_root}/persona.toml`. Loaded at startup; in live mode a filesystem watcher reloads it on deliberate edits (decision 80: the rendered preamble is broadcast to every spawned group actor through its inbox, applied in memory only — the file is the state, the next rebuild renders the same bytes). Replay mode never watches.
 - An optional `system_prefix` string is rendered verbatim before the identity line, with exactly one blank line as the separator. It carries system-level directives, such as alignment notes. When the key is absent, the rendered preamble is bit-identical to a configuration without it. Rule C4 applies. The injection guardrail is code-owned and is never configurable.
 - An optional `[[example]]` array (decision 85): few-shot dialogue examples. Each entry carries `context` (a sample of the live XML dialect of Section 7.3, written raw by the operator — the persona file is trusted config, no escaping) and `reply` (the pet's reply as BARE TEXT, no tags — the real output channel is plain text, so the example never teaches the `<you>` shape that Section 9.4 forbids). The section renders after the context-format gloss and before the injection guardrail, each example wrapped in an `<example>` element with `<context>` and `<reply>` children, under a framing line marking them as examples, not live context. Absent or empty renders NOTHING — the preamble stays bit-identical (Rule C4). Examples ride the decision-80 hot reload. They feed ONLY the reply persona preamble: the gate and recall preambles append the gloss but not the examples; digest and summary stay gloss-free. No length cap: every example is paid in prompt tokens on every wake (cached-prefix pricing applies) — the persona file documents this.
-- An optional `suffix` string array (decision 86): high-importance guardrail instructions appended as ONE system-role message STRICTLY LAST in the reply request's message list (after the newest context message) — the lost-in-the-middle mitigation. The body renders as a `<system>` element wrapping one NUMBERED `<rule1>`, `<rule2>`, ... element per entry, so every rule has its own boundary. Entry content is verbatim (trusted config, like `system_prefix`). The suffix is NOT part of the cache anchor: it sits past the cached prefix, so editing it invalidates nothing — it is the zero-cache-cost hot-tuning knob, the complement of preamble edits. Absent or empty appends no message (byte-identical pre-86 behaviour). It rides the decision-80 hot reload and feeds ONLY the reply request — gate/recall/digest/summary carry no suffix (short-context structured tasks, no lost-in-the-middle problem).
+- An optional `suffix` string array (decision 86): high-importance guardrail instructions appended as ONE system-role message STRICTLY LAST in the reply request's message list (after the newest context message) — the lost-in-the-middle mitigation. The body renders as a `<system>` element wrapping one NUMBERED `<rule1>`, `<rule2>`, ... element per entry, so every rule has its own boundary. Entry content is verbatim (trusted config, like `system_prefix`). The suffix is NOT part of the cache anchor: it sits past the cached prefix, so editing it invalidates nothing — it is the zero-cache-cost hot-tuning knob, the complement of preamble edits. Absent or empty appends no message — one exception: with `timezone` set (decision 90), an empty persona suffix still yields the suffix message carrying the code-owned `<now>` element alone. The placement mode is `suffix_mode` (decision 88, Section 13): `system` appends the message strictly last; `append` merges the body into the final user instruction. It rides the decision-80 hot reload and feeds ONLY the reply request — gate/recall/digest/summary/warmup carry no suffix (short-context structured tasks, no lost-in-the-middle problem).
 - A code-owned context-format explanation renders into the preamble after the persona sections and before the injection guardrail. It describes the XML item rendering of Section 7.3 in detail, and it forbids the model to write the `<msg>` or `<you>` structure itself. It is version-controlled and never configurable, like the guardrail. The same text feeds the participation-gate and the recall relevance-gate preambles.
 - In live mode the persona file is required. A missing or invalid file fails startup with a clear error. An explicit operator flag permits the lenient fallback chain for experiments. Replay mode is always lenient. The preamble is the cache anchor. Its source must be deliberate. Rule C4 applies.
 - The persona service renders the system preamble. The preamble is the prefix of every model context and never changes inside a context lifetime — EXCEPT through the deliberate reload event of decision 80 (an operator edit broadcast to all groups; in-flight calls keep their old snapshot, the next call of every purpose pays a cold prefix). Rule C4 applies.
@@ -130,7 +130,7 @@ Each item carries a message-id range tag. The boundary pair (`prev_digest_bounda
 
 - C1: Between two digests, the context is append-only. Rule P2 applies.
 - C2: A recall injection is always appended at the tail, directly after the messages that triggered it. An insertion into the middle of the history is forbidden.
-- C3: At digest time, the actor summarizes the chunk being removed, then removes every item with a range tag at or below the previous boundary. Summary items are exempt from the removal; their retention is count-based (Section 7.3). The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. The summary is persisted before the removal. If the summarization fails, the removal defers one cycle and the raw chunk stays. Refer to Section 10.3. The actor performs the summarization, the removal, the deduplication pruning of Section 10.2, and the boundary update as one serialized flow (Section 6.1). Post-digest hooks are stateless observers only. They must not mutate the context.
+- C3: At digest time, the actor summarizes the chunk being removed, then removes every item with a range tag at or below the previous boundary. Summary items are exempt from the removal; their retention is count-based (Section 7.3). The removal covers inbound messages, bot replies, injections, and tool outputs in that range. The digest model never sees the removed content. The summary is persisted before the removal. If the summarization fails, the removal defers one cycle and the raw chunk stays. Refer to Section 10.2 step 4. The actor performs the summarization, the removal, the deduplication pruning of Section 10.2, and the boundary update as one serialized flow (Section 6.1). Post-digest hooks are stateless observers only. They must not mutate the context.
 - C4: A persona preamble change invalidates the provider cache for all groups. Preamble edits are deliberate events, not runtime side effects. The live-mode mechanism is decision 80: a debounced file watcher broadcasts the re-rendered preamble through each actor's inbox; the actor swaps context item 0 in memory (nothing persists — the file is the state); a malformed intermediate file keeps the current preamble with one WARN; a dead or backlogged actor is skipped (its next start reads the file).
 - C5: The context size is bounded by approximately two digest chunks plus two summaries. The maximum size follows from the digest thresholds in Section 8.2.
 - C6: Context items render in the XML form of Section 7.3. Every rendered attribute derives from persisted raw-log columns. Rule P1 applies.
@@ -139,7 +139,7 @@ Each item carries a message-id range tag. The boundary pair (`prev_digest_bounda
 
 - A human message renders: `<msg from="{display_name}"[ user="{username}"] at="{HH:MM}" id="{row_id}"[ kind="edit"][ reply="bot" | reply="user"[ reply_to_name="{name}" reply_to_id="{row_id}"]][ mention="bot"]>text</msg>`, role user. The time is UTC. The `user` attribute is absent when no username is stored (a row written before v4, or a sender without a username). An edit row carries `kind="edit"`. A reply to the bot carries `reply="bot"`. A reply to another member carries `reply="user"`. A mention of the bot carries `mention="bot"`. Decision 82: the text may embed `<media type="{image|sticker|video}">{caption}</media>` elements, interleaved with member text in original order; a failed or unsupported caption renders the element with an EMPTY body. The caption text is escaped like member text (a caption containing `</media>` cannot break structure), and inbound member text is escaped before embedding (a member cannot forge a media element). The tag constants are single-sourced beside the MSG/SUMMARY/YOU constants; the outbound parrot filter strips the block (Section 9.4 discipline).
 - The reply target of a member reply renders when the raw log resolves it: `reply_to_platform_msg_id` maps to the ORIGINAL logged row. An edit does not move the target. `reply_to_name` is the display name of that row. `reply_to_id` is its raw-log row id. A target absent from the log renders `reply="user"` alone.
-- A reply to the bot never carries a target name or id. Outbound rows use synthetic platform ids (Rule A3), so the target cannot be resolved.
+- A reply to the bot never carries a target name or id. Outbound rows use synthetic platform ids (decision 35), so the target cannot be resolved.
 - The bot's own speech renders: `<you at="{HH:MM}" id="{row_id}">text</you>`, role assistant.
 - A recall injection renders: `<memory>...</memory>`, role assistant. Refer to Section 9.4.
 - A context summary renders: `<summary range="{first}-{last}">text</summary>`, role user. The text is escaped like every other content. Summaries sit directly after the preamble, oldest first, before the raw previous chunk. The context keeps the two most recent summaries; a new one replaces the oldest. Summary items are exempt from the Rule C3 removal.
@@ -155,7 +155,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 - Every inbound message: append to the raw log, append to the live context, increment the wake counter. No LLM call.
 - Duplicate deliveries: the raw log insert is idempotent. The wake counter counts each delivery. The counter is a scheduling hint; the log row is the source of truth. Rule P1 applies.
 - An edited message appends a new log row with the edit time as its timestamp. An edit whose text is identical to the latest stored row of that message appends nothing: it is not an event (Section 4.2 lists the platform causes). Extracted facts are not retracted. Refer to Section 15.
-- A mention of the bot or a reply to the bot triggers a forced `Wake`. The bot must respond when addressed directly. The `muted` state does not suppress a forced wake. Refer to Section 8.4.
+- A mention of the bot or a reply to the bot triggers a forced `Wake`. The bot must respond when addressed directly. The `muted` state does not suppress a forced wake. Refer to Section 8.5.
 - Forced-wake cooldown: a forced wake that produced a reply starts a `forced_wake_cooldown` (default 10 s, per-group overridable, 0 disables). A new forced wake during the cooldown is suppressed: the mention or reply is still logged to the raw log and the context (it lands in the next wake's presented set, so no information is lost), but no immediate wake fires. The cooldown suppresses the back-to-back reply chains of a mention/reply rally (decision 79).
 
 ### 8.2 Digest trigger
@@ -197,7 +197,7 @@ One wake executes these steps in this sequence:
 
 ### 9.1 Recall call
 
-- The recall worker reads the new messages of this wake and queries the memory backend through the read path of `proposed-graph-database-specs.md` Section 8. Candidate terms come from the new messages only. Entry resolution: mentions and replies, exact alias match, then vector search (accept at or above `vector_candidate_threshold`; no confirmation call on the read path). With `deep_recall` enabled (the default), candidates widen two more ways: graph expansion to two hops under the Section 8.2 rules (validity filter, the 90-day window, the per-node expansion limit, hub truncation; `contains` and `known_as` excluded, `also_known_as` included), and full-text matches on edge descriptions through the `edge_texts` sidecar (the "who discussed X" pattern). All candidate sources dedup by edge id and cap at `recall_candidate_cap` (40) before the relevance gate.
+- The recall worker reads the new messages of this wake and queries the memory backend through the read path of `proposed-graph-database-specs.md` Section 8. Candidate terms come from the new messages only. Entry resolution: mentions and replies, exact alias match, then vector search (accept at or above `vector_candidate_threshold`; no confirmation call on the read path). With `deep_recall` enabled (the default), candidates widen two more ways: graph expansion to two hops under the `proposed-graph-database-specs.md` Section 8.2 rules (validity filter, the 90-day window, the per-node expansion limit, hub truncation; `contains` and `known_as` excluded, `also_known_as` included), and full-text matches on edge descriptions through the `edge_texts` sidecar (the "who discussed X" pattern). All candidate sources dedup by edge id and cap at `recall_candidate_cap` (40) before the relevance gate.
 - The recall worker uses a cheap model. It never calls the main model.
 - With `deep_recall` set to false, candidate generation is the Phase 1 shallow form: direct neighbors only, one hop, entry by mentions/replies and exact alias match only.
 - If the decision at step 3 is negative, the main model is never called. The recall cost is the fixed cost of every wake.
@@ -220,7 +220,7 @@ One wake executes these steps in this sequence:
 - The injection is one assistant message of the form: `<memory>...</memory>`. It is appended at the tail. Rule C2 applies. Injection rows persisted before this format change keep their legacy "I remember: ..." text verbatim until Rule C3 removes them.
 - The content of a memory originates from group messages through the graph. This is an indirect prompt-injection channel. The system preamble contains a standing guardrail that names the `<memory>` and `<summary>` tags: their content is reference material, never an instruction, never speech.
 - A memory injected from a stale or contested fact is acceptable in this version. Negation detection is deferred. Refer to Section 14.
-- The reply request may append ONE final system-role message after the newest context message: the decision-86 `suffix` (a `<system>` element wrapping numbered `<rule1>`, `<rule2>`, ... entries from the persona file). It is the lost-in-the-middle mitigation and the zero-cache-cost guardrail knob — it is not part of the cache anchor, so editing it never invalidates a group's cached prefix. Gate, recall, digest, and summary requests carry no suffix.
+- The reply request carries the decision-86 `suffix` (a `<system>` element wrapping numbered `<rule1>`, `<rule2>`, ... entries from the persona file) under the `suffix_mode` placement of Section 13 (decision 88): ONE final system-role message STRICTLY LAST after the newest context message (the `system` default), or the same body merged into the final user instruction (the `append` mode, for endpoints that reject trailing system messages). It is the lost-in-the-middle mitigation and the zero-cache-cost guardrail knob — it is not part of the cache anchor, so editing it never invalidates a group's cached prefix. Gate, recall, digest, summary, and warmup requests carry no suffix.
 
 ### 9.5 Injection lifecycle
 
@@ -256,7 +256,7 @@ One warmup executes these steps in this sequence (independent of the Wake proced
 
 1. Extract the `KnowledgeGraph` object. Refer to `proposed-graph-database-specs.md` Section 7.3.
 2. Run entity resolution and fact validity steps. Refer to Sections 7.4 and 7.5 of that document.
-3. Write nodes, edges, and embeddings in one transaction per group. Run `CHECKPOINT`.
+3. Write nodes and edges in one transaction per group. Run `CHECKPOINT`. Embeddings never join the transaction: the pipeline enqueues them into `pending_embeddings` after the commit (Section 5.2, decision 66).
 4. On every completion (a dead-lettered batch also advances the boundary), advance `last_digest_boundary_msg_id`, obtain and persist the summary of the removed chunk (Rule C3, Section 7.3), apply the context removal, and prune the deduplication set of Section 9.3. A crash between the summary write and the boundary advance is replay-safe: the next completion finds the existing summary row and skips the model call. If the summarization fails, the removal defers one cycle; a later completion retries over the widened range. After 3 consecutive failures the chunk is removed without a summary (one ERROR), and the failure count resets. The summarizer input is capped at 2 × `digest_max_messages`; an oversized chunk summarizes its newest suffix while the summary row records the full range.
 
 ### 10.3 Failure handling
@@ -272,8 +272,8 @@ One warmup executes these steps in this sequence (independent of the Wake proced
 
 ## 11. Warmup behavior
 
-- A warmup run executes the recall step against recent group history and generates a message from the recalled material. A message grounded in a real memory of the group is preferred over a generic cute message.
-- If recall returns nothing relevant, the warmup falls back to a persona-consistent generic message.
+- A warmup run samples one eligible interest Concept node from the group's own graph (Section 9.7 step 2) and generates a message about that topic with the reply purpose. A message grounded in the group's real interests is preferred over a generic cute message.
+- No eligible topic means no warmup — forced small talk is worse than silence. There is no generic fallback message.
 - The warmup obeys the monologue lock and the soft backoff. Refer to Section 8.5.
 
 ## 12. Observability
@@ -291,33 +291,33 @@ Metrics per group:
 | Wake rate | Wakes per hour. Watch against the floor configuration. |
 | Warmup activity | `warmups_total` and `warmup_engaged_total`. The engagement ratio is the Phase 2 exit-criterion metric (roadmap Section 4); watch it per group via `--status`. |
 | Summarization failures | `summaries_failed_total`, cumulative. A rising count warns of a stuck summarizer before the circuit breaker of Section 10.2 engages. |
-| Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Counted post-commit from the final attempt only (decision 77). Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. |
-| Media captioning | `captions_total`, `captions_failed_total`, `captions_empty_total` (Empty is not Provider — the model answered with nothing usable, never retried), `sticker_cache_hits_total`, `placeholder_media_total` (by kind). The placeholder rate is the quality signal for the intake-caption timing assumption of decision 82. |
+| Fact invalidations | `facts_invalidated_total`, cumulative. Counts invalidation events from all three write paths (digest, merge apply, manual `--invalidate`); `--revalidate` never decrements. |
+| Vector resolution outcomes | `vector_resolution_matched_total`, `vector_resolution_confirmed_total`, `vector_resolution_rejected_total`. Counted post-commit from the final attempt only (decision 77). Calibrates the provisional thresholds of `proposed-graph-database-specs.md` Section 7.4. Persisted counters; `--status` does not print them yet (accepted follow-up). |
+| Media captioning | `captions_total`, `captions_failed_total`, `captions_empty_total` (Empty is not Provider — the model answered with nothing usable, never retried), `sticker_cache_hits_total`, `placeholder_media_total` (by kind). The placeholder rate is the quality signal for the intake-caption timing assumption of decision 82. Emitted as structured tracing fields only at cutover; `--status` surfacing is an accepted follow-up (decision 82). |
 
-The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the counters, the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
+The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the persisted counters (every row above except Vector resolution outcomes and Media captioning, as noted), the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
 ## 13. Configuration
 
-Global defaults. Every item is overridable per group. Config load WARNs on any TOML key that matches no known field — global table and per-group tables alike (decision 84(e)): one curated WARN per unknown key at startup, never a hard error (forward compatibility: an older binary reading a newer config must not fail).
+Global defaults. Every item is overridable per group. Keys below are the exact TOML spellings; the `_secs`-suffixed keys take integer seconds. Config load WARNs on any TOML key that matches no known field — global table and per-group tables alike (decision 84(e)): one curated WARN per unknown key at startup, never a hard error (forward compatibility: an older binary reading a newer config must not fail).
 
 | Key | Default | Section |
 |---|---|---|
 | `wake_msg_count` | 5 | 8.3 |
-| `wake_interval` | 1 h | 8.3 |
-| `wake_jitter` | uniform [0.7, 1.3] | 8.3 |
-| `wake_floor` | 5 min | 8.3 |
+| `wake_interval_secs` | 1 h | 8.3 |
+| `wake_jitter_min` / `wake_jitter_max` | uniform [0.7, 1.3] | 8.3 |
+| `wake_floor_secs` | 5 min | 8.3 |
 | `digest_max_chars_cjk` | 5000 | 8.2 |
 | `digest_max_messages` | 100 | 8.2 |
 | `digest_max_words` | 2500 | 8.2 |
 | `digest_max_bytes` | 20 kB | 8.2 |
-| `digest_timeout` | 6 h | 8.2 |
+| `digest_timeout_secs` | 6 h | 8.2 |
 | `digest_max_retries` | 5 total attempts, including the first | 10.3 |
-| `warmup_quota` | 1–3 per day | 8.4 |
-| `warmup_silence` | 4 h | 8.4 |
+| `warmup_silence_secs` | 4 h | 8.4 |
 | `monologue_limit` | 2 | 8.5 |
 | `reply_staleness_threshold` | 20 newer human messages | 6.2 |
 | `reply_quote_threshold` | 10 newer human messages | 6.2 |
-| `forced_wake_cooldown` | 10 s (0 disables) | 8.1 |
+| `forced_wake_cooldown_secs` | 10 s (0 disables) | 8.1 |
 | `gate_context` | true | 9.6 |
 | `vector_resolution` | true | graph 7.4 |
 | `vector_match_threshold` | 0.92 (provisional) | graph 7.4 |
@@ -328,15 +328,12 @@ Global defaults. Every item is overridable per group. Config load WARNs on any T
 | `warmup` | true | 8.4 |
 | `warmup_quota` | 1 (range 1–3) | 8.4 |
 | `warmup_active_hours` | "08:00-23:00" host-local | 8.4 |
-| `warmup_reaction_window` | 30 min | 8.5 |
+| `warmup_reaction_window_secs` | 30 min | 8.5 |
 | `warmup_topic_cooldown_days` | 3 | 9.7 |
 | `deep_recall` | true | 9.1 |
 | `recall_candidate_cap` | 40 per wake | 9.1 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
-| `suffix_mode` | `system` | 9.4 |
-| `timezone` | unset (no time line) | 9.4 |
-
-LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
+LLM access and the reply-suffix keys resolve from the per-group effective configuration (global defaults with per-group overrides, like every key above):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -348,15 +345,15 @@ LLM access resolves from the per-group effective configuration (global defaults 
 | `gate_model` | `claude-haiku-4-5` | Participation decision (Section 9.6). Environment override: `TAMAKO_GATE_MODEL`. |
 | `reply_model` | `claude-sonnet-4-5` | Reply generation (Section 9, step 4). Environment override: `TAMAKO_REPLY_MODEL`. |
 | `summary_model` | `claude-haiku-4-5` | Removed-chunk summarization (Rule C3, Section 10.2). Environment override: `TAMAKO_SUMMARY_MODEL`. |
-| `caption_model` | `minimax/minimax-m3` | Media captioning at intake (decision 82, Section 14). The caption call shares the openai-compatible family's base URL and key unless `caption_llm_base_url` overrides the URL (per-group-capable keys; intake uses one process-wide provider at cutover — per-group resolution is an accepted follow-up). Environment overrides: `TAMAKO_CAPTION_MODEL` / `TAMAKO_CAPTION_LLM_BASE_URL`. |
-| `caption_llm_base_url` | (family default) | Caption-endpoint base-URL override (decision 82). |
+| `caption_model` | `minimax/minimax-m3` | Media captioning at intake (decision 82, Section 14). The caption call shares the openai-compatible family's key (`OPENAI_API_KEY`); the base URL defaults to the pinned OpenRouter URL unless `caption_llm_base_url` overrides it (per-group-capable keys; intake uses one process-wide provider at cutover — per-group resolution is an accepted follow-up). Environment overrides: `TAMAKO_CAPTION_MODEL` / `TAMAKO_CAPTION_BASE_URL`. |
+| `caption_llm_base_url` | `"https://openrouter.ai/api/v1"` | Caption-endpoint base-URL override (decision 82). Environment override: `TAMAKO_CAPTION_BASE_URL`. |
 | `structured_output` | `schema` | Structured-output mode: `schema` (send the JSON schema), `json_object` (JSON mode without a schema), `prompt_only` (no response_format; for endpoints that reject unknown parameters). Environment override: `TAMAKO_STRUCTURED_OUTPUT`. |
 | `llm_session_id` | `"tamako"` | Session-affinity PREFIX (decision 84). Every LLM call sends BOTH `x-opencode-session` (Opencode Go affinity) and `x-session-id` (OpenRouter sticky routing) — dual-send, each gateway reads its own key. The header value is `{prefix}-{suffix}`: the prefix is this key (env `TAMAKO_LLM_SESSION_ID` → config → `"tamako"`; empty string counts as unset; global-only — a group table setting it is a hard startup error, unchanged), and the suffix is a 16-char random base64url string minted once per (group, purpose) and persisted in the group's `llm_session_keys` table (Section 5.2) so provider affinity survives restarts. Purposes receiving a per-group suffix at cutover: digest, gate, reply, summary (embedding and caption send the bare prefix — their providers are process-wide shared; follow-up accepted). The per-(group, purpose) disambiguation is machine-generated, not operator-facing. |
 | `embedding_model` | `"google/gemini-embedding-2"` (3072 dims native; decision 81, schema v11) | Embedding model for the vector sidecar. Global only: no per-purpose and no per-group variant. Environment override: `TAMAKO_EMBEDDING_MODEL`. |
 | `embedding_llm_base_url` | `"https://openrouter.ai/api/v1"` | Base URL of the openai-compatible embeddings endpoint. Global only. Environment override: `TAMAKO_EMBEDDING_BASE_URL`. The embedding dimension is pinned at 3072 (decision 81); changing it means recreating the `node_embeddings` table. |
 | `embedding_enabled` | true | Master switch for the embedding sidecar: the provider, the worker, and the digest-path enqueue. Global only. When false, no content leaves for embeddings; enabling later backfills through the reconciliation pass. |
 
-A purpose (`digest`, `gate`, `reply`, `summary`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
+A purpose (`digest`, `gate`, `reply`, `summary`) may override `llm_api`, `llm_base_url`, and `structured_output` individually. The per-purpose keys are `digest_llm_api`, `digest_structured_output`, and so on, with environment overrides `TAMAKO_DIGEST_STRUCTURED_OUTPUT` and so on. Per-purpose environment overrides of `llm_api` / `llm_base_url` exist for the summary purpose only (`TAMAKO_SUMMARY_LLM_API` / `TAMAKO_SUMMARY_LLM_BASE_URL`). This permits mixed deployments, for example a cheap self-hosted OpenAI-compatible endpoint for extraction and a first-party Anthropic endpoint for replies.
 
 API keys come from the environment only, never from a config file: `ANTHROPIC_API_KEY` for anthropic-compatible endpoints, `OPENAI_API_KEY` for openai-compatible endpoints. These variable names are the convention for the format, for third-party endpoints as well. Decision 87: each completion purpose may override the family key with `TAMAKO_{DIGEST|GATE|REPLY|SUMMARY}_LLM_API_KEY` (purpose env → family env → missing-key error) — the enabler for pointing one purpose at a different provider of the same API family. The override is environment-only by the same invariant (no TOML key exists). An empty string counts as unset and falls through to the family key. Embedding and caption providers keep the family key (they are process-wide; the decision-84 M5 follow-up).
 
