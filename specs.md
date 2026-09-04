@@ -334,12 +334,14 @@ Global defaults. Every item is overridable per group. Config load WARNs on any T
 | `recall_candidate_cap` | 40 per wake | 9.1 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 | `suffix_mode` | `system` | 9.4 |
+| `timezone` | unset (no time line) | 9.4 |
 
 LLM access resolves from the per-group effective configuration (global defaults with per-group overrides, like every key above):
 
 | Key | Default | Notes |
 |---|---|---|
-| `suffix_mode` | `system` | Decision 88: suffix placement mode in reply requests. `system` (Decision 86 default: separate system message strictly last) or `append` (appended into the final user instruction with an authoritative preamble contract). Environment override: `TAMAKO_SUFFIX_MODE`. |
+| `suffix_mode` | `system` | Decision 88: suffix placement mode in reply requests. `system` (Decision 86 default: separate system message strictly last) or `append` (appended into the final user instruction with an authoritative preamble contract). Environment override: `TAMAKO_SUFFIX_MODE` (decision 90 implements it). Per-group TOML wins over the environment value. |
+| `timezone` | unset | Decision 90: the reply-suffix current-time line. An IANA zone name (`Asia/Shanghai`; DST-aware, via the time-tz database — the workspace keeps the `time` crate, not chrono) or a fixed UTC offset (`+08:00`). When set, the reply request's suffix gains a code-owned `<now>` element (the FIRST child of `<system>`, ahead of every operator rule) with the current civil time in the zone, rendered per request past the cached prefix — the decision-86 (d) cache-anchor property is preserved. Unset (or empty string) disables the line: byte-identical pre-90 behavior. An unknown zone name is a hard startup error (Section 5.3 strictness). Environment override: `TAMAKO_TIMEZONE`. Per-group TOML wins over the environment value. |
 | `llm_api` | `anthropic-compatible` | API family: `anthropic-compatible` or `openai-compatible`. The family selects the wire format only, not the vendor. Environment override: `TAMAKO_LLM_API`. |
 | `llm_base_url` | The canonical URL of the selected family | Base URL of the endpoint. Any endpoint that speaks the family format works: first-party, proxy, aggregator, self-hosted. Environment override: `TAMAKO_LLM_BASE_URL`. |
 | `digest_model` | `claude-haiku-4-5` | Extraction (Section 10). Environment override: `TAMAKO_DIGEST_MODEL`. |
