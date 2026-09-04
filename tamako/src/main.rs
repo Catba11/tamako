@@ -102,8 +102,8 @@ Options:
                            Section 7.7): scans the group's vector index for
                            duplicate Person/Concept pairs, confirms each
                            candidate once on the digest endpoint (three-way
-                           verdict: same merges, related links
-                           also_known_as, different skips), prints the
+                           verdict: same merges, related writes a
+                           related_pairs row, different skips), prints the
                            plan, and writes it to
                            <data-root>/<chat_id>/merge_plan.json. DRY RUN
                            by default: the group's store.db opens
@@ -2687,7 +2687,7 @@ fn format_group_status(
             let _ = writeln!(
                 out,
                 "    {:<27}{participation_rate:.1}% ({participations}/{wakes}) \
-                 (healthy target: below 50%)",
+                 (healthy band: 30-60%)",
                 "participation rate:"
             );
             let _ = writeln!(
@@ -4162,7 +4162,7 @@ mod tests {
             "text:\n{text}"
         );
         assert!(
-            text.contains("participation rate:        40.0% (12/30) (healthy target: below 50%)"),
+            text.contains("participation rate:        40.0% (12/30) (healthy band: 30-60%)"),
             "text:\n{text}"
         );
         assert!(
