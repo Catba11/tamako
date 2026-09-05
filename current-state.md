@@ -2276,6 +2276,75 @@ audits — re-stamp when re-verified, not on every feature commit
     backup-branch and stray-data-directory deletions (an operator
     snapshot first).
 
+93. (2026-09-04) Reply output contract (`<reply>` fence) plus
+    reasoning-markup sanitation (specs.md Section 9.8). Two
+    production leaks from the live groups. (a) A reasoning model's
+    trace reached the group: the provider's reasoning parser split
+    at the FIRST literal `</think>` — a string the reasoning itself
+    mentioned while discussing a glitchy AI output — so the content
+    field carried the reasoning tail, a stray `</think>`, and the
+    answer; the codebase had zero think-tag handling. (b) The reply
+    model wrapped its answer in a `<reply>` element — the wrapper
+    the decision-85 examples render byte-for-byte: the decision-85
+    design guarded the CONTENT shape (bare text, never `<you>`) but
+    not the WRAPPER shape, and the wrapper is itself a
+    model-visible shape. The root causes differ — (a) is a
+    transport artifact of the serving stack, (b) is a prompt-taught
+    confabulation — so the fix layers three defenses. **Layer 1,
+    endpoint reasoning stripper (all purposes).** Every
+    completion's extracted text passes `strip_reasoning_markup`
+    before any purpose sees it (reply, gates, summary, extraction,
+    caption): balanced `<think>...</think>` regions strip; an
+    orphan `</think>` drops everything up to and including it (the
+    observed botched-split shape); an unclosed `<think>` voids the
+    remainder, so an all-reasoning response becomes the same
+    extraction error as a text-less response — every caller's
+    backoff and dead-letter discipline applies unchanged
+    (fail-closed: a leak never ships). Well-behaved providers were
+    already safe: rig maps `reasoning_content`/`reasoning` response
+    fields to a separate content variant the text extraction never
+    selects. Side benefit: captions no longer persist reasoning
+    tails into memory, and the structured flows stop spending
+    repair retries on leaked reasoning. **Layer 2, reply fence
+    contract.** The ephemeral reply instruction requires the whole
+    reply in exactly one `<reply>...</reply>` element — the
+    sentence lives in the reply instruction ONLY, because the
+    shared context-format gloss also feeds the JSON-outputting
+    gates. Extraction at the reply validation seam takes the FIRST
+    complete pair (an attribute-carrying `<reply ...>` opener is
+    accepted: the instruction names a message id, so an imitated
+    attribute is an expected variant) and drops everything outside
+    the fence, one WARN with the dropped byte count. This is the
+    allowlist complement of the layer-1 blocklist: an UNKNOWN
+    future reasoning marker outside the fence drops with no code
+    change. The contract is deliberately FAIL-OPEN — an absent or
+    malformed fence passes the whole text through with one WARN —
+    because the deployment runs several endpoints and models, and
+    strict fence-or-drop would turn a model swap into silence.
+    Production observation supports the contract: the live model
+    fenced spontaneously before the contract existed. The warmup
+    path carries no fence sentence and keeps the pre-93 handling
+    (layers 1 and 3 still apply). **Layer 3, residual fence-token
+    hygiene** in the decision-59 parrot filter: tag-only
+    `<reply>`/`</reply>` lines drop, inline pairs unwrap, edge
+    tokens strip; a mid-line single token survives (quotation
+    protection — the group discusses AI glitch output). The
+    actor-side seams keep applying the parrot filter only; fence
+    extraction runs once, at the generator seam. Rejected: changing
+    the decision-85 example rendering (any delimiter is imitable; a
+    rendering change breaks the Rule C4 cache anchor for every
+    examples-using config; the output-side contract is fail-safe
+    regardless); strict fence-or-drop semantics (reply-loss
+    distribution unacceptable in a multi-model deployment);
+    request-side reasoning suppression via provider-specific
+    parameters (dialects differ per provider, strict providers
+    reject unknown parameters, and reasoning improves reply
+    quality — the goal is keeping it out of the content, not
+    turning it off). Telemetry: one WARN per fence fallback, one
+    per dropped outside-fence span, one per non-trivial reasoning
+    strip — the frequencies gauge contract compliance and endpoint
+    behavior per model.
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:
