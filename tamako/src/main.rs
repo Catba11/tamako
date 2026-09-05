@@ -848,14 +848,20 @@ fn build_wake_services(
     // generator (the ONLY purpose that carries a suffix). Read at
     // request-assembly time; rewritten by the persona hot reload.
     suffix: Arc<RwLock<String>>,
+    // Decision 95: the shared pet-tag slot, wired into the gate, reply,
+    // and recall generators (every wake purpose whose prompts explain
+    // or enforce the speech tag). Same hot-reload discipline.
+    pet_tag: Arc<RwLock<String>>,
 ) -> Result<Option<WakeServices>> {
     match (
-        RigGate::from_endpoint(&endpoints.gate),
+        RigGate::from_endpoint(&endpoints.gate)
+            .map(|gate| gate.with_pet_tag_slot(Arc::clone(&pet_tag))),
         RigReplyGenerator::from_endpoint(&endpoints.reply).map(|generator| {
             generator
                 .with_suffix_slot(suffix)
                 .with_suffix_mode(trigger_config.suffix_mode)
                 .with_timezone(trigger_config.timezone)
+                .with_pet_tag_slot(Arc::clone(&pet_tag))
         }),
     ) {
         (Ok(gate), Ok(reply)) => {
@@ -866,7 +872,9 @@ fn build_wake_services(
                 // The gate renders the cap into its preamble (decision
                 // 65); ShallowRecall enforces the same cap.
                 trigger_config.recall_injection_cap,
-            ) {
+            )
+            .map(|gate| gate.with_pet_tag_slot(pet_tag))
+            {
                 Ok(relevance_gate) => {
                     // Decision 76: the deep-recall plan of this group.
                     // `Some` carries the dedicated one-group store and
@@ -947,8 +955,13 @@ fn build_wake_services(
 /// (reported as `AgentError::ProviderConfig`) degrades to `Ok(None)`
 /// with one warning — the actor treats `None` as fully inert — and
 /// every other build error propagates.
-fn build_warmup_services(endpoints: &LlmEndpoints) -> Result<Option<WarmupServices>> {
-    match RigWarmupGenerator::from_endpoint(&endpoints.reply) {
+fn build_warmup_services(
+    endpoints: &LlmEndpoints,
+    pet_tag: Arc<RwLock<String>>,
+) -> Result<Option<WarmupServices>> {
+    match RigWarmupGenerator::from_endpoint(&endpoints.reply)
+        .map(|generator| generator.with_pet_tag_slot(pet_tag))
+    {
         Ok(generator) => {
             info!(reply_model = %endpoints.reply.model, "warmup trigger wired (reply endpoint)");
             Ok(Some(WarmupServices {
@@ -1219,6 +1232,13 @@ struct SharedSetup {
     /// part of the context or the cache anchor (decision 86 (d)). EMPTY
     /// string means no suffix (byte-identical pre-86 behavior).
     suffix: Arc<RwLock<String>>,
+    /// The decision-95 pet tag (`tamako_persona::pet_tag_for_name` of
+    /// the persona name): ONE slot shared by the gate, reply, warmup,
+    /// and recall generators, rewritten by the persona watcher on each
+    /// accepted reload. NEVER persisted — the group actors hold their
+    /// own copy (`GroupActorParams::pet_tag`) swapped via the
+    /// `ReloadPreamble` broadcast.
+    pet_tag: Arc<RwLock<String>>,
     bot_name: String,
     store: Arc<Store>,
     memory: Arc<LbugBackend>,
@@ -1243,15 +1263,19 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     // watcher on each reload. It rides the SAME hot-reload discipline as
     // the preamble but is NEVER persisted and never part of the anchor.
     let suffix = tamako_persona::render_suffix(&persona.suffix);
+    // Decision 95: the speech/fence tag derives from the persona name
+    // ONCE here; every wake-purpose generator shares the slot.
+    let pet_tag = tamako_persona::pet_tag_for_name(&persona.name);
     // Decision 94 (d): the suffix rule count rides the startup line, so
     // a silently empty suffix is one log read away.
-    info!(persona = %persona.name, preamble_len = preamble.len(), suffix_rules = persona.suffix.len(), "persona preamble rendered");
+    info!(persona = %persona.name, pet_tag = %pet_tag, preamble_len = preamble.len(), suffix_rules = persona.suffix.len(), "persona preamble rendered");
     Ok(SharedSetup {
         bot_config,
         // Decision 80: updatable in live mode; the startup render is the
         // initial value.
         preamble: Arc::new(RwLock::new(preamble)),
         suffix: Arc::new(RwLock::new(suffix)),
+        pet_tag: Arc::new(RwLock::new(pet_tag)),
         bot_name: persona.name,
         store: Arc::new(Store::new(cli.data_root.clone())),
         memory: Arc::new(LbugBackend::new(cli.data_root.clone())),
@@ -1371,6 +1395,7 @@ async fn run_replay(
         // the state; replay reads the startup render). The mock adapter
         // path never sends it.
         Arc::clone(&setup.suffix),
+        Arc::clone(&setup.pet_tag),
     )?;
     // The Rule C3 summarizer (decision 62). A missing family API key
     // degrades to the old C3 behavior (drop without a summary) with one
@@ -1396,6 +1421,13 @@ async fn run_replay(
         // forever.
         preamble: setup
             .preamble
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        // Decision 95: the speech/fence tag of the startup persona
+        // (replay never reloads — the startup value stands).
+        pet_tag: setup
+            .pet_tag
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone(),
@@ -3035,6 +3067,7 @@ async fn run_live(
                                 // Decision 86: the shared rendered-suffix
                                 // slot, hot-reloaded by the persona watcher.
                                 Arc::clone(&setup.suffix),
+                                Arc::clone(&setup.pet_tag),
                             ) {
                                 Ok(wake) => wake,
                                 Err(error) => {
@@ -3048,7 +3081,9 @@ async fn run_live(
                             // call); the degrade doctrine mirrors
                             // build_wake_services (no provider key, no
                             // warmup — the actor stays inert).
-                            let warmup = match build_warmup_services(&endpoints) {
+                            let warmup =
+                                match build_warmup_services(&endpoints, Arc::clone(&setup.pet_tag))
+                                {
                                 Ok(warmup) => warmup,
                                 Err(error) => {
                                     fatal = Some(error);
@@ -3084,6 +3119,14 @@ async fn run_live(
                                 // born current.
                                 preamble: setup
                                     .preamble
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .clone(),
+                                // Decision 95: the CURRENT pet tag — an
+                                // actor spawned after a persona reload is
+                                // born with the renamed tag.
+                                pet_tag: setup
+                                    .pet_tag
                                     .read()
                                     .unwrap_or_else(PoisonError::into_inner)
                                     .clone(),
@@ -3171,8 +3214,19 @@ async fn run_live(
                     .suffix
                     .write()
                     .unwrap_or_else(PoisonError::into_inner) = notice.suffix.clone();
+                // Decision 95: the shared pet-tag slot follows the name
+                // of the reloaded persona. Unconditional (cheap and
+                // idempotent): a tag change always travels with a
+                // preamble change (the name is rendered into it), so the
+                // broadcast below carries it to the actors.
+                let pet_tag = tamako_persona::pet_tag_for_name(&notice.persona_name);
+                *setup
+                    .pet_tag
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = pet_tag.clone();
                 if notice.preamble_changed {
-                    let skipped = persona_watch::broadcast_preamble(&actors, &notice.preamble);
+                    let skipped =
+                        persona_watch::broadcast_preamble(&actors, &notice.preamble, &pet_tag);
                     // ONE curated INFO line per applied reload (decision-53
                     // addition, the decision-78 warmup line's class): a
                     // deliberate operator event is exactly the startup-class

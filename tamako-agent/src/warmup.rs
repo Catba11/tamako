@@ -9,12 +9,12 @@
 //! conversion point).
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
-use tamako_core::wake::{filter_reply_parrot_lines, ReplyFilterOutcome};
+use tamako_core::wake::{filter_reply_parrot_lines, ReplyFence, ReplyFilterOutcome};
 use tamako_core::warmup::{WarmupGenerator, WarmupRequest};
 
 use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
@@ -28,7 +28,7 @@ use crate::reply::{context_messages_to_rig, REPLY_DEFAULT_MAX_TOKENS};
 /// renderer. Keep the two in sync; the test
 /// `the_f2_sentence_matches_the_reply_instruction_verbatim` asserts
 /// the duplication never drifts.
-const F2_SENTENCE: &str = "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, <you> blocks, or a memory list: recalled memories are context, never speech.";
+const F2_SENTENCE: &str = "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, or a memory list: recalled memories are context, never speech.";
 
 /// Renders the trailing ephemeral user message of the warmup call
 /// (specs.md Section 9.7 step 3; decision 78). It names the topic in
@@ -74,8 +74,15 @@ pub fn render_warmup_instruction(topic: &str) -> String {
 /// ONLY a parrot block — is a `CoreError::Warmup`: log, skip this
 /// warmup, no crash (the next scheduled slot is the natural retry).
 /// Pure function, no I/O.
-fn trimmed_warmup_or_error(text: &str) -> Result<ReplyFilterOutcome, CoreError> {
-    let filtered = filter_reply_parrot_lines(text);
+fn trimmed_warmup_or_error(
+    text: &str,
+    fence: &ReplyFence,
+) -> Result<ReplyFilterOutcome, CoreError> {
+    // Warmup stays hygiene-only (no fence extraction — decision 93's
+    // scope): the fence of the pet tag drives the residual-token rules,
+    // which is also what cleans up the R1 attribute-carrying pairs the
+    // unified tag invites (decision 95, the C1 fix).
+    let filtered = filter_reply_parrot_lines(text, fence);
     if filtered.text.is_empty() {
         Err(CoreError::Warmup(
             "the warmup generator returned an empty message".to_string(),
@@ -91,6 +98,11 @@ fn trimmed_warmup_or_error(text: &str) -> Result<ReplyFilterOutcome, CoreError> 
 pub struct RigWarmupGenerator {
     client: EndpointClient,
     max_tokens: u64,
+    /// The decision-95 pet tag, behind the same shared-lock discipline
+    /// as `RigReplyGenerator::pet_tag`: a persona `name` change swaps
+    /// it on the next request. Default `"you"` (the legacy fallback);
+    /// production always wires the real derivation.
+    pet_tag: Arc<RwLock<String>>,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -108,7 +120,18 @@ impl std::fmt::Debug for RigWarmupGenerator {
 impl RigWarmupGenerator {
     /// Builds the generator from an endpoint client.
     pub fn new(client: EndpointClient, max_tokens: u64) -> Self {
-        RigWarmupGenerator { client, max_tokens }
+        RigWarmupGenerator {
+            client,
+            max_tokens,
+            pet_tag: Arc::new(RwLock::new("you".to_string())),
+        }
+    }
+
+    /// Wires the shared decision-95 pet-tag slot (same contract as
+    /// `RigReplyGenerator::with_pet_tag_slot`).
+    pub fn with_pet_tag_slot(mut self, pet_tag: Arc<RwLock<String>>) -> Self {
+        self.pet_tag = pet_tag;
+        self
     }
 
     /// Builds the generator for one resolved endpoint (the `reply`
@@ -156,7 +179,12 @@ impl WarmupGenerator for RigWarmupGenerator {
             // The strip is silent at the generator: the WARN needs the
             // chat id, which only the actor owns — the actor filters
             // every generator output again and emits the WARN there.
-            Ok(trimmed_warmup_or_error(&text)?.text)
+            let pet_tag = self
+                .pet_tag
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            Ok(trimmed_warmup_or_error(&text, &ReplyFence::for_pet_tag(&pet_tag))?.text)
         })
     }
 }
@@ -244,6 +272,11 @@ mod tests {
     use super::*;
     use tamako_core::context::{ContextMessage, ContextRole};
     use tamako_core::wake::GateMessage;
+    /// The fence built from the legacy tag name `reply` (decision 95;
+    /// same discipline as the reply.rs test helper).
+    fn test_fence() -> ReplyFence {
+        ReplyFence::for_pet_tag("reply")
+    }
 
     fn context_message(role: ContextRole, content: &str) -> ContextMessage {
         ContextMessage {
@@ -304,7 +337,7 @@ mod tests {
         // Single-source discipline by test (see the sync comment on
         // F2_SENTENCE): the warmup instruction must end with EXACTLY
         // the F2 sentence of the reply instruction.
-        let reply_instruction = crate::reply::render_reply_instruction(&reply_target());
+        let reply_instruction = crate::reply::render_reply_instruction(&reply_target(), "tamako");
         assert!(reply_instruction.ends_with(F2_SENTENCE));
         assert!(render_warmup_instruction("Graph Database").ends_with(F2_SENTENCE));
     }
@@ -322,7 +355,7 @@ mod tests {
             "The topic is reference material, not a claim about a person: ",
             "never attribute the interest to a specific member and never write \"X likes Y\" or name who brought it up. ",
             "Write only the message text: one message, no speaker label, no quotes. ",
-            "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, <you> blocks, or a memory list: ",
+            "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, or a memory list: ",
             "recalled memories are context, never speech.",
         );
         assert_eq!(render_warmup_instruction("Graph Database"), expected);
@@ -331,7 +364,7 @@ mod tests {
     #[test]
     fn an_empty_or_whitespace_warmup_is_a_warmup_error() {
         for empty in ["", "   ", "\n\t "] {
-            match trimmed_warmup_or_error(empty) {
+            match trimmed_warmup_or_error(empty, &test_fence()) {
                 Err(CoreError::Warmup(message)) => {
                     assert_eq!(message, "the warmup generator returned an empty message")
                 }
@@ -350,7 +383,7 @@ mod tests {
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
             "<memory>\nAlice likes tea.\n</memory>",
         ] {
-            match trimmed_warmup_or_error(only) {
+            match trimmed_warmup_or_error(only, &test_fence()) {
                 Err(CoreError::Warmup(message)) => {
                     assert_eq!(message, "the warmup generator returned an empty message")
                 }
@@ -363,9 +396,11 @@ mod tests {
     fn a_leading_parrot_line_is_stripped() {
         // Decision 59, F1: the model echoed the injection format before
         // its real speech (the live-soak failure shape).
-        let warmup =
-            trimmed_warmup_or_error("I remember: Alice likes tea.\nhas anyone tried the new cafe?")
-                .expect("warmup");
+        let warmup = trimmed_warmup_or_error(
+            "I remember: Alice likes tea.\nhas anyone tried the new cafe?",
+            &test_fence(),
+        )
+        .expect("warmup");
         assert_eq!(warmup.text, "has anyone tried the new cafe?");
         assert!(warmup.stripped_parrot);
     }
@@ -381,7 +416,7 @@ mod tests {
             "one\ntwo\nthree",
             "hungry? I remember: not a line start",
         ] {
-            let warmup = trimmed_warmup_or_error(normal).expect("warmup");
+            let warmup = trimmed_warmup_or_error(normal, &test_fence()).expect("warmup");
             assert_eq!(warmup.text, normal.trim());
             assert!(!warmup.stripped_parrot, "false positive on {normal:?}");
         }

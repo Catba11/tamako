@@ -158,7 +158,7 @@ use crate::summary::{SummaryError, SummaryProvider};
 use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeScheduler};
 use crate::wake::{
     filter_reply_parrot_lines, GateDecision, GateInput, GateMessage, ParticipationGate,
-    PlannedInjection, RecallProvider, ReplyGenerator, ReplyRequest, WakeServices,
+    PlannedInjection, RecallProvider, ReplyFence, ReplyGenerator, ReplyRequest, WakeServices,
 };
 use crate::warmup::{
     effective_quota, local_date_string, pick_topic, prune_cooldowns, schedule_next, WarmupServices,
@@ -290,8 +290,12 @@ pub enum ActorCommand {
     /// through the FIFO inbox like every other command — it never
     /// interrupts in-flight work. The handler swaps context item 0 in
     /// memory (Rule C4); nothing persists (the persona file is the
-    /// state).
-    ReloadPreamble(String),
+    /// state). Decision 95: carries the unified speech tag alongside —
+    /// a persona-name change swaps both the preamble and the tag.
+    ReloadPreamble {
+        preamble: String,
+        pet_tag: String,
+    },
     /// The spawned digest task reports its result through this command
     /// (internal plumbing). Every session mutation stays serialized in
     /// the actor loop — specs.md Section 6.1, rule 2.
@@ -464,6 +468,11 @@ pub struct GroupActorParams<M: MemoryBackend> {
     /// The sender display name of outbound raw-log rows (the persona
     /// name). `None` falls back to "Tamako".
     pub bot_name: Option<String>,
+    /// The unified speech tag of decision 95 (derived from the persona
+    /// name by the caller via `tamako_persona::pet_tag_for_name`): the
+    /// live context renders the bot's own speech with it, and the
+    /// parrot-filter seams build the reply fence from it.
+    pub pet_tag: String,
 }
 
 /// Spawns the actor task and returns the handle immediately.
@@ -969,6 +978,7 @@ async fn run_actor<M: MemoryBackend>(
         summary_provider,
         outbound,
         bot_name,
+        pet_tag,
         ..
     } = params;
     let bot_name = bot_name.unwrap_or_else(|| "Tamako".to_string());
@@ -1071,8 +1081,14 @@ async fn run_actor<M: MemoryBackend>(
         store.list_newest_context_summaries(&summaries_chat_id, 2)
     })
     .await?;
-    let mut context =
-        LiveContext::rebuild(preamble, &rows, &injections, &reply_targets, &summaries);
+    let mut context = LiveContext::rebuild(
+        preamble,
+        pet_tag,
+        &rows,
+        &injections,
+        &reply_targets,
+        &summaries,
+    );
 
     // One digest at a time per group (Section 6.1, rule 2).
     let mut digest_in_flight = false;
@@ -1758,7 +1774,7 @@ async fn run_actor<M: MemoryBackend>(
                 // actor failure.
                 let _ = reply.send(context.items().to_vec());
             }
-            ActorCommand::ReloadPreamble(preamble) => {
+            ActorCommand::ReloadPreamble { preamble, pet_tag } => {
                 // Decision 80 (specs.md Section 6.1 rule 1 as amended):
                 // the live-mode persona hot reload. IN-MEMORY ONLY: the
                 // Rule C4 item-0 swap mutates no session state and
@@ -1768,6 +1784,7 @@ async fn run_actor<M: MemoryBackend>(
                 // line lives at the binary's watcher site, not here.
                 let preamble_len = preamble.len();
                 context.reload_preamble(preamble);
+                context.set_pet_tag(pet_tag);
                 debug!(
                     chat_id = %chat_id,
                     preamble_len,
@@ -2494,7 +2511,8 @@ async fn handle_warmup_report(
 ) -> Result<(), CoreError> {
     // The parrot filter (Section 9.7 step 3): decisions 59/64 apply to
     // the warmup text like every reply.
-    let filtered = filter_reply_parrot_lines(&raw_text);
+    let filtered =
+        filter_reply_parrot_lines(&raw_text, &ReplyFence::for_pet_tag(context.pet_tag()));
     if filtered.stripped_parrot {
         tracing::warn!(chat_id = %chat_id, "the warmup text parrots context structure: the parrot filter stripped the imitated lines");
     }
@@ -2725,6 +2743,10 @@ async fn start_wake(
     // at all. Inbound messages during the call are logged and appended;
     // they do not interrupt it (Section 6.2).
     let snapshot = context.messages_for_llm();
+    // Decision 95: the reply fence of the wake task derives from the
+    // CURRENT speech tag; it travels as an owned value (the task
+    // touches no actor state).
+    let pet_tag = context.pet_tag().to_string();
     *wake_in_flight = true;
     let recall = Arc::clone(&services.recall);
     let gate = Arc::clone(&services.gate);
@@ -2754,6 +2776,7 @@ async fn start_wake(
                 tail_id,
                 trigger,
                 context_view,
+                pet_tag,
             )
             .await
         })
@@ -2798,6 +2821,10 @@ async fn run_wake_calls(
     injection_position: i64,
     trigger: &'static str,
     context_view: Option<String>,
+    // Decision 95: the wake task runs over owned data and never touches
+    // actor state, so the unified speech tag travels as a value; the
+    // parrot filter below builds the reply fence from it.
+    pet_tag: String,
 ) -> Result<WakeReport, CoreError> {
     // Step 2 (Sections 9.1-9.5): recall before the gate. The rendered
     // injection texts enter the gate input (Section 9.6: the recall
@@ -2884,6 +2911,7 @@ async fn run_wake_calls(
     // snapshot. Skipped when the decision is no-participation.
     let reply_text = match &target {
         Some(target) => {
+            let fence = ReplyFence::for_pet_tag(&pet_tag);
             let raw_text = reply
                 .generate(&ReplyRequest {
                     messages: snapshot,
@@ -2897,7 +2925,7 @@ async fn run_wake_calls(
             // context element into the WakeReport. The filtered
             // text is what the completion handler persists (Rule B1)
             // and sends: the log and the group see the same text.
-            let filtered = filter_reply_parrot_lines(&raw_text);
+            let filtered = filter_reply_parrot_lines(&raw_text, &fence);
             if filtered.stripped_parrot {
                 tracing::warn!(chat_id = %chat_id, "the reply parrots context structure: the parrot filter stripped the imitated lines");
             }
@@ -3376,6 +3404,7 @@ mod tests {
         digest: Arc<dyn DigestPipeline>,
     ) -> GroupActorHandle {
         spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -3606,6 +3635,7 @@ mod tests {
 
     fn spawn_on(fixture: &Fixture, config: TriggerConfig) -> GroupActorHandle {
         spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -3630,6 +3660,7 @@ mod tests {
             store: Arc::clone(&fixture.store),
         });
         spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -3761,6 +3792,7 @@ mod tests {
 
         // A NEW actor on the same store and the same started_at.
         let restarted = spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::new(NoopMemory::new()),
@@ -3821,7 +3853,10 @@ mod tests {
             blocking_store_call(&fixture.store, |store| store.load_all_state(CHAT_ID)).await;
 
         handle
-            .send(ActorCommand::ReloadPreamble("new preamble".to_string()))
+            .send(ActorCommand::ReloadPreamble {
+                preamble: "new preamble".to_string(),
+                pet_tag: "tamako".to_string(),
+            })
             .await
             .expect("send succeeds");
         // FIFO barrier: when this snapshot returns, the reload ran.
@@ -3863,7 +3898,10 @@ mod tests {
             .await
             .expect("context snapshot succeeds");
         handle
-            .send(ActorCommand::ReloadPreamble("hot preamble".to_string()))
+            .send(ActorCommand::ReloadPreamble {
+                preamble: "hot preamble".to_string(),
+                pet_tag: "tamako".to_string(),
+            })
             .await
             .expect("send succeeds");
         let after = handle
@@ -3889,7 +3927,10 @@ mod tests {
             .await
             .expect("the actor task joins")
             .expect("shutdown succeeds");
-        let result = handle.try_send(ActorCommand::ReloadPreamble("x".to_string()));
+        let result = handle.try_send(ActorCommand::ReloadPreamble {
+            preamble: "x".to_string(),
+            pet_tag: "tamako".to_string(),
+        });
         assert!(matches!(result, Err(CoreError::InboxClosed)));
         // The full-inbox arm (`TrySendError::Full`) is not tested: it
         // needs 256 pending commands, and the collapsed error makes the
@@ -4239,6 +4280,7 @@ mod tests {
         .await;
         let expected = LiveContext::rebuild(
             TEST_PREAMBLE.to_string(),
+            "tamako".to_string(),
             &rows,
             &injections,
             &HashMap::new(),
@@ -4490,6 +4532,7 @@ mod tests {
             store: Arc::clone(&fixture.store),
         });
         spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -5928,6 +5971,7 @@ mod tests {
             reply,
         };
         let handle = spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -5959,6 +6003,7 @@ mod tests {
     ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let handle = spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -6174,11 +6219,16 @@ mod tests {
         let last = items.last().expect("items exist");
         assert_eq!(last.kind, ContextItemKind::BotSpeech);
         assert_eq!(last.role, ContextRole::Assistant);
-        // The `<you>` item of the row (the row timestamp is the same
+        // The `<tamako>` item of the row (the row timestamp is the same
         // `now` the append used).
         assert_eq!(
             last.content,
-            render_bot_content(bot_row.id, bot_row.timestamp, "a thoughtful reply")
+            render_bot_content(
+                bot_row.id,
+                bot_row.timestamp,
+                "a thoughtful reply",
+                "tamako"
+            )
         );
         assert_eq!(last.range_tag, Some(RangeTag::single(bot_row.id)));
 
@@ -6388,6 +6438,7 @@ mod tests {
         let reply = ScriptedReply::new("recovered reply");
         let (outbound_tx, mut outbound) = mpsc::channel(64);
         let handle = spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -7908,6 +7959,7 @@ mod tests {
     ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let handle = spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: CHAT_ID.to_string(),
             store: Arc::clone(&fixture.store),
             memory: Arc::clone(&fixture.memory),
@@ -8444,7 +8496,7 @@ mod tests {
         assert_eq!(last.kind, ContextItemKind::BotSpeech);
         assert_eq!(
             last.content,
-            render_bot_content(bot_row.id, bot_row.timestamp, "warmup hello")
+            render_bot_content(bot_row.id, bot_row.timestamp, "warmup hello", "tamako")
         );
         assert_eq!(last.range_tag, Some(RangeTag::single(bot_row.id)));
 

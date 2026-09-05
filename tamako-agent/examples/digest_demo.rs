@@ -149,6 +149,7 @@ async fn main() {
         ..TriggerConfig::default()
     };
     let handle = spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: chat_id.clone(),
         store: Arc::clone(&store),
         memory: Arc::clone(&memory),

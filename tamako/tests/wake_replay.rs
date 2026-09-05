@@ -162,6 +162,7 @@ fn spawn_on(
         })
     };
     let handle = spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),
@@ -460,7 +461,7 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
         .collect();
     let expected: Vec<String> = outbound
         .iter()
-        .map(|row| render_bot_content(row.id, row.timestamp, &row.text))
+        .map(|row| render_bot_content(row.id, row.timestamp, &row.text, "tamako"))
         .collect();
     assert_eq!(bot_speeches, expected);
     // The gate ran exactly once (the two forced wakes bypass it,
@@ -978,7 +979,7 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
         .collect();
     let expected_speeches: Vec<String> = outbound
         .iter()
-        .map(|row| render_bot_content(row.id, row.timestamp, &row.text))
+        .map(|row| render_bot_content(row.id, row.timestamp, &row.text, "tamako"))
         .collect();
     let expected_speeches: Vec<&str> = expected_speeches.iter().map(String::as_str).collect();
     assert_eq!(bot_speeches, expected_speeches);
@@ -1244,7 +1245,7 @@ async fn the_gate_context_view_extends_byte_for_byte_across_consecutive_wakes() 
     assert_eq!(outbound[0].id, 4);
     assert_eq!(outbound[0].text, "r1");
     let suffix = [
-        render_bot_content(outbound[0].id, outbound[0].timestamp, "r1"),
+        render_bot_content(outbound[0].id, outbound[0].timestamp, "r1", "tamako"),
         rendered(5, "p4", 4),
         rendered(6, "p5", 5),
         rendered(7, "p6", 6),
