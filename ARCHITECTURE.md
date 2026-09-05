@@ -177,7 +177,15 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   `forced_pending` with the intake timestamp of its forcing message
   (Section 6.2, deterministic replay clock) and starts immediately
   after the current wake completes.
-- The reply text of step 4 passes the parrot filter of decision 59 IN
+- The reply text of step 4 satisfies the `<reply>` fence contract of
+  decision 93 (specs.md Section 9.8) at the live generator's
+  validation seam: the first complete fence yields the text, anything
+  outside it drops (one WARN); an absent or malformed fence passes
+  the whole text through (one WARN) — fail-open by design. The
+  endpoint layer additionally strips reasoning markup (`<think>`
+  regions, orphan closers) from every completion's text before any
+  purpose consumes it (decision 93). The reply text then passes the
+  parrot filter of decision 59 IN
   the wake task, before the report: every line whose trimmed start
   matches the recall-injection prefix (`INJECTION_TEXT_PREFIX`, ASCII
   or full-width colon) or opens a `<memory>`/`<summary>`/`<msg>`/`<you>`
