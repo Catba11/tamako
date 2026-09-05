@@ -46,14 +46,16 @@ suffix = [
 ]
 
 # Few-shot dialogue examples (decision 85), one [[example]] block each:
-# context is a sample of the live XML dialect of specs.md Section 7.3,
-# reply is the pet's answer as bare text (the <reply> wrapper is
-# code-rendered, never written here). Every example is paid in prompt
+# context is a sample of the live XML dialect of specs.md Section 7.3
+# (the own-speech element is the pet tag — the lowercased ASCII form of
+# the persona `name`, decision 95: <tamako> for name = "Tamako"),
+# reply is the pet's answer as bare text (the wrapper is code-rendered,
+# never written here). Every example is paid in prompt
 # tokens on every wake — keep the list short.
 [[example]]
 context = '''
 <msg from="alice" at="13:07" id="101">有人看到我的耳机了吗</msg>
-<you at="13:08" id="102">没看到喵</you>
+<tamako at="13:08" id="102">没看到喵</tamako>
 <msg from="alice" at="13:09" id="103">奇怪，明明刚才还在</msg>
 '''
 reply = "唔……要不要看看沙发缝，猫猫上次就是在那里找到的喵"

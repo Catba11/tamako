@@ -177,8 +177,10 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   `forced_pending` with the intake timestamp of its forcing message
   (Section 6.2, deterministic replay clock) and starts immediately
   after the current wake completes.
-- The reply text of step 4 satisfies the `<reply>` fence contract of
-  decision 93 (specs.md Section 9.8) at the live generator's
+- The reply text of step 4 satisfies the `<{pet}>` fence contract of
+  decision 93 (specs.md Section 9.8; decision 95 unified the fence tag
+  with the own-speech tag — the persona-name-derived pet tag — so every
+  own-history item demonstrates the fence shape) at the live generator's
   validation seam: the first complete fence yields the text, anything
   outside it drops (one WARN); an absent or malformed fence passes
   the whole text through (one WARN) — fail-open by design. The
@@ -193,7 +195,12 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   line) is removed — the reply model can imitate the
   injection format and the context structure it sees, and a
   confabulated "I remember: ..." line or `<msg>`/`<you>` block (the
-  2026-08-14 live incident) must never become bot speech. A
+  2026-08-14 live incident) must never become bot speech. Decision 95:
+  the `<you>` region is now the LEGACY anchor (stored pre-95 summaries
+  and memories can quote the old shape); the current own-speech tag
+  needs no region — its residuals are the fence hygiene of Section
+  9.8 (tag-only line drops on the first-`>`-ends-line test, inline
+  pairs unwrap, edge tokens strip). A
   strip that leaves text logs one WARN with the chat id; an empty
   remainder is the empty-reply `CoreError::Wake` (log, skip, no
   crash). The live reply generator applies the same pure function at
@@ -276,8 +283,10 @@ only inside the actor loop (Section 6.1, rule 2).
 
 - **Item model**: an ordered list. Item 0 is always the system preamble
   from the persona service — the provider cache anchor (Rule C4; since
-  decision 63 it embeds the code-owned `CONTEXT_FORMAT_GLOSS`
-  explaining the XML format). Every
+  decision 63 it embeds the code-owned format gloss explaining the XML
+  format — decision 95 made it the function
+  `tamako_persona::context_format_gloss(pet_tag)`, rendered for the
+  current pet tag). Every
   other item carries a message-id range tag (Section 7.1, raw-log row
   ids) and a role (system / user / assistant). Kinds: `HumanMessage`
   (user role), `BotSpeech` (assistant role — Rule B1),
@@ -288,7 +297,8 @@ only inside the actor loop (Section 6.1, rule 2).
   (reserved, no producer). Item CONTENT renders as XML (decision 61;
   the item model itself is unchanged): a human message renders
   `<msg from="{display_name}"[ user="{username}"] at="{HH:MM UTC}" id="{row_id}"[ kind="edit"][ reply="bot" | reply="user"[ reply_to_name="{name}" reply_to_id="{row_id}"]][ mention="bot"]>text</msg>`,
-  bot speech renders `<you at="{HH:MM}" id="{row_id}">text</you>`, a
+  bot speech renders `<{pet} at="{HH:MM}" id="{row_id}">text</{pet}>`
+  (the pet tag of specs.md Section 7.3, decision 95), a
   recall injection renders `<memory>escaped edge texts</memory>`,
   and a summary renders
   `<summary range="{first}-{last}">escaped text</summary>` (decision
@@ -586,8 +596,11 @@ read the XML dialogue dialect). A missing family key degrades to the
 old C3 drop (the binary builds `None` with one startup warning).
 `ScriptedSummary` (tamako-core) is the hermetic double. Decision 63:
 the `GATE_PREAMBLE` and the recall relevance-gate preamble append the
-shared `CONTEXT_FORMAT_GLOSS` (the same constant the persona preamble
-embeds — tamako-agent → tamako-persona, acyclic); the digest
+shared format gloss (the same text the persona preamble
+embeds — tamako-agent → tamako-persona, acyclic; since decision 95
+`context_format_gloss(pet_tag)` renders it for the CURRENT pet tag,
+read per call from the binary's shared slot so a persona rename follows
+through the hot reload); the digest
 extraction prompts stay gloss-free (they do not render XML).
 
 ## 9. The binary
