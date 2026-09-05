@@ -39,7 +39,9 @@ use rig::OneOrMany;
 use tamako_core::caption::{CaptionError, CaptionProvider};
 use tamako_core::context::MediaKindName;
 
-use crate::endpoint::{env_value, session_header_map, CaptionEndpoint, OPENAI_API_KEY_ENV_VAR};
+use crate::endpoint::{
+    env_value, session_header_map, strip_reasoning_markup, CaptionEndpoint, OPENAI_API_KEY_ENV_VAR,
+};
 use crate::extract::AgentError;
 
 /// The PER-ATTEMPT timeout of one caption call (decision 82 (d), M1
@@ -202,6 +204,18 @@ impl CaptionProvider for RigCaptionProvider {
                 .ok_or_else(|| {
                     CaptionError::Provider("no text content in the caption response".to_string())
                 })?;
+            // Decision 93: the same reasoning-markup sanitation as the
+            // completion seam — a leaked reasoning tail must never be
+            // persisted as a caption (it would pollute every later
+            // recall over the media row).
+            let caption = strip_reasoning_markup(&caption);
+            if caption.stripped_bytes > 0 {
+                tracing::warn!(
+                    stripped_bytes = caption.stripped_bytes,
+                    "stripped reasoning markup from the caption text"
+                );
+            }
+            let caption = caption.text;
             // An empty or whitespace-only reply is CaptionError::Empty
             // — the placeholder path of decision 82 (d), deliberately
             // distinct from a transport failure so the retry decorator
