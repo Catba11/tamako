@@ -2345,6 +2345,49 @@ audits — re-stamp when re-verified, not on every feature commit
     strip — the frequencies gauge contract compliance and endpoint
     behavior per model.
 
+94. (2026-09-04) Config silent-failure repairs (specs.md Sections
+    5.3 and 13). A live-config audit the same day exposed the
+    family: the operator's seven-rule `suffix` array had sat BELOW
+    the last `[[example]]` header of data/persona.toml, so TOML
+    scoping nested it into the fifth example element and serde (no
+    `deny_unknown_fields`) dropped it without a word — the rules
+    never reached the model. (a) Persona unknown keys.
+    `PersonaExample` now denies unknown fields: a root-level array
+    mis-scoped below a `[[example]]` block fails startup with a
+    TOML error naming the field (line and column); on reload the
+    same failure lands in the watcher's Invalid arm (the current
+    configuration stays, one WARN, the watcher keeps running).
+    Unknown ROOT keys stay tolerated for forward compatibility (the
+    decision-84(e) rationale) but each now earns one curated WARN
+    through a flatten catch-all mirroring `TriggerConfigToml`. The
+    pre-94 test that pinned unconditional tolerance is rewritten to
+    pin the split: tolerated at the root, rejected inside examples.
+    Rejected: WARN on both levels (the deployment's own evidence —
+    two misspelled tamako.toml digest keys WARNed at every startup
+    for weeks without action — shows WARN-only observability
+    accumulates unread on this file class); deny at the root (a
+    newer schema's keys must not hard-fail an older binary after a
+    rollback). (b) Suffix-only hot reload (decision 86(h) repair).
+    The decision-80 watcher's identity gate compared PREAMBLE bytes
+    only, and the suffix never enters the preamble (decision
+    86(d)), so an edit touching only the suffix rendered Identical
+    and silently discarded the new rules until restart — the
+    documented zero-cache-cost hot-tuning knob was inert for its
+    primary use. The gate now compares the (preamble, suffix) pair;
+    a suffix-only reload rewrites the shared suffix slot WITHOUT
+    the actor broadcast (no context item-0 swap, no cold prefix —
+    the 86(d) property made real) and logs its own INFO line. A
+    preamble-changing reload behaves exactly as before. (c)
+    tamako.toml top-level keys. `BotConfigToml` gains the 84(e)
+    flatten catch-all: a stray key above the first header, or a
+    misspelled table header such as `[group."-1001"]` (which used
+    to un-register the intended group silently), now WARNs as table
+    `<top-level>`. (d) Observability: the startup "persona preamble
+    rendered" line and the reload INFO lines carry `suffix_rules`,
+    so a silently empty suffix is one log read away. The shipped
+    example persona.toml gains the placement warning comment and
+    demo suffix/example keys.
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:
