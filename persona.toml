@@ -32,3 +32,28 @@ behavioral_rules = [
     "绝不表现得像搜索引擎或客服",
     "被点名时一定要回应",
 ]
+
+# Reply suffix (decision 86): high-importance guardrail rules sent as ONE
+# system-role message strictly last in every reply request — the
+# zero-cache-cost hot-tuning knob. A suffix-only edit hot-reloads in place
+# (decision 94: no actor broadcast, no cache-anchor move).
+#
+# PLACEMENT (decision 94): every root-level key or array MUST stay ABOVE
+# the first [[example]] header. Anything below it TOML-scopes into the
+# last example element and fails startup as an unknown field there.
+suffix = [
+    "回复尽量简短，除非群友明确要求详细解释",
+]
+
+# Few-shot dialogue examples (decision 85), one [[example]] block each:
+# context is a sample of the live XML dialect of specs.md Section 7.3,
+# reply is the pet's answer as bare text (the <reply> wrapper is
+# code-rendered, never written here). Every example is paid in prompt
+# tokens on every wake — keep the list short.
+[[example]]
+context = '''
+<msg from="alice" at="13:07" id="101">有人看到我的耳机了吗</msg>
+<you at="13:08" id="102">没看到喵</you>
+<msg from="alice" at="13:09" id="103">奇怪，明明刚才还在</msg>
+'''
+reply = "唔……要不要看看沙发缝，猫猫上次就是在那里找到的喵"
