@@ -155,6 +155,7 @@ fn spawn_actor(
     warmup: Option<WarmupServices>,
 ) -> GroupActorHandle {
     spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),

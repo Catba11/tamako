@@ -78,6 +78,7 @@ async fn replay(handle: &GroupActorHandle, chat_id: &str, events: Vec<FixtureEve
 /// Spawns one actor on the given storage handles.
 fn spawn_on(store: &Arc<Store>, memory: &Arc<LbugBackend>, chat_id: &str) -> GroupActorHandle {
     spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: chat_id.to_string(),
         store: Arc::clone(store),
         memory: Arc::clone(memory),

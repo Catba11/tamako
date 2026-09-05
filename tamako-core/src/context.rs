@@ -156,13 +156,18 @@ pub struct ContextStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveContext {
     items: Vec<ContextItem>,
+    /// The unified speech tag of decision 95 (derived from the persona
+    /// name by `tamako_persona::pet_tag_for_name`, threaded by the
+    /// caller): the bot's own speech items render as `<{tag}>`, and the
+    /// reply fence of specs.md Section 9.8 shares the same tag.
+    pet_tag: String,
 }
 
 impl LiveContext {
     /// Creates a context that holds only the preamble. Rule C4: item 0 is
     /// the provider cache anchor; the prefix never changes between
     /// digests.
-    pub fn new(preamble: String) -> Self {
+    pub fn new(preamble: String, pet_tag: String) -> Self {
         Self {
             items: vec![ContextItem {
                 kind: ContextItemKind::Preamble,
@@ -170,7 +175,22 @@ impl LiveContext {
                 content: preamble,
                 range_tag: None,
             }],
+            pet_tag,
         }
+    }
+
+    /// The unified speech tag (decision 95).
+    pub fn pet_tag(&self) -> &str {
+        &self.pet_tag
+    }
+
+    /// Swaps the unified speech tag (decision 95) when the persona hot
+    /// reload changes the persona name — the same in-memory-only
+    /// discipline as [`LiveContext::reload_preamble`]: already rendered
+    /// history items keep the old tag until they scroll out (a rename
+    /// mid-session is cosmetic, never a correctness event).
+    pub fn set_pet_tag(&mut self, pet_tag: String) {
+        self.pet_tag = pet_tag;
     }
 
     /// The preamble text (item 0).
@@ -219,14 +239,15 @@ impl LiveContext {
 
     /// Appends one message of the bot at the tail (Rule C1). Rule B1: the
     /// bot's own speech is part of the raw log. The model sees its own
-    /// speech as plain assistant text; the `<you>` element distinguishes
-    /// group members, not the bot. This is the M4 append API for the
-    /// bot's own sent messages.
+    /// speech as plain assistant text; the unified speech tag element
+    /// (decision 95) distinguishes group members from the bot. This is
+    /// the M4 append API for the bot's own sent messages.
     pub fn append_bot_speech(&mut self, msg_id: i64, timestamp: OffsetDateTime, text: &str) {
+        let content = render_bot_content(msg_id, timestamp, text, &self.pet_tag);
         self.items.push(ContextItem {
             kind: ContextItemKind::BotSpeech,
             role: ContextRole::Assistant,
-            content: render_bot_content(msg_id, timestamp, text),
+            content,
             range_tag: Some(RangeTag::single(msg_id)),
         });
     }
@@ -430,6 +451,7 @@ impl LiveContext {
     /// together with decision 64.
     pub fn rebuild(
         preamble: String,
+        pet_tag: String,
         rows: &[MessageRow],
         injections: &[InjectedMemoryRow],
         reply_targets: &HashMap<String, ReplyTargetRow>,
@@ -445,7 +467,7 @@ impl LiveContext {
                 .push(injection);
         }
 
-        let mut context = Self::new(preamble);
+        let mut context = Self::new(preamble, pet_tag);
         // Rule P1: the summary block lands through the same upsert as
         // the live digest-completion window (bit-identity), directly
         // after the preamble, before every raw item.
@@ -533,16 +555,19 @@ pub const MSG_TAG_OPEN_PREFIX: &str = "<msg ";
 /// filter.
 pub const MSG_TAG_CLOSE: &str = "</msg>";
 
-/// The opening-tag prefix of a rendered bot-speech item: `"<you "`
-/// (with the trailing space before the attributes). Same single-source
-/// discipline as [`MSG_TAG_OPEN_PREFIX`]: shared by
-/// [`render_bot_content`] and the outbound parrot filter
-/// ([`crate::wake::filter_reply_parrot_lines`]).
+/// LEGACY (pre-decision-95) opening-tag prefix of a rendered bot-speech
+/// item: `"<you "` (with the trailing space before the attributes).
+/// Since decision 95 the bot's own speech renders with the unified pet
+/// tag derived from the persona name, and [`render_bot_content`] no
+/// longer reads this constant. It stays as the strip anchor of the
+/// outbound parrot filter ([`crate::wake::filter_reply_parrot_lines`]):
+/// stored summaries and memory texts persisted before decision 95 can
+/// still quote the old shape, and a quoted pre-95 block must still
+/// strip from an outbound reply.
 pub const YOU_TAG_OPEN_PREFIX: &str = "<you ";
 
-/// The closing tag of a rendered bot-speech item: `"</you>"`. The
-/// closer of the [`YOU_TAG_OPEN_PREFIX`] strip region in the parrot
-/// filter.
+/// The closing tag of the LEGACY pre-decision-95 bot-speech item:
+/// `"</you>"`. Refer to [`YOU_TAG_OPEN_PREFIX`].
 pub const YOU_TAG_CLOSE: &str = "</you>";
 
 /// The opening-tag prefix of a rendered media element: `"<media "`
@@ -781,16 +806,22 @@ fn media_region_is_trusted(region: &str) -> bool {
     }
 }
 
-/// Renders one message of the bot: the `<you>` element of the approved
-/// XML context rendering. The model sees its own speech as plain
-/// assistant text; `<you>` marks the bot's rows (Rule B1: the bot's own
-/// speech is part of the raw log).
-pub fn render_bot_content(msg_id: i64, timestamp: OffsetDateTime, text: &str) -> String {
-    format!(
-        "{YOU_TAG_OPEN_PREFIX}at=\"{}\" id=\"{msg_id}\">{}{YOU_TAG_CLOSE}",
-        hhmm_of(timestamp),
-        escape_xml_text(text)
-    )
+/// Renders one message of the bot: the own-speech element of the
+/// approved XML context rendering — `<{pet_tag} at=".." id="..">` since
+/// decision 95 (pre-95: the fixed `<you>` tag). The model sees its own
+/// speech as plain assistant text; the tag marks the bot's rows (Rule
+/// B1: the bot's own speech is part of the raw log) and IS the reply
+/// fence of specs.md Section 9.8 — every history turn demonstrates the
+/// wrapper the reply contract asks for.
+pub fn render_bot_content(
+    msg_id: i64,
+    timestamp: OffsetDateTime,
+    text: &str,
+    pet_tag: &str,
+) -> String {
+    let hhmm = hhmm_of(timestamp);
+    let text = escape_xml_text(text);
+    format!("<{pet_tag} at=\"{hhmm}\" id=\"{msg_id}\">{text}</{pet_tag}>")
 }
 
 /// The opening-tag prefix of a rendered summary item: `"<summary"`.
@@ -854,7 +885,7 @@ mod tests {
 
     #[test]
     fn new_context_has_the_preamble_as_item_zero() {
-        let context = LiveContext::new("You are Tamako.".to_string());
+        let context = LiveContext::new("You are Tamako.".to_string(), "tamako".to_string());
         assert_eq!(context.items().len(), 1);
         let item = &context.items()[0];
         assert_eq!(item.kind, ContextItemKind::Preamble);
@@ -865,7 +896,7 @@ mod tests {
 
     #[test]
     fn appends_land_at_the_tail_in_order() {
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -892,7 +923,10 @@ mod tests {
         let speech = &context.items()[2];
         assert_eq!(speech.kind, ContextItemKind::BotSpeech);
         assert_eq!(speech.role, ContextRole::Assistant);
-        assert_eq!(speech.content, r#"<you at="13:07" id="2">hi there</you>"#);
+        assert_eq!(
+            speech.content,
+            r#"<tamako at="13:07" id="2">hi there</tamako>"#
+        );
         assert_eq!(tag_of(speech), RangeTag::single(2));
 
         let injection = &context.items()[3];
@@ -921,14 +955,18 @@ mod tests {
         assert!(human.starts_with(MSG_TAG_OPEN_PREFIX));
         assert!(human.ends_with(MSG_TAG_CLOSE));
 
-        let speech = render_bot_content(2, at_1307(), "hi there");
-        assert!(speech.starts_with(YOU_TAG_OPEN_PREFIX));
-        assert!(speech.ends_with(YOU_TAG_CLOSE));
+        let speech = render_bot_content(2, at_1307(), "hi there", "tamako");
+        // Decision 95: the own-speech element renders with the TAG the
+        // caller passes (the persona-name derivation of tamako-persona),
+        // not a shared constant — the 59/61 single-source discipline
+        // moves from constants to the threaded value.
+        assert!(speech.starts_with("<tamako "));
+        assert!(speech.ends_with("</tamako>"));
     }
 
     #[test]
     fn lag_one_semantics_across_two_digests() {
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         for msg_id in 1..=3 {
             context.append_human_message(
                 msg_id,
@@ -978,7 +1016,7 @@ mod tests {
 
     #[test]
     fn removal_at_or_below_covers_every_kind() {
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -1005,7 +1043,7 @@ mod tests {
 
     #[test]
     fn removal_boundary_is_exact() {
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             5,
             "Alice",
@@ -1036,7 +1074,7 @@ mod tests {
 
     #[test]
     fn reload_preamble_replaces_item_zero_only() {
-        let mut context = LiveContext::new("old preamble".to_string());
+        let mut context = LiveContext::new("old preamble".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -1141,8 +1179,14 @@ mod tests {
             injection(13, 99, "memory beyond the tail"),
         ];
 
-        let context =
-            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+        let context = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &injections,
+            &HashMap::new(),
+            &[],
+        );
 
         let rendered: Vec<(ContextItemKind, String)> = context
             .items()
@@ -1162,7 +1206,7 @@ mod tests {
                 (ContextItemKind::RecallInjection, "memory at 1".to_string()),
                 (
                     ContextItemKind::BotSpeech,
-                    r#"<you at="13:07" id="2">two</you>"#.to_string()
+                    r#"<tamako at="13:07" id="2">two</tamako>"#.to_string()
                 ),
                 (
                     ContextItemKind::RecallInjection,
@@ -1215,7 +1259,7 @@ mod tests {
         // target, and an edit row.
         let reply_targets = HashMap::from([("p1".to_string(), target(1, "Alice"))]);
 
-        let mut live = LiveContext::new("P".to_string());
+        let mut live = LiveContext::new("P".to_string(), "tamako".to_string());
         live.append_human_message(
             1,
             "Alice",
@@ -1292,8 +1336,14 @@ mod tests {
             injection(10, 1, "memory at 1"),
             injection(11, 2, "memory at 2"),
         ];
-        let rebuilt =
-            LiveContext::rebuild("P".to_string(), &rows, &injections, &reply_targets, &[]);
+        let rebuilt = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &injections,
+            &reply_targets,
+            &[],
+        );
 
         assert_eq!(rebuilt, live);
     }
@@ -1308,7 +1358,7 @@ mod tests {
         // that run into one item, or the post-restart context carries
         // duplicate `<memory>` items (the Rule P1 violation this test
         // would have caught).
-        let mut live = LiveContext::new("P".to_string());
+        let mut live = LiveContext::new("P".to_string(), "tamako".to_string());
         live.append_human_message(
             1,
             "Alice",
@@ -1349,8 +1399,14 @@ mod tests {
             injection(11, 2, "<memory>Alice likes tea</memory>"),
             injection(12, 2, "<memory>Alice likes tea</memory>"),
         ];
-        let rebuilt =
-            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+        let rebuilt = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &injections,
+            &HashMap::new(),
+            &[],
+        );
 
         assert_eq!(rebuilt, live);
     }
@@ -1372,8 +1428,14 @@ mod tests {
             injection(10, 99, "leftover memory"),
             injection(11, 99, "leftover memory"),
         ];
-        let context =
-            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+        let context = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &injections,
+            &HashMap::new(),
+            &[],
+        );
 
         let kinds: Vec<(ContextItemKind, String)> = context
             .items()
@@ -1437,8 +1499,14 @@ mod tests {
             // Same content, different position: no collapse.
             injection(13, 3, "memory X"),
         ];
-        let context =
-            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+        let context = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &injections,
+            &HashMap::new(),
+            &[],
+        );
 
         let rendered: Vec<(ContextItemKind, String, Option<RangeTag>)> = context
             .items()
@@ -1462,7 +1530,7 @@ mod tests {
                 ),
                 (
                     ContextItemKind::BotSpeech,
-                    r#"<you at="13:07" id="2">two</you>"#.to_string(),
+                    r#"<tamako at="13:07" id="2">two</tamako>"#.to_string(),
                     Some(RangeTag::single(2))
                 ),
                 (
@@ -1508,8 +1576,14 @@ mod tests {
             "one",
         )];
         let injections = vec![injection(10, 1, "I remember: Alice likes tea.")];
-        let context =
-            LiveContext::rebuild("P".to_string(), &rows, &injections, &HashMap::new(), &[]);
+        let context = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &injections,
+            &HashMap::new(),
+            &[],
+        );
 
         assert_eq!(context.items().len(), 3);
         let injection = &context.items()[2];
@@ -1552,7 +1626,14 @@ mod tests {
         ];
         let reply_targets = HashMap::from([("p1".to_string(), target(1, "Alice"))]);
 
-        let context = LiveContext::rebuild("P".to_string(), &rows, &[], &reply_targets, &[]);
+        let context = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &[],
+            &reply_targets,
+            &[],
+        );
 
         assert_eq!(
             context.items()[1].content,
@@ -1594,7 +1675,14 @@ mod tests {
         to_bot.is_reply_to_bot = true;
         let rows = vec![unresolved, to_bot];
 
-        let context = LiveContext::rebuild("P".to_string(), &rows, &[], &HashMap::new(), &[]);
+        let context = LiveContext::rebuild(
+            "P".to_string(),
+            "tamako".to_string(),
+            &rows,
+            &[],
+            &HashMap::new(),
+            &[],
+        );
 
         assert_eq!(
             context.items()[1].content,
@@ -1728,18 +1816,18 @@ mod tests {
     #[test]
     fn render_bot_content_wraps_in_the_you_element_with_escaping() {
         assert_eq!(
-            render_bot_content(49, at_utc(13, 12), r#"hi & <bye>"#),
-            r#"<you at="13:12" id="49">hi &amp; &lt;bye&gt;</you>"#
+            render_bot_content(49, at_utc(13, 12), r#"hi & <bye>"#, "tamako"),
+            r#"<tamako at="13:12" id="49">hi &amp; &lt;bye&gt;</tamako>"#
         );
         assert_eq!(
-            render_bot_content(50, at_utc(9, 5), "plain"),
-            r#"<you at="09:05" id="50">plain</you>"#
+            render_bot_content(50, at_utc(9, 5), "plain", "tamako"),
+            r#"<tamako at="09:05" id="50">plain</tamako>"#
         );
     }
 
     #[test]
     fn messages_for_llm_maps_roles_and_order() {
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -1766,7 +1854,7 @@ mod tests {
                 },
                 ContextMessage {
                     role: ContextRole::Assistant,
-                    content: r#"<you at="13:07" id="2">hi</you>"#.to_string(),
+                    content: r#"<tamako at="13:07" id="2">hi</tamako>"#.to_string(),
                 },
             ]
         );
@@ -1774,7 +1862,7 @@ mod tests {
 
     #[test]
     fn stats_counts_items_and_sums_content_bytes() {
-        let mut context = LiveContext::new("abc".to_string());
+        let mut context = LiveContext::new("abc".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -1791,9 +1879,9 @@ mod tests {
         assert_eq!(stats.item_count, 3);
         let expected_bytes: usize = context.items().iter().map(|item| item.content.len()).sum();
         // "abc" (3) + `<msg from="Alice" at="13:07" id="1">hello</msg>`
-        // (47) + `<you at="13:07" id="2">hi</you>` (31) = 81.
-        assert_eq!(expected_bytes, 81);
-        assert_eq!(stats.estimated_bytes, 81);
+        // (47) + `<tamako at="13:07" id="2">hi</tamako>` (37) = 87.
+        assert_eq!(expected_bytes, 87);
+        assert_eq!(stats.estimated_bytes, 87);
     }
 
     #[test]
@@ -2078,7 +2166,7 @@ mod tests {
 
     #[test]
     fn upsert_summaries_places_the_block_after_the_preamble_oldest_first() {
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -2126,7 +2214,7 @@ mod tests {
         // the API itself only replaces the whole block (never merges,
         // never prunes by count). An upsert with the next pair drops
         // the previous block entirely.
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -2183,7 +2271,7 @@ mod tests {
         // driven by upsert_summaries, never by the C3 cutoff. A summary
         // whose last_msg_id is at or below the boundary SURVIVES while
         // the neighboring raw items are removed.
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.upsert_summaries(&[summary_row(10, 1, 3, "digested chunk")]);
         context.append_human_message(
             1,
@@ -2251,7 +2339,7 @@ mod tests {
         ];
         let injections = vec![injection(20, 7, "memory at 7")];
 
-        let mut live = LiveContext::new("P".to_string());
+        let mut live = LiveContext::new("P".to_string(), "tamako".to_string());
         live.upsert_summaries(&summaries);
         live.append_human_message(
             7,
@@ -2268,6 +2356,7 @@ mod tests {
 
         let rebuilt = LiveContext::rebuild(
             "P".to_string(),
+            "tamako".to_string(),
             &rows,
             &injections,
             &HashMap::new(),
@@ -2300,7 +2389,7 @@ mod tests {
         // A summary is compressed history: reference data, User role
         // (never Assistant — the reply model must not learn to speak
         // `<summary>` blocks).
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.upsert_summaries(&[summary_row(10, 1, 3, "digested")]);
         context.append_bot_speech(4, at_1307(), "hi");
 
@@ -2318,7 +2407,7 @@ mod tests {
                 },
                 ContextMessage {
                     role: ContextRole::Assistant,
-                    content: r#"<you at="13:07" id="4">hi</you>"#.to_string(),
+                    content: r#"<tamako at="13:07" id="4">hi</tamako>"#.to_string(),
                 },
             ]
         );
@@ -2330,7 +2419,7 @@ mod tests {
         // (preamble excluded), newline-joined in context order, for the
         // items at or below the wake's marker. A previous wake's
         // injection joins with the range it follows (Rule C2).
-        let mut context = LiveContext::new("You are Tamako.".to_string());
+        let mut context = LiveContext::new("You are Tamako.".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -2359,7 +2448,7 @@ mod tests {
             view,
             [
                 r#"<msg from="Alice" at="13:07" id="1">one</msg>"#,
-                r#"<you at="13:07" id="2">two</you>"#,
+                r#"<tamako at="13:07" id="2">two</tamako>"#,
                 "<memory>Alice likes tea</memory>",
             ]
             .join("\n")
@@ -2388,7 +2477,8 @@ mod tests {
         // block is always in the view, exempt from the row-id bound
         // (the same exemption as remove_at_or_below) — even a bound
         // below the whole summary range keeps the block.
-        let mut context = LiveContext::new("PREAMBLE-MARKER-BYTES".to_string());
+        let mut context =
+            LiveContext::new("PREAMBLE-MARKER-BYTES".to_string(), "tamako".to_string());
         context.upsert_summaries(&[
             summary_row(10, 1, 3, "chunk one"),
             summary_row(11, 4, 6, "chunk two"),
@@ -2422,10 +2512,10 @@ mod tests {
     fn gate_context_view_is_empty_for_an_empty_context_or_a_zero_bound() {
         // The empty-view representation is the empty String: the gate
         // prompt then shows no view section.
-        let empty = LiveContext::new("P".to_string());
+        let empty = LiveContext::new("P".to_string(), "tamako".to_string());
         assert_eq!(empty.gate_context_view(10), "");
 
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.append_human_message(
             1,
             "Alice",
@@ -2449,7 +2539,7 @@ mod tests {
         // / append_recall_injection), render at the new marker b2:
         // view(b2) == view(b1) + "\n" + the newly appended items'
         // rendered bytes, byte-for-byte.
-        let mut context = LiveContext::new("P".to_string());
+        let mut context = LiveContext::new("P".to_string(), "tamako".to_string());
         context.upsert_summaries(&[summary_row(10, 1, 3, "digested chunk")]);
         context.append_human_message(
             4,
@@ -2511,7 +2601,7 @@ mod tests {
                 ReplyRender::None,
                 "wake k new",
             ),
-            render_bot_content(6, at_1307(), "the reply"),
+            render_bot_content(6, at_1307(), "the reply", "tamako"),
             "<memory>Bob likes hotpot</memory>".to_string(),
         ]
         .join("\n");

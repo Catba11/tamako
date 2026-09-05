@@ -373,6 +373,7 @@ fn spawn_with_wake(
         config.recall_injection_cap,
     );
     spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),
@@ -922,6 +923,7 @@ async fn a_restart_rebuilds_the_injection_bit_identically() {
         .open_group(CHAT_ID)
         .expect("open_group succeeds");
     let restarted = spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),
@@ -1029,6 +1031,7 @@ async fn a_restart_rebuilds_a_multi_edge_injection_bit_identically() {
         .open_group(CHAT_ID)
         .expect("open_group succeeds");
     let restarted = spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),
@@ -1610,6 +1613,7 @@ fn spawn_with_deep_wake(
         candidate_cap: config.recall_candidate_cap,
     });
     spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),

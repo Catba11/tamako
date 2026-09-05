@@ -247,15 +247,22 @@ pub fn spawn_persona_watcher(
 /// `try_send` never blocks on a backlogged actor: a dead or full-inbox
 /// actor is SKIPPED with one WARN (the file is the state; its next start
 /// reads it) and its chat id joins the returned list (sorted, for
-/// deterministic tests).
+/// deterministic tests). Decision 95: the pet tag of the reloaded
+/// persona name rides the SAME command — the actor swaps its speech-tag
+/// anchor with the preamble (the name is rendered into the preamble,
+/// so a tag change can never arrive without a preamble change).
 pub fn broadcast_preamble(
     actors: &HashMap<String, GroupActorHandle>,
     preamble: &str,
+    pet_tag: &str,
 ) -> Vec<String> {
     let mut skipped = Vec::new();
     for (chat_id, handle) in actors {
         if handle
-            .try_send(ActorCommand::ReloadPreamble(preamble.to_string()))
+            .try_send(ActorCommand::ReloadPreamble {
+                preamble: preamble.to_string(),
+                pet_tag: pet_tag.to_string(),
+            })
             .is_err()
         {
             warn!(chat_id = %chat_id, "persona reload skipped: the actor is dead or its inbox is full; its next start reads the file");
@@ -442,6 +449,7 @@ mod tests {
     /// warmup_integration.rs harness pattern) for the broadcast tests.
     fn spawn_test_actor(dir: &Path, chat_id: &str) -> GroupActorHandle {
         spawn_group_actor(GroupActorParams {
+            pet_tag: "tamako".to_string(),
             chat_id: chat_id.to_string(),
             store: Arc::new(Store::new(dir.to_path_buf())),
             memory: Arc::new(LbugBackend::new(dir.to_path_buf())),
@@ -466,7 +474,7 @@ mod tests {
         let handle = spawn_test_actor(dir.path(), "chat-live");
         let mut actors = HashMap::new();
         actors.insert("chat-live".to_string(), handle);
-        let skipped = broadcast_preamble(&actors, "new preamble");
+        let skipped = broadcast_preamble(&actors, "new preamble", "tamako");
         assert!(skipped.is_empty(), "a live actor is not skipped");
         let handle = actors.remove("chat-live").expect("the handle is there");
         handle.shutdown().await.expect("shutdown succeeds");
@@ -486,7 +494,10 @@ mod tests {
         // Shutdown command is already in the FIFO.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while handle
-            .try_send(ActorCommand::ReloadPreamble("probe".to_string()))
+            .try_send(ActorCommand::ReloadPreamble {
+                preamble: "probe".to_string(),
+                pet_tag: "tamako".to_string(),
+            })
             .is_ok()
         {
             assert!(
@@ -497,7 +508,7 @@ mod tests {
         }
         let mut actors = HashMap::new();
         actors.insert("chat-dead".to_string(), handle);
-        let skipped = broadcast_preamble(&actors, "new preamble");
+        let skipped = broadcast_preamble(&actors, "new preamble", "tamako");
         assert_eq!(skipped, vec!["chat-dead".to_string()]);
     }
 

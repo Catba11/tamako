@@ -237,6 +237,7 @@ fn spawn_with_wake(
 ) -> (GroupActorHandle, mpsc::Receiver<OutboundAction>) {
     let (outbound_tx, outbound_rx) = mpsc::channel(64);
     let handle = spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),
@@ -267,6 +268,7 @@ fn spawn_with_digest(
     digest: Arc<ScriptedDigest>,
 ) -> GroupActorHandle {
     spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),

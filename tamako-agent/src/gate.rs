@@ -24,7 +24,7 @@ use rig::completion::Message;
 
 use tamako_core::actor::CoreError;
 use tamako_core::wake::{GateDecision, GateInput, GateMessage, ParticipationGate};
-use tamako_persona::CONTEXT_FORMAT_GLOSS;
+use tamako_persona::context_format_gloss;
 
 use crate::endpoint::{EndpointClient, EndpointConfig, LlmPurpose};
 use crate::extract::AgentError;
@@ -85,8 +85,8 @@ Rules:
 /// the same constant, so the format explanations can never drift
 /// apart. The gate consumes the XML-shaped `GateMessage.content`
 /// lines, so it must read the same explanation.
-pub fn gate_system_preamble() -> String {
-    format!("{GATE_PREAMBLE}\n\n{CONTEXT_FORMAT_GLOSS}")
+pub fn gate_system_preamble(pet_tag: &str) -> String {
+    format!("{GATE_PREAMBLE}\n\n{}", context_format_gloss(pet_tag))
 }
 
 /// The section header of the shared context view (decision 72,
@@ -230,6 +230,11 @@ fn gate_decision_from_output(output: GateOutput, presented: &[GateMessage]) -> G
 pub struct RigGate {
     client: EndpointClient,
     max_tokens: u64,
+    /// The decision-95 pet tag (the own-speech element name the gloss
+    /// explains), behind a shared lock so the decision-80 persona hot
+    /// reload swaps it in place. Default `"you"` (the legacy
+    /// fallback); production always wires the real derivation.
+    pet_tag: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -247,7 +252,21 @@ impl std::fmt::Debug for RigGate {
 impl RigGate {
     /// Builds the gate from an endpoint client.
     pub fn new(client: EndpointClient, max_tokens: u64) -> Self {
-        RigGate { client, max_tokens }
+        RigGate {
+            client,
+            max_tokens,
+            pet_tag: std::sync::Arc::new(std::sync::RwLock::new("you".to_string())),
+        }
+    }
+
+    /// Wires the shared decision-95 pet-tag slot (the binary's persona
+    /// snapshot; the live persona watcher rewrites it on each accepted
+    /// reload when the persona name changes). The gate reads the
+    /// current tag at every call — the gloss follows the rename on the
+    /// next call with no reconstruction.
+    pub fn with_pet_tag_slot(mut self, pet_tag: std::sync::Arc<std::sync::RwLock<String>>) -> Self {
+        self.pet_tag = pet_tag;
+        self
     }
 
     /// Builds the gate for one resolved endpoint (the `gate` purpose,
@@ -282,12 +301,17 @@ impl ParticipationGate for RigGate {
         Box::pin(async move {
             // The shared structured flow of the endpoint layer
             // (schema per the resolved mode, one-shot repair retry).
+            // The gloss of the system preamble explains the CURRENT pet
+            // tag (decision 95), read per call from the shared slot.
+            let pet_tag = self
+                .pet_tag
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let output = self
                 .client
                 .complete_structured::<GateOutput>(
-                    // The preamble plus the shared format gloss becomes
-                    // the system message.
-                    Some(gate_system_preamble()),
+                    Some(gate_system_preamble(&pet_tag)),
                     vec![Message::user(render_gate_prompt(input, context_view))],
                     schemars::schema_for!(GateOutput),
                     self.max_tokens,
@@ -636,10 +660,14 @@ The reply target MUST be the id of one of the new messages above; the context se
         // format explanation as the persona preamble (single source in
         // tamako-persona). The scarce-attention text stays first; the
         // gloss appends as a clearly separated section.
-        let preamble = gate_system_preamble();
+        // Decision 95: the gloss renders for the CURRENT pet tag.
+        let preamble = gate_system_preamble("tamako");
         assert!(preamble.starts_with(GATE_PREAMBLE));
-        assert!(preamble.ends_with(&format!("\n\n{CONTEXT_FORMAT_GLOSS}")));
-        assert!(preamble.contains(CONTEXT_FORMAT_GLOSS));
+        let gloss = context_format_gloss("tamako");
+        assert!(preamble.ends_with(&format!("\n\n{gloss}")));
+        assert!(preamble.contains(&gloss));
+        assert!(preamble.contains("<tamako at="));
+        assert!(!preamble.contains("<you at="));
         // The scarce-attention rules are unchanged and still present.
         assert!(preamble.contains("speaks rarely"));
         assert!(preamble.contains("50 percent"));

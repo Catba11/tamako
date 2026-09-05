@@ -145,7 +145,7 @@ use tamako_core::wake::{
 };
 use tamako_memory::identifiers::{alias_id, normalize, person_id};
 use tamako_memory::{CandidateEdge, MemoryBackend, NEIGHBOR_EXPANSION_LIMIT};
-use tamako_persona::CONTEXT_FORMAT_GLOSS;
+use tamako_persona::context_format_gloss;
 use tamako_store::{Store, StoreError};
 use time::macros::format_description;
 
@@ -439,10 +439,11 @@ pub fn recall_preamble(injection_cap: u32) -> String {
 /// relevance gate consumes the same XML-shaped
 /// `GateMessage.content` lines as the participation gate, so it must
 /// read the same explanation.
-pub fn recall_system_preamble(injection_cap: u32) -> String {
+pub fn recall_system_preamble(injection_cap: u32, pet_tag: &str) -> String {
     format!(
-        "{}\n\n{CONTEXT_FORMAT_GLOSS}",
-        recall_preamble(injection_cap)
+        "{}\n\n{}",
+        recall_preamble(injection_cap),
+        context_format_gloss(pet_tag)
     )
 }
 
@@ -569,6 +570,11 @@ pub struct RigRelevanceGate {
     /// (decision 65), so the model reads the same cap the
     /// post-validation of `ShallowRecall` enforces.
     injection_cap: u32,
+    /// The decision-95 pet tag (the own-speech element name the gloss
+    /// explains), behind a shared lock so the decision-80 persona hot
+    /// reload swaps it in place. Default `"you"` (the legacy
+    /// fallback); production always wires the real derivation.
+    pet_tag: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 // The rig model handles do not implement Debug. A manual impl keeps
@@ -590,7 +596,15 @@ impl RigRelevanceGate {
             client,
             max_tokens,
             injection_cap,
+            pet_tag: std::sync::Arc::new(std::sync::RwLock::new("you".to_string())),
         }
+    }
+
+    /// Wires the shared decision-95 pet-tag slot (same contract as
+    /// `RigGate::with_pet_tag_slot`).
+    pub fn with_pet_tag_slot(mut self, pet_tag: std::sync::Arc<std::sync::RwLock<String>>) -> Self {
+        self.pet_tag = pet_tag;
+        self
     }
 
     /// Builds the relevance gate for one resolved endpoint (the `gate`
@@ -631,13 +645,20 @@ impl RelevanceGate for RigRelevanceGate {
         Box::pin(async move {
             // The shared structured flow of the endpoint layer
             // (schema per the resolved mode, one-shot repair retry).
+            // The gloss of the system preamble explains the CURRENT pet
+            // tag (decision 95), read per call from the shared slot.
+            let pet_tag = self
+                .pet_tag
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let selection = self
                 .client
                 .complete_structured::<RecallSelection>(
                     // The preamble (with the configured cap rendered
                     // in) plus the shared format gloss becomes the
                     // system message.
-                    Some(recall_system_preamble(self.injection_cap)),
+                    Some(recall_system_preamble(self.injection_cap, &pet_tag)),
                     vec![Message::user(render_recall_prompt(input, context_view))],
                     schemars::schema_for!(RecallSelection),
                     self.max_tokens,
@@ -1901,10 +1922,14 @@ The context section is read-only orientation; the selection names candidate numb
         // participation-gate preamble (single source in
         // tamako-persona). The conservative rules stay first; the
         // gloss appends as a clearly separated section.
-        let preamble = recall_system_preamble(5);
+        // Decision 95: the gloss renders for the CURRENT pet tag.
+        let preamble = recall_system_preamble(5, "tamako");
         assert!(preamble.starts_with(&recall_preamble(5)));
-        assert!(preamble.ends_with(&format!("\n\n{CONTEXT_FORMAT_GLOSS}")));
-        assert!(preamble.contains(CONTEXT_FORMAT_GLOSS));
+        let gloss = context_format_gloss("tamako");
+        assert!(preamble.ends_with(&format!("\n\n{gloss}")));
+        assert!(preamble.contains(&gloss));
+        assert!(preamble.contains("<tamako at="));
+        assert!(!preamble.contains("<you at="));
         // The conservative rules are unchanged and still present.
         assert!(preamble.contains("materially reduce the quality"));
         assert!(preamble.contains("the normal case"));

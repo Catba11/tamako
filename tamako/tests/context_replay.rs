@@ -192,6 +192,7 @@ fn spawn_actor(
         PipelineConfig::default(),
     ));
     spawn_group_actor(GroupActorParams {
+        pet_tag: "tamako".to_string(),
         chat_id: CHAT_ID.to_string(),
         store: Arc::clone(&fixture.store),
         memory: Arc::clone(&fixture.memory),
@@ -768,6 +769,8 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
     );
     let expected = LiveContext::rebuild(
         TEST_PREAMBLE.to_string(),
+        // The actor rebuilds with the fixture tag of GroupActorParams.
+        "tamako".to_string(),
         &rows,
         &injections,
         &HashMap::new(),
@@ -838,6 +841,8 @@ async fn restart_rebuilds_a_bit_identical_context_with_injections() {
     .await;
     let expected = LiveContext::rebuild(
         TEST_PREAMBLE.to_string(),
+        // The actor rebuilds with the fixture tag of GroupActorParams.
+        "tamako".to_string(),
         &rows,
         &injections,
         &HashMap::new(),

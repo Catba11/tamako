@@ -188,7 +188,7 @@ struct StripRegion {
 /// `ReplyGenerator` output, and tamako-agent's live generator applies
 /// the same function at its own validation seam. Always on; no
 /// configuration key. Pure function, no I/O.
-pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
+pub fn filter_reply_parrot_lines(text: &str, fence: &ReplyFence) -> ReplyFilterOutcome {
     // Single-source discipline (decisions 59/61): the memory opener is
     // derived from the tag constant; the summary and message shapes use
     // the context.rs constants shared with the renderers.
@@ -205,6 +205,11 @@ pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
             open_line_prefix: MSG_TAG_OPEN_PREFIX,
             closer: MSG_TAG_CLOSE,
         },
+        // LEGACY (pre-decision-95): the fixed `<you>` bot-speech tag.
+        // Nothing renders it since decision 95 (the unified pet tag
+        // took over; its residual tokens are fence hygiene, not a strip
+        // region), but stored summaries and memory texts persisted
+        // before decision 95 can still quote the old shape.
         StripRegion {
             open_line_prefix: YOU_TAG_OPEN_PREFIX,
             closer: YOU_TAG_CLOSE,
@@ -221,7 +226,7 @@ pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
         // Decision 93 layer 3: fence-token hygiene runs first, so an
         // inline-unwrapped region opener still matches the shape
         // checks below.
-        let line = match fence_token_hygiene(line) {
+        let line = match fence_token_hygiene(line, fence) {
             Some(hygiened) => {
                 if hygiened.as_ref() != line {
                     stripped_parrot = true;
@@ -275,16 +280,39 @@ pub fn filter_reply_parrot_lines(text: &str) -> ReplyFilterOutcome {
     }
 }
 
-/// The opener token prefix of the decision-93 reply fence
-/// (`"<reply"`, no closing `>`: an attribute-carrying opener like
-/// `<reply to="44">` is an expected imitation variant — the reply
-/// instruction names a message id). Shared by [`extract_reply_fence`]
-/// and [`fence_token_hygiene`] (decisions 59/61 single-source
-/// discipline).
-const REPLY_FENCE_OPEN: &str = "<reply";
+/// The reply fence token pair of decision 93, derived from the unified
+/// speech tag of decision 95 (`tamako_persona::pet_tag_for_name`,
+/// threaded by the caller): opener prefix `"<{tag}"` (no closing `>`:
+/// an attribute-carrying opener like `<tamako at="09:05" id="3734">`
+/// is an expected imitation variant — the model sees the tag on every
+/// history turn, attributes included, and the 2026-09-05 replay
+/// measured such imitation in up to 6/10 outputs) and closer
+/// `"</{tag}>"`. Shared by [`extract_reply_fence`] and
+/// [`fence_token_hygiene`] (decisions 59/61 single-source discipline,
+/// dynamic form: one derivation, threaded value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyFence {
+    /// The opener token prefix (`"<tamako"`, no closing `>`).
+    open: String,
+    /// The closer tag (`"</tamako>"`).
+    close: String,
+}
 
-/// The closer tag of the decision-93 reply fence.
-const REPLY_FENCE_CLOSE: &str = "</reply>";
+impl ReplyFence {
+    /// Builds the fence token pair of one speech tag.
+    pub fn for_pet_tag(pet_tag: &str) -> Self {
+        Self {
+            open: format!("<{pet_tag}"),
+            close: format!("</{pet_tag}>"),
+        }
+    }
+
+    /// The opener token prefix (`"<tamako"`, no closing `>`) — for
+    /// log attribution at the call seams.
+    pub fn open(&self) -> &str {
+        &self.open
+    }
+}
 
 /// The outcome of [`extract_reply_fence`] (decision 93, specs.md
 /// Section 9.8).
@@ -322,18 +350,18 @@ pub struct ReplyFenceOutcome {
 /// `trimmed_reply_or_error`): the warmup instruction carries no fence
 /// sentence, and the actor-side seams stay fence-agnostic. Pure
 /// function, no I/O.
-pub fn extract_reply_fence(text: &str) -> ReplyFenceOutcome {
+pub fn extract_reply_fence(text: &str, fence: &ReplyFence) -> ReplyFenceOutcome {
     let no_fence = || ReplyFenceOutcome {
         text: text.to_string(),
         fenced: false,
         dropped_bytes: 0,
     };
-    let Some(tag_start) = text.find(REPLY_FENCE_OPEN) else {
+    let Some(tag_start) = text.find(&fence.open) else {
         return no_fence();
     };
-    // The character after `<reply` must be `>` or whitespace —
+    // The character after the opener prefix must be `>` or whitespace —
     // otherwise this is a different tag (`<replies>`, ...).
-    let after = &text[tag_start + REPLY_FENCE_OPEN.len()..];
+    let after = &text[tag_start + fence.open.len()..];
     if !after.starts_with('>') && !after.starts_with(char::is_whitespace) {
         return no_fence();
     }
@@ -344,7 +372,7 @@ pub fn extract_reply_fence(text: &str) -> ReplyFenceOutcome {
     };
     let body_start = tag_end + 1;
     let Some(close) = text[body_start..]
-        .find(REPLY_FENCE_CLOSE)
+        .find(&fence.close)
         .map(|p| body_start + p)
     else {
         // An unclosed fence (e.g. truncation at max_tokens): no
@@ -354,7 +382,7 @@ pub fn extract_reply_fence(text: &str) -> ReplyFenceOutcome {
     };
     let body = &text[body_start..close];
     let dropped_bytes =
-        text[..tag_start].trim().len() + text[close + REPLY_FENCE_CLOSE.len()..].trim().len();
+        text[..tag_start].trim().len() + text[close + fence.close.len()..].trim().len();
     ReplyFenceOutcome {
         text: body.to_string(),
         fenced: true,
@@ -375,19 +403,30 @@ pub fn extract_reply_fence(text: &str) -> ReplyFenceOutcome {
 ///
 /// A mid-line single token survives untouched: quotation protection
 /// for a group that discusses AI glitch output.
-fn fence_token_hygiene(line: &str) -> Option<Cow<'_, str>> {
-    if !line.contains(REPLY_FENCE_OPEN) && !line.contains(REPLY_FENCE_CLOSE) {
+fn fence_token_hygiene<'a>(line: &'a str, fence: &ReplyFence) -> Option<Cow<'a, str>> {
+    if !line.contains(&fence.open) && !line.contains(&fence.close) {
         return Some(Cow::Borrowed(line));
     }
     let trimmed = line.trim();
-    if trimmed == REPLY_FENCE_CLOSE {
+    if trimmed == fence.close {
         return None;
     }
-    if let Some(after) = trimmed.strip_prefix(REPLY_FENCE_OPEN) {
+    if let Some(after) = trimmed.strip_prefix(&fence.open) {
         let tag_only = if let Some(rest) = after.strip_prefix('>') {
             rest.is_empty()
+        } else if after.starts_with(char::is_whitespace) {
+            // An attribute-carrying opener is tag-only only when the
+            // tag ENDS the line. The first `>` closes the tag; text
+            // past it is content (an inline pair such as
+            // `<tamako at="09:05" id="4">come eat</tamako>` unwraps in
+            // rule 2 below — pre-fix, the `trimmed.ends_with('>')` test
+            // misread the pair's closer as the tag end and DROPPED the
+            // whole line, content included: decision-95 C1 fix).
+            after
+                .find('>')
+                .is_some_and(|p| after[p + 1..].trim().is_empty())
         } else {
-            after.starts_with(char::is_whitespace) && trimmed.ends_with('>')
+            false
         };
         if tag_only {
             return None;
@@ -395,16 +434,16 @@ fn fence_token_hygiene(line: &str) -> Option<Cow<'_, str>> {
     }
     let mut current = line.to_owned();
     // Rule 2: inline pairs unwrap.
-    while let Some(open) = current.find(REPLY_FENCE_OPEN) {
-        let after = &current[open + REPLY_FENCE_OPEN.len()..];
+    while let Some(open) = current.find(&fence.open) {
+        let after = &current[open + fence.open.len()..];
         if !(after.starts_with('>') || after.starts_with(char::is_whitespace)) {
             break;
         }
         let Some(tag_rel) = after.find('>') else {
             break;
         };
-        let body_start = open + REPLY_FENCE_OPEN.len() + tag_rel + 1;
-        let Some(close_rel) = current[body_start..].find(REPLY_FENCE_CLOSE) else {
+        let body_start = open + fence.open.len() + tag_rel + 1;
+        let Some(close_rel) = current[body_start..].find(&fence.close) else {
             break;
         };
         let close = body_start + close_rel;
@@ -412,20 +451,20 @@ fn fence_token_hygiene(line: &str) -> Option<Cow<'_, str>> {
             "{}{}{}",
             &current[..open],
             &current[body_start..close],
-            &current[close + REPLY_FENCE_CLOSE.len()..]
+            &current[close + fence.close.len()..]
         );
         current = next;
     }
     // Rule 3a: a leading fence token strips.
     {
         let t = current.trim_start();
-        let tag_len = if t.starts_with(REPLY_FENCE_CLOSE) {
-            Some(REPLY_FENCE_CLOSE.len())
-        } else if let Some(after) = t.strip_prefix(REPLY_FENCE_OPEN) {
+        let tag_len = if t.starts_with(&fence.close) {
+            Some(fence.close.len())
+        } else if let Some(after) = t.strip_prefix(&fence.open) {
             if after.starts_with('>') {
-                Some(REPLY_FENCE_OPEN.len() + 1)
+                Some(fence.open.len() + 1)
             } else if after.starts_with(char::is_whitespace) {
-                after.find('>').map(|p| REPLY_FENCE_OPEN.len() + p + 1)
+                after.find('>').map(|p| fence.open.len() + p + 1)
             } else {
                 None
             }
@@ -440,12 +479,12 @@ fn fence_token_hygiene(line: &str) -> Option<Cow<'_, str>> {
     // Rule 3b: a trailing fence token strips.
     {
         let t = current.trim_end();
-        let cut = if t.ends_with(REPLY_FENCE_CLOSE) {
-            Some(REPLY_FENCE_CLOSE.len())
+        let cut = if t.ends_with(&fence.close) {
+            Some(fence.close.len())
         } else if t.ends_with('>') {
             t.rfind('<').and_then(|p| {
                 let candidate = &t[p..];
-                let after = candidate.strip_prefix(REPLY_FENCE_OPEN)?;
+                let after = candidate.strip_prefix(&fence.open)?;
                 (after.starts_with('>') || after.starts_with(char::is_whitespace))
                     .then_some(candidate.len())
             })
@@ -634,6 +673,49 @@ pub struct WakeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The fence built from the legacy tag name `reply`: opener
+    /// `<reply` and closer `</reply>` — keeps every pre-95 fence
+    /// fixture byte-identical while the production tag comes from the
+    /// persona name (decision 95).
+    fn test_fence() -> ReplyFence {
+        ReplyFence::for_pet_tag("reply")
+    }
+
+    #[test]
+    fn the_unified_pet_tag_fence_extracts_and_hygienes() {
+        // Decision 95: the fence tokens derive from the speech tag.
+        let fence = ReplyFence::for_pet_tag("tamako");
+        let outcome = extract_reply_fence("<tamako>\nnya\n</tamako>", &fence);
+        assert!(outcome.fenced);
+        assert_eq!(outcome.text, "\nnya\n");
+        // The measured R1 shape: an attribute-carrying opener imitated
+        // from the history items (up to 6/10 of outputs in the replay).
+        let outcome = extract_reply_fence("<tamako at=\"09:05\" id=\"4\">nya</tamako>", &fence);
+        assert!(outcome.fenced);
+        assert_eq!(outcome.text, "nya");
+        // A foreign-tag fence is no fence.
+        let outcome = extract_reply_fence("<reply>nya</reply>", &fence);
+        assert!(!outcome.fenced);
+        assert_eq!(outcome.text, "<reply>nya</reply>");
+    }
+
+    #[test]
+    fn an_attribute_carrying_inline_pair_unwraps_instead_of_dropping() {
+        // Decision-95 C1 fix. Pre-fix, hygiene rule 1 misread the
+        // pair's closing `>` as the tag end (`trimmed.ends_with('>')`),
+        // classified the line as tag-only and DROPPED the content —
+        // on the warmup path (no fence extraction upstream) that was
+        // the whole output: an empty-warmup error.
+        let fence = ReplyFence::for_pet_tag("tamako");
+        let filtered =
+            filter_reply_parrot_lines("<tamako at=\"09:05\" id=\"4\">come eat</tamako>", &fence);
+        assert_eq!(filtered.text, "come eat");
+        assert!(filtered.stripped_parrot);
+        // A genuine tag-only line with attributes still drops.
+        let filtered = filter_reply_parrot_lines("<tamako at=\"09:05\" id=\"4\">", &fence);
+        assert_eq!(filtered.text, "");
+        assert!(filtered.stripped_parrot);
+    }
 
     fn sample_gate_message() -> GateMessage {
         GateMessage {
@@ -678,6 +760,7 @@ mod tests {
         // its real speech (the live-soak failure shape).
         let filtered = filter_reply_parrot_lines(
             "I remember: Alice likes tea.\nI remember: Bob runs.\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -685,7 +768,8 @@ mod tests {
 
     #[test]
     fn the_parrot_filter_strips_a_mid_text_line() {
-        let filtered = filter_reply_parrot_lines("one\nI remember: Alice likes tea.\ntwo");
+        let filtered =
+            filter_reply_parrot_lines("one\nI remember: Alice likes tea.\ntwo", &test_fence());
         assert_eq!(filtered.text, "one\ntwo");
         assert!(filtered.stripped_parrot);
     }
@@ -693,7 +777,7 @@ mod tests {
     #[test]
     fn the_parrot_filter_strips_the_full_width_colon_variant() {
         // Chinese-context model output uses the full-width colon.
-        let filtered = filter_reply_parrot_lines("I remember：小明喜欢吃辣。\n在的");
+        let filtered = filter_reply_parrot_lines("I remember：小明喜欢吃辣。\n在的", &test_fence());
         assert_eq!(filtered.text, "在的");
         assert!(filtered.stripped_parrot);
     }
@@ -702,8 +786,10 @@ mod tests {
     fn the_parrot_filter_strips_a_single_line_memory_block() {
         // Decision 59, F1, new shape: one line carrying both tags
         // strips as one.
-        let filtered =
-            filter_reply_parrot_lines("<memory>Alice likes tea</memory>\nthe cafe on main street");
+        let filtered = filter_reply_parrot_lines(
+            "<memory>Alice likes tea</memory>\nthe cafe on main street",
+            &test_fence(),
+        );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
     }
@@ -712,6 +798,7 @@ mod tests {
     fn the_parrot_filter_strips_a_multi_line_memory_block() {
         let filtered = filter_reply_parrot_lines(
             "<memory>Alice likes tea\nBob runs</memory>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -719,7 +806,7 @@ mod tests {
 
     #[test]
     fn the_parrot_filter_strips_a_bare_memory_closer_line() {
-        let filtered = filter_reply_parrot_lines("one\n</memory>\ntwo");
+        let filtered = filter_reply_parrot_lines("one\n</memory>\ntwo", &test_fence());
         assert_eq!(filtered.text, "one\ntwo");
         assert!(filtered.stripped_parrot);
     }
@@ -727,7 +814,8 @@ mod tests {
     #[test]
     fn the_parrot_filter_strips_an_unterminated_memory_block_to_the_end() {
         // No closer appears: the region strips to the end of the text.
-        let filtered = filter_reply_parrot_lines("one\n<memory>never closed\nrest of the text");
+        let filtered =
+            filter_reply_parrot_lines("one\n<memory>never closed\nrest of the text", &test_fence());
         assert_eq!(filtered.text, "one");
         assert!(filtered.stripped_parrot);
     }
@@ -736,6 +824,7 @@ mod tests {
     fn the_parrot_filter_strips_both_shapes_in_one_text() {
         let filtered = filter_reply_parrot_lines(
             "<memory>Alice likes tea</memory>\nI remember: Bob runs.\nthe cafe",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe");
         assert!(filtered.stripped_parrot);
@@ -747,6 +836,7 @@ mod tests {
         // one line carrying both tags strips as one.
         let filtered = filter_reply_parrot_lines(
             "<summary range=\"1-3\">they argued about dinner</summary>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -754,16 +844,14 @@ mod tests {
 
     #[test]
     fn the_parrot_filter_strips_a_multi_line_summary_block() {
-        let filtered = filter_reply_parrot_lines(
-            "<summary range=\"1-3\">they argued about dinner\nand made up</summary>\nthe cafe on main street",
-        );
+        let filtered = filter_reply_parrot_lines("<summary range=\"1-3\">they argued about dinner\nand made up</summary>\nthe cafe on main street", &test_fence());
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
     }
 
     #[test]
     fn the_parrot_filter_strips_a_bare_summary_closer_line() {
-        let filtered = filter_reply_parrot_lines("one\n</summary>\ntwo");
+        let filtered = filter_reply_parrot_lines("one\n</summary>\ntwo", &test_fence());
         assert_eq!(filtered.text, "one\ntwo");
         assert!(filtered.stripped_parrot);
     }
@@ -771,17 +859,17 @@ mod tests {
     #[test]
     fn the_parrot_filter_strips_an_unterminated_summary_block_to_the_end() {
         // No closer appears: the region strips to the end of the text.
-        let filtered =
-            filter_reply_parrot_lines("one\n<summary range=\"1-3\">never closed\nrest of the text");
+        let filtered = filter_reply_parrot_lines(
+            "one\n<summary range=\"1-3\">never closed\nrest of the text",
+            &test_fence(),
+        );
         assert_eq!(filtered.text, "one");
         assert!(filtered.stripped_parrot);
     }
 
     #[test]
     fn the_parrot_filter_strips_memory_and_summary_shapes_in_one_text() {
-        let filtered = filter_reply_parrot_lines(
-            "<summary range=\"1-3\">digested chunk</summary>\n<memory>Alice likes tea</memory>\nthe cafe",
-        );
+        let filtered = filter_reply_parrot_lines("<summary range=\"1-3\">digested chunk</summary>\n<memory>Alice likes tea</memory>\nthe cafe", &test_fence());
         assert_eq!(filtered.text, "the cafe");
         assert!(filtered.stripped_parrot);
     }
@@ -793,6 +881,7 @@ mod tests {
         // context structure live).
         let filtered = filter_reply_parrot_lines(
             "<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -802,6 +891,7 @@ mod tests {
     fn the_parrot_filter_strips_a_multi_line_msg_block() {
         let filtered = filter_reply_parrot_lines(
             "<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello\nthere</msg>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -809,7 +899,7 @@ mod tests {
 
     #[test]
     fn the_parrot_filter_strips_a_bare_msg_closer_line() {
-        let filtered = filter_reply_parrot_lines("one\n</msg>\ntwo");
+        let filtered = filter_reply_parrot_lines("one\n</msg>\ntwo", &test_fence());
         assert_eq!(filtered.text, "one\ntwo");
         assert!(filtered.stripped_parrot);
     }
@@ -819,6 +909,7 @@ mod tests {
         // No closer appears: the region strips to the end of the text.
         let filtered = filter_reply_parrot_lines(
             "one\n<msg from=\"Alice\" at=\"13:07\" id=\"1\">never closed\nrest of the text",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "one");
         assert!(filtered.stripped_parrot);
@@ -828,6 +919,7 @@ mod tests {
     fn the_parrot_filter_strips_a_single_line_you_block() {
         let filtered = filter_reply_parrot_lines(
             "<you at=\"13:07\" id=\"2\">hi there</you>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -837,6 +929,7 @@ mod tests {
     fn the_parrot_filter_strips_a_multi_line_you_block() {
         let filtered = filter_reply_parrot_lines(
             "<you at=\"13:07\" id=\"2\">hi\nthere</you>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -844,7 +937,7 @@ mod tests {
 
     #[test]
     fn the_parrot_filter_strips_a_bare_you_closer_line() {
-        let filtered = filter_reply_parrot_lines("one\n</you>\ntwo");
+        let filtered = filter_reply_parrot_lines("one\n</you>\ntwo", &test_fence());
         assert_eq!(filtered.text, "one\ntwo");
         assert!(filtered.stripped_parrot);
     }
@@ -854,6 +947,7 @@ mod tests {
         // No closer appears: the region strips to the end of the text.
         let filtered = filter_reply_parrot_lines(
             "one\n<you at=\"13:07\" id=\"2\">never closed\nrest of the text",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "one");
         assert!(filtered.stripped_parrot);
@@ -866,6 +960,7 @@ mod tests {
         // reply model must never emit media blocks.
         let filtered = filter_reply_parrot_lines(
             "<media type=\"image\">confabulated</media>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -875,6 +970,7 @@ mod tests {
     fn the_parrot_filter_strips_a_multi_line_media_block() {
         let filtered = filter_reply_parrot_lines(
             "<media type=\"image\">confabulated\ncaption</media>\nthe cafe on main street",
+            &test_fence(),
         );
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
@@ -883,7 +979,7 @@ mod tests {
     #[test]
     fn the_parrot_filter_strips_a_bare_media_closer_line() {
         // The surrounding legitimate text is preserved.
-        let filtered = filter_reply_parrot_lines("one\n</media>\ntwo");
+        let filtered = filter_reply_parrot_lines("one\n</media>\ntwo", &test_fence());
         assert_eq!(filtered.text, "one\ntwo");
         assert!(filtered.stripped_parrot);
     }
@@ -891,8 +987,10 @@ mod tests {
     #[test]
     fn the_parrot_filter_strips_an_unterminated_media_block_to_the_end() {
         // No closer appears: the region strips to the end of the text.
-        let filtered =
-            filter_reply_parrot_lines("one\n<media type=\"image\">never closed\nrest of the text");
+        let filtered = filter_reply_parrot_lines(
+            "one\n<media type=\"image\">never closed\nrest of the text",
+            &test_fence(),
+        );
         assert_eq!(filtered.text, "one");
         assert!(filtered.stripped_parrot);
     }
@@ -901,9 +999,7 @@ mod tests {
     fn the_parrot_filter_strips_the_old_and_xml_shapes_in_one_text() {
         // The injection shapes and the imitated context structure strip
         // together; only real speech remains.
-        let filtered = filter_reply_parrot_lines(
-            "I remember: Bob runs.\n<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>\n<you at=\"13:08\" id=\"2\">hi</you>\nthe cafe",
-        );
+        let filtered = filter_reply_parrot_lines("I remember: Bob runs.\n<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>\n<you at=\"13:08\" id=\"2\">hi</you>\nthe cafe", &test_fence());
         assert_eq!(filtered.text, "the cafe");
         assert!(filtered.stripped_parrot);
     }
@@ -923,18 +1019,30 @@ mod tests {
             crate::context::ReplyRender::None,
             "hello",
         );
-        let filtered = filter_reply_parrot_lines(&human);
+        let filtered = filter_reply_parrot_lines(&human, &test_fence());
         assert_eq!(filtered.text, "");
         assert!(filtered.stripped_parrot);
 
+        // Decision 95: the own-speech tag IS the reply fence, so a
+        // rendered speech item in an output reads as an inline fence
+        // pair — hygiene UNWRAPS it (the content is speech, a pair is
+        // never a quotation) instead of stripping the line. Filter with
+        // the fence of the same tag; the 59/61 interlock now holds
+        // through the threaded tag value, not a shared constant.
         let speech = crate::context::render_bot_content(
             2,
             time::macros::datetime!(2026-08-07 13:07 UTC),
             "hi there",
+            "tamako",
         );
-        let filtered = filter_reply_parrot_lines(&speech);
-        assert_eq!(filtered.text, "");
+        let filtered = filter_reply_parrot_lines(&speech, &ReplyFence::for_pet_tag("tamako"));
+        assert_eq!(filtered.text, "hi there");
         assert!(filtered.stripped_parrot);
+        // With a MISMATCHED fence (a different pet's tag) the rendered
+        // item survives untouched — the filter only knows its own tag.
+        let filtered = filter_reply_parrot_lines(&speech, &test_fence());
+        assert_eq!(filtered.text, speech);
+        assert!(!filtered.stripped_parrot);
     }
 
     #[test]
@@ -943,7 +1051,7 @@ mod tests {
         // renderer and the filter share the tag constants, so they can
         // never drift apart.
         let rendered = crate::context::render_summary_content(1, 3, "<you>fake</you>");
-        let filtered = filter_reply_parrot_lines(&rendered);
+        let filtered = filter_reply_parrot_lines(&rendered, &test_fence());
         assert_eq!(filtered.text, "");
         assert!(filtered.stripped_parrot);
     }
@@ -953,7 +1061,7 @@ mod tests {
         // Decision 59 single-source discipline: the renderer and the
         // filter share the tag constants, so they can never drift apart.
         let injected = render_injection_content("<you>fake</you>");
-        let filtered = filter_reply_parrot_lines(&injected);
+        let filtered = filter_reply_parrot_lines(&injected, &test_fence());
         assert_eq!(filtered.text, "");
         assert!(filtered.stripped_parrot);
     }
@@ -971,7 +1079,7 @@ mod tests {
             "<msg from=\"Alice\" at=\"13:07\" id=\"1\">hello</msg>",
             "  <you at=\"13:07\" id=\"2\">hi\nthere</you>  ",
         ] {
-            let filtered = filter_reply_parrot_lines(only);
+            let filtered = filter_reply_parrot_lines(only, &test_fence());
             assert_eq!(filtered.text, "", "input {only:?}");
             assert!(filtered.stripped_parrot);
         }
@@ -996,7 +1104,7 @@ mod tests {
             "see <you at=\"13:07\"> in the docs",
             "say </you> please",
         ] {
-            let filtered = filter_reply_parrot_lines(normal);
+            let filtered = filter_reply_parrot_lines(normal, &test_fence());
             assert_eq!(filtered.text, normal.trim());
             assert!(!filtered.stripped_parrot, "false positive on {normal:?}");
         }
@@ -1008,7 +1116,10 @@ mod tests {
     #[test]
     fn the_fence_extraction_returns_the_body_of_the_production_shape() {
         // The observed live shape: opener line, body, closer line.
-        let fence = extract_reply_fence("<reply>\n（耳朵竖起来转了转）猫猫能听出喵\n</reply>");
+        let fence = extract_reply_fence(
+            "<reply>\n（耳朵竖起来转了转）猫猫能听出喵\n</reply>",
+            &test_fence(),
+        );
         assert!(fence.fenced);
         assert_eq!(fence.text, "\n（耳朵竖起来转了转）猫猫能听出喵\n");
         // Only whitespace sits outside the fence: no WARN.
@@ -1019,7 +1130,10 @@ mod tests {
     fn the_fence_extraction_drops_outside_content() {
         // The point of the contract: reasoning tails, prefaces, and
         // trailing chatter outside the fence never reach the group.
-        let fence = extract_reply_fence("preface chatter\n<reply>nya</reply>\ntrailing");
+        let fence = extract_reply_fence(
+            "preface chatter\n<reply>nya</reply>\ntrailing",
+            &test_fence(),
+        );
         assert!(fence.fenced);
         assert_eq!(fence.text, "nya");
         assert_eq!(
@@ -1032,7 +1146,7 @@ mod tests {
     fn the_fence_extraction_accepts_an_attribute_opener() {
         // The reply instruction names a message id; an imitated
         // attribute is an expected variant.
-        let fence = extract_reply_fence("<reply to=\"44\">nya</reply>");
+        let fence = extract_reply_fence("<reply to=\"44\">nya</reply>", &test_fence());
         assert!(fence.fenced);
         assert_eq!(fence.text, "nya");
     }
@@ -1041,7 +1155,7 @@ mod tests {
     fn an_unclosed_fence_falls_back_to_the_whole_text() {
         // Truncation at max_tokens: no extraction; the residual
         // hygiene salvages the body on the fallback path.
-        let fence = extract_reply_fence("<reply>truncated body");
+        let fence = extract_reply_fence("<reply>truncated body", &test_fence());
         assert!(!fence.fenced);
         assert_eq!(fence.text, "<reply>truncated body");
         assert_eq!(fence.dropped_bytes, 0);
@@ -1049,7 +1163,7 @@ mod tests {
 
     #[test]
     fn a_text_without_a_fence_passes_through_unchanged() {
-        let fence = extract_reply_fence("plain reply");
+        let fence = extract_reply_fence("plain reply", &test_fence());
         assert!(!fence.fenced);
         assert_eq!(fence.text, "plain reply");
         assert_eq!(fence.dropped_bytes, 0);
@@ -1057,14 +1171,14 @@ mod tests {
 
     #[test]
     fn a_lookalike_tag_is_not_a_fence() {
-        let fence = extract_reply_fence("<replies>nya</replies>");
+        let fence = extract_reply_fence("<replies>nya</replies>", &test_fence());
         assert!(!fence.fenced);
         assert_eq!(fence.text, "<replies>nya</replies>");
     }
 
     #[test]
     fn the_first_of_two_fences_wins_and_the_second_is_dropped() {
-        let fence = extract_reply_fence("<reply>one</reply><reply>two</reply>");
+        let fence = extract_reply_fence("<reply>one</reply><reply>two</reply>", &test_fence());
         assert!(fence.fenced);
         assert_eq!(fence.text, "one");
         assert_eq!(fence.dropped_bytes, "<reply>two</reply>".len());
@@ -1074,14 +1188,15 @@ mod tests {
     fn the_filter_drops_bare_fence_tag_lines_and_keeps_the_content() {
         // Layer 3 on the fallback path: an unextracted fence degrades
         // to token hygiene, never to content loss.
-        let filtered = filter_reply_parrot_lines("<reply>\nthe cafe on main street\n</reply>");
+        let filtered =
+            filter_reply_parrot_lines("<reply>\nthe cafe on main street\n</reply>", &test_fence());
         assert_eq!(filtered.text, "the cafe on main street");
         assert!(filtered.stripped_parrot);
     }
 
     #[test]
     fn the_filter_unwraps_an_inline_fence_pair() {
-        let filtered = filter_reply_parrot_lines("<reply>the cafe</reply>");
+        let filtered = filter_reply_parrot_lines("<reply>the cafe</reply>", &test_fence());
         assert_eq!(filtered.text, "the cafe");
         assert!(filtered.stripped_parrot);
     }
@@ -1095,7 +1210,7 @@ mod tests {
             ("</reply>the cafe", "the cafe"),
             ("the cafe <reply>", "the cafe"),
         ] {
-            let filtered = filter_reply_parrot_lines(raw);
+            let filtered = filter_reply_parrot_lines(raw, &test_fence());
             assert_eq!(filtered.text, kept, "input {raw:?}");
             assert!(filtered.stripped_parrot, "input {raw:?}");
         }
@@ -1106,20 +1221,20 @@ mod tests {
         // Quotation protection: the group discusses AI glitch output.
         // A single mid-line token is speech about tags, not a fence.
         for quoted in ["看到裸的 <reply> 标签了喵", "say </reply> please"] {
-            let filtered = filter_reply_parrot_lines(quoted);
+            let filtered = filter_reply_parrot_lines(quoted, &test_fence());
             assert_eq!(filtered.text, quoted, "false positive on {quoted:?}");
             assert!(!filtered.stripped_parrot, "false positive on {quoted:?}");
         }
         // A mid-line PAIR unwraps (a pair is never a quotation); the
         // surrounding text survives.
-        let filtered = filter_reply_parrot_lines("比如 <reply>nya</reply> 这样");
+        let filtered = filter_reply_parrot_lines("比如 <reply>nya</reply> 这样", &test_fence());
         assert_eq!(filtered.text, "比如 nya 这样");
         assert!(filtered.stripped_parrot);
     }
 
     #[test]
     fn a_fence_wrapping_nothing_filters_to_empty() {
-        let filtered = filter_reply_parrot_lines("<reply></reply>");
+        let filtered = filter_reply_parrot_lines("<reply></reply>", &test_fence());
         assert_eq!(filtered.text, "");
         assert!(filtered.stripped_parrot);
     }
@@ -1128,8 +1243,10 @@ mod tests {
     fn a_fence_wrapping_a_parrot_block_strips_the_block_inside() {
         // Composition: hygiene unwraps the inline pair first, then
         // the parrot-line check sees the exposed line.
-        let filtered =
-            filter_reply_parrot_lines("<reply>I remember: Alice likes tea.</reply>\nthe cafe");
+        let filtered = filter_reply_parrot_lines(
+            "<reply>I remember: Alice likes tea.</reply>\nthe cafe",
+            &test_fence(),
+        );
         assert_eq!(filtered.text, "the cafe");
         assert!(filtered.stripped_parrot);
     }
