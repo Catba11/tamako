@@ -895,6 +895,14 @@ fn validate_warmup_overlay(
 /// order deterministic.
 fn unknown_keys(parsed: &BotConfigToml) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    // Decision 94 (c): top-level strays and misspelled table headers
+    // first (the BTreeMap keeps them sorted among themselves).
+    out.extend(
+        parsed
+            .extra
+            .keys()
+            .map(|key| ("<top-level>".to_string(), key.clone())),
+    );
     if let Some(overlay) = &parsed.global {
         out.extend(
             overlay
@@ -950,6 +958,15 @@ struct BotConfigToml {
     global: Option<TriggerConfigToml>,
     #[serde(default)]
     groups: HashMap<String, TriggerConfigToml>,
+    /// Unknown TOP-LEVEL keys land here (decision 94 (c), the root-level
+    /// mirror of `TriggerConfigToml`'s decision-84(e) catch-all) and are
+    /// WARNed about at load as table `<top-level>`: a stray key above
+    /// the first header applies nothing, and a misspelled table header
+    /// (e.g. `[group."-1001"]`) surfaces here as the unknown key `group`
+    /// instead of silently un-registering the intended group.
+    /// `BTreeMap` keeps the WARN order deterministic.
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
 }
 
 impl BotConfig {
@@ -968,7 +985,8 @@ impl BotConfig {
     /// section and one `[groups.<chat_id>]` table per group override.
     /// A global-only key under a group table is a LOUD error
     /// (decision 77, S6-F7) naming the key and the group. An unknown
-    /// key is a curated WARN, never an error (decision 84 (e)).
+    /// key is a curated WARN, never an error (decision 84 (e);
+    /// decision 94 extends the net to the top level of the file).
     pub fn from_toml_str(text: &str) -> Result<BotConfig, ConfigError> {
         let parsed: BotConfigToml = toml::from_str(text)?;
         // Decision 84 (e): one curated WARN per unknown key, global
@@ -2046,6 +2064,45 @@ digest_max_chars_bytes = 4096
                 ("global".to_string(), "digest_max_chars_bytes".to_string()),
                 ("global".to_string(), "digest_max_chars_words".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn top_level_unknown_keys_warn_and_apply_nothing() {
+        // Decision 94 (c): a stray key above the first header and a
+        // misspelled `[group."-100"]` table header both land in the
+        // root catch-all — before, both applied NOTHING silently (the
+        // singular-header typo un-registered the intended group).
+        let text = r#"
+stray_top_key = 1
+
+[group."-100"]
+wake_msg_count = 2
+"#;
+        let config = BotConfig::from_toml_str(text).expect("top-level strays load, warn-only");
+        assert!(
+            config.overrides.is_empty(),
+            "the typo header registers no group"
+        );
+        let parsed: BotConfigToml = toml::from_str(text).expect("the TOML parses");
+        assert_eq!(
+            unknown_keys(&parsed),
+            vec![
+                ("<top-level>".to_string(), "group".to_string()),
+                ("<top-level>".to_string(), "stray_top_key".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn top_level_unknown_keys_survive_a_serialize_round_trip() {
+        let parsed: BotConfigToml =
+            toml::from_str("future_key = 1\n").expect("a top-level future key parses");
+        let serialized = toml::to_string(&parsed).expect("the config serializes");
+        let reparsed: BotConfigToml = toml::from_str(&serialized).expect("the round trip parses");
+        assert_eq!(
+            unknown_keys(&reparsed),
+            vec![("<top-level>".to_string(), "future_key".to_string())]
         );
     }
 

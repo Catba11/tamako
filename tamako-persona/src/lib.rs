@@ -6,6 +6,7 @@
 //! Phase 0 loads the configuration once at startup. Hot reload enters in
 //! Phase 2.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use time::format_description::FormatItem;
 use time::macros::format_description;
@@ -72,7 +73,15 @@ pub const CONTEXT_FORMAT_GLOSS: &str = r#"Context format:
 ///
 /// Rule P5: one configuration for all groups. It lives at
 /// `{data_root}/persona.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// Unknown-key posture (decision 94): unknown ROOT keys land in the
+/// `unknown` catch-all and earn one curated WARN each at load (the
+/// decision-84(e) posture, extended to the persona file) — tolerated
+/// for forward compatibility, never applied. Unknown keys inside an
+/// `[[example]]` element are a HARD parse error instead: see
+/// [`PersonaExample`]. `Eq` is impossible with a `toml::Value`
+/// catch-all (TOML floats).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersonaConfig {
     /// System-level directives, rendered verbatim BEFORE the identity line;
     /// for alignment and system notes that must precede the persona itself.
@@ -140,6 +149,15 @@ pub struct PersonaConfig {
     /// only, with no anchor invalidation.
     #[serde(default)]
     pub suffix: Vec<String>,
+    /// Unknown root keys land here (decision 94, the decision-84(e)
+    /// mirror on [`TriggerConfigToml`](https://docs.rs/tamako-core)) and
+    /// are WARNed about at load, never applied. `flatten` keeps forward
+    /// compatibility: a newer config's keys don't hard-fail an older
+    /// binary (no `deny_unknown_fields` at the root). Private: the
+    /// in-crate constructors use struct literals and the tests read it
+    /// directly. `BTreeMap` keeps the WARN order deterministic.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 /// Renders the suffix body of decision 86: a `<system>` element wrapping
@@ -171,7 +189,17 @@ pub fn render_suffix(entries: &[String]) -> String {
 /// One few-shot dialogue example (decision 85). The persona file is
 /// trusted config (decision 85 (d), decision 45 strict startup), so both
 /// fields render VERBATIM — no escaping.
+///
+/// `deny_unknown_fields` (decision 94): the element contract is exactly
+/// `context` + `reply`, so an unknown key HERE is never a forward-compat
+/// case — it is a mechanical misplacement. The 2026-09-04 live incident:
+/// a root-level `suffix` array written BELOW the last `[[example]]`
+/// header TOML-scoped into that element and serde dropped it silently;
+/// with the deny, the same file fails startup with a parse error naming
+/// the field (line and column), and a reload of the same shape lands in
+/// the watcher's keep-current-with-one-WARN arm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersonaExample {
     /// A sample of the LIVE XML context dialect (specs.md Section 7.3):
     /// `<msg>`/`<you>`/`<media>`/`<memory>`/`<summary>` as they actually
@@ -188,7 +216,15 @@ pub struct PersonaExample {
 impl PersonaConfig {
     /// Parses a persona configuration from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, PersonaError> {
-        Ok(toml::from_str(s)?)
+        let config: Self = toml::from_str(s)?;
+        // Decision 94: one curated WARN per unknown ROOT key (the
+        // decision-84(e) mirror). Unknown keys inside an [[example]]
+        // element never reach this point — PersonaExample denies them
+        // at the parse step above.
+        for key in config.unknown.keys() {
+            tracing::warn!(key = %key, "unknown persona key, ignored");
+        }
+        Ok(config)
     }
 }
 
@@ -204,6 +240,7 @@ impl Default for PersonaConfig {
             behavioral_rules: Vec::new(),
             examples: Vec::new(),
             suffix: Vec::new(),
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -559,6 +596,7 @@ behavioral_rules = [
             ],
             examples: Vec::new(),
             suffix: Vec::new(),
+            unknown: BTreeMap::new(),
         }
     }
 
@@ -612,12 +650,62 @@ identity = "a small cat"
     }
 
     #[test]
-    fn from_toml_str_tolerates_unknown_keys() {
-        // serde default behavior: unknown keys are ignored, so a config
-        // written for a newer schema still loads on an older binary.
+    fn from_toml_str_tolerates_unknown_root_keys() {
+        // Decision 94: an unknown ROOT key is tolerated for forward
+        // compatibility (a config written for a newer schema still
+        // loads on an older binary) but lands in the catch-all, which
+        // from_toml_str WARNs about key by key.
         let toml = "name = \"Tamako\"\nidentity = \"a small cat\"\nfuture_key = 42\n";
-        let config = PersonaConfig::from_toml_str(toml).expect("unknown keys must be tolerated");
+        let config = PersonaConfig::from_toml_str(toml).expect("unknown root keys are tolerated");
         assert_eq!(config.name, "Tamako");
+        assert!(
+            config.unknown.contains_key("future_key"),
+            "the unknown root key lands in the catch-all"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_an_unknown_key_inside_an_example() {
+        // Decision 94: the element contract is exactly context+reply.
+        let toml = "name = \"Tamako\"\nidentity = \"a small cat\"\n\n[[example]]\ncontext = \"<msg from=\\\"a\\\" at=\\\"01:02\\\" id=\\\"1\\\">hi</msg>\"\nreply = \"nya\"\nfuture_key = 42\n";
+        let result = PersonaConfig::from_toml_str(toml);
+        assert!(
+            matches!(result, Err(PersonaError::Parse(_))),
+            "an unknown key inside [[example]] is a hard parse error"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_a_root_array_scoped_below_the_last_example() {
+        // The 2026-09-04 live incident: a root-level `suffix` array
+        // written BELOW the last [[example]] header TOML-scopes into
+        // that element. Pre-94 serde dropped it silently; now the
+        // element's deny_unknown_fields fails the file.
+        let toml = "name = \"Tamako\"\nidentity = \"a small cat\"\n\n[[example]]\ncontext = \"ctx\"\nreply = \"nya\"\n\nsuffix = [\n    \"keep it short\",\n]\n";
+        let result = PersonaConfig::from_toml_str(toml);
+        let Err(PersonaError::Parse(error)) = result else {
+            panic!("the mis-scoped suffix array must fail the parse");
+        };
+        assert!(
+            error.to_string().contains("suffix"),
+            "the error names the misplaced key: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_root_keys_survive_a_serialize_round_trip() {
+        // The decision-84(e) Serialize-round-trip discipline: a
+        // parse→serialize→parse cycle does not lose the catch-all
+        // (the machine never writes persona.toml, but the property
+        // keeps the struct honest).
+        let toml = "name = \"Tamako\"\nidentity = \"a small cat\"\nfuture_key = 42\n";
+        let config = PersonaConfig::from_toml_str(toml).expect("the TOML parses");
+        let serialized = toml::to_string(&config).expect("the config serializes");
+        let reparsed = PersonaConfig::from_toml_str(&serialized).expect("the round trip parses");
+        assert_eq!(
+            reparsed.unknown.get("future_key"),
+            config.unknown.get("future_key")
+        );
     }
 
     #[test]

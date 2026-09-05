@@ -1238,12 +1238,14 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     };
     let preamble =
         PetPreambleRenderer.render_preamble_for_mode(&persona, bot_config.global.suffix_mode);
-    info!(persona = %persona.name, preamble_len = preamble.len(), "persona preamble rendered");
     // Decision 86: the reply suffix body is rendered once here (the
     // startup value of the shared slot) and re-rendered by the persona
     // watcher on each reload. It rides the SAME hot-reload discipline as
     // the preamble but is NEVER persisted and never part of the anchor.
     let suffix = tamako_persona::render_suffix(&persona.suffix);
+    // Decision 94 (d): the suffix rule count rides the startup line, so
+    // a silently empty suffix is one log read away.
+    info!(persona = %persona.name, preamble_len = preamble.len(), suffix_rules = persona.suffix.len(), "persona preamble rendered");
     Ok(SharedSetup {
         bot_config,
         // Decision 80: updatable in live mode; the startup render is the
@@ -2898,6 +2900,11 @@ async fn run_live(
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone(),
+        setup
+            .suffix
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
         setup.bot_config.global.suffix_mode,
         reload_tx,
     );
@@ -3164,13 +3171,22 @@ async fn run_live(
                     .suffix
                     .write()
                     .unwrap_or_else(PoisonError::into_inner) = notice.suffix.clone();
-                let skipped = persona_watch::broadcast_preamble(&actors, &notice.preamble);
-                // ONE curated INFO line per applied reload (decision-53
-                // addition, the decision-78 warmup line's class): a
-                // deliberate operator event is exactly the startup-class
-                // kind. The fields mirror the startup "persona preamble
-                // rendered" line and add the skip count.
-                info!(persona = %notice.persona_name, preamble_len = notice.preamble.len(), skipped = skipped.len(), "persona preamble reloaded");
+                if notice.preamble_changed {
+                    let skipped = persona_watch::broadcast_preamble(&actors, &notice.preamble);
+                    // ONE curated INFO line per applied reload (decision-53
+                    // addition, the decision-78 warmup line's class): a
+                    // deliberate operator event is exactly the startup-class
+                    // kind. The fields mirror the startup "persona preamble
+                    // rendered" line and add the skip count.
+                    info!(persona = %notice.persona_name, preamble_len = notice.preamble.len(), suffix_rules = notice.suffix_rules, skipped = skipped.len(), "persona preamble reloaded");
+                } else {
+                    // Decision 94 (b): a suffix-only reload rewrites the
+                    // slot WITHOUT the broadcast — the suffix never
+                    // enters the preamble (decision 86 (d)), so the
+                    // actors' context item 0 is untouched and no cache
+                    // anchor moves.
+                    info!(persona = %notice.persona_name, suffix_rules = notice.suffix_rules, "persona suffix reloaded");
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("ctrl-c received; shutting down");
