@@ -91,6 +91,26 @@
 //! keeps the base URL under one configuration scheme (specs.md
 //! Section 13).
 //!
+//! ## Reasoning-markup sanitation (decision 93)
+//!
+//! Every completion's extracted text passes [`strip_reasoning_markup`]
+//! before any purpose sees it (reply, gates, summary, extraction — and
+//! captions via `caption.rs`). A serving stack that splits reasoning
+//! from content with a NAIVE first-`</think>` string match breaks when
+//! the reasoning itself mentions the tag — observed live: the group
+//! discussed a glitchy AI output, the reasoning quoted `</think>`, and
+//! the content field carried the reasoning tail, the stray closer, and
+//! the answer. The stripper is fail-closed: balanced
+//! `<think>...</think>` regions strip; an orphan `</think>` drops
+//! everything up to and including it; an unclosed `<think>` voids the
+//! remainder, so an all-reasoning response maps to the same
+//! `AgentError::Extraction` as a text-less response and every caller's
+//! backoff discipline applies unchanged. One WARN per non-trivial
+//! strip. Providers that return reasoning on a separate response field
+//! (`reasoning_content` / `reasoning`) were already safe: rig maps
+//! them to `AssistantContent::Reasoning`, which the text extraction
+//! never selects.
+//!
 //! ## Per-attempt timeout (H4b)
 //!
 //! Every completion attempt is bounded by [`ENDPOINT_TIMEOUT`] (a code
@@ -1523,6 +1543,79 @@ fn checked_batch_vectors(vecs: Vec<Vec<f64>>) -> Result<Vec<Vec<f32>>, AgentErro
     vecs.into_iter().map(checked_embedding_vector).collect()
 }
 
+/// The outcome of [`strip_reasoning_markup`]: the text with reasoning
+/// markup removed, plus the removed byte count for the WARN (the
+/// operator's per-model endpoint-behavior gauge, decision 93).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasoningStripOutcome {
+    /// The text with every reasoning-markup region removed. NOT
+    /// trimmed — the caller owns trimming.
+    pub(crate) text: String,
+    /// The removed byte count; zero means the input passed through
+    /// untouched.
+    pub(crate) stripped_bytes: usize,
+}
+
+/// Removes reasoning markup from one completion's text (decision 93,
+/// specs.md Section 9.8). Exact-match lowercase `<think>` only — the
+/// machine templates emit one spelling. The scan:
+///
+/// - a balanced `<think>...</think>` region strips (first closer
+///   wins), and the scan resumes after it;
+/// - an orphan `</think>` (no unmatched opener before it) drops
+///   everything up to and including it — the observed shape of a
+///   provider-side reasoning parser that split at a literal `</think>`
+///   the reasoning itself mentioned;
+/// - an unclosed `<think>` voids the remainder: everything from the
+///   opener on is reasoning without an answer (fail closed).
+///
+/// Deliberate tradeoff: a genuine reply QUOTING a raw `</think>` loses
+/// its head up to the quote. Accepted over the alternative (leaking
+/// reasoning): the leak is the recurring live failure, the quote is
+/// not, and every strip emits a WARN with the byte count.
+pub(crate) fn strip_reasoning_markup(text: &str) -> ReasoningStripOutcome {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut stripped_bytes = 0;
+    loop {
+        let open = rest.find(OPEN);
+        let close = rest.find(CLOSE);
+        // An orphan closer ahead of any opener: a reasoning tail.
+        if let Some(c) = close {
+            if open.is_none_or(|o| c < o) {
+                stripped_bytes += c + CLOSE.len();
+                rest = &rest[c + CLOSE.len()..];
+                continue;
+            }
+        }
+        match open {
+            Some(o) => {
+                out.push_str(&rest[..o]);
+                match rest[o + OPEN.len()..].find(CLOSE) {
+                    Some(rel) => {
+                        stripped_bytes += OPEN.len() + rel + CLOSE.len();
+                        rest = &rest[o + OPEN.len() + rel + CLOSE.len()..];
+                    }
+                    None => {
+                        stripped_bytes += rest.len() - o;
+                        rest = "";
+                    }
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    ReasoningStripOutcome {
+        text: out,
+        stripped_bytes,
+    }
+}
+
 /// The shared completion flow of both families. The request shape is
 /// identical; only the rig model type differs. `purpose` and
 /// `model_name` label the curated per-call usage INFO line (decision
@@ -1603,14 +1696,34 @@ where
         output_tokens = response.usage.output_tokens,
         "llm completion usage"
     );
-    response
+    let text = response
         .choice
         .iter()
         .find_map(|content| match content {
             AssistantContent::Text(text) => Some(text.text.clone()),
             _ => None,
         })
-        .ok_or_else(|| AgentError::Extraction("no text content in the response".to_string()))
+        .ok_or_else(|| AgentError::Extraction("no text content in the response".to_string()))?;
+    // Decision 93: reasoning-markup sanitation at the one seam every
+    // purpose flows through (module docs, specs.md Section 9.8).
+    let stripped = strip_reasoning_markup(&text);
+    if stripped.stripped_bytes > 0 {
+        tracing::warn!(
+            purpose,
+            model = model_name,
+            stripped_bytes = stripped.stripped_bytes,
+            "stripped reasoning markup from the completion text"
+        );
+    }
+    // Fail closed: an all-reasoning response is the same Extraction
+    // class as a text-less response, so every caller's backoff and
+    // dead-letter discipline applies unchanged.
+    if stripped.text.trim().is_empty() {
+        return Err(AgentError::Extraction(
+            "the response text is entirely reasoning markup".to_string(),
+        ));
+    }
+    Ok(stripped.text)
 }
 
 /// The system preamble of the repair completion (module docs). The
@@ -3171,6 +3284,167 @@ mod tests {
                 .any(|line| { line.eq_ignore_ascii_case("x-session-id: test-session-xyz") }),
             "the request carried x-session-id: test-session-xyz, head:\n{head}"
         );
+        server.join().expect("the server thread joins");
+    }
+
+    // --- Decision 93: reasoning-markup sanitation ---
+
+    #[test]
+    fn strip_reasoning_markup_passes_clean_text_through_untouched() {
+        let outcome = strip_reasoning_markup("the cafe on main street");
+        assert_eq!(outcome.text, "the cafe on main street");
+        assert_eq!(outcome.stripped_bytes, 0);
+    }
+
+    #[test]
+    fn strip_reasoning_markup_strips_a_balanced_region() {
+        let outcome = strip_reasoning_markup("<think>let me think</think>the answer");
+        assert_eq!(outcome.text, "the answer");
+        assert_eq!(outcome.stripped_bytes, "<think>let me think</think>".len());
+    }
+
+    #[test]
+    fn strip_reasoning_markup_strips_multiple_regions() {
+        let outcome = strip_reasoning_markup("<think>a</think>one<think>b</think>two");
+        assert_eq!(outcome.text, "onetwo");
+    }
+
+    #[test]
+    fn strip_reasoning_markup_drops_a_reasoning_tail_before_an_orphan_closer() {
+        // The observed production shape: a provider-side reasoning
+        // parser split at a literal </think> the reasoning itself
+        // mentioned, so the content field carried the reasoning tail,
+        // the real closer, and the answer.
+        let outcome = strip_reasoning_markup(
+            "` tags and \"zz\" patterns, joking about the glitch. Good.</think>mrrp……那才不是故障喵",
+        );
+        assert_eq!(outcome.text, "mrrp……那才不是故障喵");
+    }
+
+    #[test]
+    fn strip_reasoning_markup_iterates_over_multiple_orphan_closers() {
+        let outcome = strip_reasoning_markup("tail one</think>tail two</think>the answer");
+        assert_eq!(outcome.text, "the answer");
+    }
+
+    #[test]
+    fn strip_reasoning_markup_voids_an_unclosed_region() {
+        let outcome = strip_reasoning_markup("the start<think>reasoning without end");
+        assert_eq!(outcome.text, "the start");
+        let outcome = strip_reasoning_markup("<think>only reasoning");
+        assert_eq!(outcome.text, "");
+    }
+
+    /// Serves one fixed completion body: reads the request (head +
+    /// body per Content-Length, so the socket closes without unread
+    /// data), answers, closes. The decision-93 wire tests script the
+    /// content field through it. No external network.
+    fn spawn_fixed_body_server(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("the listener binds");
+        let port = listener.local_addr().expect("a local address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one connection");
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let head_end = loop {
+                let read = stream.read(&mut buffer).expect("a readable request");
+                raw.extend_from_slice(&buffer[..read]);
+                if let Some(position) = raw
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                {
+                    break position;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())?
+                })
+                .expect("a content-length header");
+            while raw.len() < head_end + content_length {
+                let read = stream.read(&mut buffer).expect("a readable body");
+                raw.extend_from_slice(&buffer[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("the response is writable");
+        });
+        (port, server)
+    }
+
+    /// One `EndpointClient::complete` against a local fixed-body
+    /// server. The API key is read at build time only, so the env
+    /// guard drops BEFORE the await (no lock is held across it).
+    async fn complete_against(port: u16) -> Result<String, AgentError> {
+        let endpoint = EndpointConfig {
+            api: LlmApi::OpenAiCompatible,
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            model: "test-model".to_string(),
+            structured_output: StructuredOutputMode::Schema,
+            session_id: "test-session".to_string(),
+        };
+        let client = {
+            let (_lock, env) = EnvGuard::cleared();
+            env.set(OPENAI_API_KEY_ENV_VAR, "test-openai-key");
+            EndpointClient::build(&endpoint).expect("openai client")
+        };
+        client
+            .complete(
+                Some("p".to_string()),
+                vec![Message::user("hi".to_string())],
+                None,
+                64,
+            )
+            .await
+    }
+
+    /// Decision 93: a completion whose content carries a reasoning
+    /// tail plus a stray closer (the botched provider-side split)
+    /// yields the answer only — the full `EndpointClient::complete`
+    /// path against a local server.
+    #[tokio::test]
+    async fn a_reasoning_tail_in_the_content_is_stripped() {
+        let body = concat!(
+            r#"{"id":"x","object":"chat.completion","model":"test-model","#,
+            r#""choices":[{"index":0,"message":{"role":"assistant","content":"reasoning tail about glitchy tags</think>the answer"},"finish_reason":"stop"}],"#,
+            r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+        );
+        let (port, server) = spawn_fixed_body_server(body);
+        let text = complete_against(port)
+            .await
+            .expect("the completion succeeds");
+        assert_eq!(text, "the answer");
+        server.join().expect("the server thread joins");
+    }
+
+    /// An all-reasoning response fails closed: the same Extraction
+    /// class as a text-less response, so every caller's backoff and
+    /// dead-letter discipline applies unchanged.
+    #[tokio::test]
+    async fn an_all_reasoning_response_is_an_extraction_error() {
+        let body = concat!(
+            r#"{"id":"x","object":"chat.completion","model":"test-model","#,
+            r#""choices":[{"index":0,"message":{"role":"assistant","content":"<think>only reasoning, no answer"},"finish_reason":"stop"}],"#,
+            r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+        );
+        let (port, server) = spawn_fixed_body_server(body);
+        match complete_against(port).await {
+            Err(AgentError::Extraction(message)) => {
+                assert_eq!(message, "the response text is entirely reasoning markup");
+            }
+            other => panic!("expected the all-reasoning Extraction error, got {other:?}"),
+        }
         server.join().expect("the server thread joins");
     }
 

@@ -14,7 +14,8 @@ use rig::completion::Message;
 use tamako_core::actor::CoreError;
 use tamako_core::context::{ContextMessage, ContextRole};
 use tamako_core::wake::{
-    filter_reply_parrot_lines, GateMessage, ReplyFilterOutcome, ReplyGenerator, ReplyRequest,
+    extract_reply_fence, filter_reply_parrot_lines, GateMessage, ReplyFilterOutcome,
+    ReplyGenerator, ReplyRequest,
 };
 use tamako_persona::{ResolvedTimezone, SuffixMode};
 
@@ -72,6 +73,13 @@ pub fn context_messages_to_rig(messages: &[ContextMessage]) -> (Option<String>, 
 /// appended to the live context: the live context holds group speech
 /// and bot speech (Section 7.1), not per-call scaffolding.
 ///
+/// Decision 93 (specs.md Section 9.8): the fence sentence is the
+/// reply-path output contract — the whole reply in exactly one
+/// `<reply>...</reply>` element, extracted by `extract_reply_fence`
+/// at the validation seam. The sentence lives HERE and not in the
+/// shared context-format gloss: the gloss also feeds the
+/// JSON-outputting gates, which must never learn a wrapper.
+///
 /// The F2 tail sentence stays in sync with the outbound parrot filter
 /// of tamako-core (decision 59 F1 + decision 64): the filter strips
 /// `I remember:` lines, `<memory>` blocks, and `<summary>` blocks
@@ -116,6 +124,8 @@ pub fn render_reply_instruction(target: &GateMessage) -> String {
         "{reference}\n\
          Reply as the group pet persona. Write only the reply text: \
          one message, no speaker label, no quotes. \
+         Wrap the whole reply in exactly one <reply>...</reply> element \
+         and write nothing outside it. \
          Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, \
          <msg> blocks, <you> blocks, or a memory list: \
          recalled memories are context, never speech."
@@ -207,9 +217,13 @@ fn unescape_xml_attr(value: &str) -> String {
 }
 
 /// Trims the model output and applies the parrot filter
-/// (`tamako_core::wake::filter_reply_parrot_lines`, decision 59 F1):
-/// every line whose trimmed start matches the recall-injection prefix
-/// (ASCII or full-width colon) is removed. The filter runs at the
+/// (`tamako_core::wake::filter_reply_parrot_lines`, decision 59 F1).
+/// Decision 93 (specs.md Section 9.8) runs FIRST: the `<reply>` fence
+/// extraction takes the body of a complete fence and drops everything
+/// outside it (one WARN with the dropped byte count); an absent or
+/// malformed fence passes the whole text through (one WARN — the
+/// contract is fail-open, and the filter's residual fence-token
+/// hygiene still cleans up debris). The parrot filter then runs at the
 /// reply-text validation seam, BEFORE the outbound raw-log row
 /// persists (Rule B1): the log and the group see the same filtered
 /// text, and the raw log never carries hallucinated speech (Rule P1).
@@ -221,7 +235,19 @@ fn unescape_xml_attr(value: &str) -> String {
 /// today (Section 9 step 4: log, skip this wake, no crash). Pure
 /// function, no I/O.
 pub fn trimmed_reply_or_error(text: &str) -> Result<ReplyFilterOutcome, CoreError> {
-    let filtered = filter_reply_parrot_lines(text);
+    // Decision 93 layer 2 (specs.md Section 9.8): the fence contract.
+    // Fail-open — an absent or malformed fence passes the whole text
+    // through; the filter's residual-token hygiene still applies.
+    let fence = extract_reply_fence(text);
+    if !fence.fenced {
+        tracing::warn!("the reply carries no complete <reply> fence; the whole text proceeds");
+    } else if fence.dropped_bytes > 0 {
+        tracing::warn!(
+            dropped_bytes = fence.dropped_bytes,
+            "dropped content outside the reply fence"
+        );
+    }
+    let filtered = filter_reply_parrot_lines(&fence.text);
     if filtered.text.is_empty() {
         Err(CoreError::Wake(
             "the reply model returned an empty reply".to_string(),
@@ -824,13 +850,15 @@ mod tests {
     #[test]
     fn the_reply_instruction_states_the_f2_sentence_and_the_target_verbatim() {
         // The full ephemeral instruction, byte-exact: the non-XML
-        // target reference (decision 64) plus the F2 sentence naming
-        // every shape the outbound parrot filter strips.
+        // target reference (decision 64), the decision-93 fence sentence,
+        // plus the F2 sentence naming every shape the outbound parrot
+        // filter strips.
         let expected = concat!(
             "Reply to THIS message (id 42), from Bob at 13:02: \"what should we eat?\"",
             "\n",
             "Reply as the group pet persona. Write only the reply text: ",
             "one message, no speaker label, no quotes. ",
+            "Wrap the whole reply in exactly one <reply>...</reply> element and write nothing outside it. ",
             "Never write \"I remember:\" lines, <memory> blocks, <summary> blocks, <msg> blocks, <you> blocks, or a memory list: ",
             "recalled memories are context, never speech.",
         );
@@ -917,6 +945,56 @@ mod tests {
             assert_eq!(reply.text, normal.trim());
             assert!(!reply.stripped_parrot, "false positive on {normal:?}");
         }
+    }
+
+    // --- Decision 93: the fence contract at the validation seam ---
+
+    #[test]
+    fn a_fenced_reply_is_extracted() {
+        let reply = trimmed_reply_or_error("<reply>\nnya 喵\n</reply>").expect("reply");
+        assert_eq!(reply.text, "nya 喵");
+        assert!(!reply.stripped_parrot);
+    }
+
+    #[test]
+    fn content_outside_the_fence_is_dropped() {
+        let reply =
+            trimmed_reply_or_error("let me think about this\n<reply>nya</reply>").expect("reply");
+        assert_eq!(reply.text, "nya");
+    }
+
+    #[test]
+    fn an_unfenced_reply_passes_through() {
+        // Fail-open: a model that ignores the fence sentence still
+        // gets its text through (the pre-contract behavior).
+        let reply = trimmed_reply_or_error("plain reply").expect("reply");
+        assert_eq!(reply.text, "plain reply");
+    }
+
+    #[test]
+    fn an_unclosed_fence_degrades_to_token_hygiene() {
+        let reply = trimmed_reply_or_error("<reply>\nnya").expect("reply");
+        assert_eq!(reply.text, "nya");
+        assert!(reply.stripped_parrot);
+    }
+
+    #[test]
+    fn an_empty_fence_is_the_empty_reply_error() {
+        match trimmed_reply_or_error("<reply>\n</reply>") {
+            Err(CoreError::Wake(message)) => {
+                assert_eq!(message, "the reply model returned an empty reply")
+            }
+            other => panic!("expected the empty-reply error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parrot_block_inside_the_fence_is_stripped() {
+        let reply =
+            trimmed_reply_or_error("<reply>\nI remember: Alice likes tea.\nthe cafe\n</reply>")
+                .expect("reply");
+        assert_eq!(reply.text, "the cafe");
+        assert!(reply.stripped_parrot);
     }
 
     #[tokio::test]
