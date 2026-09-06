@@ -2510,7 +2510,10 @@ async fn handle_warmup_report(
     local_offset: UtcOffset,
 ) -> Result<(), CoreError> {
     // The parrot filter (Section 9.7 step 3): decisions 59/64 apply to
-    // the warmup text like every reply.
+    // the warmup text like every reply. Decision 96 (F5): on the live
+    // path the generator seam already filtered AND warned, so this
+    // idempotent second pass fires its WARN only for generators
+    // without a seam filter (the scripted doubles).
     let filtered =
         filter_reply_parrot_lines(&raw_text, &ReplyFence::for_pet_tag(context.pet_tag()));
     if filtered.stripped_parrot {
@@ -2925,6 +2928,9 @@ async fn run_wake_calls(
             // context element into the WakeReport. The filtered
             // text is what the completion handler persists (Rule B1)
             // and sends: the log and the group see the same text.
+            // Decision 96 (F5): the seam warns first on the live path;
+            // this idempotent second pass is the net for generators
+            // without a seam filter, so its WARN fires only there.
             let filtered = filter_reply_parrot_lines(&raw_text, &fence);
             if filtered.stripped_parrot {
                 tracing::warn!(chat_id = %chat_id, "the reply parrots context structure: the parrot filter stripped the imitated lines");
