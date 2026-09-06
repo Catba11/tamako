@@ -2644,6 +2644,26 @@ feature commit (decision 92).
     (the experiment escape hatch, by design), and the decision-80
     watcher reload keeps the current preamble under the existing
     malformed-file WARN arm.
+100. (2026-09-06) The overlength-reply reject (2026-09-04 review, the
+    deferred operator ruling B1; specs.md Sections 9 and 9.7).
+
+    A generated reply or warmup text longer than the platform's
+    4096-character limit is REJECTED in the actor's send path BEFORE
+    the Rule B1 raw-log write (operator-ruled: reject, NOT truncate —
+    an overlength reply is an incident regardless, and a truncated
+    variant reaching the group is still an incident). Nothing
+    persists, nothing sends, no context append, no monologue or
+    cooldown bookkeeping, no participation counter or warmup-quota
+    consumption: log, context, and group stay consistent. The length
+    counts CHARACTERS (the platform limit is a character limit, not a
+    byte limit). The wake path rejects with the SAME wake error as the
+    empty-remainder case, so the decision-65 failure machinery applies
+    unchanged — the marker rolls back, one ERROR names the character
+    count, and a forced wake requeues ONCE (a regeneration can come
+    back under the limit; the empty-reply precedent). The warmup path
+    logs one ERROR (chat id, topic, count) and ends the run quietly —
+    no quota consumed, no engagement watch opened. Both paths share
+    the one constant and the one rule.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 

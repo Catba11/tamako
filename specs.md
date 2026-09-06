@@ -193,7 +193,7 @@ One wake executes these steps in this sequence:
 1. If `muted` and not forced, return. Reset the counters and the timer.
 2. Recall. Refer to Section 9.1 to 9.5.
 3. Participation decision. Refer to Section 9.6.
-4. If the decision is to participate, generate a reply with the main model. The output contract of Section 9.8 applies. Write the bot's own message to the raw log FIRST, then send it through the adapter, then append it to the context (Rule B1: the log precedes the send, so the log and the group see the same text — the pre-2026-09-06 sentence order of this step read send-then-log; the code was always log-then-send).
+4. If the decision is to participate, generate a reply with the main model. The output contract of Section 9.8 applies. Decision 100: a reply longer than the platform limit of 4096 characters is REJECTED before the raw-log write — the SAME wake error as an empty reply: nothing persists, nothing sends, no context append, the marker rolls back, and a forced wake requeues once per the failure handling above (never a truncation: an overlength reply is an incident). Otherwise write the bot's own message to the raw log FIRST, then send it through the adapter, then append it to the context (Rule B1: the log precedes the send, so the log and the group see the same text — the pre-2026-09-06 sentence order of this step read send-then-log; the code was always log-then-send).
 5. Reset the wake counter and the timer with fresh jitter.
 
 ### 9.1 Recall call
@@ -242,7 +242,7 @@ One warmup executes these steps in this sequence (independent of the Wake proced
 1. Check the gates: `warmup` enabled, not `muted`, quota remains for today (after the Section 8.5 backoff), the group silent for `warmup_silence`, and the persisted `warmup_next_at` due. Any failure exits quietly (DEBUG).
 2. Pick a topic: sample the group's Concept nodes weighted by edge count × recency decay, excluding topics on their per-topic cooldown (`warmup_topic_cooldown_days`, 3 days) and topics whose normalized name appears in the 50-row raw-log tail (never restart the conversation that just went quiet). No eligible topic means no warmup — forced small talk is worse than silence.
 3. Generate with the reply purpose: the persona preamble, the gloss, the guardrail, the shared context view, and a warmup instruction naming the topic. An interest attached to a specific person is framed as an open question to the group, never as "X likes Y" — the Section 9.4 guardrail spirit extended to proactive speech. The decision-59/64 parrot filter applies to the generated text like every reply.
-4. Send as a plain standalone message. Proactive speech never quotes a target (Section 6.2's quoting rule governs replies; warmup has no target). Write the outbound row to the raw log first. Rule B1 applies.
+4. Send as a plain standalone message. Proactive speech never quotes a target (Section 6.2's quoting rule governs replies; warmup has no target). Write the outbound row to the raw log first.  Rule B1 applies. The decision-100 overlength reject (4096 characters) applies to the warmup text alike — rejected before the raw-log write, one ERROR, no quota consumed, no engagement watch opened.
 5. Emit one curated `warmup` INFO line, persist the engagement-watch state, and schedule the next activation (`warmup_next_at`).
 
 ### 9.8 Reply output contract and outbound text hygiene
