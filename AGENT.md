@@ -92,10 +92,10 @@ A change that touches one of these surfaces updates ALL of the listed documents 
 | TOML key (add, rename, default change) | `specs.md` Section 13; `tamako.example.toml` |
 | CLI flag or operator-facing output string | The owning `specs.md` section; `README.md` Operator commands; the USAGE/help text |
 | Phase or delivery status | `current-state.md` Section 1; the `dev-roadmap.md` status header; the `README.md` status line; Section 3 of this file |
-| Crate added or dependency boundary changed | Section 4 of this file; `current-state.md` Section 2; `Cargo.toml` |
-| Observable behavior | The `current-state.md` Section 3 decision entry; the owning `specs.md` section |
+| Crate added or dependency boundary changed | Section 4 of this file; `current-state.md` Section 2; `ARCHITECTURE.md` Sections 1–2; `Cargo.toml` |
+| Observable behavior | The `current-state.md` Section 3 decision entry; the owning `specs.md` section; the owning `ARCHITECTURE.md` section |
 
-Backstop before committing such a change: `grep -n <token> README.md tamako.example.toml specs.md current-state.md dev-roadmap.md AGENT.md` and review every hit.
+Backstop before committing such a change: `grep -n <token> README.md tamako.example.toml specs.md current-state.md dev-roadmap.md AGENT.md ARCHITECTURE.md` and review every hit.
 
 `README.md` restates reference content only where bring-up usability wins (the environment table). Everywhere else, compress and point to the owning document (decision 92).
 
