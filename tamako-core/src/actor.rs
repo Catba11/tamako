@@ -2517,7 +2517,7 @@ async fn handle_warmup_report(
     let filtered =
         filter_reply_parrot_lines(&raw_text, &ReplyFence::for_pet_tag(context.pet_tag()));
     if filtered.stripped_parrot {
-        tracing::warn!(chat_id = %chat_id, "the warmup text parrots context structure: the parrot filter stripped the imitated lines");
+        tracing::warn!(chat_id = %chat_id, "the warmup text carries imitated structure or fence debris: the parrot filter stripped the affected lines");
     }
     if filtered.text.is_empty() {
         // The wake empty-reply analog: nothing persisted, nothing sent.
@@ -2933,7 +2933,7 @@ async fn run_wake_calls(
             // without a seam filter, so its WARN fires only there.
             let filtered = filter_reply_parrot_lines(&raw_text, &fence);
             if filtered.stripped_parrot {
-                tracing::warn!(chat_id = %chat_id, "the reply parrots context structure: the parrot filter stripped the imitated lines");
+                tracing::warn!(chat_id = %chat_id, "the reply carries imitated structure or fence debris: the parrot filter stripped the affected lines");
             }
             if filtered.text.is_empty() {
                 // Nothing remains: the SAME wake error as an empty
@@ -8456,7 +8456,7 @@ mod tests {
         let (handle, mut outbound) =
             fire_one_warmup(&fixture, warmup_config(), generator.clone(), due).await;
 
-        assert!(capture.contains("the warmup text parrots context structure"));
+        assert!(capture.contains("the warmup text carries imitated structure or fence debris"));
         let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
         assert_eq!(text, "real text");
         let rows = list_messages(&fixture.store).await;
