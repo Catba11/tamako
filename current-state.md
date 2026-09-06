@@ -2576,6 +2576,49 @@ feature commit (decision 92).
     token never carries the `<reply` prefix; the real lookalike
     class is `<{pet}` + alphanumerics/punctuation. specs.md
     Section 9.8 documents the scan and the delimiter rule.
+98. (2026-09-06) The append-contract coherence round and the
+    per-group suffix override (2026-09-04 review, the deferred
+    operator rulings B2a/B2b; specs.md Sections 5.3, 9, 13).
+
+    Gate fix (B2a). The append-mode authority contract of decision
+    88 now renders whenever the GLOBAL `suffix_mode` is `append` —
+    the `!persona.suffix.is_empty()` condition is gone. Pre-98, an
+    empty-suffix append configuration still merged the decision-90
+    `<now>` element into the final user message (the assembly gates
+    on the SPLICED effective suffix) while the contract stayed
+    unrendered (the preamble gated on the RAW suffix): the
+    decision-88 hardening was inert exactly when a merge still
+    happened. The contract text is generic (it names no rule), so
+    rendering it against an empty suffix is harmless, and it now
+    truthfully covers the `<now>` merge.
+
+    Per-group constraint (B2b(i), operator-ruled hard error). A
+    group table that sets `suffix_mode = "append"` while the
+    GLOBAL mode is `system` is a loud startup error in the
+    decision-77 style: the preamble — and with it the contract —
+    renders once per process from the global mode, so the mixed
+    configuration merged the suffix with NO contract rendered (the
+    pre-98 M6 gap, undocumented). The check runs after the
+    environment overrides apply, so `TAMAKO_SUFFIX_MODE=append`
+    satisfies it. The reverse mix (global `append`, group
+    `system`) stays LEGAL: the group never merges and the contract
+    text is inert for it — an accepted, now-documented state.
+
+    Per-group suffix override (operator-ruled). A group may carry
+    its own suffix rule set in `{data_root}/{chat_id}/persona.toml`:
+    when — and only when — the override file has a `suffix` key,
+    that array replaces the GLOBAL suffix for this group's reply
+    requests; `suffix = []` explicitly silences the global rules
+    for the group. An override without the key, a missing file, or
+    a malformed file (one WARN, degrade to the global suffix — one
+    bad override never blocks a group's wake path) all mean the
+    global suffix applies. The override supplies the BODY only;
+    the placement mode still comes from the trigger configuration.
+    The override loads at actor spawn (boot): unlike the global
+    persona it has NO hot-reload watcher — edit and restart. An
+    override group holds a private suffix slot, so a global persona
+    reload never touches it; the global hot reload still serves
+    every non-override group.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
