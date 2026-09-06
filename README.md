@@ -95,6 +95,8 @@ When set, the prefix is followed by exactly one blank line and the unchanged exi
 
 For experiments, `--allow-default-persona` restores the old lenient fallback chain (repo-root example, then the built-in default). `--replay` never needs the file.
 
+A group may override the reply-suffix rule set: `<data-root>/<chat-id>/persona.toml` with a `suffix` key replaces the global suffix for that group's replies (`suffix = []` silences the global rules there); every other key is rejected at the schema. The file loads at startup only — edit and restart (decision 98). A missing file, no `suffix` key, or a malformed file (one WARN) keeps the global suffix.
+
 ### 4. Run
 
 ```sh
@@ -134,7 +136,7 @@ Environment variables:
 | `TAMAKO_REPLY_STRUCTURED_OUTPUT` | Structured-output mode override of the reply purpose. |
 | `TAMAKO_SUMMARY_STRUCTURED_OUTPUT` | Structured-output mode override of the summary purpose. |
 | **Reply suffix** | |
-| `TAMAKO_SUFFIX_MODE` | Reply-suffix placement, global fallback: `system` (default) or `append` (decisions 88/90). Overrides the global value only; per-group TOML wins. |
+| `TAMAKO_SUFFIX_MODE` | Reply-suffix placement, global fallback: `system` (default) or `append` (decisions 88/90). Overrides the global value only; per-group TOML wins. A per-group `append` under a global `system` mode is a startup error (decision 98). |
 | `TAMAKO_TIMEZONE` | Timezone of the reply-suffix `<now>` time line: IANA name or fixed `±HH:MM`; unset/empty disables the line (decision 90). Overrides the global value only; per-group TOML wins. |
 
 Endpoint portability (specs.md Section 13): every LLM call uses one of the two API families; "compatible" describes the wire format, never the vendor. The config keys `llm_api` / `llm_base_url` select any anthropic-compatible or openai-compatible endpoint (proxy, aggregator, self-hosted), each purpose (`digest`, `gate`, `reply`, `summary`) may override them individually, and the same pattern applies to the structured-output mode. Section 13 owns the full key set, the per-purpose env overrides, and the precedence rules. API keys come from the environment only, never from the config file.

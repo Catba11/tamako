@@ -115,6 +115,9 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # gate_context = true           # the gates see the shared context view (9.6)
 # suffix_mode = "system"          # suffix placement (9.4, decision 88): "system" (separate trailing
 #                                 # system message) or "append" (merged into the final user instruction)
+#                                 # decision 98: per-group "append" requires the global mode to be
+#                                 # "append" too (loud startup error otherwise); a group may replace
+#                                 # the suffix BODY via {data_root}/{chat_id}/persona.toml
 # timezone = "Asia/Shanghai"        # decision 90: the reply-suffix <now> current-time line; an IANA
 #                                 # name or a fixed "+08:00" offset; unset = no time line
 
