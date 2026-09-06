@@ -93,7 +93,7 @@ fn trimmed_warmup_or_error(
         tracing::warn!(
             purpose,
             model,
-            "the warmup text parrots context structure: the parrot filter stripped the imitated lines"
+            "the warmup text carries imitated structure or fence debris: the parrot filter stripped the affected lines"
         );
     }
     if filtered.text.is_empty() {
