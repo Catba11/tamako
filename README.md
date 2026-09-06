@@ -121,6 +121,7 @@ Environment variables:
 | `TAMAKO_REPLY_MODEL` | Reply-generation model override. Default `claude-sonnet-4-5`. |
 | `TAMAKO_SUMMARY_MODEL` | Summary-model override (the segmented C3 summarizer). Default `claude-haiku-4-5`. |
 | `TAMAKO_DIGEST_LLM_API_KEY`, `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`, `TAMAKO_SUMMARY_LLM_API_KEY` | Per-purpose LLM-key overrides of the family key (decision 87), env-only — no TOML key. Unset or empty falls through to the family key. |
+| `TAMAKO_SUMMARY_LLM_API`, `TAMAKO_SUMMARY_LLM_BASE_URL` | Per-purpose endpoint-family and base-URL overrides for the SUMMARY purpose (the decision-62 summarizer gets its own endpoint, decision 84), env-only. Unset or empty falls through to the family values. |
 | **Embeddings and media captions** | |
 | `TAMAKO_EMBEDDING_MODEL` | Embedding-model override for the vector sidecar. Default `google/gemini-embedding-2`. Global only. |
 | `TAMAKO_EMBEDDING_BASE_URL` | Embedding-endpoint base-URL override. Default `https://openrouter.ai/api/v1`. Global only. |
