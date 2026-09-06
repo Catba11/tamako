@@ -1015,7 +1015,7 @@ async fn run_actor<M: MemoryBackend>(
     // One RNG per actor task, seeded from entropy. Tests need deterministic
     // STATE, not deterministic jitter; encode/decode gives them the state.
     let mut rng = StdRng::from_rng(&mut rand::rng());
-    let mut session = SessionState::decode(&persisted, &config, started_at, &mut rng);
+    let mut session = SessionState::decode(&chat_id, &persisted, &config, started_at, &mut rng);
     let mut wake = WakeScheduler::from_state(session.wake.clone());
 
     // --- Startup rebuild of the live context (Rule P1) ---

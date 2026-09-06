@@ -264,6 +264,14 @@ impl PersonaConfig {
         for key in config.unknown.keys() {
             tracing::warn!(key = %key, "unknown persona key, ignored");
         }
+        // Decision 99 (B4): semantic validation — a degenerate identity
+        // line shifts the cache anchor; loud at load, never rendered.
+        if config.name.trim().is_empty() {
+            return Err(PersonaError::EmptyField("name"));
+        }
+        if config.identity.trim().is_empty() {
+            return Err(PersonaError::EmptyField("identity"));
+        }
         Ok(config)
     }
 }
@@ -294,6 +302,12 @@ pub enum PersonaError {
     /// The configuration file is not valid TOML or misses required keys.
     #[error("failed to parse persona configuration: {0}")]
     Parse(#[from] toml::de::Error),
+    /// The configuration parses but is semantically degenerate
+    /// (decision 99, B4): `name` or `identity` empty or whitespace-only
+    /// — the degenerate preamble ("You are , .") shifts the cache
+    /// anchor, so the load fails loudly and never renders.
+    #[error("the persona {0} is empty or whitespace-only (decision 99)")]
+    EmptyField(&'static str),
 }
 
 /// The placement mode for the decision-86 suffix in the reply message list.
@@ -1365,6 +1379,22 @@ identity = "a small cat"
             config.system_prefix.as_deref(),
             Some("Line one.\nLine two.\n")
         );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_an_empty_name() {
+        // Decision 99 (B4): the degenerate preamble ("You are , .") is
+        // a config error, loud at load.
+        let error =
+            PersonaConfig::from_toml_str("name = \"\"\nidentity = \"a cat\"\n").unwrap_err();
+        assert!(matches!(error, PersonaError::EmptyField("name")));
+    }
+
+    #[test]
+    fn from_toml_str_rejects_a_whitespace_only_identity() {
+        let error =
+            PersonaConfig::from_toml_str("name = \"Tamako\"\nidentity = \"   \"\n").unwrap_err();
+        assert!(matches!(error, PersonaError::EmptyField("identity")));
     }
 
     #[test]

@@ -253,101 +253,157 @@ impl SessionState {
     /// The function is total: a missing key (first start) falls back to the
     /// fresh default, and a malformed value falls back to the fresh default
     /// of THAT field. Well-formed input round-trips losslessly through
-    /// `encode`. Nothing is logged here; the caller sees the result.
+    /// `encode`. Decision 99 (B3): a PRESENT, non-empty value that fails to
+    /// parse earns one WARN (chat id, key, and value attributed) as the
+    /// field resets — the pre-99 silent default hid operator edits and
+    /// writer bugs; missing/empty keys stay silent (first start is the
+    /// normal case).
     pub fn decode(
+        chat_id: &str,
         map: &HashMap<String, String>,
         config: &TriggerConfig,
         now: OffsetDateTime,
         rng: &mut impl Rng,
     ) -> Self {
         let fresh = Self::new(config, now, rng);
+        // Decision 99 (B3): a PRESENT, non-empty value that fails to
+        // parse earns one WARN as the field resets to its fresh
+        // default — the pre-99 silent default hid operator edits and
+        // writer bugs. Missing/empty keys stay silent (first start is
+        // the normal case).
+        let malformed = |key: &str, value: &str| {
+            tracing::warn!(chat_id = %chat_id, key = %key, value = %value, "malformed persisted session value; the field resets to its fresh default");
+        };
+        // The parse-with-fallback pattern of every scalar field.
+        macro_rules! field {
+            ($key:expr, $fresh:expr) => {
+                match map.get($key).filter(|value| !value.is_empty()) {
+                    Some(value) => match value.parse() {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            malformed($key, value);
+                            $fresh
+                        }
+                    },
+                    None => $fresh,
+                }
+            };
+        }
+        // The Option-field pattern: None is the fresh default.
+        macro_rules! opt_field {
+            ($key:expr) => {
+                match map.get($key).filter(|value| !value.is_empty()) {
+                    Some(value) => match value.parse() {
+                        Ok(parsed) => Some(parsed),
+                        Err(_) => {
+                            malformed($key, value);
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+        }
         let muted = match map.get(KEY_MUTED).map(String::as_str) {
             Some("0") => false,
             Some("1") => true,
-            _ => fresh.muted,
+            other => {
+                if let Some(value) = other.filter(|value| !value.is_empty()) {
+                    malformed(KEY_MUTED, value);
+                }
+                fresh.muted
+            }
         };
         // The RFC 3339 Option pattern of last_digest_at: a missing,
-        // empty, or malformed value decodes to the fresh default (None).
-        let parse_at = |key: &str| {
-            map.get(key)
-                .filter(|value| !value.is_empty())
-                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        // empty, or malformed value decodes to the fresh default (None)
+        // — decision 99: the malformed case earns the WARN first.
+        let parse_at = |key: &str| match map.get(key).filter(|value| !value.is_empty()) {
+            Some(value) => match OffsetDateTime::parse(value, &Rfc3339) {
+                Ok(at) => Some(at),
+                Err(_) => {
+                    malformed(key, value);
+                    None
+                }
+            },
+            None => None,
         };
         let warmup_watch_pending = match map.get(KEY_WARMUP_WATCH_PENDING).map(String::as_str) {
             Some("0") => false,
             Some("1") => true,
-            _ => fresh.warmup_watch_pending,
+            other => {
+                if let Some(value) = other.filter(|value| !value.is_empty()) {
+                    malformed(KEY_WARMUP_WATCH_PENDING, value);
+                }
+                fresh.warmup_watch_pending
+            }
         };
         Self {
-            last_digest_boundary_msg_id: map
-                .get(KEY_DIGEST_BOUNDARY)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(fresh.last_digest_boundary_msg_id),
+            last_digest_boundary_msg_id: field!(
+                KEY_DIGEST_BOUNDARY,
+                fresh.last_digest_boundary_msg_id
+            ),
             // A missing, empty, or malformed value means no previous
             // digest boundary exists: None is the fresh default.
-            prev_digest_boundary_msg_id: map
-                .get(KEY_PREV_DIGEST_BOUNDARY)
-                .filter(|value| !value.is_empty())
-                .and_then(|value| value.parse().ok()),
+            prev_digest_boundary_msg_id: opt_field!(KEY_PREV_DIGEST_BOUNDARY),
             // A missing, empty, or malformed value means the tail was
             // never digested: None is the fresh default.
             last_digest_at: parse_at(KEY_LAST_DIGEST_AT),
             muted,
-            consecutive_bot_msgs: map
-                .get(KEY_CONSECUTIVE_BOT)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(fresh.consecutive_bot_msgs),
+            consecutive_bot_msgs: field!(KEY_CONSECUTIVE_BOT, fresh.consecutive_bot_msgs),
             wake: WakeSchedulerState {
-                msgs_since_wake: map
-                    .get(KEY_WAKE_MSGS)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(fresh.wake.msgs_since_wake),
-                last_wake_at: map
-                    .get(KEY_WAKE_LAST_AT)
-                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-                    .unwrap_or(fresh.wake.last_wake_at),
-                current_interval: map
-                    .get(KEY_WAKE_INTERVAL_MS)
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(Duration::from_millis)
-                    .unwrap_or(fresh.wake.current_interval),
+                msgs_since_wake: field!(KEY_WAKE_MSGS, fresh.wake.msgs_since_wake),
+                last_wake_at: match map.get(KEY_WAKE_LAST_AT).filter(|value| !value.is_empty()) {
+                    Some(value) => match OffsetDateTime::parse(value, &Rfc3339) {
+                        Ok(at) => at,
+                        Err(_) => {
+                            malformed(KEY_WAKE_LAST_AT, value);
+                            fresh.wake.last_wake_at
+                        }
+                    },
+                    None => fresh.wake.last_wake_at,
+                },
+                current_interval: Duration::from_millis(field!(
+                    KEY_WAKE_INTERVAL_MS,
+                    fresh.wake.current_interval.as_millis() as u64
+                )),
             },
             // The same total-function fallback policy as the other
-            // fields: missing or malformed decodes to the fresh default.
-            wake_last_row_id: map
-                .get(KEY_WAKE_LAST_ROW_ID)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(fresh.wake_last_row_id),
+            // fields: missing or malformed decodes to the fresh default
+            // (decision 99: the malformed case earns one WARN).
+            wake_last_row_id: field!(KEY_WAKE_LAST_ROW_ID, fresh.wake_last_row_id),
             // Decision 78 (b)(d): the warmup keys follow the same
             // per-field total-function fallback policy.
             warmup_next_at: parse_at(KEY_WARMUP_NEXT_AT),
-            warmup_quota_used_today: map
-                .get(KEY_WARMUP_QUOTA_USED_TODAY)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(fresh.warmup_quota_used_today),
+            warmup_quota_used_today: field!(
+                KEY_WARMUP_QUOTA_USED_TODAY,
+                fresh.warmup_quota_used_today
+            ),
             // The quota-day date string; a missing or empty value means
             // no quota spent: None is the fresh default.
             warmup_quota_day: map
                 .get(KEY_WARMUP_QUOTA_DAY)
                 .filter(|value| !value.is_empty())
                 .cloned(),
-            warmup_backoff_factor: map
-                .get(KEY_WARMUP_BACKOFF_FACTOR)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(fresh.warmup_backoff_factor),
+            warmup_backoff_factor: field!(KEY_WARMUP_BACKOFF_FACTOR, fresh.warmup_backoff_factor),
             // A missing, empty, or malformed JSON object decodes to the
-            // empty map (the fresh default).
-            warmup_topic_cooldowns: map
+            // empty map (the fresh default) — decision 99: malformed
+            // earns the WARN first.
+            warmup_topic_cooldowns: match map
                 .get(KEY_WARMUP_TOPIC_COOLDOWNS)
                 .filter(|value| !value.is_empty())
-                .and_then(|value| serde_json::from_str(value).ok())
-                .unwrap_or_default(),
+            {
+                Some(value) => match serde_json::from_str(value) {
+                    Ok(cooldowns) => cooldowns,
+                    Err(_) => {
+                        malformed(KEY_WARMUP_TOPIC_COOLDOWNS, value);
+                        Default::default()
+                    }
+                },
+                None => Default::default(),
+            },
             // The prev_digest_boundary pattern: None encodes as the
             // empty string; missing/empty/malformed decodes to None.
-            warmup_watch_row_id: map
-                .get(KEY_WARMUP_WATCH_ROW_ID)
-                .filter(|value| !value.is_empty())
-                .and_then(|value| value.parse().ok()),
+            warmup_watch_row_id: opt_field!(KEY_WARMUP_WATCH_ROW_ID),
             warmup_watch_sent_at: parse_at(KEY_WARMUP_WATCH_SENT_AT),
             warmup_watch_expires_at: parse_at(KEY_WARMUP_WATCH_EXPIRES_AT),
             warmup_watch_pending,
@@ -383,6 +439,103 @@ mod tests {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid unix timestamp")
     }
 
+    /// A `tracing` subscriber capturing the rendered fields of every
+    /// event (the actor.rs pattern, replicated: tamako-core has no
+    /// tracing-subscriber dependency). `set_default` is thread-local,
+    /// so the capture sees the events of this test only.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl EventCapture {
+        fn contains(&self, needle: &str) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|event| event.contains(needle))
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct FieldText(String);
+
+            impl tracing::field::Visit for FieldText {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+
+            let mut text = FieldText(String::new());
+            event.record(&mut text);
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(text.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn decode_warns_per_field_on_a_malformed_persisted_value() {
+        // Decision 99 (B3): a present, non-empty, unparseable value
+        // earns one WARN naming the chat, the key, and the value.
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(50);
+        let mut corrupt = HashMap::new();
+        corrupt.insert(KEY_CONSECUTIVE_BOT.to_string(), "not-a-number".to_string());
+        corrupt.insert(KEY_WARMUP_NEXT_AT.to_string(), "not-a-date".to_string());
+        let capture = EventCapture::default();
+        let decoded = tracing::subscriber::with_default(capture.clone(), || {
+            SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng)
+        });
+        // Both fields reset to the fresh defaults, and both WARNs fired.
+        assert_eq!(decoded.consecutive_bot_msgs, 0);
+        assert_eq!(decoded.warmup_next_at, None);
+        assert!(capture.contains("malformed persisted session value"));
+        assert!(capture.contains(KEY_CONSECUTIVE_BOT));
+        assert!(capture.contains(KEY_WARMUP_NEXT_AT));
+        assert!(capture.contains("c1"));
+        assert!(capture.contains("not-a-number"));
+    }
+
+    #[test]
+    fn decode_stays_silent_on_missing_and_empty_keys() {
+        // Decision 99: first start (missing keys) and explicit empty
+        // strings are the normal case — NO warn.
+        let config = TriggerConfig::default();
+        let mut rng = StdRng::seed_from_u64(51);
+        let mut map = HashMap::new();
+        map.insert(KEY_CONSECUTIVE_BOT.to_string(), String::new());
+        let capture = EventCapture::default();
+        let _ = tracing::subscriber::with_default(capture.clone(), || {
+            SessionState::decode("c1", &map, &config, fixed_now(), &mut rng)
+        });
+        assert!(!capture.contains("malformed persisted session value"));
+    }
+
     #[test]
     fn encode_decode_round_trip_is_identical() {
         let config = TriggerConfig::default();
@@ -406,7 +559,7 @@ mod tests {
 
         let encoded = state.encode();
         let map: HashMap<String, String> = encoded.into_iter().collect();
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
 
         assert_eq!(decoded, state);
     }
@@ -420,11 +573,12 @@ mod tests {
         let map: HashMap<String, String> = state.encode().into_iter().collect();
 
         // Round trip.
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_next_at, Some(fixed_now()));
 
         // Missing key.
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -435,7 +589,7 @@ mod tests {
         // Malformed value falls back to the fresh default (None).
         let mut corrupt = map;
         corrupt.insert(KEY_WARMUP_NEXT_AT.to_string(), "not-a-date".to_string());
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_next_at, None);
     }
 
@@ -449,12 +603,13 @@ mod tests {
         let map: HashMap<String, String> = state.encode().into_iter().collect();
 
         // Round trip.
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_quota_used_today, 3);
         assert_eq!(decoded.warmup_quota_day.as_deref(), Some("2026-08-21"));
 
         // Missing keys fall back to the fresh defaults (0 / None).
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -470,7 +625,7 @@ mod tests {
             "not-a-number".to_string(),
         );
         corrupt.insert(KEY_WARMUP_QUOTA_DAY.to_string(), String::new());
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_quota_used_today, 0);
         assert_eq!(decoded.warmup_quota_day, None);
     }
@@ -484,11 +639,12 @@ mod tests {
         let map: HashMap<String, String> = state.encode().into_iter().collect();
 
         // Round trip.
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_backoff_factor, 2);
 
         // Missing or malformed falls back to the fresh default (0).
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -500,7 +656,7 @@ mod tests {
             KEY_WARMUP_BACKOFF_FACTOR.to_string(),
             "not-a-number".to_string(),
         );
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_backoff_factor, 0);
     }
 
@@ -516,7 +672,7 @@ mod tests {
         let map: HashMap<String, String> = state.encode().into_iter().collect();
 
         // Round trip of a populated map.
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_topic_cooldowns, state.warmup_topic_cooldowns);
 
         // The empty map encodes as "{}" and decodes to the empty map.
@@ -526,11 +682,12 @@ mod tests {
             fresh_map.get(KEY_WARMUP_TOPIC_COOLDOWNS),
             Some(&"{}".to_string())
         );
-        let decoded = SessionState::decode(&fresh_map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &fresh_map, &config, fixed_now(), &mut rng);
         assert!(decoded.warmup_topic_cooldowns.is_empty());
 
         // Missing key.
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -542,7 +699,7 @@ mod tests {
         for bad in ["", "not-json", "[1,2]", "{\"a\":1}"] {
             let mut corrupt = map.clone();
             corrupt.insert(KEY_WARMUP_TOPIC_COOLDOWNS.to_string(), bad.to_string());
-            let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+            let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
             assert!(
                 decoded.warmup_topic_cooldowns.is_empty(),
                 "{bad:?} decodes to the empty map"
@@ -562,7 +719,7 @@ mod tests {
         let map: HashMap<String, String> = state.encode().into_iter().collect();
 
         // Round trip.
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_watch_row_id, Some(4242));
         assert_eq!(decoded.warmup_watch_sent_at, Some(fixed_now()));
         assert_eq!(decoded.warmup_watch_expires_at, Some(fixed_now()));
@@ -570,6 +727,7 @@ mod tests {
 
         // Missing keys fall back to the fresh defaults.
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -596,7 +754,7 @@ mod tests {
             "not-a-date".to_string(),
         );
         corrupt.insert(KEY_WARMUP_WATCH_PENDING.to_string(), "yes".to_string());
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.warmup_watch_row_id, None);
         assert_eq!(decoded.warmup_watch_sent_at, None);
         assert_eq!(decoded.warmup_watch_expires_at, None);
@@ -612,6 +770,7 @@ mod tests {
 
         // Missing key.
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -621,13 +780,13 @@ mod tests {
 
         // Empty value (the encoding of None).
         assert_eq!(map.get(KEY_LAST_DIGEST_AT), Some(&String::new()));
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.last_digest_at, None);
 
         // Malformed value falls back to the fresh default (None).
         let mut corrupt = map;
         corrupt.insert(KEY_LAST_DIGEST_AT.to_string(), "not-a-date".to_string());
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.last_digest_at, None);
     }
 
@@ -638,6 +797,7 @@ mod tests {
         // fresh fallback inside decode rolls the same jittered interval.
         let fresh = SessionState::new(&config, fixed_now(), &mut StdRng::seed_from_u64(7));
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -656,8 +816,13 @@ mod tests {
         map.insert(KEY_WAKE_MSGS.to_string(), "not-a-number".to_string());
         map.insert(KEY_MUTED.to_string(), "yes".to_string());
 
-        let decoded =
-            SessionState::decode(&map, &config, fixed_now(), &mut StdRng::seed_from_u64(9));
+        let decoded = SessionState::decode(
+            "c1",
+            &map,
+            &config,
+            fixed_now(),
+            &mut StdRng::seed_from_u64(9),
+        );
         assert_eq!(decoded.wake.msgs_since_wake, 0);
         assert!(!decoded.muted);
         // Untouched fields keep their persisted values.
@@ -677,14 +842,14 @@ mod tests {
         let mut state = SessionState::new(&config, fixed_now(), &mut rng);
         state.prev_digest_boundary_msg_id = Some(137);
         let map: HashMap<String, String> = state.encode().into_iter().collect();
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.prev_digest_boundary_msg_id, Some(137));
         assert_eq!(decoded, state);
 
         // No boundary (before the first digest, or exactly one digest done).
         let state = SessionState::new(&config, fixed_now(), &mut rng);
         let map: HashMap<String, String> = state.encode().into_iter().collect();
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.prev_digest_boundary_msg_id, None);
         assert_eq!(decoded, state);
     }
@@ -698,6 +863,7 @@ mod tests {
 
         // Missing key.
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -707,7 +873,7 @@ mod tests {
 
         // Empty value (the encoding of None).
         assert_eq!(map.get(KEY_PREV_DIGEST_BOUNDARY), Some(&String::new()));
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.prev_digest_boundary_msg_id, None);
 
         // Malformed value falls back to the fresh default (None).
@@ -716,7 +882,7 @@ mod tests {
             KEY_PREV_DIGEST_BOUNDARY.to_string(),
             "not-a-number".to_string(),
         );
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.prev_digest_boundary_msg_id, None);
     }
 
@@ -729,11 +895,12 @@ mod tests {
         let map: HashMap<String, String> = state.encode().into_iter().collect();
 
         // Round trip.
-        let decoded = SessionState::decode(&map, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &map, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.wake_last_row_id, 137);
 
         // Missing key falls back to the fresh default (0).
         let decoded = SessionState::decode(
+            "c1",
             &HashMap::new(),
             &config,
             fixed_now(),
@@ -744,7 +911,7 @@ mod tests {
         // Malformed value falls back to the fresh default.
         let mut corrupt = map;
         corrupt.insert(KEY_WAKE_LAST_ROW_ID.to_string(), "not-a-number".to_string());
-        let decoded = SessionState::decode(&corrupt, &config, fixed_now(), &mut rng);
+        let decoded = SessionState::decode("c1", &corrupt, &config, fixed_now(), &mut rng);
         assert_eq!(decoded.wake_last_row_id, 0);
     }
 
