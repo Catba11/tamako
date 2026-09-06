@@ -223,17 +223,22 @@ fn unescape_xml_attr(value: &str) -> String {
 
 /// Trims the model output and applies the parrot filter
 /// (`tamako_core::wake::filter_reply_parrot_lines`, decision 59 F1).
-/// Decision 93 (specs.md Section 9.8) runs FIRST: the `<reply>` fence
-/// extraction takes the body of a complete fence and drops everything
-/// outside it (one WARN with the dropped byte count); an absent or
-/// malformed fence passes the whole text through (one WARN — the
-/// contract is fail-open, and the filter's residual fence-token
-/// hygiene still cleans up debris). The parrot filter then runs at the
-/// reply-text validation seam, BEFORE the outbound raw-log row
-/// persists (Rule B1): the log and the group see the same filtered
-/// text, and the raw log never carries hallucinated speech (Rule P1).
-/// The actor applies the same filter to every generator output, so no
-/// reply text can bypass it.
+/// Decision 93 (specs.md Section 9.8) runs FIRST: the fence
+/// extraction (the decision-95 pet tag) takes the body of a complete
+/// fence and drops everything outside it (one WARN with the dropped
+/// byte count); an absent or malformed fence passes the whole
+/// text through (one WARN — the contract is fail-open, and the
+/// filter's residual fence-token hygiene still cleans up debris). The
+/// parrot filter then runs at the reply-text validation seam, BEFORE
+/// the outbound raw-log row persists (Rule B1): the log and the group
+/// see the same filtered text, and the raw log never carries
+/// hallucinated speech (Rule P1). The actor applies the same filter
+/// to every generator output, so no reply text can bypass it.
+/// Decision 96 (F5/C4): every WARN of this seam — the two fence WARNs
+/// and the parrot-strip WARN — carries the purpose and the resolved
+/// model name; pre-96 the parrot WARN sat on the actor's idempotent
+/// second pass, which sees the already-filtered text on the live
+/// path, so it never fired and live parrot events were invisible.
 ///
 /// An empty or whitespace-only remainder — including a reply that was
 /// ONLY a parrot block — is the SAME wake error as an empty reply
@@ -242,6 +247,8 @@ fn unescape_xml_attr(value: &str) -> String {
 pub fn trimmed_reply_or_error(
     text: &str,
     fence: &ReplyFence,
+    purpose: &str,
+    model: &str,
 ) -> Result<ReplyFilterOutcome, CoreError> {
     // Decision 93 layer 2 (specs.md Section 9.8): the fence contract.
     // Fail-open — an absent or malformed fence passes the whole text
@@ -251,16 +258,30 @@ pub fn trimmed_reply_or_error(
     let outcome = extract_reply_fence(text, fence);
     if !outcome.fenced {
         tracing::warn!(
+            purpose,
+            model,
             fence_open = %fence.open(),
             "the reply carries no complete fence; the whole text proceeds"
         );
     } else if outcome.dropped_bytes > 0 {
         tracing::warn!(
+            purpose,
+            model,
             dropped_bytes = outcome.dropped_bytes,
             "dropped content outside the reply fence"
         );
     }
     let filtered = filter_reply_parrot_lines(&outcome.text, fence);
+    // Decision 96 (F5): the parrot WARN fires AT THE SEAM — the
+    // actor's second pass only nets generators without a seam
+    // filter.
+    if filtered.stripped_parrot {
+        tracing::warn!(
+            purpose,
+            model,
+            "the reply parrots context structure: the parrot filter stripped the imitated lines"
+        );
+    }
     if filtered.text.is_empty() {
         Err(CoreError::Wake(
             "the reply model returned an empty reply".to_string(),
@@ -418,12 +439,18 @@ impl ReplyGenerator for RigReplyGenerator {
                 // A reply failure skips this wake; the next wake is the
                 // natural retry (CoreError::Wake docs).
                 .map_err(|error| CoreError::Wake(error.to_string()))?;
-            // The parrot filter runs here too, at the reply-text
-            // validation seam of the live generator (decision 59, F1).
-            // The strip is silent at the generator: the WARN needs the
-            // chat id, which only the actor owns — the actor filters
-            // every generator output again and emits the WARN there.
-            Ok(trimmed_reply_or_error(&text, &fence)?.text)
+            // The parrot filter runs here, at the reply-text
+            // validation seam of the live generator (decision 59, F1)
+            // — and decision 96 (F5) moves its WARN to the seam (the
+            // actor's second pass sees the already-filtered text on
+            // the live path, so a WARN there never fired).
+            Ok(trimmed_reply_or_error(
+                &text,
+                &fence,
+                self.client.purpose(),
+                self.client.model_name(),
+            )?
+            .text)
         })
     }
 }
@@ -935,7 +962,7 @@ mod tests {
     #[test]
     fn an_empty_or_whitespace_reply_is_a_wake_error() {
         for empty in ["", "   ", "\n\t "] {
-            match trimmed_reply_or_error(empty, &test_fence()) {
+            match trimmed_reply_or_error(empty, &test_fence(), "reply", "test-model") {
                 Err(CoreError::Wake(message)) => {
                     assert_eq!(message, "the reply model returned an empty reply")
                 }
@@ -946,8 +973,13 @@ mod tests {
 
     #[test]
     fn a_reply_is_trimmed() {
-        let reply =
-            trimmed_reply_or_error("  the cafe on main street \n", &test_fence()).expect("reply");
+        let reply = trimmed_reply_or_error(
+            "  the cafe on main street \n",
+            &test_fence(),
+            "reply",
+            "test-model",
+        )
+        .expect("reply");
         assert_eq!(reply.text, "the cafe on main street");
         assert!(!reply.stripped_parrot);
     }
@@ -959,6 +991,8 @@ mod tests {
         let reply = trimmed_reply_or_error(
             "I remember: Alice likes tea.\nI remember: Bob runs.\nthe cafe on main street",
             &test_fence(),
+            "reply",
+            "test-model",
         )
         .expect("reply");
         assert_eq!(reply.text, "the cafe on main street");
@@ -967,8 +1001,13 @@ mod tests {
 
     #[test]
     fn a_mid_text_parrot_line_is_stripped() {
-        let reply = trimmed_reply_or_error("one\nI remember: Alice likes tea.\ntwo", &test_fence())
-            .expect("reply");
+        let reply = trimmed_reply_or_error(
+            "one\nI remember: Alice likes tea.\ntwo",
+            &test_fence(),
+            "reply",
+            "test-model",
+        )
+        .expect("reply");
         assert_eq!(reply.text, "one\ntwo");
         assert!(reply.stripped_parrot);
     }
@@ -976,8 +1015,13 @@ mod tests {
     #[test]
     fn the_full_width_colon_variant_is_stripped() {
         // Chinese-context model output uses the full-width colon.
-        let reply = trimmed_reply_or_error("I remember：小明喜欢吃辣。\n在的", &test_fence())
-            .expect("reply");
+        let reply = trimmed_reply_or_error(
+            "I remember：小明喜欢吃辣。\n在的",
+            &test_fence(),
+            "reply",
+            "test-model",
+        )
+        .expect("reply");
         assert_eq!(reply.text, "在的");
         assert!(reply.stripped_parrot);
     }
@@ -991,7 +1035,7 @@ mod tests {
             "I remember: Alice likes tea.",
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
         ] {
-            match trimmed_reply_or_error(only, &test_fence()) {
+            match trimmed_reply_or_error(only, &test_fence(), "reply", "test-model") {
                 Err(CoreError::Wake(message)) => {
                     assert_eq!(message, "the reply model returned an empty reply")
                 }
@@ -1011,7 +1055,8 @@ mod tests {
             "one\ntwo\nthree",
             "hungry? I remember: not a line start",
         ] {
-            let reply = trimmed_reply_or_error(normal, &test_fence()).expect("reply");
+            let reply = trimmed_reply_or_error(normal, &test_fence(), "reply", "test-model")
+                .expect("reply");
             assert_eq!(reply.text, normal.trim());
             assert!(!reply.stripped_parrot, "false positive on {normal:?}");
         }
@@ -1021,17 +1066,26 @@ mod tests {
 
     #[test]
     fn a_fenced_reply_is_extracted() {
-        let reply =
-            trimmed_reply_or_error("<reply>\nnya 喵\n</reply>", &test_fence()).expect("reply");
+        let reply = trimmed_reply_or_error(
+            "<reply>\nnya 喵\n</reply>",
+            &test_fence(),
+            "reply",
+            "test-model",
+        )
+        .expect("reply");
         assert_eq!(reply.text, "nya 喵");
         assert!(!reply.stripped_parrot);
     }
 
     #[test]
     fn content_outside_the_fence_is_dropped() {
-        let reply =
-            trimmed_reply_or_error("let me think about this\n<reply>nya</reply>", &test_fence())
-                .expect("reply");
+        let reply = trimmed_reply_or_error(
+            "let me think about this\n<reply>nya</reply>",
+            &test_fence(),
+            "reply",
+            "test-model",
+        )
+        .expect("reply");
         assert_eq!(reply.text, "nya");
     }
 
@@ -1039,20 +1093,22 @@ mod tests {
     fn an_unfenced_reply_passes_through() {
         // Fail-open: a model that ignores the fence sentence still
         // gets its text through (the pre-contract behavior).
-        let reply = trimmed_reply_or_error("plain reply", &test_fence()).expect("reply");
+        let reply = trimmed_reply_or_error("plain reply", &test_fence(), "reply", "test-model")
+            .expect("reply");
         assert_eq!(reply.text, "plain reply");
     }
 
     #[test]
     fn an_unclosed_fence_degrades_to_token_hygiene() {
-        let reply = trimmed_reply_or_error("<reply>\nnya", &test_fence()).expect("reply");
+        let reply = trimmed_reply_or_error("<reply>\nnya", &test_fence(), "reply", "test-model")
+            .expect("reply");
         assert_eq!(reply.text, "nya");
         assert!(reply.stripped_parrot);
     }
 
     #[test]
     fn an_empty_fence_is_the_empty_reply_error() {
-        match trimmed_reply_or_error("<reply>\n</reply>", &test_fence()) {
+        match trimmed_reply_or_error("<reply>\n</reply>", &test_fence(), "reply", "test-model") {
             Err(CoreError::Wake(message)) => {
                 assert_eq!(message, "the reply model returned an empty reply")
             }
@@ -1065,6 +1121,8 @@ mod tests {
         let reply = trimmed_reply_or_error(
             "<reply>\nI remember: Alice likes tea.\nthe cafe\n</reply>",
             &test_fence(),
+            "reply",
+            "test-model",
         )
         .expect("reply");
         assert_eq!(reply.text, "the cafe");

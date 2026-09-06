@@ -68,7 +68,11 @@ pub fn render_warmup_instruction(topic: &str) -> String {
 /// the warmup generator's own validation seam — the actor filters
 /// every generator output again (the same double-seam discipline as
 /// `reply::trimmed_reply_or_error`). Decision 59/64: the parrot filter
-/// applies to the warmup like every reply.
+/// applies to the warmup like every reply. Decision 96 (F5/C4): the
+/// parrot-strip WARN fires AT THIS SEAM, carrying the purpose and the
+/// resolved model name — pre-96 it sat on the actor's idempotent
+/// second pass, which sees the already-filtered text on the live
+/// path, so it never fired and live parrot events were invisible.
 ///
 /// An empty or whitespace-only remainder — including a warmup that was
 /// ONLY a parrot block — is a `CoreError::Warmup`: log, skip this
@@ -77,12 +81,21 @@ pub fn render_warmup_instruction(topic: &str) -> String {
 fn trimmed_warmup_or_error(
     text: &str,
     fence: &ReplyFence,
+    purpose: &str,
+    model: &str,
 ) -> Result<ReplyFilterOutcome, CoreError> {
     // Warmup stays hygiene-only (no fence extraction — decision 93's
     // scope): the fence of the pet tag drives the residual-token rules,
     // which is also what cleans up the R1 attribute-carrying pairs the
     // unified tag invites (decision 95, the C1 fix).
     let filtered = filter_reply_parrot_lines(text, fence);
+    if filtered.stripped_parrot {
+        tracing::warn!(
+            purpose,
+            model,
+            "the warmup text parrots context structure: the parrot filter stripped the imitated lines"
+        );
+    }
     if filtered.text.is_empty() {
         Err(CoreError::Warmup(
             "the warmup generator returned an empty message".to_string(),
@@ -174,17 +187,21 @@ impl WarmupGenerator for RigWarmupGenerator {
                 // scheduled slot is the natural retry
                 // (CoreError::Warmup docs).
                 .map_err(|error| CoreError::Warmup(error.to_string()))?;
-            // The parrot filter runs here too, at the warmup-text
-            // validation seam of the live generator (decision 59, F1).
-            // The strip is silent at the generator: the WARN needs the
-            // chat id, which only the actor owns — the actor filters
-            // every generator output again and emits the WARN there.
+            // The parrot filter runs here, at the warmup-text
+            // validation seam of the live generator (decision 59, F1)
+            // — with its WARN at the seam (decision 96, F5).
             let pet_tag = self
                 .pet_tag
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            Ok(trimmed_warmup_or_error(&text, &ReplyFence::for_pet_tag(&pet_tag))?.text)
+            Ok(trimmed_warmup_or_error(
+                &text,
+                &ReplyFence::for_pet_tag(&pet_tag),
+                self.client.purpose(),
+                self.client.model_name(),
+            )?
+            .text)
         })
     }
 }
@@ -364,7 +381,7 @@ mod tests {
     #[test]
     fn an_empty_or_whitespace_warmup_is_a_warmup_error() {
         for empty in ["", "   ", "\n\t "] {
-            match trimmed_warmup_or_error(empty, &test_fence()) {
+            match trimmed_warmup_or_error(empty, &test_fence(), "warmup", "test-model") {
                 Err(CoreError::Warmup(message)) => {
                     assert_eq!(message, "the warmup generator returned an empty message")
                 }
@@ -383,7 +400,7 @@ mod tests {
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
             "<memory>\nAlice likes tea.\n</memory>",
         ] {
-            match trimmed_warmup_or_error(only, &test_fence()) {
+            match trimmed_warmup_or_error(only, &test_fence(), "warmup", "test-model") {
                 Err(CoreError::Warmup(message)) => {
                     assert_eq!(message, "the warmup generator returned an empty message")
                 }
@@ -399,6 +416,8 @@ mod tests {
         let warmup = trimmed_warmup_or_error(
             "I remember: Alice likes tea.\nhas anyone tried the new cafe?",
             &test_fence(),
+            "warmup",
+            "test-model",
         )
         .expect("warmup");
         assert_eq!(warmup.text, "has anyone tried the new cafe?");
@@ -416,7 +435,8 @@ mod tests {
             "one\ntwo\nthree",
             "hungry? I remember: not a line start",
         ] {
-            let warmup = trimmed_warmup_or_error(normal, &test_fence()).expect("warmup");
+            let warmup = trimmed_warmup_or_error(normal, &test_fence(), "warmup", "test-model")
+                .expect("warmup");
             assert_eq!(warmup.text, normal.trim());
             assert!(!warmup.stripped_parrot, "false positive on {normal:?}");
         }

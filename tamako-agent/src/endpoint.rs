@@ -1068,6 +1068,19 @@ impl EndpointClient {
         self
     }
 
+    /// The purpose stamp of the client (decision 96, C4): labels the
+    /// validation-seam WARNs so the decision-93 per-model telemetry
+    /// goal is reachable from the log stream.
+    pub fn purpose(&self) -> &'static str {
+        self.purpose
+    }
+
+    /// The resolved model name of the client (decision 96, C4):
+    /// labels the validation-seam WARNs alongside the purpose.
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
     /// Sends one completion request and returns the first text content.
     ///
     /// Prompt convention: the last message is the prompt; the preceding
@@ -1580,33 +1593,38 @@ pub(crate) fn strip_reasoning_markup(text: &str) -> ReasoningStripOutcome {
     let mut rest = text;
     let mut stripped_bytes = 0;
     loop {
-        let open = rest.find(OPEN);
-        let close = rest.find(CLOSE);
-        // An orphan closer ahead of any opener: a reasoning tail.
-        if let Some(c) = close {
-            if open.is_none_or(|o| c < o) {
+        // Decision 96 (C3): with NO opener in the remainder every
+        // remaining closer is an orphan, and the survivor is provably
+        // the tail past the LAST one — one rfind jump replaces the
+        // per-closer loop, whose opener rescan made closer-dense input
+        // quadratic (measured 400 KB -> 9.4 s, synchronously inside
+        // the async completion task). Output and stripped_bytes are
+        // unchanged.
+        let Some(o) = rest.find(OPEN) else {
+            if let Some(last) = rest.rfind(CLOSE) {
+                stripped_bytes += last + CLOSE.len();
+                rest = &rest[last + CLOSE.len()..];
+            }
+            out.push_str(rest);
+            break;
+        };
+        // An orphan closer ahead of the opener: a reasoning tail.
+        if let Some(c) = rest.find(CLOSE) {
+            if c < o {
                 stripped_bytes += c + CLOSE.len();
                 rest = &rest[c + CLOSE.len()..];
                 continue;
             }
         }
-        match open {
-            Some(o) => {
-                out.push_str(&rest[..o]);
-                match rest[o + OPEN.len()..].find(CLOSE) {
-                    Some(rel) => {
-                        stripped_bytes += OPEN.len() + rel + CLOSE.len();
-                        rest = &rest[o + OPEN.len() + rel + CLOSE.len()..];
-                    }
-                    None => {
-                        stripped_bytes += rest.len() - o;
-                        rest = "";
-                    }
-                }
+        out.push_str(&rest[..o]);
+        match rest[o + OPEN.len()..].find(CLOSE) {
+            Some(rel) => {
+                stripped_bytes += OPEN.len() + rel + CLOSE.len();
+                rest = &rest[o + OPEN.len() + rel + CLOSE.len()..];
             }
             None => {
-                out.push_str(rest);
-                break;
+                stripped_bytes += rest.len() - o;
+                rest = "";
             }
         }
     }
@@ -2358,6 +2376,19 @@ mod tests {
         env.set(OPENAI_API_KEY_ENV_VAR, "family-key");
         EndpointClient::build_for_purpose(&openai_endpoint(), LlmPurpose::Digest)
             .expect("the family key is the fallback");
+    }
+
+    #[test]
+    fn the_client_stamps_purpose_and_model_for_the_seam_warns() {
+        // Decision 96 (C4): the seam WARNs label themselves with the
+        // client's purpose stamp and resolved model name.
+        let (_lock, env) = EnvGuard::cleared();
+        env.set(OPENAI_API_KEY_ENV_VAR, "family-key");
+        let endpoint = openai_endpoint();
+        let client = EndpointClient::build_for_purpose(&endpoint, LlmPurpose::Reply)
+            .expect("the family key builds the client");
+        assert_eq!(client.purpose(), "reply");
+        assert_eq!(client.model_name(), endpoint.model);
     }
 
     #[test]
@@ -3333,6 +3364,32 @@ mod tests {
         assert_eq!(outcome.text, "the start");
         let outcome = strip_reasoning_markup("<think>only reasoning");
         assert_eq!(outcome.text, "");
+    }
+
+    #[test]
+    fn strip_reasoning_markup_jumps_a_closer_dense_tail_in_one_pass() {
+        // Decision 96 (C3): with no opener in the remainder, every
+        // closer is an orphan and the survivor is the tail past the
+        // LAST one — one rfind, not a per-closer rescan (quadratic
+        // pre-fix: 400 KB of closers measured at 9.4 s). The size
+        // makes a regression audible in the suite wall time.
+        let mut input = String::with_capacity(420_000);
+        for _ in 0..50_000 {
+            input.push_str("</think>");
+        }
+        input.push_str("the answer");
+        let outcome = strip_reasoning_markup(&input);
+        assert_eq!(outcome.text, "the answer");
+        assert_eq!(outcome.stripped_bytes, 50_000 * "</think>".len());
+        // The mixed shape: content between the closers is part of the
+        // reasoning tail and drops with it.
+        let outcome =
+            strip_reasoning_markup("tail one</think>tail two</think>tail three</think>the answer");
+        assert_eq!(outcome.text, "the answer");
+        assert_eq!(
+            outcome.stripped_bytes,
+            "tail one</think>tail two</think>tail three</think>".len()
+        );
     }
 
     /// Serves one fixed completion body: reads the request (head +
