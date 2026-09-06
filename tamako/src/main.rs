@@ -847,12 +847,18 @@ fn build_wake_services(
     // Decision 86: the shared rendered-suffix slot, wired into the reply
     // generator (the ONLY purpose that carries a suffix). Read at
     // request-assembly time; rewritten by the persona hot reload.
+    // (unless decision 98 swapped in a group-private slot — the hot
+    // reload never touches that one).
     suffix: Arc<RwLock<String>>,
     // Decision 95: the shared pet-tag slot, wired into the gate, reply,
     // and recall generators (every wake purpose whose prompts explain
     // or enforce the speech tag). Same hot-reload discipline.
     pet_tag: Arc<RwLock<String>>,
 ) -> Result<Option<WakeServices>> {
+    // Decision 98: the per-group suffix override (boot-loaded) — a
+    // `{data_root}/{chat_id}/persona.toml` with a `suffix` key swaps the
+    // shared global slot for a private one the hot reload never touches.
+    let suffix = tamako_persona::suffix_slot_for_group(data_root, chat_id, suffix);
     match (
         RigGate::from_endpoint(&endpoints.gate)
             .map(|gate| gate.with_pet_tag_slot(Arc::clone(&pet_tag))),
