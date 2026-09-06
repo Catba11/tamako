@@ -992,6 +992,66 @@ async fn parroting_replies_are_filtered_before_log_and_send() {
     shutdown(harness).await;
 }
 
+/// Scenario H: the decision-100 overlength reject end to end (B1). A
+/// forced wake's scripted reply is 4097 characters — over the
+/// platform's 4096-character limit: the wake fails like an empty reply
+/// (nothing persisted, nothing sent), decision 65 requeues the forced
+/// wake ONCE, and the retry's reply of exactly 4096 THREE-BYTE
+/// characters (12288 bytes — the limit counts characters, not bytes)
+/// goes out. The raw log holds ONLY the retry's text (Rule B1).
+#[tokio::test]
+async fn overlength_reply_is_rejected_before_persist() {
+    let fixture = make_fixture();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid timestamp");
+    let config = TriggerConfig {
+        wake_msg_count: 3,
+        wake_floor: Duration::ZERO,
+        wake_interval: HUGE_INTERVAL,
+        forced_wake_cooldown: Duration::ZERO,
+        ..TriggerConfig::default()
+    };
+    let gate = Arc::new(ScriptedGate::with_decisions(vec![]));
+    let overlong = "x".repeat(4097);
+    let at_limit = "喵".repeat(4096);
+    assert_eq!(at_limit.chars().count(), 4096);
+    assert_eq!(at_limit.len(), 12288);
+    let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
+        overlong.clone(),
+        at_limit.clone(),
+    ]));
+    let harness = spawn_on(&fixture, config, t0, gate, reply);
+    harness
+        .handle
+        .send_event(InboundEvent::Message(message(
+            "f1",
+            t0 + time::Duration::seconds(1),
+            true,
+        )))
+        .await
+        .expect("the actor inbox is open");
+    // The barrier: the retry's send proves the first wake rejected the
+    // overlong reply AND the decision-65 requeue completed.
+    let actions = wait_for_actions(&harness.sink, 1).await;
+    let sends = send_texts(&actions);
+    assert_eq!(
+        sends,
+        vec![(
+            CHAT_ID.to_string(),
+            at_limit.clone(),
+            Some("f1".to_string())
+        )],
+        "the overlong reply never reaches the group; the requeued wake sends the retry"
+    );
+    // Rule B1: the ONLY outbound raw-log row is the retry's text.
+    let outbound = rows_of_direction(&fixture.store, Direction::Outbound).await;
+    assert_eq!(outbound.len(), 1, "the rejected reply left no row");
+    assert_eq!(outbound[0].text, at_limit);
+    // Two wake starts (the rejection, the requeue); one participation.
+    wait_for_counter(&fixture.store, "wakes_total", "2").await;
+    wait_for_counter(&fixture.store, "participations_total", "1").await;
+    shutdown(harness).await;
+}
+
 /// Scenario G: the decision-70 quote rule on a STALE target (specs.md
 /// Section 6.2). The gate targets the FIRST of twelve new messages;
 /// when the count threshold fires, eleven newer human messages follow

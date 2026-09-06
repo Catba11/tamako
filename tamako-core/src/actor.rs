@@ -217,6 +217,13 @@ const SUMMARY_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// always the final attempt before the drop.
 const SUMMARY_INPUT_CAP_DIGEST_MULTIPLE: usize = 2;
 
+/// The platform's outbound text limit in CHARACTERS (Telegram: 4096).
+/// Decision 100 (B1): a generated reply or warmup text longer than
+/// this is an incident, never a truncation candidate — the actor
+/// rejects it before the Rule B1 raw-log write; nothing persists,
+/// nothing sends.
+const MAX_OUTBOUND_TEXT_CHARS: usize = 4096;
+
 /// The result of one wake procedure run, reported back through the
 /// FIFO inbox (specs.md Section 6.1, rule 1).
 #[derive(Debug)]
@@ -2524,6 +2531,14 @@ async fn handle_warmup_report(
         tracing::error!(chat_id = %chat_id, topic = %topic, "the warmup text is empty after the parrot filter; nothing is sent");
         return Ok(());
     }
+    // Decision 100 (B1): the overlength reject of the wake path applies
+    // to warmup speech alike — nothing persists, nothing sends, no
+    // quota consumed, no engagement watch opened.
+    let chars = filtered.text.chars().count();
+    if chars > MAX_OUTBOUND_TEXT_CHARS {
+        tracing::error!(chat_id = %chat_id, topic = %topic, chars, limit = MAX_OUTBOUND_TEXT_CHARS, "the generated warmup exceeds the platform character limit; the warmup is rejected before persist");
+        return Ok(());
+    }
     let text = filtered.text;
 
     // Rule B1 FIRST (the wake send path's exact pattern): the outbound
@@ -2941,6 +2956,17 @@ async fn run_wake_calls(
                 return Err(CoreError::Wake(
                     "the reply model returned an empty reply".to_string(),
                 ));
+            }
+            // Decision 100 (B1): an overlength reply is an incident,
+            // never a truncation candidate — reject it with the SAME
+            // wake error as the empty remainder: nothing persists,
+            // nothing sends, and a forced wake requeues once
+            // (decision 65). The limit counts CHARACTERS, not bytes.
+            let chars = filtered.text.chars().count();
+            if chars > MAX_OUTBOUND_TEXT_CHARS {
+                return Err(CoreError::Wake(format!(
+                    "the reply model returned {chars} characters, over the {MAX_OUTBOUND_TEXT_CHARS}-character platform limit; the reply is rejected before persist"
+                )));
             }
             Some(filtered.text)
         }
@@ -8303,6 +8329,50 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].direction, Direction::Outbound);
         restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn overlength_warmup_is_rejected_before_persist() {
+        // Decision 100 (B1): an overlength warmup text is rejected
+        // before the Rule B1 write — nothing persists, nothing sends,
+        // no quota consumed, no engagement watch opened.
+        let fixture = make_fixture();
+        let generator = ScriptedWarmup::new(&"x".repeat(4097));
+        fixture.memory.set_topics(vec![topic("Tea")]);
+        let due = t0() + time::Duration::hours(1);
+        seed_warmup_due(&fixture, due).await;
+        let (handle, mut outbound) =
+            spawn_with_warmup(&fixture, warmup_config(), Arc::clone(&generator));
+        handle
+            .send(ActorCommand::Tick(due))
+            .await
+            .expect("send succeeds");
+        wait_for_warmup_calls(&generator, 1).await;
+        // The FIFO barrier: the snapshot command lands behind the
+        // WarmupCompleted completion, so the reject has run.
+        let session = handle.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(
+            session.warmup_quota_used_today, 0,
+            "a rejected warmup consumes no quota"
+        );
+        assert!(
+            session.warmup_watch_row_id.is_none(),
+            "a rejected warmup opens no engagement watch"
+        );
+        assert!(
+            outbound.try_recv().is_err(),
+            "a rejected warmup sends nothing"
+        );
+        assert!(
+            list_messages(&fixture.store).await.is_empty(),
+            "a rejected warmup persists no outbound row"
+        );
+        assert_eq!(
+            counter_value(&fixture.store, "warmups_total").await,
+            None,
+            "a rejected warmup bumps no counter"
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
     }
 
     #[tokio::test]
