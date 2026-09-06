@@ -1,11 +1,13 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-06 — decision 96 (the seam telemetry and stripper
-robustness round: the reasoning stripper's orphan-closer path goes
-linear, the parrot WARN moves to the generator seams, and the seam
-WARNs carry purpose and model), after decision 95 (the unified pet
-speech tag: the own-speech element and the reply fence merge into
-the persona-name-derived `<{pet}>`).
+A living document. Update it at every milestone. Last update: 2026-09-06 — decision 97 (the wake.rs fence/region
+robustness round: lookalike fence tokens skip instead of disabling
+both fence layers, the inline-pair unwrap and the edge-token strip
+run to a fixpoint, and region openers require a tag delimiter),
+after decision 96 (the seam telemetry and stripper robustness
+round: linear strip, parrot WARNs at the generator seams, purpose
+and model on the seam WARNs), after decision 95 (the unified pet
+speech tag).
 Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
 Phase 1 shipped as v0.0.1 (alpha).
 
@@ -2503,6 +2505,66 @@ audits — re-stamp when re-verified, not on every feature commit
     94's deny rules), effective at the next restart since config
     keys are not hot-reloadable. specs.md Section 9.8 documents the
     seam WARN placement and the linear strip.
+
+97. (2026-09-06) The wake.rs fence/region robustness round of the
+    2026-09-04 review (C2 plus three minors, one package per
+    operator ruling; the per-pattern auto-heal semantics below are
+    the operator-ruled design point). All code changes are in
+    tamako-core/src/wake.rs. The failure patterns and their heals,
+    by layer:
+
+    Fence extraction (layer 2). A LOOKALIKE opener token — the
+    `<{pet}` prefix NOT followed by `>` or whitespace, e.g.
+    `<tamakong>` or `<tamako->` — no longer disables extraction:
+    the scan skips past the lookalike and keeps looking for a real
+    opener (pre-97 the first prefix hit returned the no-fence
+    fallback, so one injected lookalike silenced BOTH fence
+    layers, and the fail-open WARN then falsely reported "no
+    complete fence" — telemetry lying exactly under injection,
+    review finding C2). No real pair anywhere still fails open
+    with the same WARN, now truthful.
+
+    Fence-token hygiene (layer 3). (a) The inline-pair unwrap is
+    a single-pass cursor scan repeated to a fixpoint: pairs after
+    a lookalike now unwrap (pre-97 the loop BROKE at the
+    lookalike and every later pair survived wrapped — the second
+    half of C2); nested pairs still fully unnest (the pre-97
+    rescan semantics); and the per-pair `format!` rebuild —
+    measured 84.5 ms on 16k pairs / 240 KB — is gone (one pass
+    over the bytes, nesting depth bounds the passes). (b) A
+    lookalike token mid-line is copied through and survives as
+    speech text: it is not our tag (the quotation class,
+    deliberate). (c) The edge-token strip runs to a fixpoint:
+    `<tamako><tamako>nya` loses BOTH openers (pre-97 the single
+    pass leaked the second token into the group).
+
+    Region shapes (the parrot filter). The opener match now
+    requires a tag delimiter after the prefix (`>`, whitespace,
+    or line end) for ALL FIVE regions, normalized to the bare
+    prefix form: a lookalike opener like `<memorybank robbery…`
+    or `<summaryx…` is ordinary text, not a region (pre-97 it
+    opened a region that ate the tail and erred the wake with
+    CoreError::Wake — the fail-open auto-heal direction is
+    operator-ruled: a non-delimited prefix is speech, not
+    structure). The uniform rule also strips BARE
+    `<msg>`/`<you>`/`<media>` openers, which previously survived
+    on the technicality of the space-carrying prefix constants;
+    `<memory>`/`<summary>` already matched bare.
+
+    Telemetry: the heals ride the existing signals — hygiene
+    rewrites set `stripped_parrot` (the decision-96 seam WARN
+    fires), and a skipped lookalike ahead of the real fence
+    counts in `dropped_bytes` — so no new fields. The
+    exact-match scope is now pinned by tests: fence tokens match
+    case-sensitively and on the full prefix + delimiter only
+    (`<Tamako>` and `<tamak` are text, not tokens). Two comment
+    fixes ride along: `ReplyFenceOutcome.dropped_bytes` is made
+    precise (the EXTRACTED pair's tags never count; a second
+    pair's tokens are outside content and do count), and the
+    extraction comment's `<replies>` example is corrected — that
+    token never carries the `<reply` prefix; the real lookalike
+    class is `<{pet}` + alphanumerics/punctuation. specs.md
+    Section 9.8 documents the scan and the delimiter rule.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
