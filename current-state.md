@@ -2619,6 +2619,31 @@ feature commit (decision 92).
     override group holds a private suffix slot, so a global persona
     reload never touches it; the global hot reload still serves
     every non-override group.
+99. (2026-09-06) The silent-config zeroing round (2026-09-04 review,
+    the deferred operator rulings B3/B4; specs.md Sections 5.3 and
+    6.1).
+
+    Session decode (B3). `SessionState::decode` keeps its
+    total-function policy — a missing key still decodes to the fresh
+    default silently (first start is the normal case) — but a
+    PRESENT, non-empty value that fails to parse now earns one WARN
+    per field (chat id, key, and value attributed) as the field
+    resets. The persisted store is operator-editable and
+    bug-writable; the pre-99 silent default hid both. The function
+    gains a `chat_id` parameter for the attribution; the
+    missing/empty-key path stays silent by design.
+
+    Persona semantic validation (B4, operator-ruled: cut the
+    degenerate config AT LOAD). `PersonaConfig::from_toml_str`
+    rejects a `name` or `identity` that is empty or whitespace-only
+    (new `PersonaError::EmptyField`): the degenerate preamble
+    ("You are , .") and the anchor shift it causes are a config
+    error, loud at load, never rendered. Every load path routes
+    through `from_toml_str`: the strict live load fails startup, the
+    lenient fallback chain WARNs and moves to the next candidate
+    (the experiment escape hatch, by design), and the decision-80
+    watcher reload keeps the current preamble under the existing
+    malformed-file WARN arm.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
