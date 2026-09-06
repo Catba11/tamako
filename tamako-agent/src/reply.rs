@@ -258,6 +258,7 @@ pub fn trimmed_reply_or_error(
     fence: &ReplyFence,
     purpose: &str,
     model: &str,
+    chat_id: &str,
 ) -> Result<ReplyFilterOutcome, CoreError> {
     // Decision 93 layer 2 (specs.md Section 9.8): the fence contract.
     // Fail-open — an absent or malformed fence passes the whole text
@@ -269,6 +270,7 @@ pub fn trimmed_reply_or_error(
         tracing::warn!(
             purpose,
             model,
+            chat_id = %chat_id,
             fence_open = %fence.open(),
             "the reply carries no complete fence; the whole text proceeds"
         );
@@ -276,6 +278,7 @@ pub fn trimmed_reply_or_error(
         tracing::warn!(
             purpose,
             model,
+            chat_id = %chat_id,
             dropped_bytes = outcome.dropped_bytes,
             "dropped content outside the reply fence"
         );
@@ -288,6 +291,7 @@ pub fn trimmed_reply_or_error(
         tracing::warn!(
             purpose,
             model,
+            chat_id = %chat_id,
             "the reply carries imitated structure or fence debris: the parrot filter stripped the affected lines"
         );
     }
@@ -412,6 +416,7 @@ impl RigReplyGenerator {
 impl ReplyGenerator for RigReplyGenerator {
     fn generate<'a>(
         &'a self,
+        chat_id: &'a str,
         request: &'a ReplyRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
     {
@@ -458,6 +463,7 @@ impl ReplyGenerator for RigReplyGenerator {
                 &fence,
                 self.client.purpose(),
                 self.client.model_name(),
+                chat_id,
             )?
             .text)
         })
@@ -518,6 +524,7 @@ impl ScriptedReplyGenerator {
 impl ReplyGenerator for ScriptedReplyGenerator {
     fn generate<'a>(
         &'a self,
+        _chat_id: &'a str,
         request: &'a ReplyRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
     {
@@ -991,7 +998,7 @@ mod tests {
     #[test]
     fn an_empty_or_whitespace_reply_is_a_wake_error() {
         for empty in ["", "   ", "\n\t "] {
-            match trimmed_reply_or_error(empty, &test_fence(), "reply", "test-model") {
+            match trimmed_reply_or_error(empty, &test_fence(), "reply", "test-model", "c1") {
                 Err(CoreError::Wake(message)) => {
                     assert_eq!(message, "the reply model returned an empty reply")
                 }
@@ -1007,6 +1014,7 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "the cafe on main street");
@@ -1022,6 +1030,7 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "the cafe on main street");
@@ -1035,6 +1044,7 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "one\ntwo");
@@ -1049,6 +1059,7 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "在的");
@@ -1064,7 +1075,7 @@ mod tests {
             "I remember: Alice likes tea.",
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
         ] {
-            match trimmed_reply_or_error(only, &test_fence(), "reply", "test-model") {
+            match trimmed_reply_or_error(only, &test_fence(), "reply", "test-model", "c1") {
                 Err(CoreError::Wake(message)) => {
                     assert_eq!(message, "the reply model returned an empty reply")
                 }
@@ -1084,7 +1095,7 @@ mod tests {
             "one\ntwo\nthree",
             "hungry? I remember: not a line start",
         ] {
-            let reply = trimmed_reply_or_error(normal, &test_fence(), "reply", "test-model")
+            let reply = trimmed_reply_or_error(normal, &test_fence(), "reply", "test-model", "c1")
                 .expect("reply");
             assert_eq!(reply.text, normal.trim());
             assert!(!reply.stripped_parrot, "false positive on {normal:?}");
@@ -1100,6 +1111,7 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "nya 喵");
@@ -1113,6 +1125,7 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "nya");
@@ -1122,22 +1135,30 @@ mod tests {
     fn an_unfenced_reply_passes_through() {
         // Fail-open: a model that ignores the fence sentence still
         // gets its text through (the pre-contract behavior).
-        let reply = trimmed_reply_or_error("plain reply", &test_fence(), "reply", "test-model")
-            .expect("reply");
+        let reply =
+            trimmed_reply_or_error("plain reply", &test_fence(), "reply", "test-model", "c1")
+                .expect("reply");
         assert_eq!(reply.text, "plain reply");
     }
 
     #[test]
     fn an_unclosed_fence_degrades_to_token_hygiene() {
-        let reply = trimmed_reply_or_error("<reply>\nnya", &test_fence(), "reply", "test-model")
-            .expect("reply");
+        let reply =
+            trimmed_reply_or_error("<reply>\nnya", &test_fence(), "reply", "test-model", "c1")
+                .expect("reply");
         assert_eq!(reply.text, "nya");
         assert!(reply.stripped_parrot);
     }
 
     #[test]
     fn an_empty_fence_is_the_empty_reply_error() {
-        match trimmed_reply_or_error("<reply>\n</reply>", &test_fence(), "reply", "test-model") {
+        match trimmed_reply_or_error(
+            "<reply>\n</reply>",
+            &test_fence(),
+            "reply",
+            "test-model",
+            "c1",
+        ) {
             Err(CoreError::Wake(message)) => {
                 assert_eq!(message, "the reply model returned an empty reply")
             }
@@ -1152,18 +1173,96 @@ mod tests {
             &test_fence(),
             "reply",
             "test-model",
+            "c1",
         )
         .expect("reply");
         assert_eq!(reply.text, "the cafe");
         assert!(reply.stripped_parrot);
     }
 
+    /// A `tracing` subscriber capturing the rendered fields of every
+    /// event (the session.rs/actor.rs pattern, replicated:
+    /// tamako-agent has no tracing-subscriber dependency).
+    /// `set_default` is thread-local, so the capture sees the events
+    /// of this test only.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl EventCapture {
+        fn contains(&self, needle: &str) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|event| event.contains(needle))
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct FieldText(String);
+
+            impl tracing::field::Visit for FieldText {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+
+            let mut text = FieldText(String::new());
+            event.record(&mut text);
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(text.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn the_seam_warn_names_the_chat() {
+        // Decision 101 (B6): the fence-fallback WARN carries the chat
+        // id alongside the purpose and the model.
+        let capture = EventCapture::default();
+        let _ = tracing::subscriber::with_default(capture.clone(), || {
+            trimmed_reply_or_error("plain reply", &test_fence(), "reply", "test-model", "c1")
+                .expect("reply")
+        });
+        assert!(capture.contains("no complete fence"));
+        assert!(capture.contains("c1"));
+        assert!(capture.contains("test-model"));
+    }
+
     #[tokio::test]
     async fn scripted_replies_pop_fifo_then_fail() {
         let generator = ScriptedReplyGenerator::with_replies(vec!["pizza".to_string()]);
-        let first = generator.generate(&sample_request()).await.expect("first");
+        let first = generator
+            .generate("c1", &sample_request())
+            .await
+            .expect("first");
         assert_eq!(first, "pizza");
-        match generator.generate(&sample_request()).await {
+        match generator.generate("c1", &sample_request()).await {
             Err(CoreError::Wake(message)) => assert_eq!(message, "scripted replies exhausted"),
             other => panic!("expected Wake error, got {other:?}"),
         }
@@ -1175,7 +1274,7 @@ mod tests {
     async fn scripted_failing_mode_fails_every_call_and_records_requests() {
         let generator = ScriptedReplyGenerator::failing("boom");
         for _ in 0..2 {
-            match generator.generate(&sample_request()).await {
+            match generator.generate("c1", &sample_request()).await {
                 Err(CoreError::Wake(message)) => assert_eq!(message, "boom"),
                 other => panic!("expected Wake error, got {other:?}"),
             }

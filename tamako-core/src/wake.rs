@@ -719,6 +719,7 @@ pub struct ReplyRequest {
 pub trait ReplyGenerator: Send + Sync {
     fn generate<'a>(
         &'a self,
+        chat_id: &'a str,
         request: &'a ReplyRequest,
     ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>>;
 }
