@@ -124,13 +124,29 @@ fn is_parrot_line(line: &str) -> bool {
 /// block semantics (decision 59 F1).
 #[derive(Clone, Copy)]
 struct StripRegion {
-    /// The opener prefix of the region: the open tag minus its trailing
-    /// `>` (`"<memory"` / `"<summary"`), or the open tag plus its
-    /// trailing space (`"<msg "` / `"<you "` / `"<media "`, before the
-    /// attributes). Line-start anchored only.
+    /// The BARE opener prefix of the region (`"<summary"` /
+    /// `"<memory"` / `"<msg"` / `"<you"` / `"<media"`). A match
+    /// requires a tag delimiter right after the prefix
+    /// ([`region_opener_matches`], decision 97). Line-start anchored
+    /// only.
     open_line_prefix: &'static str,
     /// The closer tag; the first line containing it ends the region.
     closer: &'static str,
+}
+
+/// True when the trimmed line START opens the strip region of the
+/// given bare opener prefix: the prefix must end at a tag delimiter
+/// (`>`, whitespace, or the line end) — decision 97. A lookalike
+/// opener like `<memorybank robbery…` is ordinary text, not a region
+/// (pre-97 it opened a region that ate the tail and erred the wake
+/// with CoreError::Wake — fail-open heal: a non-delimited prefix is
+/// speech, not structure); a bare opener (`<msg>` without
+/// attributes) matches under the uniform rule.
+fn region_opener_matches(start: &str, prefix: &str) -> bool {
+    let Some(after) = start.strip_prefix(prefix) else {
+        return false;
+    };
+    after.is_empty() || after.starts_with('>') || after.starts_with(char::is_whitespace)
 }
 
 /// The outbound parrot filter (decision 59, F1). Removes every line
@@ -165,6 +181,12 @@ struct StripRegion {
 ///   them like the other context structure; the reply model must never
 ///   emit media blocks.
 ///
+/// Decision 97: every region opener must end at a tag delimiter
+/// (`>`, whitespace, or the line end) — a lookalike opener like
+/// `<memorybank…` is ordinary text, not a region (pre-97 it opened
+/// a region that ate the tail and erred the wake) — and bare
+/// `<msg>`/`<you>`/`<media>` openers match under the uniform rule.
+///
 /// The reply model can imitate the injection format (the injections
 /// enter its context as assistant-role messages, Sections 9.3-9.5) and
 /// speak a confabulated "I remember: ..." or `<memory>...</memory>`
@@ -173,8 +195,8 @@ struct StripRegion {
 /// same holds for the imitated context structure: an echoed `<msg>` or
 /// `<you>` element is not the bot's speech and must not be sent.
 ///
-/// Decision 93 layer 3 (specs.md Section 9.8): residual `<reply>`
-/// fence tokens are hygiene, not speech. [`fence_token_hygiene`] runs
+/// Decision 93 layer 3 (specs.md Section 9.8): residual fence tokens
+/// of the pet tag are hygiene, not speech. [`fence_token_hygiene`] runs
 /// per line BEFORE the shape checks: a tag-only line drops, an inline
 /// pair unwraps to its content, an edge token strips, and a mid-line
 /// single token survives (quotation protection — the group discusses
@@ -202,7 +224,7 @@ pub fn filter_reply_parrot_lines(text: &str, fence: &ReplyFence) -> ReplyFilterO
             closer: INJECTION_TAG_CLOSE,
         },
         StripRegion {
-            open_line_prefix: MSG_TAG_OPEN_PREFIX,
+            open_line_prefix: MSG_TAG_OPEN_PREFIX.trim_end_matches(' '),
             closer: MSG_TAG_CLOSE,
         },
         // LEGACY (pre-decision-95): the fixed `<you>` bot-speech tag.
@@ -211,11 +233,11 @@ pub fn filter_reply_parrot_lines(text: &str, fence: &ReplyFence) -> ReplyFilterO
         // region), but stored summaries and memory texts persisted
         // before decision 95 can still quote the old shape.
         StripRegion {
-            open_line_prefix: YOU_TAG_OPEN_PREFIX,
+            open_line_prefix: YOU_TAG_OPEN_PREFIX.trim_end_matches(' '),
             closer: YOU_TAG_CLOSE,
         },
         StripRegion {
-            open_line_prefix: MEDIA_TAG_OPEN_PREFIX,
+            open_line_prefix: MEDIA_TAG_OPEN_PREFIX.trim_end_matches(' '),
             closer: MEDIA_TAG_CLOSE,
         },
     ];
@@ -250,7 +272,7 @@ pub fn filter_reply_parrot_lines(text: &str, fence: &ReplyFence) -> ReplyFilterO
         }
         if let Some(region) = regions
             .iter()
-            .find(|region| start.starts_with(region.open_line_prefix))
+            .find(|region| region_opener_matches(start, region.open_line_prefix))
         {
             // The line opens a strip region (line-start anchored only).
             // A single line carrying the closer too strips as one line.
@@ -324,17 +346,20 @@ pub struct ReplyFenceOutcome {
     /// True when a complete fence was found and extracted.
     pub fenced: bool,
     /// The non-whitespace byte count of the content dropped OUTSIDE
-    /// the fence (the tags themselves never count — a compliant reply
-    /// with surrounding whitespace raises no WARN). Always zero when
-    /// `fenced` is false.
+    /// the fence. The tags of the EXTRACTED pair never count — a
+    /// compliant reply with surrounding whitespace raises no WARN —
+    /// but the tokens of a SECOND pair are outside content and do
+    /// count (decision 97 precision). Always zero when `fenced` is
+    /// false.
     pub dropped_bytes: usize,
 }
 
 /// Extracts the body of the reply fence (decision 93 layer 2, specs.md
 /// Section 9.8). The ephemeral reply instruction requires the whole
-/// reply in exactly one `<reply>...</reply>` element; the FIRST
-/// complete pair yields the reply text and everything outside it drops
-/// (the allowlist complement of the reasoning-markup blocklist: an
+/// reply in exactly one `<{pet}>...</{pet}>` element (decision 95);
+/// the FIRST complete pair yields the reply text and everything
+/// outside it drops (the allowlist complement of the reasoning-markup
+/// blocklist: an
 /// unknown future reasoning marker outside the fence drops with no
 /// code change).
 ///
@@ -356,15 +381,25 @@ pub fn extract_reply_fence(text: &str, fence: &ReplyFence) -> ReplyFenceOutcome 
         fenced: false,
         dropped_bytes: 0,
     };
-    let Some(tag_start) = text.find(&fence.open) else {
-        return no_fence();
+    // Decision 97 (C2): a LOOKALIKE opener token — the opener prefix
+    // NOT followed by `>` or whitespace, e.g. `<tamakong>` or
+    // `<tamako->` — is skipped and the scan continues past it.
+    // Pre-97 the first prefix hit returned the no-fence fallback, so
+    // one injected lookalike silenced BOTH fence layers, and the
+    // fail-open WARN then falsely reported "no complete fence" —
+    // telemetry lying exactly under injection.
+    let mut cursor = 0;
+    let tag_start = loop {
+        let Some(rel) = text[cursor..].find(&fence.open) else {
+            return no_fence();
+        };
+        let candidate = cursor + rel;
+        let after = &text[candidate + fence.open.len()..];
+        if after.starts_with('>') || after.starts_with(char::is_whitespace) {
+            break candidate;
+        }
+        cursor = candidate + fence.open.len();
     };
-    // The character after the opener prefix must be `>` or whitespace —
-    // otherwise this is a different tag (`<replies>`, ...).
-    let after = &text[tag_start + fence.open.len()..];
-    if !after.starts_with('>') && !after.starts_with(char::is_whitespace) {
-        return no_fence();
-    }
     // The opener tag ends at its first `>`. An attribute value
     // carrying `>` ends the tag early — hygiene, not parsing.
     let Some(tag_end) = text[tag_start..].find('>').map(|p| tag_start + p) else {
@@ -390,19 +425,27 @@ pub fn extract_reply_fence(text: &str, fence: &ReplyFence) -> ReplyFenceOutcome 
     }
 }
 
-/// Removes residual `<reply>`-fence tokens from one line (decision 93
-/// layer 3, specs.md Section 9.8). Returns `None` when the line is
-/// nothing but a fence tag (possibly after surgery). Rules:
+/// Removes residual fence tokens of the pet tag from one line
+/// (decision 93 layer 3, specs.md Section 9.8). Returns `None` when
+/// the line is nothing but a fence tag (possibly after surgery).
+/// Rules:
 ///
 /// 1. A tag-only line drops: the bare closer, or the bare opener with
 ///    or without attributes.
-/// 2. An inline `<reply>...</reply>` pair unwraps to its content — a
+/// 2. An inline `<{pet}>...</{pet}>` pair unwraps to its content — a
 ///    pair is never a quotation (quoting writes a single token).
+///    Decision 97: the unwrap is a single-pass cursor scan repeated
+///    to a fixpoint; a LOOKALIKE token (the opener prefix not
+///    followed by `>` or whitespace, e.g. `<tamakong>`) is copied
+///    through and the scan resumes past it — pre-97 it stopped the
+///    unwrap and every later pair survived wrapped (C2).
 /// 3. An edge token strips: a leading fence tag or closer, a trailing
-///    fence tag or closer.
+///    fence tag or closer. Decision 97: the strip runs to a fixpoint
+///    — a doubled `<tamako><tamako>` edge no longer leaks one token.
 ///
-/// A mid-line single token survives untouched: quotation protection
-/// for a group that discusses AI glitch output.
+/// A mid-line single token survives untouched — and a lookalike token
+/// is speech text, never a token (it is not our tag): quotation
+/// protection for a group that discusses AI glitch output.
 fn fence_token_hygiene<'a>(line: &'a str, fence: &ReplyFence) -> Option<Cow<'a, str>> {
     if !line.contains(&fence.open) && !line.contains(&fence.close) {
         return Some(Cow::Borrowed(line));
@@ -433,30 +476,51 @@ fn fence_token_hygiene<'a>(line: &'a str, fence: &ReplyFence) -> Option<Cow<'a, 
         }
     }
     let mut current = line.to_owned();
-    // Rule 2: inline pairs unwrap.
-    while let Some(open) = current.find(&fence.open) {
-        let after = &current[open + fence.open.len()..];
-        if !(after.starts_with('>') || after.starts_with(char::is_whitespace)) {
+    // Rule 2 (decision 97): inline pairs unwrap in a single-pass
+    // cursor scan, repeated to a fixpoint — nesting depth bounds the
+    // passes, and the per-pair `format!` rebuild of the pre-97 loop
+    // (measured 84.5 ms on 16k pairs / 240 KB) is gone. A lookalike
+    // token is copied through and the scan resumes past it.
+    loop {
+        let mut unwrapped = String::with_capacity(current.len());
+        let mut cursor = 0;
+        let mut rewrote = false;
+        while let Some(rel) = current[cursor..].find(&fence.open) {
+            let open = cursor + rel;
+            let after = &current[open + fence.open.len()..];
+            if !(after.starts_with('>') || after.starts_with(char::is_whitespace)) {
+                // A lookalike token: copy through the prefix and
+                // resume the scan past it.
+                unwrapped.push_str(&current[cursor..open + fence.open.len()]);
+                cursor = open + fence.open.len();
+                continue;
+            }
+            let Some(tag_rel) = after.find('>') else {
+                break;
+            };
+            let body_start = open + fence.open.len() + tag_rel + 1;
+            let Some(close_rel) = current[body_start..].find(&fence.close) else {
+                break;
+            };
+            let close = body_start + close_rel;
+            unwrapped.push_str(&current[cursor..open]);
+            unwrapped.push_str(&current[body_start..close]);
+            cursor = close + fence.close.len();
+            rewrote = true;
+        }
+        if !rewrote {
+            // No pair unwrapped: the copied buffer is byte-identical
+            // to the line; discard it and keep `current` untouched.
             break;
         }
-        let Some(tag_rel) = after.find('>') else {
-            break;
-        };
-        let body_start = open + fence.open.len() + tag_rel + 1;
-        let Some(close_rel) = current[body_start..].find(&fence.close) else {
-            break;
-        };
-        let close = body_start + close_rel;
-        let next = format!(
-            "{}{}{}",
-            &current[..open],
-            &current[body_start..close],
-            &current[close + fence.close.len()..]
-        );
-        current = next;
+        unwrapped.push_str(&current[cursor..]);
+        current = unwrapped;
     }
-    // Rule 3a: a leading fence token strips.
-    {
+    // Rule 3a (decision 97 fixpoint): leading fence tokens strip
+    // until none leads — a doubled `<tamako><tamako>nya` loses BOTH
+    // openers (pre-97 the single pass leaked the second token into
+    // the group).
+    loop {
         let t = current.trim_start();
         let tag_len = if t.starts_with(&fence.close) {
             Some(fence.close.len())
@@ -471,13 +535,15 @@ fn fence_token_hygiene<'a>(line: &'a str, fence: &ReplyFence) -> Option<Cow<'a, 
         } else {
             None
         };
-        if let Some(n) = tag_len {
-            let ws = current.len() - t.len();
-            current = format!("{}{}", &current[..ws], &current[ws + n..]);
-        }
+        let Some(n) = tag_len else {
+            break;
+        };
+        let ws = current.len() - t.len();
+        current = format!("{}{}", &current[..ws], &current[ws + n..]);
     }
-    // Rule 3b: a trailing fence token strips.
-    {
+    // Rule 3b (decision 97 fixpoint): trailing fence tokens strip
+    // until none trails.
+    loop {
         let t = current.trim_end();
         let cut = if t.ends_with(&fence.close) {
             Some(fence.close.len())
@@ -491,15 +557,16 @@ fn fence_token_hygiene<'a>(line: &'a str, fence: &ReplyFence) -> Option<Cow<'a, 
         } else {
             None
         };
-        if let Some(n) = cut {
-            let trailing_ws = current.len() - t.len();
-            let keep = current.len() - trailing_ws - n;
-            current = format!(
-                "{}{}",
-                &current[..keep],
-                &current[current.len() - trailing_ws..]
-            );
-        }
+        let Some(n) = cut else {
+            break;
+        };
+        let trailing_ws = current.len() - t.len();
+        let keep = current.len() - trailing_ws - n;
+        current = format!(
+            "{}{}",
+            &current[..keep],
+            &current[current.len() - trailing_ws..]
+        );
     }
     // A line reduced to whitespace (e.g. an inline pair wrapping
     // nothing) is a tag-only line by another route.
@@ -1170,7 +1237,11 @@ mod tests {
     }
 
     #[test]
-    fn a_lookalike_tag_is_not_a_fence() {
+    fn a_foreign_tag_is_not_a_fence() {
+        // `<replies>` never even carries the `<reply` prefix ("repli"
+        // vs "reply") — a purely foreign tag. The lookalike class
+        // that DOES carry the prefix is decision-97 territory
+        // (`a_lookalike_opener_does_not_disable_extraction`).
         let fence = extract_reply_fence("<replies>nya</replies>", &test_fence());
         assert!(!fence.fenced);
         assert_eq!(fence.text, "<replies>nya</replies>");
@@ -1249,6 +1320,144 @@ mod tests {
         );
         assert_eq!(filtered.text, "the cafe");
         assert!(filtered.stripped_parrot);
+    }
+
+    // --- Decision 97: the wake.rs fence/region robustness round
+    // --- (specs.md Section 9.8)
+
+    #[test]
+    fn a_lookalike_opener_does_not_disable_extraction() {
+        // C2: pre-97 the FIRST `<{pet}` prefix hit — even a lookalike
+        // — disabled extraction for the whole text, silencing both
+        // fence layers, and the fail-open WARN falsely reported "no
+        // complete fence".
+        let fence = ReplyFence::for_pet_tag("tamako");
+        let outcome =
+            extract_reply_fence("<tamakong>noise</tamakong>\n<tamako>nya</tamako>", &fence);
+        assert!(outcome.fenced);
+        assert_eq!(outcome.text, "nya");
+        assert_eq!(outcome.dropped_bytes, "<tamakong>noise</tamakong>".len());
+        // A punctuation lookalike behaves the same.
+        let outcome = extract_reply_fence("<tamako-> <tamako>nya</tamako>", &fence);
+        assert!(outcome.fenced);
+        assert_eq!(outcome.text, "nya");
+        // A lookalike alone is no fence: fail-open passthrough.
+        let outcome = extract_reply_fence("<tamakong>nya</tamakong>", &fence);
+        assert!(!outcome.fenced);
+        assert_eq!(outcome.text, "<tamakong>nya</tamakong>");
+        // The legacy-tag repro of the review (`<replying>`).
+        let outcome = extract_reply_fence("<replying>hey</replying>", &test_fence());
+        assert!(!outcome.fenced);
+        assert_eq!(outcome.text, "<replying>hey</replying>");
+    }
+
+    #[test]
+    fn hygiene_unwraps_pairs_past_a_lookalike() {
+        // C2, layer 3: pre-97 the unwrap loop BROKE at the lookalike
+        // and the real pair after it survived wrapped.
+        let fence = ReplyFence::for_pet_tag("tamako");
+        let filtered =
+            filter_reply_parrot_lines("he said <tamakong> then <tamako>nya</tamako> ok", &fence);
+        assert_eq!(filtered.text, "he said <tamakong> then nya ok");
+        assert!(filtered.stripped_parrot);
+        // The lookalike itself is speech text (the quotation class) —
+        // it is not our tag.
+        let filtered = filter_reply_parrot_lines("the <tamakong> glitch again", &fence);
+        assert_eq!(filtered.text, "the <tamakong> glitch again");
+        assert!(!filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn doubled_edge_tokens_strip_to_a_fixpoint() {
+        // Pre-97 the single-pass edge strip leaked the second token
+        // into the group.
+        let fence = ReplyFence::for_pet_tag("tamako");
+        for (raw, kept) in [
+            ("<tamako><tamako>nya", "nya"),
+            ("nya</tamako></tamako>", "nya"),
+            ("<tamako><tamako at=\"09:05\">nya", "nya"),
+            ("<tamako> <tamako> nya", "nya"),
+        ] {
+            let filtered = filter_reply_parrot_lines(raw, &fence);
+            assert_eq!(filtered.text, kept, "input {raw:?}");
+            assert!(filtered.stripped_parrot, "input {raw:?}");
+        }
+        // The legacy tag too.
+        let filtered = filter_reply_parrot_lines("<reply><reply>the cafe", &test_fence());
+        assert_eq!(filtered.text, "the cafe");
+    }
+
+    #[test]
+    fn nested_inline_pairs_unnest_to_a_fixpoint() {
+        // The pre-97 rescan semantics preserved: nesting fully
+        // unnests, now with whole-line passes instead of per-pair
+        // rebuilds.
+        let fence = ReplyFence::for_pet_tag("tamako");
+        let filtered =
+            filter_reply_parrot_lines("x <tamako><tamako>nya</tamako></tamako> y", &fence);
+        assert_eq!(filtered.text, "x nya y");
+        assert!(filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn a_lookalike_region_opener_is_ordinary_text() {
+        // Decision 97, the operator-ruled fail-open heal: a
+        // non-delimited region prefix is speech, not structure.
+        // Pre-97 `<memorybank…` opened a region that ate the tail and
+        // erred the wake (CoreError::Wake on the empty survivor).
+        for text in [
+            "<memorybank robbery\nrest of the text",
+            "<memorybank\nrest",
+            "<summaryx>digested</summaryx>\nthe cafe",
+            "<msgx from=\"Alice\">hello",
+        ] {
+            let filtered = filter_reply_parrot_lines(text, &test_fence());
+            assert_eq!(filtered.text, text, "input {text:?}");
+            assert!(!filtered.stripped_parrot, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn bare_region_openers_strip_under_the_uniform_rule() {
+        // Decision 97: the space-carrying prefix constants no longer
+        // let a bare opener survive on a technicality.
+        for (raw, kept) in [
+            ("<msg>bare</msg>\nthe cafe", "the cafe"),
+            ("<you>hi</you>\nthe cafe", "the cafe"),
+            ("<media>x</media>\nthe cafe", "the cafe"),
+            ("<msg>\nthe cafe", ""),
+        ] {
+            let filtered = filter_reply_parrot_lines(raw, &test_fence());
+            assert_eq!(filtered.text, kept, "input {raw:?}");
+            assert!(filtered.stripped_parrot, "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn fence_tokens_match_case_sensitively_on_the_full_prefix() {
+        // The exact-match scope pin (review N3): a case variant or a
+        // partial token is text, not a fence token.
+        let fence = ReplyFence::for_pet_tag("tamako");
+        let outcome = extract_reply_fence("<Tamako>nya</Tamako>", &fence);
+        assert!(!outcome.fenced);
+        assert_eq!(outcome.text, "<Tamako>nya</Tamako>");
+        let filtered = filter_reply_parrot_lines("<Tamako>nya</Tamako>", &fence);
+        assert_eq!(filtered.text, "<Tamako>nya</Tamako>");
+        assert!(!filtered.stripped_parrot);
+        let filtered = filter_reply_parrot_lines("<tamak nya", &fence);
+        assert_eq!(filtered.text, "<tamak nya");
+        assert!(!filtered.stripped_parrot);
+    }
+
+    #[test]
+    fn the_inline_unwrap_is_single_pass_over_pair_dense_input() {
+        // The pre-97 per-pair `format!` rebuild measured 84.5 ms on
+        // 16k pairs / 240 KB; the single-pass scan handles every pair
+        // in one pass, so a regression is audible in the suite wall
+        // time.
+        let line = "<tamako>x</tamako>".repeat(16_000);
+        let filtered = filter_reply_parrot_lines(&line, &ReplyFence::for_pet_tag("tamako"));
+        assert_eq!(filtered.text, "x".repeat(16_000));
     }
 
     #[test]
