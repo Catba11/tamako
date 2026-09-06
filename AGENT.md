@@ -99,6 +99,8 @@ Backstop before committing such a change: `grep -n <token> README.md tamako.exam
 
 `README.md` restates reference content only where bring-up usability wins (the environment table). Everywhere else, compress and point to the owning document (decision 92).
 
+Search scope convention (operator ruling, 2026-09-06): repo-wide searches EXCLUDE `./data` (live data) and `./target` (build output) — pass explicit paths to the search tool instead of searching the repository root. Search inside those directories only when troubleshooting their contents.
+
 ## 7. Definition of done
 
 1. The four commands of Section 5 pass.
