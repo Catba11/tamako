@@ -2664,6 +2664,21 @@ feature commit (decision 92).
     logs one ERROR (chat id, topic, count) and ends the run quietly —
     no quota consumed, no engagement watch opened. Both paths share
     the one constant and the one rule.
+101. (2026-09-06) Chat attribution through the generator traits
+    (2026-09-04 review, the deferred operator ruling B6; specs.md
+    Section 9.8).
+
+    The decision-96 seam WARNs (fence fallback, dropped-outside-fence,
+    parrot strip — reply and warmup alike) carried the purpose and the
+    resolved model but NOT the group, and no tracing spans exist in
+    the actor to recover it. `ReplyGenerator::generate` and
+    `WarmupGenerator::generate_warmup` gain a `chat_id: &str`
+    parameter (first argument — the `SessionState::decode` pattern of
+    decision 99), threaded from the actor's wake and warmup spawn
+    tasks through the live generators to the seam WARN macros, which
+    now log `chat_id` alongside `purpose` and `model`. The scripted
+    doubles ignore the parameter. The six live groups' seam telemetry
+    is per-group attributable from here on.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
