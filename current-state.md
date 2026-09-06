@@ -1,10 +1,11 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-05 — decision 95 (the
-unified pet speech tag: the own-speech element and the reply fence
-merge into the persona-name-derived `<{pet}>`), after decision 94
-(the config silent-failure repairs) and decision 93 (the reply fence
-contract).
+A living document. Update it at every milestone. Last update: 2026-09-06 — decision 96 (the seam telemetry and stripper
+robustness round: the reasoning stripper's orphan-closer path goes
+linear, the parrot WARN moves to the generator seams, and the seam
+WARNs carry purpose and model), after decision 95 (the unified pet
+speech tag: the own-speech element and the reply fence merge into
+the persona-name-derived `<{pet}>`).
 Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
 Phase 1 shipped as v0.0.1 (alpha).
 
@@ -2458,6 +2459,50 @@ audits — re-stamp when re-verified, not on every feature commit
     rules 3 and 6, and the example contexts swap `<reply>`/`<you>` to
     `<tamako>`. Expected telemetry: the fence-fallback WARN falls to
     about five percent.
+
+96. (2026-09-06) The seam telemetry and stripper robustness round of
+    the 2026-09-04 review (C3, F5, C4-partial; operator-ruled scope).
+    C3 — the reasoning stripper's orphan-closer path was QUADRATIC:
+    each loop iteration rescanned the remainder for an opener, so
+    closer-dense input cost O(closers × length) — measured 100 KB →
+    0.61 s, 200 KB → 2.39 s, 400 KB → 9.44 s — synchronously inside
+    the async completion task and outside ENDPOINT_TIMEOUT, on every
+    completion purpose. With no `<think>` opener in the remainder
+    every closer is an orphan and the survivor is provably the tail
+    past the LAST closer, so one `rfind` jump replaces the rescan
+    (tamako-agent/src/endpoint.rs; output and stripped_bytes
+    unchanged, pinned by the existing semantics tests plus a
+    closer-dense regression test). F5 — the decision-59 parrot WARNs
+    in the actor were DEAD on the live path: the generator seam
+    filters first, so the actor's idempotent second pass always saw
+    `stripped_parrot = false`, and the seam itself filtered SILENTLY
+    (its comment claimed the WARN belonged to the actor because only
+    the actor owns the chat id) — live parrot events were invisible.
+    The WARN moves to the generator seams
+    (`trimmed_reply_or_error`, `trimmed_warmup_or_error`); the actor
+    pass stays as the net for generators without a seam filter (the
+    scripted doubles), comments corrected. C4 (partial — purpose and
+    model only; chat attribution is a SEPARATE project per operator
+    ruling, it needs the generator-trait signature change): the seam
+    WARNs (fence fallback, dropped-outside-fence, parrot) now carry
+    `purpose` and the resolved `model` name via new
+    `EndpointClient::purpose`/`model_name` accessors, making the
+    decision-93 per-model telemetry goal achievable for layer 2; the
+    decision-95 `fence_open` field stays. Considered and rejected in
+    this round: the per-call message-list deep copy and the stripper
+    Cow (endpoint inputs are KB-scale; the churn is not justified).
+    The wake.rs robustness items of the same review (C2 lookalike
+    fence tokens, doubled edge tokens, region-opener delimiter
+    checks, rule-2 single pass) are operator-approved as the next
+    numbered round. Operator-side companion (no code): the live
+    tamako.toml typo keys `digest_max_chars_words`/
+    `digest_max_chars_bytes` are corrected to `digest_max_words`/
+    `digest_max_bytes` (5000 words / 30 KB — the values the file
+    always intended; the decision-84(e) WARN proved WARN-only
+    observability goes unread, which is what motivated decision
+    94's deny rules), effective at the next restart since config
+    keys are not hot-reloadable. specs.md Section 9.8 documents the
+    seam WARN placement and the linear strip.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
