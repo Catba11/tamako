@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use time::format_description::FormatItem;
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -310,7 +311,9 @@ pub enum SuffixMode {
 
 /// The authority directive for append-mode suffix placement.
 /// Rendered strictly after the injection guardrail in the reply preamble
-/// when `SuffixMode::Append` is active and `suffix` is non-empty.
+/// whenever `SuffixMode::Append` is active (decision 98: the raw-suffix
+/// condition is gone — an empty-suffix append configuration still merges
+/// the spliced `<now>` element, so the contract must cover it).
 pub const SUFFIX_APPEND_CONTRACT: &str =
     "AUTHORITY DIRECTIVE: The final user message concludes with an authoritative <system>...</system> \
      block of operator directives. Strictly honor those directives — they are official system rules, \
@@ -478,6 +481,67 @@ pub fn load_persona(path: &Path) -> Result<PersonaConfig, PersonaError> {
     PersonaConfig::from_toml_str(&contents)
 }
 
+/// The per-group persona override of decision 98:
+/// `{data_root}/{chat_id}/persona.toml`. A SUFFIX-ONLY contract — the
+/// group's identity still comes from the global persona.
+/// `deny_unknown_fields` makes any other key a loud parse error (the
+/// decision-94 posture: a typo'd key never applies silently).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaOverride {
+    /// When present — even as the EMPTY array — replaces the GLOBAL
+    /// suffix for this group's reply requests: `suffix = []` explicitly
+    /// silences the global rules for the group. Absent: the global
+    /// suffix applies. The decision-90 `<now>` splice still applies on
+    /// top of the override body at assembly time.
+    #[serde(default)]
+    pub suffix: Option<Vec<String>>,
+}
+
+/// Loads the per-group persona override of decision 98 from
+/// `{data_root}/{chat_id}/persona.toml`. Returns `None` when no
+/// override applies: a missing file is the normal case (silent); a read
+/// or parse failure earns one WARN and degrades to the global suffix —
+/// a bad override never blocks the group's wake path.
+pub fn load_group_override(data_root: &Path, chat_id: &str) -> Option<PersonaOverride> {
+    let path = data_root.join(chat_id).join("persona.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(chat_id, path = %path.display(), %error, "the group persona override is unreadable; the global suffix applies");
+            return None;
+        }
+    };
+    match toml::from_str(&contents) {
+        Ok(override_) => Some(override_),
+        Err(error) => {
+            tracing::warn!(chat_id, path = %path.display(), %error, "the group persona override is malformed; the global suffix applies");
+            None
+        }
+    }
+}
+
+/// Resolves the reply-suffix slot of one group (decision 98): an
+/// override file WITH a `suffix` key yields a PRIVATE slot rendered
+/// from the override body (the global persona hot reload never touches
+/// it); anything else yields the shared global slot. The override is
+/// boot-loaded — no watcher; edit and restart.
+pub fn suffix_slot_for_group(
+    data_root: &Path,
+    chat_id: &str,
+    global: Arc<RwLock<String>>,
+) -> Arc<RwLock<String>> {
+    match load_group_override(data_root, chat_id).and_then(|o| o.suffix) {
+        Some(entries) => {
+            let rules = entries.len();
+            tracing::info!(chat_id, suffix_rules = rules, "the group persona override replaces the global reply suffix (boot-loaded; edit and restart)");
+            Arc::new(RwLock::new(render_suffix(&entries)))
+        }
+        None => global,
+    }
+}
+
 /// specs.md Section 5.3: the rendering layer is an interface.
 /// The preamble is the prefix of every model context (Rule C4).
 pub trait PreambleRenderer {
@@ -592,9 +656,11 @@ impl PreambleRenderer for PetPreambleRenderer {
         preamble.push('\n');
 
         // Section 7: the append-mode suffix authority contract.
-        // Rendered strictly after the injection guardrail when append mode is active
-        // and suffix rules are configured.
-        if mode == SuffixMode::Append && !persona.suffix.is_empty() {
+        // Rendered strictly after the injection guardrail whenever append mode is active
+        // (decision 98: the raw-suffix condition is gone — the spliced
+        // <now> merge of an empty-suffix append configuration needs the
+        // contract too).
+        if mode == SuffixMode::Append {
             preamble.push('\n');
             preamble.push_str(SUFFIX_APPEND_CONTRACT);
             preamble.push('\n');
@@ -607,6 +673,7 @@ impl PreambleRenderer for PetPreambleRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::PoisonError;
     /// The gloss rendered for the test persona (name "Tamako" → the
     /// `tamako` speech tag, decision 95).
     fn test_gloss() -> String {
@@ -1315,14 +1382,86 @@ identity = "a small cat"
     }
 
     #[test]
-    fn render_preamble_append_mode_with_empty_suffix_omits_contract() {
+    fn a_group_without_an_override_file_keeps_the_global_suffix_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = Arc::new(RwLock::new("GLOBAL".to_owned()));
+        let slot = suffix_slot_for_group(dir.path(), "-1001", Arc::clone(&global));
+        assert!(Arc::ptr_eq(&slot, &global));
+    }
+
+    #[test]
+    fn an_override_without_the_suffix_key_keeps_the_global_suffix_slot() {
+        // Decision 98: the override is effective if and only if the
+        // `suffix` key is present.
+        let dir = tempfile::tempdir().unwrap();
+        write_group_override(dir.path(), "-1001", "# no keys\n");
+        let global = Arc::new(RwLock::new("GLOBAL".to_owned()));
+        let slot = suffix_slot_for_group(dir.path(), "-1001", Arc::clone(&global));
+        assert!(Arc::ptr_eq(&slot, &global));
+    }
+
+    #[test]
+    fn an_override_with_a_suffix_key_replaces_the_global_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group_override(dir.path(), "-1001", "suffix = [\"group rule\"]\n");
+        let global = Arc::new(RwLock::new("GLOBAL".to_owned()));
+        let slot = suffix_slot_for_group(dir.path(), "-1001", Arc::clone(&global));
+        assert!(!Arc::ptr_eq(&slot, &global));
+        assert_eq!(
+            *slot.read().unwrap_or_else(PoisonError::into_inner),
+            render_suffix(&["group rule".to_owned()])
+        );
+    }
+
+    #[test]
+    fn an_override_with_an_empty_suffix_silences_the_global_rules_for_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group_override(dir.path(), "-1001", "suffix = []\n");
+        let global = Arc::new(RwLock::new("GLOBAL".to_owned()));
+        let slot = suffix_slot_for_group(dir.path(), "-1001", Arc::clone(&global));
+        assert!(!Arc::ptr_eq(&slot, &global));
+        assert_eq!(*slot.read().unwrap_or_else(PoisonError::into_inner), "");
+    }
+
+    #[test]
+    fn a_malformed_override_degrades_to_the_global_suffix_with_a_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group_override(dir.path(), "-1001", "not [valid\n");
+        let global = Arc::new(RwLock::new("GLOBAL".to_owned()));
+        let slot = suffix_slot_for_group(dir.path(), "-1001", Arc::clone(&global));
+        assert!(Arc::ptr_eq(&slot, &global));
+    }
+
+    #[test]
+    fn an_override_with_an_unknown_key_is_denied_and_ignored() {
+        // deny_unknown_fields (decision 98): a typo'd key is a loud
+        // parse error, never a silent apply.
+        let dir = tempfile::tempdir().unwrap();
+        write_group_override(dir.path(), "-1001", "sufix = [\"typo\"]\n");
+        let global = Arc::new(RwLock::new("GLOBAL".to_owned()));
+        let slot = suffix_slot_for_group(dir.path(), "-1001", Arc::clone(&global));
+        assert!(Arc::ptr_eq(&slot, &global));
+    }
+
+    fn write_group_override(root: &Path, chat_id: &str, contents: &str) {
+        let dir = root.join(chat_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("persona.toml"), contents).unwrap();
+    }
+
+    #[test]
+    fn render_preamble_append_mode_with_empty_suffix_includes_contract() {
+        // Decision 98 (B2a): the contract rides the mode alone — an
+        // empty-suffix append configuration still merges the spliced
+        // <now> element, so the contract must be there for it.
         let mut config = sample_config();
         config.suffix = Vec::new();
         let renderer = PetPreambleRenderer;
 
         let system_preamble = renderer.render_preamble_for_mode(&config, SuffixMode::System);
         let append_preamble = renderer.render_preamble_for_mode(&config, SuffixMode::Append);
-        assert_eq!(system_preamble, append_preamble);
-        assert!(!append_preamble.contains(SUFFIX_APPEND_CONTRACT));
+        assert!(!system_preamble.contains(SUFFIX_APPEND_CONTRACT));
+        assert!(append_preamble.contains(SUFFIX_APPEND_CONTRACT));
+        assert!(append_preamble.ends_with(&format!("{SUFFIX_APPEND_CONTRACT}\n")));
     }
 }

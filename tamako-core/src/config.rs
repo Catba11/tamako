@@ -823,6 +823,20 @@ pub enum ConfigError {
         /// The group table the key appeared under.
         group: String,
     },
+    /// A group table sets `suffix_mode = "append"` while the global
+    /// mode is `system` (decision 98, B2b(i)): the append-mode
+    /// authority contract renders once per process from the GLOBAL
+    /// mode, so the mix would merge the suffix with no contract
+    /// rendered. Loud at startup, in the decision-77 style. The reverse
+    /// mix (global `append`, group `system`) is legal — the contract is
+    /// inert for that group.
+    #[error(
+        "suffix_mode = \"append\" under [groups.{group}] requires the global suffix_mode to be \"append\" (decision 98): the authority contract renders per global mode"
+    )]
+    AppendRequiresGlobal {
+        /// The group table the mode appeared under.
+        group: String,
+    },
     /// A warmup key carries an out-of-range or malformed value
     /// (decision 78 (e)): loud at startup, never a silent clamp.
     #[error("invalid value for '{key}'{group_context}: {value:?} — {reason}")]
@@ -1059,6 +1073,31 @@ impl BotConfig {
                     reason: error.to_string(),
                 },
             )?);
+        }
+        self.validate_suffix_mode_coherence()?;
+        Ok(())
+    }
+
+    /// Decision 98 (B2b(i)): a per-group `suffix_mode = "append"`
+    /// requires the global mode to be `append` too — the authority
+    /// contract renders once per process from the GLOBAL mode, so the
+    /// mix would merge with no contract rendered. Runs AFTER the
+    /// environment overrides apply (`TAMAKO_SUFFIX_MODE=append`
+    /// satisfies the constraint); the reverse mix is legal (the
+    /// contract is inert for a `system` group).
+    pub fn validate_suffix_mode_coherence(&self) -> Result<(), ConfigError> {
+        if self.global.suffix_mode == SuffixMode::Append {
+            return Ok(());
+        }
+        // Sorted group ids keep the reported error deterministic.
+        let mut groups: Vec<&String> = self.overrides.keys().collect();
+        groups.sort();
+        for group in groups {
+            if self.overrides[group].suffix_mode == Some(SuffixMode::Append) {
+                return Err(ConfigError::AppendRequiresGlobal {
+                    group: group.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -2199,6 +2238,74 @@ suffix-mode = "system"
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_group_append_mode_under_a_global_system_mode_is_a_loud_error() {
+        let toml = r#"
+[groups."-100123"]
+suffix_mode = "append"
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        let error = config.validate_suffix_mode_coherence().unwrap_err();
+        assert!(matches!(error, ConfigError::AppendRequiresGlobal { .. }));
+        assert!(error.to_string().contains("-100123"));
+    }
+
+    #[test]
+    fn a_group_append_mode_under_a_global_append_mode_is_legal() {
+        let toml = r#"
+[global]
+suffix_mode = "append"
+
+[groups."-100123"]
+suffix_mode = "append"
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        config.validate_suffix_mode_coherence().expect("coherent");
+    }
+
+    #[test]
+    fn a_group_system_mode_under_a_global_append_mode_is_legal() {
+        // Decision 98: the reverse mix stays legal — the contract
+        // renders but is inert for the system-mode group.
+        let toml = r#"
+[global]
+suffix_mode = "append"
+
+[groups."-100123"]
+suffix_mode = "system"
+"#;
+        let config = BotConfig::from_toml_str(toml).expect("config parses");
+        config.validate_suffix_mode_coherence().expect("coherent");
+    }
+
+    #[test]
+    fn the_environment_append_mode_satisfies_the_group_constraint() {
+        let (_lock, guard) = EnvGuard::cleared();
+        guard.set("TAMAKO_SUFFIX_MODE", "append");
+        let toml = r#"
+[groups."-100123"]
+suffix_mode = "append"
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        config
+            .apply_trigger_env_overrides()
+            .expect("env append satisfies");
+    }
+
+    #[test]
+    fn the_coherence_check_runs_inside_apply_trigger_env_overrides() {
+        let (_lock, _guard) = EnvGuard::cleared();
+        let toml = r#"
+[groups."-100123"]
+suffix_mode = "append"
+"#;
+        let mut config = BotConfig::from_toml_str(toml).expect("config parses");
+        assert!(matches!(
+            config.apply_trigger_env_overrides(),
+            Err(ConfigError::AppendRequiresGlobal { .. })
+        ));
     }
 
     #[test]
