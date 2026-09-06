@@ -13,17 +13,18 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 50 |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 170 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v13), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 38 |
-| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 18 (incl. the concurrent-access regression test) |
-| `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63). | 18 |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 110 (+3 ignored) |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 360 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v13), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 93 |
+| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 73 (incl. the concurrent-access regression test) |
+| `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63). | 46 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
-| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions, and the decision-82 media enrichment stage (download → `tamako-vision` normalize → caption → `<media>` elements embedded before the IntakeEvent exists). | 53 (+1 ignored live test) |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions, and the decision-82 media enrichment stage (download → `tamako-vision` normalize → caption → `<media>` elements embedded before the IntakeEvent exists). | 88 (+1 ignored live test) |
 | `tamako-vision` | The pure media-normalization crate (decision 82): bytes in, normalized JPEG/data-URI out; no I/O, no async, no LLM. | 10 |
-| `tamako-agent` | All LLM concerns: the endpoint layer, the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator, the shallow recall worker, the Rule C3 summarizer (decision 62). | 167 (+3 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer (per-purpose session affinity, decision 84; the reasoning-markup stripper, decisions 93/96), the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator and the warmup generator (decision 78) with the fence-extraction validation seam (decisions 93/95, decision-96 seam telemetry), the deep/shallow recall worker (decision 76), the Rule C3 summarizer (decision 62), the intake captioner (decision 82), the merge-tool confirmation seam (decision 74). | 311 (+5 ignored live tests) |
 
-Total: 523 tests (+4 ignored live tests). Build, test,
+Total: 1100 tests (+9 ignored live tests), verified 2026-09-06 @
+decision 97 (re-stamp when re-verified, decision 92). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
@@ -190,9 +191,13 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   parrot filter of decision 59 IN
   the wake task, before the report: every line whose trimmed start
   matches the recall-injection prefix (`INJECTION_TEXT_PREFIX`, ASCII
-  or full-width colon) or opens a `<memory>`/`<summary>`/`<msg>`/`<you>`
-  region (decisions 61/62/64 — the region strips through its closer
-  line) is removed — the reply model can imitate the
+  or full-width colon) or opens a
+  `<memory>`/`<summary>`/`<msg>`/`<you>`/`<media>` region (decisions
+  61/62/64/82 — the region strips through its closer line; decision
+  97: the opener prefix must end at a tag delimiter, so a lookalike
+  like `<memorybank…` is ordinary text, and bare
+  `<msg>`/`<you>`/`<media>` openers strip under the uniform rule) is
+  removed — the reply model can imitate the
   injection format and the context structure it sees, and a
   confabulated "I remember: ..." line or `<msg>`/`<you>` block (the
   2026-08-14 live incident) must never become bot speech. Decision 95:
@@ -200,8 +205,12 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   and memories can quote the old shape); the current own-speech tag
   needs no region — its residuals are the fence hygiene of Section
   9.8 (tag-only line drops on the first-`>`-ends-line test, inline
-  pairs unwrap, edge tokens strip). A
-  strip that leaves text logs one WARN with the chat id; an empty
+  pairs unwrap, edge tokens strip — decision 97: the unwrap and the
+  edge strips run to a fixpoint and skip lookalike tokens). A
+  strip that leaves text logs one WARN at the validation seam with
+  the purpose and the resolved model name (decision 96; the actor's
+  idempotent second pass keeps its chat-id WARN as the net for
+  generators without a seam filter); an empty
   remainder is the empty-reply `CoreError::Wake` (log, skip, no
   crash). The live reply generator applies the same pure function at
   its own validation seam (`tamako-agent`, `trimmed_reply_or_error`).
