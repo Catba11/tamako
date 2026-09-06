@@ -83,6 +83,7 @@ fn trimmed_warmup_or_error(
     fence: &ReplyFence,
     purpose: &str,
     model: &str,
+    chat_id: &str,
 ) -> Result<ReplyFilterOutcome, CoreError> {
     // Warmup stays hygiene-only (no fence extraction — decision 93's
     // scope): the fence of the pet tag drives the residual-token rules,
@@ -93,6 +94,7 @@ fn trimmed_warmup_or_error(
         tracing::warn!(
             purpose,
             model,
+            chat_id = %chat_id,
             "the warmup text carries imitated structure or fence debris: the parrot filter stripped the affected lines"
         );
     }
@@ -164,6 +166,7 @@ impl RigWarmupGenerator {
 impl WarmupGenerator for RigWarmupGenerator {
     fn generate_warmup<'a>(
         &'a self,
+        chat_id: &'a str,
         request: &'a WarmupRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
     {
@@ -200,6 +203,7 @@ impl WarmupGenerator for RigWarmupGenerator {
                 &ReplyFence::for_pet_tag(&pet_tag),
                 self.client.purpose(),
                 self.client.model_name(),
+                chat_id,
             )?
             .text)
         })
@@ -260,6 +264,7 @@ impl ScriptedWarmupGenerator {
 impl WarmupGenerator for ScriptedWarmupGenerator {
     fn generate_warmup<'a>(
         &'a self,
+        _chat_id: &'a str,
         request: &'a WarmupRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
     {
@@ -381,7 +386,7 @@ mod tests {
     #[test]
     fn an_empty_or_whitespace_warmup_is_a_warmup_error() {
         for empty in ["", "   ", "\n\t "] {
-            match trimmed_warmup_or_error(empty, &test_fence(), "warmup", "test-model") {
+            match trimmed_warmup_or_error(empty, &test_fence(), "warmup", "test-model", "c1") {
                 Err(CoreError::Warmup(message)) => {
                     assert_eq!(message, "the warmup generator returned an empty message")
                 }
@@ -400,7 +405,7 @@ mod tests {
             "  I remember: Alice likes tea.\nI remember：小明喜欢吃辣。 ",
             "<memory>\nAlice likes tea.\n</memory>",
         ] {
-            match trimmed_warmup_or_error(only, &test_fence(), "warmup", "test-model") {
+            match trimmed_warmup_or_error(only, &test_fence(), "warmup", "test-model", "c1") {
                 Err(CoreError::Warmup(message)) => {
                     assert_eq!(message, "the warmup generator returned an empty message")
                 }
@@ -418,6 +423,7 @@ mod tests {
             &test_fence(),
             "warmup",
             "test-model",
+            "c1",
         )
         .expect("warmup");
         assert_eq!(warmup.text, "has anyone tried the new cafe?");
@@ -435,8 +441,9 @@ mod tests {
             "one\ntwo\nthree",
             "hungry? I remember: not a line start",
         ] {
-            let warmup = trimmed_warmup_or_error(normal, &test_fence(), "warmup", "test-model")
-                .expect("warmup");
+            let warmup =
+                trimmed_warmup_or_error(normal, &test_fence(), "warmup", "test-model", "c1")
+                    .expect("warmup");
             assert_eq!(warmup.text, normal.trim());
             assert!(!warmup.stripped_parrot, "false positive on {normal:?}");
         }
@@ -446,11 +453,11 @@ mod tests {
     async fn scripted_warmup_replies_pop_fifo_then_fail() {
         let generator = ScriptedWarmupGenerator::with_replies(vec!["tea anyone?".to_string()]);
         let first = generator
-            .generate_warmup(&sample_request())
+            .generate_warmup("c1", &sample_request())
             .await
             .expect("first");
         assert_eq!(first, "tea anyone?");
-        match generator.generate_warmup(&sample_request()).await {
+        match generator.generate_warmup("c1", &sample_request()).await {
             Err(CoreError::Warmup(message)) => {
                 assert_eq!(message, "scripted warmup replies exhausted")
             }
@@ -465,7 +472,7 @@ mod tests {
     async fn scripted_failing_mode_fails_every_call_and_records_requests() {
         let generator = ScriptedWarmupGenerator::failing("boom");
         for _ in 0..2 {
-            match generator.generate_warmup(&sample_request()).await {
+            match generator.generate_warmup("c1", &sample_request()).await {
                 Err(CoreError::Warmup(message)) => assert_eq!(message, "boom"),
                 other => panic!("expected Warmup error, got {other:?}"),
             }

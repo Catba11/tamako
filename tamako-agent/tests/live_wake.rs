@@ -99,7 +99,7 @@ async fn the_reply_generator_returns_non_empty_text() {
         ),
     };
     let reply = generator
-        .generate(&request)
+        .generate("live_wake", &request)
         .await
         .expect("reply generation");
     // Live output is not deterministic; keep the assertion structural.

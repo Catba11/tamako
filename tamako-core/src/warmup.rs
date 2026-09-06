@@ -38,6 +38,7 @@ pub struct WarmupRequest {
 pub trait WarmupGenerator: Send + Sync {
     fn generate_warmup<'a>(
         &'a self,
+        chat_id: &'a str,
         request: &'a WarmupRequest,
     ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>>;
 }

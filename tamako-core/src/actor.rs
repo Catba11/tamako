@@ -2386,12 +2386,16 @@ async fn handle_warmup_tick<M: MemoryBackend>(
     let generator = Arc::clone(&services.generator);
     let topic_name = topic.name;
     let sender = inbox_sender.clone();
+    let chat_id_owned = chat_id.to_string();
     tokio::spawn(async move {
         // H4a panic containment (the wake-task pattern): a panicking
         // generator reports a synthetic `CoreError::Warmup` failure, so
         // the completion handler runs and `warmup_in_flight` ALWAYS
         // resets.
-        let result = contain_task_panic(async move { generator.generate_warmup(&request).await })
+        let result =
+            contain_task_panic(
+                async move { generator.generate_warmup(&chat_id_owned, &request).await },
+            )
             .await
             .unwrap_or_else(|message| Err(CoreError::Warmup(message)));
         // A failed send means the actor is shutting down; the result is
@@ -2931,10 +2935,13 @@ async fn run_wake_calls(
         Some(target) => {
             let fence = ReplyFence::for_pet_tag(&pet_tag);
             let raw_text = reply
-                .generate(&ReplyRequest {
-                    messages: snapshot,
-                    target: target.clone(),
-                })
+                .generate(
+                    chat_id,
+                    &ReplyRequest {
+                        messages: snapshot,
+                        target: target.clone(),
+                    },
+                )
                 .await?;
             // Decision 59, F1: the parrot filter guards EVERY reply
             // text here, so no generator (the live one included, and
@@ -5815,6 +5822,7 @@ mod tests {
     impl ReplyGenerator for ScriptedReply {
         fn generate<'a>(
             &'a self,
+            _chat_id: &'a str,
             request: &'a ReplyRequest,
         ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
             let call = {
@@ -5871,6 +5879,7 @@ mod tests {
     impl ReplyGenerator for FailThenReply {
         fn generate<'a>(
             &'a self,
+            _chat_id: &'a str,
             _request: &'a ReplyRequest,
         ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
             *self
@@ -7935,6 +7944,7 @@ mod tests {
     impl WarmupGenerator for ScriptedWarmup {
         fn generate_warmup<'a>(
             &'a self,
+            _chat_id: &'a str,
             request: &'a WarmupRequest,
         ) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send + 'a>> {
             *self
