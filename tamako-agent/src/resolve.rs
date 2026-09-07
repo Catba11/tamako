@@ -44,7 +44,7 @@ use crate::validate::{RelationshipName, FALLBACK_RELATIONSHIP_NAME};
 
 /// The edge properties key of the fallback relationship name marker.
 /// Section 6.3: the original name goes into the edge properties.
-const ORIGINAL_RELATIONSHIP_NAME_KEY: &str = "original_relationship_name";
+pub(crate) const ORIGINAL_RELATIONSHIP_NAME_KEY: &str = "original_relationship_name";
 
 /// The KNN overfetch of the vector pre-screen (decision 73): the kind
 /// compatibility filter discards hits, so the query fetches more than

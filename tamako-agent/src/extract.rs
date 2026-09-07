@@ -57,6 +57,34 @@ pub struct ExtractionInput {
     pub messages: Vec<BatchMessage>,
     /// The stored mention/reply map: display name -> tg_user_id.
     pub mention_map: Vec<MentionBinding>,
+    /// Decision 106: the `related_pairs` rows the promotion pass offers
+    /// the extraction call for grounding, pre-filtered to pairs whose
+    /// two endpoint names both appear in the batch text. EMPTY renders
+    /// the byte-identical pre-106 prompt (replay safety).
+    pub related_pairs: Vec<RelatedPairCandidate>,
+}
+
+/// One `related_pairs` row offered to the extraction call (decision
+/// 106): the merge tool judged the pair RELATED without graph context
+/// (decision 83); the digest model sees the pair with the full batch
+/// text and may ground one specific relationship edge. The grounded
+/// edge binds DIRECTLY on the stored node ids — entity resolution
+/// never touches a promotion edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedPairCandidate {
+    /// The `related_pairs` row id (the status-flip key).
+    pub row_id: i64,
+    /// The stored node ids of the pair (the deterministic binding).
+    pub node_a_id: String,
+    pub node_b_id: String,
+    /// The stored endpoint names and descriptions (the prompt payload;
+    /// an empty description means the node carries none).
+    pub a_name: String,
+    pub a_description: String,
+    pub b_name: String,
+    pub b_description: String,
+    /// The merge tool's reason text (why the pair was judged related).
+    pub reason: String,
 }
 
 /// Errors of tamako-agent.
@@ -173,6 +201,7 @@ mod tests {
                 tg_user_id: "1001".to_string(),
                 source: BindingSource::Sender,
             }],
+            related_pairs: vec![],
         }
     }
 

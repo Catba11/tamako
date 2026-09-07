@@ -1600,14 +1600,13 @@ impl Store {
         })
     }
 
-    /// All `related_pairs` rows ordered by id. TEST-ONLY / inspect
-    /// surface: decision 83(d) rules the table write-only for every
-    /// production read path (no recall, no resolution, no status), so
-    /// the only consumers are tests, a possible future inspect mode, and
-    /// the eventual digest-side promotion pass (which will query
-    /// `WHERE status='pending'` directly). Deliberate full scan — the
-    /// table has no indexes beyond the primary key and the UNIQUE pair
-    /// constraint (migration v12 comment).
+    /// All `related_pairs` rows ordered by id. INSPECT surface
+    /// (`--related-pairs`, decision 106 (f)) and tests; every
+    /// production read path but the promotion pass stays away
+    /// (decision 83 (d) — no recall, no resolution, no status).
+    /// Deliberate full scan — the table has no indexes beyond the
+    /// primary key and the UNIQUE pair constraint (migration v12
+    /// comment).
     pub fn list_related_pairs(&self) -> Result<Vec<RelatedPairRow>> {
         self.with_single_group_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -1619,6 +1618,56 @@ impl Store {
                 .query_map([], related_pair_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+    }
+
+    /// The `status='pending'` rows of one group, id order
+    /// (first-recorded first), capped at `limit` — the decision-106
+    /// (a) fetch of the promotion pass, and the reader the
+    /// decision-83 (d) write-only ruling anticipated. Chat-scoped
+    /// (the `increment_counter` idiom): the shared multi-group digest
+    /// store carries it.
+    pub fn list_pending_related_pairs(
+        &self,
+        chat_id: &str,
+        limit: u32,
+    ) -> Result<Vec<RelatedPairRow>> {
+        self.with_conn(chat_id, |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, node_a_id, node_b_id, reason, confirmed_by,
+                        status, created_at
+                 FROM related_pairs
+                 WHERE status = 'pending' ORDER BY id LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit], related_pair_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Flips one `pending` row to `promoted` or `dismissed` (decision
+    /// 106 (e)/(f)). Terminal states never move: the UPDATE guards on
+    /// `status = 'pending'`, and the return reports whether THIS call
+    /// moved the row — false means the row was not pending (unknown
+    /// id, or already terminal), which the mutating CLI surfaces as a
+    /// loud error and the pipeline logs as a WARN. Any other `status`
+    /// value is an InvalidValue error at this boundary (the database
+    /// CHECK never sees it).
+    pub fn set_related_pair_status(&self, chat_id: &str, id: i64, status: &str) -> Result<bool> {
+        if status != "promoted" && status != "dismissed" {
+            return Err(StoreError::InvalidValue {
+                key: "related_pairs.status".to_string(),
+                value: format!("{status:?} (must be 'promoted' or 'dismissed')"),
+            });
+        }
+        self.with_conn(chat_id, |conn| {
+            let moved = conn.execute(
+                "UPDATE related_pairs SET status = ?1
+                 WHERE id = ?2 AND status = 'pending'",
+                rusqlite::params![status, id],
+            )?;
+            Ok(moved == 1)
         })
     }
 
@@ -5328,6 +5377,69 @@ mod tests {
         let rows = store.list_related_pairs().expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "pending");
+    }
+
+    #[test]
+    fn list_pending_related_pairs_filters_orders_and_caps() {
+        let (_dir, store) = embedding_store();
+        store
+            .insert_related_pair("n-a", "n-b", "first", "operator")
+            .expect("first");
+        store
+            .insert_related_pair("n-c", "n-d", "second", "operator")
+            .expect("second");
+        store
+            .insert_related_pair("n-e", "n-f", "third", "operator")
+            .expect("third");
+        // The middle row leaves the pending set.
+        let moved = store
+            .set_related_pair_status("c1", 2, "dismissed")
+            .expect("flip");
+        assert!(moved);
+
+        // Id order, pending only, cap respected.
+        let rows = store
+            .list_pending_related_pairs("c1", 10)
+            .expect("pending list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[1].id, 3);
+        let capped = store
+            .list_pending_related_pairs("c1", 1)
+            .expect("capped list");
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].id, 1);
+    }
+
+    #[test]
+    fn set_related_pair_status_flips_pending_only() {
+        let (_dir, store) = embedding_store();
+        store
+            .insert_related_pair("n-a", "n-b", "r", "operator")
+            .expect("insert");
+
+        // pending -> promoted moves; the terminal state never moves
+        // again (the guard reports false, not an error).
+        assert!(store
+            .set_related_pair_status("c1", 1, "promoted")
+            .expect("promote"));
+        assert!(!store
+            .set_related_pair_status("c1", 1, "dismissed")
+            .expect("terminal stays"));
+        assert!(!store
+            .set_related_pair_status("c1", 999, "promoted")
+            .expect("unknown id stays"));
+        // A status outside the domain is a loud InvalidValue at the
+        // API boundary (before the database CHECK).
+        let err = store
+            .set_related_pair_status("c1", 1, "bogus")
+            .expect_err("out-of-domain status");
+        assert!(
+            matches!(err, StoreError::InvalidValue { .. }),
+            "expected InvalidValue, got {err}"
+        );
+        let rows = store.list_related_pairs().expect("list");
+        assert_eq!(rows[0].status, "promoted");
     }
 
     #[test]

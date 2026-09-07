@@ -43,6 +43,7 @@ async fn the_rig_extractor_returns_a_parseable_graph() {
                 source: BindingSource::Sender,
             },
         ],
+        related_pairs: vec![],
     };
     let graph = extractor.extract(&input).await.expect("extraction");
     // Live output is not deterministic; keep the assertions minimal.

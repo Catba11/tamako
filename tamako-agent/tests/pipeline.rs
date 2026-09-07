@@ -926,3 +926,160 @@ async fn the_candidate_band_confirmation_binds_the_candidate_without_a_duplicate
         1
     );
 }
+
+/// The decision-106 end-to-end test: a pending related_pairs row whose
+/// two endpoint names BOTH appear in the batch text rides the
+/// extraction input, the scripted extractor grounds it, and the
+/// promotion pass binds the edge DIRECTLY on the pair's stored node
+/// ids (deterministic binding), flips the row to 'promoted'
+/// post-commit, and counts the flip.
+#[tokio::test]
+async fn a_grounded_related_pair_promotes_through_the_digest() {
+    let (_dir, store, memory) = fixtures();
+    // The batch text mentions both endpoint names (the grounding
+    // precondition of decision 106 (b)).
+    insert_all(
+        &store,
+        &[
+            message(
+                "m1",
+                Direction::Inbound,
+                "1001",
+                "Alice",
+                "Bob, is the staging deploy green?",
+                1_700_000_000,
+                None,
+            ),
+            message(
+                "m2",
+                Direction::Inbound,
+                "2002",
+                "Bob",
+                "yes Alice, it went out an hour ago",
+                1_700_000_060,
+                Some("m1"),
+            ),
+        ],
+    );
+    // The two endpoints: the sender-bound person ids, so the extracted
+    // nodes "Alice"/"Bob" bind deterministically at step 1.
+    let alice_id = identifiers::person_id("1001");
+    let bob_id = identifiers::person_id("2002");
+    seed_person_node(&memory, &alice_id, "Alice", Some("A group member.")).await;
+    seed_person_node(&memory, &bob_id, "Bob", Some("Another group member.")).await;
+    store
+        .insert_related_pair(&alice_id, &bob_id, "scripted: deployment pair", "operator")
+        .expect("seed related pair");
+    let row_id = store
+        .list_related_pairs()
+        .expect("list")
+        .first()
+        .expect("one row")
+        .id;
+
+    let graph = KnowledgeGraph {
+        nodes: vec![
+            ExtractedNode {
+                name: "Alice".to_string(),
+                node_type: ExtractedNodeType::Person,
+                description: "A group member.".to_string(),
+            },
+            ExtractedNode {
+                name: "Bob".to_string(),
+                node_type: ExtractedNodeType::Person,
+                description: "Another group member.".to_string(),
+            },
+        ],
+        edges: vec![ExtractedEdge {
+            source: "Alice".to_string(),
+            target: "Bob".to_string(),
+            relationship_name: "coordinates".to_string(),
+            description: "Alice and Bob coordinate the deploy.".to_string(),
+        }],
+    };
+    let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![graph]));
+    let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
+
+    pipeline
+        .run_digest(CHAT, 0)
+        .await
+        .expect("digest")
+        .expect("non-empty tail");
+
+    // The pair rode the extraction input (decision 106 (a)).
+    let inputs = extractor.inputs();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].related_pairs.len(), 1, "one grounded pair");
+    assert_eq!(inputs[0].related_pairs[0].row_id, row_id);
+    assert_eq!(inputs[0].related_pairs[0].a_name, "Alice");
+
+    // The edge landed DIRECTLY on the pair's stored node ids, with the
+    // promotion provenance in properties. The resolved batch can carry
+    // the same-shaped edge; the natural key converges at the MERGE —
+    // exactly one edge row.
+    let rows = memory
+        .query_rows(
+            CHAT,
+            &format!(
+                "MATCH (s:Node)-[r:EDGE]->(t:Node) WHERE s.id = '{alice_id}' \
+                 AND t.id = '{bob_id}' AND r.relationship_name = 'coordinates' \
+                 RETURN r.properties"
+            ),
+        )
+        .await
+        .expect("edge query");
+    assert_eq!(rows.len(), 1, "one converged edge row: {rows:?}");
+    let properties = format!("{:?}", rows[0]);
+    assert!(
+        properties.contains("promoted_from_related_pair"),
+        "properties carry the provenance: {properties}"
+    );
+
+    // Post-commit flip + counter (decision 106 (e)).
+    let row = &store.list_related_pairs().expect("list")[0];
+    assert_eq!(row.status, "promoted");
+    assert_eq!(
+        vector_counter(&store, "related_pairs_promoted_total"),
+        Some("1".to_string())
+    );
+}
+
+/// The decision-106 (b) grounding precondition: a pending pair whose
+/// names do NOT both appear in the batch text never rides the
+/// extraction input and stays pending.
+#[tokio::test]
+async fn an_unmentioned_related_pair_stays_out_of_the_prompt() {
+    let (_dir, store, memory) = fixtures();
+    insert_prescreen_messages(&store);
+    // Carol and Dave are endpoints of the pair but neither name
+    // appears in the batch text.
+    let carol_id = identifiers::person_id("3003");
+    let dave_id = identifiers::person_id("4004");
+    seed_person_node(&memory, &carol_id, "Carol", None).await;
+    seed_person_node(&memory, &dave_id, "Dave", None).await;
+    store
+        .insert_related_pair(&carol_id, &dave_id, "scripted: unmentioned", "operator")
+        .expect("seed related pair");
+
+    let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![KnowledgeGraph {
+        nodes: vec![],
+        edges: vec![],
+    }]));
+    let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
+
+    pipeline
+        .run_digest(CHAT, 0)
+        .await
+        .expect("digest")
+        .expect("non-empty tail");
+
+    let inputs = extractor.inputs();
+    assert_eq!(inputs.len(), 1);
+    assert!(
+        inputs[0].related_pairs.is_empty(),
+        "the unmentioned pair never rides the prompt"
+    );
+    let row = &store.list_related_pairs().expect("list")[0];
+    assert_eq!(row.status, "pending", "the pair stays pending");
+    assert_eq!(vector_counter(&store, "related_pairs_promoted_total"), None);
+}
