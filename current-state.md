@@ -2723,6 +2723,40 @@ feature commit (decision 92).
     ruling (2026-09-07): the media-element forgery hard fix is a
     later discussion, and the M2 crash-window journaling is not
     scheduled.
+104. (2026-09-07, operator-ruled) Vector-resolution thresholds
+    calibrated: the auto-match band is ABOLISHED. The 2026-09-07
+    offline distribution evaluation (untracked, operator-held:
+    eval-81-2026-09-07.md) measured the per-node top-1 nearest-
+    neighbor cosine similarity of the 14,354 embedded nodes of the
+    six active groups. Two structural facts: the distribution mass
+    PEAKS inside the old gray band ([0.80, 0.85) holds 32%), so the
+    0.80 candidate floor fed the confirmation budget mostly noise
+    (the live counters agree: 44% of gray-zone confirmations end
+    rejected); and in [0.92, 1.0) the Concept pairs are almost all
+    FALSE duplicates — topical neighbors and antonym/parallel pairs
+    score up to 0.989 while true duplicates sit as low as 0.945 —
+    so NO score separates Concept identity from relatedness. Ruled:
+    (a) `vector_candidate_threshold` 0.80 -> 0.88, above the
+    distribution peak;
+    (b) the auto-match band is abolished — every candidate at or
+    above the candidate threshold takes the budget-capped
+    confirmation call (the decision-79 Person pattern extended to
+    Concept; an Alias candidate confirms against its TARGET, whose
+    kind is the binding kind, so with the binding kind only ever
+    Person or Concept nothing auto-binds any more).
+    `vector_match_threshold` is REMOVED from the config surface
+    (the live tamako.toml never set it; a stale key would hit the
+    decision-84 (e) unknown-key WARN). The
+    `vector_resolution_matched_total` counter and the
+    `VectorResolutionStats::auto_matched` field go with the band;
+    the persisted keys stay in existing stores as history;
+    (c) `merge_candidate_threshold` 0.85 -> 0.90 (the scan is a
+    volume knob; the three-way confirmer reviews every candidate
+    regardless). Budget note: every candidate now spends
+    confirmation budget (default 5 per batch) and overflow still
+    falls through to a new node — fragmentation the merge tool
+    repairs. Watch the confirmed/rejected rates after the deploy
+    before touching the budget.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
