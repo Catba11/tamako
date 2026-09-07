@@ -2679,6 +2679,24 @@ feature commit (decision 92).
     now log `chat_id` alongside `purpose` and `model`. The scripted
     doubles ignore the parameter. The six live groups' seam telemetry
     is per-group attributable from here on.
+102. (2026-09-07) Merge-side `also_known_as` residuals swept. The
+    decision-83 behavior fix (a 'related' verdict creates NO graph
+    edge: the merge.rs apply arm inserts the `related_pairs` row plus
+    the audit row only, and the confirmation prompt with its pin
+    tests forbids the old mapping) left three stragglers still
+    SPEAKING the old semantics: the --merge-tool dry-run display
+    rendered a related pair as `--also_known_as-->` (the operator
+    read exactly this line in the 2026-09 dry run and asked whether
+    the merge side was fixed), the v9 migration comment in schema.rs
+    still said "'related' links the pair via also_known_as", and the
+    MergeAuditRow rustdoc repeated it. All three now state the
+    decision-83 semantics. The legitimate also_known_as uses stay:
+    the entity-resolution bridge of decision 76 (b) (resolve.rs, the
+    recall traversal whitelist) and the stale-plan test's
+    link_also_known_as call (any graph change serves it). No
+    behavioral change beyond the dry-run output text; the migration
+    runner versions by number only, so the v9 comment edit touches
+    no live database.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
