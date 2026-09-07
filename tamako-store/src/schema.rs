@@ -257,10 +257,12 @@ DELETE FROM pending_embeddings WHERE status = 'done';
         "\
 -- Merge audit (decision 74, specs.md Section 5.2, graph-spec Section
 -- 7.7). One append-only row per merge-tool action: a 'same' verdict
--- merges, 'related' links the pair via also_known_as, 'different'
+-- merges, 'related' records the pair in the related_pairs table for
+-- later review — NO graph edge since decision 83 (the pre-2026-08-25
+-- text here linked the pair via also_known_as), 'different'
 -- skips — ALL THREE are audited (the row is the record of the LLM or
--- operator confirmation). Only a 'same' merge carries a snapshot (JSON:
--- the loser node and its original edges, plus the created edge
+-- operator confirmation). Only a 'same' merge carries a snapshot
+-- (JSON: the loser node and its original edges, plus the created edge
 -- identifiers); non-merge verdicts store NULL. The rolled_back flag
 -- flips when --merge-rollback restores the loser. Timestamps are
 -- RFC 3339 TEXT written from the Rust side, the house idiom.

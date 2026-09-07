@@ -257,9 +257,10 @@ pub struct PendingEmbedding {
 /// specs.md Section 5.2): one append-only record per merge-tool action.
 ///
 /// All three verdicts are audited: 'same' (the pair merged), 'related'
-/// (the pair was linked via `also_known_as`), and 'different' (the pair
-/// was skipped). Only a 'same' merge carries a `snapshot` (JSON: the
-/// loser node and its original edges, plus the created edge
+/// (the pair lands in `related_pairs` for later review — NO graph
+/// edge since decision 83; the pre-2026-08-25 text here linked
+/// `also_known_as`), and 'different' (the pair was skipped). Only a
+/// 'same' merge carries a `snapshot` (JSON: the loser node and its original edges, plus the created edge
 /// identifiers) — the rollback source of graph-spec Section 7.7;
 /// non-merge verdicts store None.
 ///
