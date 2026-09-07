@@ -279,12 +279,6 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
     async fn bump_vector_counters(&self, chat_id: &str, stats: VectorResolutionStats) {
         self.bump_counter_by(
             chat_id,
-            "vector_resolution_matched_total",
-            i64::from(stats.auto_matched),
-        )
-        .await;
-        self.bump_counter_by(
-            chat_id,
             "vector_resolution_confirmed_total",
             i64::from(stats.confirmed),
         )
@@ -1470,14 +1464,8 @@ mod tests {
                 .expect("state"),
             Some("1".to_string())
         );
-        // A top-band Person confirm is NEVER an auto-match (decision
-        // 79 (b)): the matched counter does not move.
-        assert_eq!(
-            store
-                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
-                .expect("state"),
-            None
-        );
+        // The matched counter was retired with the auto-match band
+        // (decision 104).
         assert_eq!(confirmer.calls().len(), 1);
         assert_eq!(provider.call_count(), 1);
     }
@@ -1528,12 +1516,8 @@ mod tests {
         }
         assert_eq!(provider.call_count(), 0);
         assert_eq!(confirmer.calls().len(), 0);
-        assert_eq!(
-            store
-                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
-                .expect("state"),
-            None
-        );
+        // The retired matched counter (decision 104) is
+        // never written.
     }
 
     // ---- Decision 75: the single-value registry rides the graph
@@ -2058,15 +2042,8 @@ mod tests {
                 .expect("state"),
             Some("1".to_string())
         );
-        // A top-band Person confirm is never an auto-match (decision
-        // 79 (b)): the matched counter does not move.
-        assert_eq!(
-            store
-                .get_state(ENQUEUE_CHAT, "vector_resolution_matched_total")
-                .expect("state"),
-            None
-        );
-        // The failed attempt itself is still counted.
+        // The matched counter was retired with the auto-match band
+        // (decision 104). The failed attempt itself is still counted.
         assert_eq!(
             store
                 .get_state(ENQUEUE_CHAT, "digest_failures_total")

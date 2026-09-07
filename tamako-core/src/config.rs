@@ -246,15 +246,14 @@ pub struct TriggerConfig {
     /// step 3 entirely (byte-identical Phase 1 behavior path, not even
     /// the embeddings call). Default true.
     pub vector_resolution: bool,
-    /// Decision 73: the cosine SIMILARITY at or above which the best
-    /// compatible sidecar hit binds without a confirmation call.
-    /// Default 0.92.
-    pub vector_match_threshold: f64,
-    /// Decision 73: the lower bound of the LLM confirmation band;
-    /// below it the entity creates a new node. Default 0.80.
+    /// Decision 104: the cosine SIMILARITY at or above which the best
+    /// compatible sidecar hit takes ONE budget-capped confirmation
+    /// call; below it the entity creates a new node. Default 0.88
+    /// (calibrated 2026-09-07; the pre-104 auto-match band above this
+    /// line is abolished — nothing binds without the confirmation).
     pub vector_candidate_threshold: f64,
     /// Decision 73: the cap of LLM confirmation calls per digest
-    /// batch; an exhausted budget treats middle-band entities as
+    /// batch; an exhausted budget treats candidate entities as
     /// below-threshold. Default 5.
     pub resolution_confirm_budget: u32,
     /// Decision 74 (proposed-graph-database-specs.md Section 7.7 step
@@ -375,10 +374,9 @@ impl Default for TriggerConfig {
             reply_quote_threshold: 10,
             gate_context: true,
             vector_resolution: true,
-            vector_match_threshold: 0.92,
-            vector_candidate_threshold: 0.80,
+            vector_candidate_threshold: 0.88,
             resolution_confirm_budget: 5,
-            merge_candidate_threshold: 0.85,
+            merge_candidate_threshold: 0.90,
             single_value_predicates: vec![
                 "currently_playing".to_string(),
                 "works_at".to_string(),
@@ -498,10 +496,7 @@ pub struct TriggerConfigToml {
     /// The vector pre-screen switch (decision 73). Refer to
     /// `TriggerConfig::vector_resolution`.
     pub vector_resolution: Option<bool>,
-    /// The auto-match similarity. Refer to
-    /// `TriggerConfig::vector_match_threshold`.
-    pub vector_match_threshold: Option<f64>,
-    /// The confirmation-band lower bound. Refer to
+    /// The confirmation-call lower bound. Refer to
     /// `TriggerConfig::vector_candidate_threshold`.
     pub vector_candidate_threshold: Option<f64>,
     /// The per-batch confirmation budget. Refer to
@@ -736,9 +731,6 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.vector_resolution {
             base.vector_resolution = value;
-        }
-        if let Some(value) = self.vector_match_threshold {
-            base.vector_match_threshold = value;
         }
         if let Some(value) = self.vector_candidate_threshold {
             base.vector_candidate_threshold = value;
@@ -1169,13 +1161,16 @@ wake_floor_secs = 60
         // Decision 73 (proposed-graph-database-specs.md Section 7.4
         // step 3, specs.md Section 13): the vector pre-screen defaults.
         assert!(config.vector_resolution);
-        assert_eq!(config.vector_match_threshold, 0.92);
-        assert_eq!(config.vector_candidate_threshold, 0.80);
+        // Decision 104 recalibrated the candidate
+        // threshold from 0.80 to 0.88 and abolished the auto-match
+        // band (the `vector_match_threshold` key is gone).
+        assert_eq!(config.vector_candidate_threshold, 0.88);
         assert_eq!(config.resolution_confirm_budget, 5);
         // Decision 74 (proposed-graph-database-specs.md Section 7.7
         // step 1): the merge-candidate threshold defaults to the
-        // provisional 0.85, narrower than the write-path band.
-        assert_eq!(config.merge_candidate_threshold, 0.85);
+        // decision-104-calibrated 0.90, narrower than the
+        // write-path band.
+        assert_eq!(config.merge_candidate_threshold, 0.90);
         // Decision 75 (proposed-graph-database-specs.md Section 7.5,
         // specs.md Section 13): the single-value predicate registry
         // defaults to the four predicates of Section 13.
@@ -1320,33 +1315,27 @@ gate_context = true
         let text = r#"
 [global]
 vector_resolution = false
-vector_match_threshold = 0.95
 vector_candidate_threshold = 0.75
 resolution_confirm_budget = 2
 
 [groups."-100777"]
 vector_resolution = true
-vector_match_threshold = 0.90
 "#;
         let config = BotConfig::from_toml_str(text).expect("the TOML loads");
         assert!(!config.global.vector_resolution);
-        assert_eq!(config.global.vector_match_threshold, 0.95);
         assert_eq!(config.global.vector_candidate_threshold, 0.75);
         assert_eq!(config.global.resolution_confirm_budget, 2);
         // A group override applies over the global value.
         assert!(config.for_group("-100777").vector_resolution);
-        assert_eq!(config.for_group("-100777").vector_match_threshold, 0.90);
         // Keys the group does not override inherit the global values.
         assert_eq!(config.for_group("-100777").vector_candidate_threshold, 0.75);
         assert_eq!(config.for_group("-100777").resolution_confirm_budget, 2);
         // A group without an override receives the global values.
         assert!(!config.for_group("-100999").vector_resolution);
-        assert_eq!(config.for_group("-100999").vector_match_threshold, 0.95);
-        // Keys the TOML does not set keep the decision-73 defaults.
+        // Keys the TOML does not set keep the decision-104 defaults.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert!(plain.global.vector_resolution);
-        assert_eq!(plain.global.vector_match_threshold, 0.92);
-        assert_eq!(plain.global.vector_candidate_threshold, 0.80);
+        assert_eq!(plain.global.vector_candidate_threshold, 0.88);
         assert_eq!(plain.global.resolution_confirm_budget, 5);
     }
 
@@ -1357,21 +1346,21 @@ vector_match_threshold = 0.90
         // 6.3).
         let text = r#"
 [global]
-merge_candidate_threshold = 0.90
+merge_candidate_threshold = 0.95
 
 [groups."-100777"]
 merge_candidate_threshold = 0.88
 "#;
         let config = BotConfig::from_toml_str(text).expect("the TOML loads");
         // Global set.
-        assert_eq!(config.global.merge_candidate_threshold, 0.90);
+        assert_eq!(config.global.merge_candidate_threshold, 0.95);
         // A group override wins over the global value.
         assert_eq!(config.for_group("-100777").merge_candidate_threshold, 0.88);
         // A group without an override inherits the global value.
-        assert_eq!(config.for_group("-100999").merge_candidate_threshold, 0.90);
-        // Keys the TOML does not set keep the decision-74 default.
+        assert_eq!(config.for_group("-100999").merge_candidate_threshold, 0.95);
+        // Keys the TOML does not set keep the decision-104 default.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
-        assert_eq!(plain.global.merge_candidate_threshold, 0.85);
+        assert_eq!(plain.global.merge_candidate_threshold, 0.90);
     }
 
     #[test]
@@ -2068,7 +2057,7 @@ digest_max_chars_bytes = 4096
 [global]
 warmup = false
 deep_recall = false
-vector_match_threshold = 0.95
+vector_candidate_threshold = 0.95
 single_value_predicates = ["works_at"]
 
 [groups."-100777"]

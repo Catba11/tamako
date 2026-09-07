@@ -752,16 +752,12 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
         }
         other => panic!("expected Extracted, got {other:?}"),
     }
-    // The decision-79 (b) confirmation bound "Al" to the seeded node;
-    // a top-band Person confirm counts as `confirmed`, never as an
-    // auto-match.
+    // The decision-79 (b) confirmation bound "Al" to the seeded node
+    // (the matched counter was retired with the auto-match band,
+    // decision 104).
     assert_eq!(
         vector_counter(&store, "vector_resolution_confirmed_total"),
         Some("1".to_string())
-    );
-    assert_eq!(
-        vector_counter(&store, "vector_resolution_matched_total"),
-        None
     );
     assert_eq!(provider.call_count(), 1);
     assert_eq!(confirmer.calls().len(), 1);
@@ -835,10 +831,11 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
 }
 
 #[tokio::test]
-async fn the_middle_band_confirmation_binds_the_candidate_without_a_duplicate() {
-    // Decision 73 middle band end to end: "Alicia" reaches step 3, the
-    // seeded person node scores in the confirmation band (similarity
-    // 0.85 in [0.80, 0.92)), the scripted confirmer accepts, and the
+async fn the_candidate_band_confirmation_binds_the_candidate_without_a_duplicate() {
+    // Decision 73 candidate band end to end: "Alicia" reaches step 3,
+    // the seeded person node scores at or above the candidate
+    // threshold (similarity 0.89 >= 0.88, decision 104), the scripted
+    // confirmer accepts, and the
     // entity binds to the candidate: the confirmed counter increments
     // and NO second person node appears.
     let (dir, store, memory) = fixtures();
@@ -853,7 +850,7 @@ async fn the_middle_band_confirmation_binds_the_candidate_without_a_duplicate() 
     .await;
     let embedding_store = dedicated_embedding_store(&dir);
     embedding_store
-        .upsert_node_embedding(&alice_id, &tilted_vector(0.85, 1))
+        .upsert_node_embedding(&alice_id, &tilted_vector(0.89, 1))
         .expect("seed embedding");
 
     let provider = Arc::new(ScriptedEmbedder::with_batches(vec![vec![unit_vector(0)]]));
@@ -900,10 +897,6 @@ async fn the_middle_band_confirmation_binds_the_candidate_without_a_duplicate() 
     assert_eq!(
         vector_counter(&store, "vector_resolution_confirmed_total"),
         Some("1".to_string())
-    );
-    assert_eq!(
-        vector_counter(&store, "vector_resolution_matched_total"),
-        None
     );
     assert_eq!(
         vector_counter(&store, "vector_resolution_rejected_total"),

@@ -704,8 +704,8 @@ fn apply_session_suffixes(
 /// resolution. A confirmer build failure degrades the pre-screen
 /// ALONE to disabled with a WARN, mirroring the store-open degrade.
 /// The four decision-73 keys (`vector_resolution` /
-/// `vector_match_threshold` / `vector_candidate_threshold` /
-/// `resolution_confirm_budget`) come from the resolved per-group
+/// `vector_candidate_threshold` / `resolution_confirm_budget`)
+/// come from the resolved per-group
 /// `trigger_config` (specs.md Section 13).
 ///
 /// Decision 75: the resolved per-group `single_value_predicates` ride
@@ -751,7 +751,6 @@ fn build_digest_pipeline(
             // (the KNN read rides the one-group store).
             let vector_config = VectorResolutionConfig {
                 enabled: trigger_config.vector_resolution,
-                match_threshold: trigger_config.vector_match_threshold,
                 candidate_threshold: trigger_config.vector_candidate_threshold,
                 confirm_budget: trigger_config.resolution_confirm_budget,
             };
@@ -1989,8 +1988,8 @@ fn read_merge_plan_file(data_root: &Path, chat_id: &str) -> Result<MergePlanFile
 
 /// The `--merge-tool` run (decision 74, graph-spec Section 7.7).
 /// OFFLINE. The threshold comes from the per-group
-/// `merge_candidate_threshold` of the resolved config (default 0.85);
-/// the confirmation budget from `--max-confirmations`.
+/// `merge_candidate_threshold` of the resolved config (default 0.90,
+/// decision 104); the confirmation budget from `--max-confirmations`.
 ///
 /// Decision 77 (H6a), the two-step apply: the DRY RUN (default) opens
 /// the group's store READ-ONLY (M7, no lock, no migrations), confirms
