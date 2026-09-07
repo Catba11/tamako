@@ -123,10 +123,9 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 
 # ------------------------------------------------------- Memory (P2) ----
 # vector_resolution = true          # step-3 vector pre-screen (graph 7.4)
-# vector_match_threshold = 0.92     # provisional; calibrate with live data
-# vector_candidate_threshold = 0.80 # provisional
-# resolution_confirm_budget = 5     # per digest batch
-# merge_candidate_threshold = 0.85  # provisional; merge-tool scan (graph 7.7)
+# vector_candidate_threshold = 0.88 # decision 104 (calibrated 2026-09-07)
+# resolution_confirm_budget = 5     # per digest batch; every candidate confirms
+# merge_candidate_threshold = 0.90  # merge-tool scan (graph 7.7)
 # single_value_predicates = ["currently_playing", "works_at", "lives_in", "dating"]
 # deep_recall = true                # false restores the Phase 1 shallow recall (9.1)
 # recall_candidate_cap = 40         # per wake, before the relevance gate

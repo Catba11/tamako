@@ -329,10 +329,9 @@ Global defaults. Every item is overridable per group. Keys below are the exact T
 | `forced_wake_cooldown_secs` | 10 s (0 disables) | 8.1 |
 | `gate_context` | true | 9.6 |
 | `vector_resolution` | true | graph 7.4 |
-| `vector_match_threshold` | 0.92 (provisional) | graph 7.4 |
-| `vector_candidate_threshold` | 0.80 (provisional) | graph 7.4 |
+| `vector_candidate_threshold` | 0.88 (decision 104) | graph 7.4 |
 | `resolution_confirm_budget` | 5 per digest batch | graph 7.4 |
-| `merge_candidate_threshold` | 0.85 (provisional) | graph 7.7 |
+| `merge_candidate_threshold` | 0.90 (decision 104) | graph 7.7 |
 | `single_value_predicates` | `currently_playing`, `works_at`, `lives_in`, `dating` | graph 7.5 |
 | `warmup` | true | 8.4 |
 | `warmup_quota` | 1 (range 1–3) | 8.4 |
