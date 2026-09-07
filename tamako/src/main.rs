@@ -2657,7 +2657,7 @@ fn format_plan_action(action: &MergePlanAction) -> String {
             action.survivor_id
         ),
         MergeVerdict::Related => format!(
-            "\"{}\" ({}) --related (no edge)--> \"{}\" ({}))",
+            "\"{}\" ({}) --related (no edge)--> \"{}\" ({})",
             endpoint_name(candidate, &action.survivor_id),
             action.survivor_id,
             endpoint_name(candidate, &action.loser_id),
