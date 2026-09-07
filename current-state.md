@@ -2783,6 +2783,57 @@ feature commit (decision 92).
     The one normalize() serves every consumer (id generation, the
     stored normalized alias name, recall terms, warmup cooldown
     keys, mention dedup) so all paths shift in lockstep.
+106. (2026-09-07) The decision-83 (g) promotion pass, built (operator
+    ruling 2026-09-07: build it now, ahead of any pending rows). One
+    digest-side step, NO new LLM call — the pending pairs ride the
+    extraction call:
+    (a) FETCH: at digest assembly the pipeline reads up to 50
+    `status='pending'` pairs (id order, first-recorded first) through
+    the NEW chat-scoped `Store::list_pending_related_pairs` (the
+    existing chat-less `list_related_pairs` stays the inspect surface)
+    and looks up each endpoint's stored name/description
+    (`MemoryBackend::node_content`); a pair whose endpoint is
+    unreadable is skipped with a DEBUG and stays pending. The
+    decision-83 (d) "write-only" ruling ends here exactly as it
+    anticipated ("awaiting the promotion pass").
+    (b) FILTER: a pair rides the extraction prompt ONLY when BOTH
+    endpoint names (normalized, decision-105 rules) appear in the
+    normalized batch text — grounding needs the text to mention the
+    entities. At most 10 filtered pairs per batch
+    (`PROMOTION_PAIR_CAP`), id order; the rest wait for a later
+    batch. No cap key: one constant, documented here.
+    (c) PROMPT: `EXTRACTION_PREAMBLE` gains one instruction (ground a
+    listed pair ONLY when the batch text supports a specific
+    relationship; emit the edge with the EXACT listed names) and
+    `render_extraction_prompt` gains the pairs section (names,
+    descriptions, the merge-tool reason per pair). An EMPTY pair
+    list renders byte-identical to before (replay safety).
+    (d) DETERMINISTIC BINDING: the promotion edge never goes through
+    entity resolution — post-extraction the pipeline matches emitted
+    edges whose two endpoint names normalize-match a prompted pair's
+    two names (either direction; the LLM's source/target ordering
+    sets the edge direction) and builds the MemoryEdge DIRECTLY on
+    the pair's stored node ids, with the post-validated relationship
+    name, the extracted description as the edge text, and
+    `{"promoted_from_related_pair": <row id>}` in the properties.
+    The pair's nodes need NOT appear in the extracted node list.
+    (e) STATUS FLIP: after a SUCCESSFUL graph commit the pipeline
+    flips the grounded rows to 'promoted' (best effort, WARN on
+    failure — a lost flip can re-ground the pair in a later batch,
+    one duplicate valid edge, repairable with --invalidate; the
+    pre-commit alternative risks losing the edge entirely).
+    `related_pairs_promoted_total` counts the flips (specs.md
+    Section 12 discipline).
+    (f) DISMISSAL: the offline `--dismiss-related-pair <chat_id>
+    <pair_id>` flips a pending row to 'dismissed' (advisory-lock
+    discipline of --invalidate; the flip only applies to a
+    'pending' row — terminal states never move). The read-only
+    `--related-pairs <chat_id>` prints the rows with the ids the
+    dismissal takes. The table ships empty everywhere; both
+    commands are the operator's instruments for when the merge
+    tool starts recording pairs.
+    No schema migration: the v12 table carried its status column
+    from birth (decision 83 (a)).
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
