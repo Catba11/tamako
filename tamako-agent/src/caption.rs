@@ -54,6 +54,18 @@ use crate::extract::AgentError;
 /// decorator's concern, unchanged.
 pub const CAPTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The caption request's `max_tokens` (decision 103, the
+/// 2026-09-04 review finding 53): a concise caption costs ~200
+/// tokens; 8192 leaves reasoning headroom while a runaway
+/// all-reasoning answer dies here instead of at the provider-side
+/// default. A code constant like [`CAPTION_ATTEMPT_TIMEOUT`],
+/// deliberately no config key. The cap BOUNDS the all-reasoning
+/// failure's cost and latency; it cannot prevent
+/// `CaptionError::Empty` — no request knob suppresses reasoning on
+/// this endpoint family — and Empty stays non-retried (decision 82
+/// (d)).
+pub const CAPTION_MAX_TOKENS: u64 = 8192;
+
 /// The fixed caption prompt template of decision 82 (c): faithful
 /// description; describe people only as "a person" — never guess an
 /// identity; transcribe any prominent in-image text (meme text is
@@ -160,6 +172,7 @@ impl CaptionProvider for RigCaptionProvider {
             let request = self
                 .model
                 .completion_request(build_caption_message(jpeg_data_uri))
+                .max_tokens(CAPTION_MAX_TOKENS)
                 .build();
             // The caption-specific per-attempt bound
             // (CAPTION_ATTEMPT_TIMEOUT, the M1 review fix): a stalled
@@ -293,6 +306,7 @@ impl CaptionProvider for RetryCaptionProvider {
                                     %error,
                                     attempt = attempt + 1,
                                     backoff_seconds = backoff.as_secs(),
+                                    media_kind = kind.as_str(),
                                     "caption attempt failed; retrying after the decision-82 (d) backoff"
                                 );
                                 tokio::time::sleep(*backoff).await;
@@ -349,6 +363,105 @@ mod tests {
                 None => std::env::remove_var(OPENAI_API_KEY_ENV_VAR),
             }
         }
+    }
+
+    // --- Retry WARN attribution (decision 103) ---
+
+    /// A `tracing` subscriber capturing the rendered fields of every
+    /// event (the reply.rs pattern, replicated: tamako-agent has no
+    /// tracing-subscriber dependency). `set_default` is thread-local
+    /// and #[tokio::test] runs current-thread, so the capture sees
+    /// the events of this test only.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl EventCapture {
+        fn contains(&self, needle: &str) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|event| event.contains(needle))
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct FieldText(String);
+
+            impl tracing::field::Visit for FieldText {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+
+            let mut text = FieldText(String::new());
+            event.record(&mut text);
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(text.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn the_retry_warn_names_the_media_kind() {
+        // Decision 103: the decision-82 (d) retry WARN carries the
+        // media kind alongside the error and the attempt number.
+        //
+        // The subscriber MUST be the global default: the sibling
+        // retry tests hit the same warn! callsite with NO subscriber,
+        // caching NEVER interest, and a thread-local set_default does
+        // not bump the callsite interest generation — registering the
+        // global default does. Video keeps the assertion unique: the
+        // concurrent siblings exercise Image/Sticker only.
+        let capture = EventCapture::default();
+        tracing::subscriber::set_global_default(capture.clone())
+            .expect("the only global-default registration of the test binary");
+        let provider =
+            RetryCaptionProvider::new(std::sync::Arc::new(ScriptedCaption::failing("boom")));
+        let future = provider.caption_image(DATA_URI, MediaKindName::Video);
+        tokio::pin!(future);
+        // The first attempt's WARN fires synchronously, BEFORE the
+        // 30 s backoff sleep: poll the future in 1 ms slices until
+        // the WARN lands, then abandon it — the backoff never runs to
+        // completion in a test.
+        for _ in 0..200 {
+            tokio::select! {
+                biased;
+                _ = &mut future => break,
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+            if capture.contains("media_kind") {
+                break;
+            }
+        }
+        assert!(capture.contains("caption attempt failed"));
+        assert!(capture.contains("media_kind"));
+        assert!(capture.contains("video"));
     }
 
     /// Extracts the content parts of the assembled caption message.
