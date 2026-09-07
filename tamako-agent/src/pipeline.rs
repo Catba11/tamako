@@ -13,21 +13,22 @@ use tamako_core::actor::CoreError;
 use tamako_core::digest::{embedding_content_hash, DigestOutcome, DigestPipeline};
 use tamako_core::embedding::EmbeddingProvider as CoreEmbeddingProvider;
 use tamako_memory::identifiers::{batch_id as message_batch_id, normalize};
-use tamako_memory::{EdgeId, MemoryBackend, MemoryBatch, NodeType};
+use tamako_memory::{EdgeId, MemoryBackend, MemoryBatch, MemoryEdge, NodeType};
 use tamako_store::{MessageRow, Store, StoreError};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,
+    RelatedPairCandidate,
 };
 use crate::graph::KnowledgeGraph;
 use crate::resolve::{
     message_batch_node, resolve_batch, ResolutionConfirmer, VectorPrescreen,
-    VectorResolutionConfig, VectorResolutionStats,
+    VectorResolutionConfig, VectorResolutionStats, ORIGINAL_RELATIONSHIP_NAME_KEY,
 };
 use crate::skeleton::is_skeleton_batch;
-use crate::validate::validate_relationship_name;
+use crate::validate::{validate_relationship_name, RelationshipName, FALLBACK_RELATIONSHIP_NAME};
 
 /// The UTC HH:MM rendering of the speaker label. Section 7.2 step 4 of
 /// the database spec.
@@ -36,6 +37,19 @@ const HHMM_FORMAT: &[time::format_description::FormatItem<'_>] =
 
 /// The cap of the exponential backoff. specs.md Section 10.3.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+/// Decision 106 (a): the pending-rows fetch limit of the promotion
+/// pass (id order, first-recorded first; the text filter below
+/// applies to this window).
+const PENDING_PAIR_FETCH_LIMIT: u32 = 50;
+
+/// Decision 106 (b): at most this many filtered pairs ride one
+/// extraction prompt.
+const PROMOTION_PAIR_CAP: usize = 10;
+
+/// Decision 106 (d): the properties key carrying the `related_pairs`
+/// row id of a promotion edge.
+const PROMOTED_FROM_KEY: &str = "promoted_from_related_pair";
 
 /// Retry/dead-letter configuration. specs.md Section 10.3.
 #[derive(Debug, Clone)]
@@ -273,6 +287,126 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         }
     }
 
+    /// The decision-106 (a)/(b) fetch of the promotion pass: the
+    /// pending `related_pairs` rows (id order, first-recorded first)
+    /// whose two endpoint names BOTH appear in the batch text, capped
+    /// at [`PROMOTION_PAIR_CAP`] after the filter. Best effort: a
+    /// store or memory failure degrades to no promotion for this
+    /// batch (one WARN / a DEBUG per skipped pair), never a digest
+    /// failure. A skipped pair STAYS pending.
+    async fn promotion_candidates(
+        &self,
+        chat_id: &str,
+        rows: &[MessageRow],
+    ) -> Vec<RelatedPairCandidate> {
+        let chat_id_owned = chat_id.to_string();
+        let pending = match self
+            .run_store(move |store| {
+                store.list_pending_related_pairs(&chat_id_owned, PENDING_PAIR_FETCH_LIMIT)
+            })
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(
+                    chat_id,
+                    %error,
+                    "related-pair promotion fetch failed; the batch digests without it"
+                );
+                return Vec::new();
+            }
+        };
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        // The grounding precondition (decision 106 (b)): both endpoint
+        // names appear in the batch text, all under the decision-105
+        // normalization rules.
+        let mut raw_text = String::new();
+        for row in rows {
+            raw_text.push_str(&row.text);
+            raw_text.push(' ');
+        }
+        let batch_text = normalize(&raw_text);
+        let mut out: Vec<RelatedPairCandidate> = Vec::new();
+        for row in pending {
+            if out.len() >= PROMOTION_PAIR_CAP {
+                break;
+            }
+            let a = self.memory.node_content(chat_id, &row.node_a_id).await;
+            let b = self.memory.node_content(chat_id, &row.node_b_id).await;
+            let (Ok(Some(a)), Ok(Some(b))) = (a, b) else {
+                // An endpoint unreadable or gone: skip the pair for
+                // this batch; the row stays pending.
+                tracing::debug!(
+                    chat_id,
+                    row_id = row.id,
+                    "related pair skipped: an endpoint is unreadable"
+                );
+                continue;
+            };
+            let a_name = normalize(&a.name);
+            let b_name = normalize(&b.name);
+            // An empty normalized name contains-matches EVERY text —
+            // guard it explicitly.
+            if a_name.is_empty()
+                || b_name.is_empty()
+                || !batch_text.contains(&a_name)
+                || !batch_text.contains(&b_name)
+            {
+                continue;
+            }
+            out.push(RelatedPairCandidate {
+                row_id: row.id,
+                node_a_id: row.node_a_id,
+                node_b_id: row.node_b_id,
+                a_name: a.name,
+                a_description: a.description,
+                b_name: b.name,
+                b_description: b.description,
+                reason: row.reason,
+            });
+        }
+        out
+    }
+
+    /// The decision-106 (e) status flips, post-commit, best effort.
+    /// The `related_pairs_promoted_total` counter counts the rows THIS
+    /// call moved (the UPDATE guards on `status='pending'` — a row
+    /// concurrently dismissed by the operator does not count).
+    async fn flip_promoted_pairs(&self, chat_id: &str, row_ids: &[i64]) {
+        let mut flipped = 0_i64;
+        for row_id in row_ids {
+            let id = *row_id;
+            let chat_id_owned = chat_id.to_string();
+            match self
+                .run_store(move |store| {
+                    store.set_related_pair_status(&chat_id_owned, id, "promoted")
+                })
+                .await
+            {
+                Ok(true) => flipped += 1,
+                Ok(false) => {
+                    tracing::warn!(
+                        chat_id,
+                        row_id = id,
+                        "related pair was no longer pending at flip time"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        chat_id,
+                        row_id = id,
+                        %error,
+                        "related-pair status flip failed; the pair may re-ground in a later batch"
+                    );
+                }
+            }
+        }
+        self.bump_counter_by(chat_id, "related_pairs_promoted_total", flipped)
+            .await;
+    }
+
     /// The decision-73 step-3 counters (specs.md Section 12 naming
     /// discipline: Prometheus-compatible, `_total` suffix). Best
     /// effort, like every counter of the pipeline.
@@ -329,7 +463,22 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         )
         .await?;
         let vector_stats = resolved.vector_stats;
-        let batch = resolved.batch;
+        let mut batch = resolved.batch;
+        // Decision 106 (d): a grounded promotion edge binds DIRECTLY on
+        // the pair's stored node ids — entity resolution never sees it.
+        // The resolved batch can carry a same-shaped edge for the same
+        // pair (the extractor emitted the pair's nodes too): the edge
+        // natural key converges at the MERGE write, no duplicate.
+        let promotions = collect_promotion_edges(
+            &graph,
+            &validated_names,
+            &input.related_pairs,
+            frame.batch_end,
+        );
+        let promoted_row_ids: Vec<i64> = promotions.iter().map(|(row_id, _)| *row_id).collect();
+        batch
+            .edges
+            .extend(promotions.into_iter().map(|(_, edge)| edge));
         let node_count = batch.nodes.len();
         let edge_count = batch.edges.len();
         // Decision 75 (Section 7.5): the graph commit rides the resolved
@@ -350,6 +499,14 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             i64::from(outcome.invalidated),
         )
         .await;
+        // Decision 106 (e): the grounded rows flip to 'promoted' AFTER
+        // the successful commit. Best effort like every counter of the
+        // pipeline: a lost flip can re-ground the pair in a later batch
+        // (one duplicate VALID edge, repairable with --invalidate); the
+        // pre-commit alternative risks losing the edge entirely.
+        if !promoted_row_ids.is_empty() {
+            self.flip_promoted_pairs(chat_id, &promoted_row_ids).await;
+        }
         // Decision 66: immediately AFTER the graph commit, enqueue the
         // (node_id, content-hash) pairs into the per-group
         // pending_embeddings queue. The sidecar vector write of Section
@@ -464,11 +621,17 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
 
         // Batch assembly.
         let frame = BatchFrame::of_rows(&rows);
-        let input = assemble_extraction_input(&frame.batch_id, &rows);
+        let mut input = assemble_extraction_input(&frame.batch_id, &rows);
         let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
         // Section 7.2 rule 5: the skeleton check. The extractor is never
         // called for a skeleton batch.
         let skeleton = is_skeleton_batch(&texts);
+        if !skeleton {
+            // Decision 106 (a)/(b): the related-pair promotion pass
+            // rides the extraction input — pending pairs whose two
+            // endpoint names both appear in the batch text.
+            input.related_pairs = self.promotion_candidates(chat_id, &rows).await;
+        }
 
         // The retry/dead-letter loop of specs.md Section 10.3. One
         // iteration is one batch attempt cycle (extract -> validate ->
@@ -731,6 +894,74 @@ impl<M: MemoryBackend> DigestPipeline for AgentDigestPipeline<M> {
     }
 }
 
+/// Decision 106 (d): the deterministic binding of the promotion pass.
+/// An extracted edge whose two endpoint names normalize-match a
+/// prompted pair's two stored names (either direction — the LLM's
+/// source/target ordering sets the edge direction) becomes a
+/// [`MemoryEdge`] DIRECTLY on the pair's stored node ids; entity
+/// resolution never sees it. The relationship name passes the same
+/// Section 6.3 post-validation as every extracted edge. Returns the
+/// (related_pairs row id, edge) pairs; the row ids drive the
+/// post-commit status flips.
+fn collect_promotion_edges(
+    graph: &KnowledgeGraph,
+    validated_names: &[RelationshipName],
+    pairs: &[RelatedPairCandidate],
+    batch_end: OffsetDateTime,
+) -> Vec<(i64, MemoryEdge)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let normed: Vec<(&RelatedPairCandidate, String, String)> = pairs
+        .iter()
+        .map(|pair| (pair, normalize(&pair.a_name), normalize(&pair.b_name)))
+        .collect();
+    let now = OffsetDateTime::now_utc();
+    let mut out = Vec::new();
+    for (edge, validated) in graph.edges.iter().zip(validated_names.iter()) {
+        let source = normalize(&edge.source);
+        let target = normalize(&edge.target);
+        let matched = normed
+            .iter()
+            .find(|(_, a, b)| (source == *a && target == *b) || (source == *b && target == *a));
+        let Some((pair, a_name, _)) = matched else {
+            continue;
+        };
+        let (source_id, target_id) = if source == *a_name {
+            (pair.node_a_id.clone(), pair.node_b_id.clone())
+        } else {
+            (pair.node_b_id.clone(), pair.node_a_id.clone())
+        };
+        let mut properties = serde_json::Map::new();
+        let relationship_name = match validated {
+            RelationshipName::Valid(name) => name.clone(),
+            RelationshipName::Fallback { original } => {
+                properties.insert(
+                    ORIGINAL_RELATIONSHIP_NAME_KEY.to_string(),
+                    original.clone().into(),
+                );
+                FALLBACK_RELATIONSHIP_NAME.to_string()
+            }
+        };
+        properties.insert(PROMOTED_FROM_KEY.to_string(), pair.row_id.into());
+        out.push((
+            pair.row_id,
+            MemoryEdge {
+                source_id,
+                target_id,
+                relationship_name,
+                valid_at: batch_end,
+                invalid_at: None,
+                edge_text: edge.description.clone(),
+                created_at: now,
+                updated_at: now,
+                properties: Some(serde_json::Value::Object(properties).to_string()),
+            },
+        ));
+    }
+    out
+}
+
 /// Batch assembly (Section 7.2): the labeled messages and the
 /// mention/reply map of the batch.
 fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionInput {
@@ -751,6 +982,8 @@ fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionI
         batch_id: batch_id.to_string(),
         messages,
         mention_map: assemble_mention_map(rows),
+        // Decision 106: filled by `run` after the skeleton check.
+        related_pairs: Vec::new(),
     }
 }
 

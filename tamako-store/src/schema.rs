@@ -378,6 +378,10 @@ DELETE FROM pending_embeddings WHERE status = 'done';
 -- status (decision 83(d)) — so no indexes beyond the primary key and
 -- the UNIQUE pair constraint; the promotion pass's status='pending'
 -- scan is rare and the table grows one row per reviewed verdict.
+-- (2026-09-07 annotation: the promotion pass shipped as decision 106 —
+-- Store::list_pending_related_pairs / set_related_pair_status are the
+-- reader/writer this comment anticipated; every OTHER read path still
+-- stays away.)
 CREATE TABLE related_pairs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     node_a_id    TEXT NOT NULL,

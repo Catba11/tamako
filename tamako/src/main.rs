@@ -13,7 +13,7 @@
 //! commands of decision 75 (graph-spec Section 7.5): they never start
 //! the event loop. Decision 77 (H5): the MUTATING offline commands
 //! (--merge-tool --apply, --merge, --merge-rollback, --invalidate,
-//! --revalidate) take the per-group advisory lock
+//! --revalidate, --dismiss-related-pair) take the per-group advisory lock
 //! ({data_root}/{chat_id}/.tamako.lock) and refuse loudly when another
 //! process holds it; --live holds the same per-group locks for its whole
 //! lifetime, so a mutating tool against a served group fails immediately
@@ -80,6 +80,8 @@ Usage:
   tamako --facts <chat_id> <name> [--data-root <dir>]
   tamako --invalidate <chat_id> <edge_id> [--data-root <dir>]
   tamako --revalidate <chat_id> <edge_id> [--data-root <dir>]
+  tamako --related-pairs <chat_id> [--data-root <dir>]
+  tamako --dismiss-related-pair <chat_id> <pair_id> [--data-root <dir>]
   tamako --help
 
 Options:
@@ -181,6 +183,26 @@ Options:
                            the per-group lock and refuses when another
                            process holds it (is the bot running?). No
                            LLM needed.
+  --related-pairs <chat_id>
+                           Lists the related_pairs side table of one
+                           group (decision 83/106): every recorded
+                           dotted-edge pair with its row id, status
+                           (pending/promoted/dismissed), endpoint
+                           names, reason, and timestamp. The row ids
+                           are the values --dismiss-related-pair
+                           takes. Read-only; the graph open conflicts
+                           with a running bot (same as --facts). No
+                           LLM needed.
+  --dismiss-related-pair <chat_id> <pair_id>
+                           Flips one PENDING related_pairs row to
+                           'dismissed' (decision 106 (f)): the
+                           promotion pass never offers the pair to the
+                           digest model again. <pair_id> is the row id
+                           --related-pairs prints; an unknown id or a
+                           row already terminal exits non-zero. Takes
+                           the per-group lock and refuses when another
+                           process holds it (is the bot running?). No
+                           LLM needed.
   --apply                  Only affects --merge-tool: executes the plan
                            file (merge_plan.json) of a previous dry run
                            instead of running a fresh dry run.
@@ -207,7 +229,8 @@ Options:
 
 /// The run mode. Exactly one of `--replay` / `--live` / `--status` /
 /// `--status-all` / `--merge-tool` / `--merge` / `--merge-rollback` /
-/// `--facts` / `--invalidate` / `--revalidate` is required.
+/// `--facts` / `--invalidate` / `--revalidate` / `--related-pairs` /
+/// `--dismiss-related-pair` is required.
 #[derive(Debug)]
 enum Mode {
     Replay {
@@ -241,6 +264,17 @@ enum Mode {
     Revalidate {
         chat_id: String,
         edge_id: String,
+    },
+    /// Decision 106 (f): the read-only listing of the `related_pairs`
+    /// side table (the dismissal operator's overview).
+    RelatedPairs {
+        chat_id: String,
+    },
+    /// Decision 106 (f): the operator dismissal — one pending row
+    /// flips to 'dismissed'.
+    DismissRelatedPair {
+        chat_id: String,
+        pair_id: i64,
     },
 }
 
@@ -285,6 +319,8 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     let mut facts = None;
     let mut invalidate = None;
     let mut revalidate = None;
+    let mut related_pairs = None;
+    let mut dismiss_related_pair = None;
     let mut allow_default_persona = false;
     let mut verbose = false;
     let mut apply = false;
@@ -332,6 +368,23 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
                 let chat_id = args.next().ok_or(missing)?;
                 let name = args.next().ok_or(missing)?;
                 facts = Some((chat_id, name));
+            }
+            "--related-pairs" => {
+                let missing = "the --related-pairs flag needs one value: <chat_id>";
+                let chat_id = args.next().ok_or(missing)?;
+                related_pairs = Some(chat_id);
+            }
+            "--dismiss-related-pair" => {
+                let missing =
+                    "the --dismiss-related-pair flag needs two values: <chat_id> <pair_id>";
+                let chat_id = args.next().ok_or(missing)?;
+                let pair_id = args.next().ok_or(missing)?;
+                let pair_id = pair_id.parse::<i64>().map_err(|_| {
+                    format!(
+                        "the --dismiss-related-pair pair id must be an integer, got '{pair_id}'"
+                    )
+                })?;
+                dismiss_related_pair = Some((chat_id, pair_id));
             }
             "--invalidate" | "--revalidate" => {
                 // The edge id is an OPAQUE string (a compact JSON of the
@@ -409,10 +462,17 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> std::result::Result<ParseO
     if let Some((chat_id, edge_id)) = revalidate {
         modes.push(Mode::Revalidate { chat_id, edge_id });
     }
+    if let Some(chat_id) = related_pairs {
+        modes.push(Mode::RelatedPairs { chat_id });
+    }
+    if let Some((chat_id, pair_id)) = dismiss_related_pair {
+        modes.push(Mode::DismissRelatedPair { chat_id, pair_id });
+    }
     const MODE_LIST: &str = "--replay <fixture.json>, --live, --status <chat_id>, \
          --status-all, --merge-tool <chat_id>, --merge <chat_id> <loser_id> <survivor_id>, \
          --merge-rollback <chat_id> <audit_id>, --facts <chat_id> <name>, \
-         --invalidate <chat_id> <edge_id>, or --revalidate <chat_id> <edge_id>";
+         --invalidate <chat_id> <edge_id>, --revalidate <chat_id> <edge_id>, \
+         --related-pairs <chat_id>, or --dismiss-related-pair <chat_id> <pair_id>";
     let mode = match modes.len() {
         1 => modes.pop().expect("exactly one mode collected"),
         0 => return Err(format!("one of {MODE_LIST} is required")),
@@ -1316,6 +1376,10 @@ async fn run(cli: Cli) -> Result<()> {
         Mode::Revalidate { chat_id, edge_id } => {
             return run_revalidate(&cli, chat_id, edge_id).await
         }
+        Mode::RelatedPairs { chat_id } => return run_related_pairs(&cli, chat_id).await,
+        Mode::DismissRelatedPair { chat_id, pair_id } => {
+            return run_dismiss_related_pair(&cli, chat_id, *pair_id).await
+        }
         Mode::Replay { .. } | Mode::Live => {}
     }
     let setup = shared_setup(&cli)?;
@@ -1333,7 +1397,9 @@ async fn run(cli: Cli) -> Result<()> {
         | Mode::MergeRollback { .. }
         | Mode::Facts { .. }
         | Mode::Invalidate { .. }
-        | Mode::Revalidate { .. } => unreachable!(),
+        | Mode::Revalidate { .. }
+        | Mode::RelatedPairs { .. }
+        | Mode::DismissRelatedPair { .. } => unreachable!(),
     }
 }
 
@@ -2494,6 +2560,78 @@ async fn run_invalidate(cli: &Cli, chat_id: &str, edge_id: &str) -> Result<()> {
 /// safety net (decision 75).
 async fn run_revalidate(cli: &Cli, chat_id: &str, edge_id: &str) -> Result<()> {
     run_edge_validity(cli, chat_id, edge_id, false).await
+}
+
+/// The `--related-pairs` run (decision 106 (f)): the dismissal
+/// operator's overview of the `related_pairs` side table — every row
+/// with its status, endpoint names (hydrated from the graph), reason,
+/// and timestamp. OFFLINE read-only (decision 77 M7): no lock, no
+/// migrations; the graph open conflicts with a running bot, the same
+/// as --facts. No LLM needed.
+async fn run_related_pairs(cli: &Cli, chat_id: &str) -> Result<()> {
+    let (store, memory) = open_merge_group_read_only(&cli.data_root, chat_id)?;
+    let rows = tokio::task::spawn_blocking(move || store.list_related_pairs())
+        .await
+        .context("the blocking store task failed to join")?
+        .with_context(|| format!("failed to read the related pairs of group {chat_id}"))?;
+    if rows.is_empty() {
+        println!("no related pairs recorded in group {chat_id}");
+        return Ok(());
+    }
+    println!("{} related pair(s) in group {chat_id}:", rows.len());
+    for row in rows {
+        // An endpoint removed from the graph renders as the raw id:
+        // the row stays inspectable. The two resolves serialize (the
+        // same backend); the listing is operator-scale, never hot.
+        let mut names: Vec<String> = Vec::with_capacity(2);
+        for node_id in [&row.node_a_id, &row.node_b_id] {
+            let rendered = match memory.node_content(chat_id, node_id).await {
+                Ok(Some(content)) => format!("\"{}\"", content.name),
+                _ => format!("<gone: {node_id}>"),
+            };
+            names.push(rendered);
+        }
+        let (a, b) = (names.remove(0), names.remove(0));
+        println!(
+            "  #{} [{}] {} ({}) <-> {} ({})\n      reason: {}\n      recorded: {} by {}",
+            row.id,
+            row.status,
+            a,
+            row.node_a_id,
+            b,
+            row.node_b_id,
+            row.reason,
+            row.created_at,
+            row.confirmed_by
+        );
+    }
+    Ok(())
+}
+
+/// The `--dismiss-related-pair` run (decision 106 (f)): flips one
+/// PENDING row to 'dismissed'. OFFLINE mutating: takes the per-group
+/// lock. An unknown id or a row already terminal (promoted/dismissed)
+/// is a loud error — the operator never silently targets the wrong
+/// row. No LLM needed.
+async fn run_dismiss_related_pair(cli: &Cli, chat_id: &str, pair_id: i64) -> Result<()> {
+    let _lock = acquire_group_lock(&cli.data_root, chat_id)?;
+    let (store, _memory) = open_merge_group(&cli.data_root, chat_id)?;
+    let chat_id_owned = chat_id.to_string();
+    let changed = tokio::task::spawn_blocking(move || {
+        store.set_related_pair_status(&chat_id_owned, pair_id, "dismissed")
+    })
+    .await
+    .context("the blocking store task failed to join")?
+    .with_context(|| format!("failed to dismiss related pair {pair_id} in group {chat_id}"))?;
+    if changed {
+        println!("related pair {pair_id} dismissed (group {chat_id})");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "related pair {pair_id} in group {chat_id} is not pending (unknown id or already \
+             terminal); run --related-pairs {chat_id} for the current statuses"
+        )
+    }
 }
 
 /// The display name of one endpoint of a plan action's pair.
@@ -3688,6 +3826,64 @@ mod tests {
             }
             _ => panic!("expected the revalidate mode"),
         }
+    }
+
+    #[test]
+    fn related_pairs_parses_chat_id() {
+        let outcome =
+            parse(&["--related-pairs", "-1001"]).expect("a valid --related-pairs command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::RelatedPairs { chat_id } => assert_eq!(chat_id, "-1001"),
+            _ => panic!("expected the related-pairs mode"),
+        }
+    }
+
+    #[test]
+    fn related_pairs_needs_one_value() {
+        let error =
+            parse(&["--related-pairs"]).expect_err("an incomplete --related-pairs must fail");
+        assert!(error.contains("--related-pairs"), "message: {error}");
+    }
+
+    #[test]
+    fn dismiss_related_pair_parses_chat_and_pair_id() {
+        let outcome = parse(&["--dismiss-related-pair", "-1001", "7"])
+            .expect("a valid --dismiss-related-pair command line");
+        let ParseOutcome::Run(cli) = outcome else {
+            panic!("expected the Run outcome");
+        };
+        match cli.mode {
+            Mode::DismissRelatedPair { chat_id, pair_id } => {
+                assert_eq!(chat_id, "-1001");
+                assert_eq!(pair_id, 7);
+            }
+            _ => panic!("expected the dismiss-related-pair mode"),
+        }
+    }
+
+    #[test]
+    fn dismiss_related_pair_needs_two_values() {
+        for args in [
+            &["--dismiss-related-pair"][..],
+            &["--dismiss-related-pair", "-1001"][..],
+        ] {
+            let error = parse(args).expect_err("an incomplete --dismiss-related-pair must fail");
+            assert!(
+                error.contains("--dismiss-related-pair"),
+                "args: {args:?}, message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dismiss_related_pair_pair_id_must_be_an_integer() {
+        let error = parse(&["--dismiss-related-pair", "-1001", "abc"])
+            .expect_err("a non-integer pair id must fail");
+        assert!(error.contains("pair id"), "message: {error}");
+        assert!(error.contains("abc"), "message: {error}");
     }
 
     #[test]
