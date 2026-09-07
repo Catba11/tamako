@@ -2757,6 +2757,32 @@ feature commit (decision 92).
     falls through to a new node — fragmentation the merge tool
     repairs. Watch the confirmed/rejected rates after the deploy
     before touching the budget.
+105. (2026-09-07, operator-ruled) Identifier normalization extended:
+    strip `@`, fold ASCII letter<->digit space boundaries. The
+    decision-81 evaluation (eval-81-2026-09-07.md) showed that
+    deterministic normalization catches name-form variants more
+    cheaply and more exactly than any vector threshold (the vector
+    instrument cannot separate identity from relatedness). The
+    extension of `identifiers::normalize`: (a) every `@` is stripped
+    before NFKC (mention-style surface forms: "@tama" and "tama" were
+    separate Alias nodes; the 2026-09-07 snapshot counts 30 collision
+    groups that now fold into one identifier each — an immediate
+    deterministic dedup win); (b) after the existing
+    NFKC/lowercase/whitespace-collapse, a space at an ASCII
+    letter<->digit boundary IN EITHER ORDER is removed ("Qwen 3.8
+    27B" and "Qwen3.8 27B" fold to one Concept identifier; "Windows
+    11" folds to "windows11"). Word-word spaces survive: "graph
+    database" keeps its space, so the blast radius stays narrow —
+    363 of the 14,037 name-derived identifiers of the snapshot
+    (2.6%) change. MIGRATION STANCE (rule R3 — primary keys never
+    change — forbids an id-rewrite migration): the 363 legacy-id
+    nodes stay under their old identifiers; new writes of the same
+    surface forms land on the new identifiers; the merge tool's
+    candidate scan (decision 74/104) pairs the fragments for the
+    operator-confirmed merge. No schema version, no data migration.
+    The one normalize() serves every consumer (id generation, the
+    stored normalized alias name, recall terms, warmup cooldown
+    keys, mention dedup) so all paths shift in lockstep.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
