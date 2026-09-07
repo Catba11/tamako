@@ -168,7 +168,7 @@ Each node identifier is a deterministic UUID5 string of 36 bytes. The identifier
 | Concept | `uuid5("concept:{normalized_canonical_name}")` |
 | MessageBatch | `uuid5("batch:{first_msg_id}:{last_msg_id}")` |
 
-Normalization rules: Unicode NFKC, lowercase, no leading or trailing spaces, and one space between words.
+Normalization rules: strip every `@`, then Unicode NFKC, lowercase, no leading or trailing spaces, one space between words, and NO space at an ASCII letter<->digit boundary in either order ("Qwen 3.8" and "Qwen3.8" fold to the same identifier, decision 105).
 
 CAUTION: Normalization does not merge synonyms across languages. The strings "entropy increase" and its Chinese equivalent get different identifiers. Merge them with an explicit `also_known_as` edge. Refer to step 5 of Section 7.4.
 
