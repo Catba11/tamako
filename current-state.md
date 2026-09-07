@@ -2019,9 +2019,17 @@ feature commit (decision 92).
     suffixes. The embedding and caption providers are built ONCE
     process-wide from the global config (a shared Arc, decision
     73) with no chat_id in scope, so they send the bare prefix at
-    cutover. Per-group affinity for them is an accepted
+    cutover. Per-group affinity for them was an accepted
     follow-up requiring provider restructuring (a per-group
     provider build or a per-request header override seam).
+    ADDENDUM (2026-09-07, operator-ruled): the follow-up is
+    evaluated and DECLINED. Affinity pays where repeated calls
+    share a long prefix (the reply path's preamble + context —
+    the premise of this decision); a caption call is a fixed
+    short template plus one image, an embedding call a single
+    stateless text — neither carries a reusable prefix, so the
+    per-group affinity win rounds to zero. The bare-prefix
+    behavior of caption and embedding is final.
     (c) RESOLUTION POINT: the suffix is minted lazily at the
     per-group service-build site (the binary's group spawn /
     per-group pipeline construction), NOT in
