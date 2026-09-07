@@ -2705,6 +2705,24 @@ feature commit (decision 92).
     behavioral change beyond the dry-run output text; the migration
     runner versions by number only, so the v9 comment edit touches
     no live database.
+103. (2026-09-07) The caption minors of the 2026-09-04 review
+    (finding 53): a request bound and retry-WARN attribution. The
+    caption request carried NO `max_tokens` — an all-reasoning
+    response burned the provider-side default before arriving at the
+    deliberate `CaptionError::Empty` — and the retry WARN of
+    decision 82 (d) named the error and the attempt but not the
+    media kind. The request now carries `CAPTION_MAX_TOKENS` = 8192
+    (a code constant like ENDPOINT_TIMEOUT, deliberately no config
+    key): a concise caption costs ~200 tokens, reasoning headroom
+    included, and a runaway all-reasoning answer now dies at 8192
+    instead of the provider default. The cap BOUNDS the failure's
+    cost and latency; it cannot prevent Empty (no request knob
+    suppresses reasoning on this endpoint family), and Empty stays
+    non-retried by decision-82 design. The retry WARN gains
+    `media_kind`. The decision-82 leftovers stay open by operator
+    ruling (2026-09-07): the media-element forgery hard fix is a
+    later discussion, and the M2 crash-window journaling is not
+    scheduled.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
