@@ -17,13 +17,21 @@ fn uuid5(key: &str) -> String {
         .to_string()
 }
 
-/// Normalizes a surface form or a canonical name. Section 7.1: Unicode
-/// NFKC, lowercase, no leading or trailing spaces, one space between words.
+/// Normalizes a surface form or a canonical name. Section 7.1
+/// (decision 105): Unicode NFKC, every `@` stripped (after NFKC, which
+/// folds the fullwidth U+FF20 to `@`), lowercase, no leading or
+/// trailing spaces, one space between words, and NO space at an ASCII
+/// letter<->digit boundary in either order ("Qwen 3.8" and "Qwen3.8"
+/// carry one identifier).
 pub fn normalize(text: &str) -> String {
     let nfkc: String = text.nfkc().collect();
     let mut out = String::with_capacity(nfkc.len());
     let mut after_space = true;
-    for ch in nfkc.chars().flat_map(char::to_lowercase) {
+    for ch in nfkc
+        .chars()
+        .filter(|ch| *ch != '@')
+        .flat_map(char::to_lowercase)
+    {
         if ch.is_whitespace() {
             if !after_space {
                 out.push(' ');
@@ -36,6 +44,27 @@ pub fn normalize(text: &str) -> String {
     }
     if out.ends_with(' ') {
         out.pop();
+    }
+    fold_letter_digit_boundaries(&out)
+}
+
+/// Decision 105 (b): removes a space at an ASCII letter<->digit
+/// boundary in either order. The input carries single spaces only (the
+/// collapse above), so the byte neighbors of a space are the token
+/// boundaries; non-ASCII bytes are never ASCII alphanumeric, so the
+/// byte check is UTF-8 safe.
+fn fold_letter_digit_boundaries(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    for (index, ch) in text.char_indices() {
+        let fold = ch == ' '
+            && index > 0
+            && index + 1 < bytes.len()
+            && (bytes[index - 1].is_ascii_alphabetic() && bytes[index + 1].is_ascii_digit()
+                || bytes[index - 1].is_ascii_digit() && bytes[index + 1].is_ascii_alphabetic());
+        if !fold {
+            out.push(ch);
+        }
     }
     out
 }
@@ -84,6 +113,22 @@ mod tests {
 
     #[test]
     fn normalize_applies_nfkc_case_and_whitespace_rules() {
+        // Decision 105: `@` stripping and the letter<->digit fold.
+        assert_eq!(normalize("@Tama"), "tama");
+        // NFKC folds the fullwidth U+FF20 to `@` first, so it strips.
+        assert_eq!(normalize("＠tama"), "tama");
+        assert_eq!(normalize("Qwen 3.8 27B"), "qwen3.8 27b");
+        assert_eq!(normalize("Qwen3.8 27B"), "qwen3.8 27b");
+        assert_eq!(normalize("Windows 11"), "windows11");
+        assert_eq!(normalize("gemini 3.7 flash"), "gemini3.7flash");
+        // A letter-letter or digit-digit boundary keeps its space.
+        assert_eq!(normalize("graph database"), "graph database");
+        assert_eq!(normalize("version 3 8"), "version3 8");
+        assert_eq!(normalize("a @ b"), "a b");
+    }
+
+    #[test]
+    fn normalize_rules_pre_decision_105_still_hold() {
         // Full-width characters fold to ASCII under NFKC.
         assert_eq!(normalize("Ｔａｍａｋｏ"), "tamako");
         assert_eq!(normalize("  Graph   Database  "), "graph database");
@@ -97,6 +142,9 @@ mod tests {
     fn normalized_inputs_give_equal_identifiers() {
         assert_eq!(alias_id("  TAMAKO "), alias_id("tamako"));
         assert_eq!(concept_id("Ｅｎｔｒｏｐｙ"), concept_id("entropy"));
+        // Decision 105: mention-style and spacing variants fold.
+        assert_eq!(alias_id("@tama"), alias_id("tama"));
+        assert_eq!(concept_id("Qwen 3.8 27B"), concept_id("qwen3.8 27b"));
     }
 
     #[test]
