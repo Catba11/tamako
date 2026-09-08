@@ -101,6 +101,14 @@ Backstop before committing such a change: `grep -n <token> README.md tamako.exam
 
 Search scope convention (operator ruling, 2026-09-06): repo-wide searches EXCLUDE `./data` (live data) and `./target` (build output) — pass explicit paths to the search tool instead of searching the repository root. Search inside those directories only when troubleshooting their contents.
 
+### 6.6 Git branch discipline (operator ruling, 2026-09-07)
+
+- Do ALL work on `main`. `catball-self-use` is the operator's live branch (main plus private prompt-tuning patches); never commit work to it directly.
+- Run `git branch --show-current` before EVERY commit. If it does not print `main`, stop and switch. (Violated once on 2026-09-08: a docs commit landed on `catball-self-use`; recovered with `git reset --soft HEAD~1`, a stash move, and a recommit on main.)
+- After pushing main, rebase the live branch: `git checkout catball-self-use && git rebase main && git checkout main`. Resolve conflicts by keeping both sides faithful (the main change plus the self-use hunks). The bot's release binary builds from the BRANCH tip: rebuild it after the rebase when a restart is due.
+- NEVER `git add -A`, and never stage a directory: untracked never-commit files live in the worktree (the gitignored live config `data/persona.toml` and `tamako.toml`, review/eval notes, scratch examples). Stage explicit file paths.
+- Prompt-tuning content is confidential: it stays on `catball-self-use` and never crosses into a main-bound commit.
+
 ## 7. Definition of done
 
 1. The four commands of Section 5 pass.
