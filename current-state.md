@@ -2834,6 +2834,36 @@ feature commit (decision 92).
     tool starts recording pairs.
     No schema migration: the v12 table carried its status column
     from birth (decision 83 (a)).
+107. (2026-09-08) New-group lock acquisition creates the group
+    directory (live regression fix). Decision 77 (H5) put
+    `acquire_group_lock` at the TOP of the live lazy-spawn branch,
+    before any store touch; the lock open (`create(true)`) creates
+    the lock FILE but not the group DIRECTORY, so the first event
+    of a never-before-served group failed the open with ENOENT and
+    the house-consistent fatal path exited the process (observed
+    2026-09-08 on the first group added since decision 77). Pre-77
+    the first filesystem touch was `Store::open_group`'s
+    `create_dir_all`, which never fails on a missing directory —
+    that is why Phase 1 added groups freely. Latent 18 days: every
+    existing group had its directory, and the H5 tests pre-create
+    it.
+    (a) FIX: `acquire_group_lock` runs `std::fs::create_dir_all` on
+    the lock file's parent directory before the open. Mutual
+    exclusion is the lock's only job; the existence check stays
+    with `check_merge_group_exists`, which tests the store.db FILE
+    — a mistyped chat id in a mutating CLI still fails loudly, now
+    with the accurate "no store.db" wording instead of the
+    misleading lock-file open error. Residue: a mistyped id leaves
+    an empty directory holding only a lock file; harmless, and a
+    later real add of the same id reuses it.
+    (b) LOG WORDING: the live spawn branch logged EVERY
+    acquisition failure as "the group lock is held by another
+    process". The static text now names acquisition generically;
+    the structured error field carries the real cause (contention
+    vs a missing directory vs a permission failure).
+    (c) REGRESSION PIN: a unit test acquires the lock on a group
+    whose directory does not exist (the contention test
+    pre-creates it, which is how the hole stayed invisible).
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
