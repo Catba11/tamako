@@ -2864,6 +2864,64 @@ feature commit (decision 92).
     (c) REGRESSION PIN: a unit test acquires the lock on a group
     whose directory does not exist (the contention test
     pre-creates it, which is how the hole stayed invisible).
+108. (2026-09-08, operator-ruled) Forwarded messages carry their
+    origin end to end. Before this entry the intake normalization
+    dropped Telegram's forward metadata entirely: a forwarded
+    message persisted, rendered, and extracted as the FORWARDER's
+    own words, and the digest bound content facts to the
+    forwarder's Person node — attribution pollution of the graph.
+    (a) CAPTURE: the adapter folds `forward_origin` (kinds user /
+    hidden_user / chat / channel, each with the original send
+    date) and `is_automatic_forward` into a core `ForwardOrigin`
+    value on the normalized message. The edit path captures the
+    same fields: manually forwarded messages are NOT editable by
+    the forwarder (operator confirmation 2026-09-08), but a
+    channel-post edit propagates to the auto-forwarded copy of the
+    discussion group and arrives as an edited message WITH the
+    origin set.
+    (b) STORAGE: schema v14 adds five NULL-able columns to the
+    messages table (forward_kind, forward_label, forward_origin_id,
+    forward_date, forward_automatic); rows written before v14 read
+    them as NULL — not forwarded (the v4 sender_username
+    precedent). The origin id (a Telegram user id for user-kind
+    forwards) is stored because the verified-origin probe of (d)
+    derives the deterministic Person id from it.
+    (c) RENDERING: the Section 7.3 <msg> grammar gains one
+    attribute, `fwd="{kind}:{label}"`, after `mention`; an
+    automatic forward renders `fwd="auto:{label}"`. A row without
+    forward data renders byte-identical (replay safety, the 106
+    (c) discipline). The digest message line carries the marker
+    inline: `[Name HH:MM] (fwd user:Origin) text`.
+    (d) EXTRACTION ATTRIBUTION (the pollution fix, specs.md
+    Section 10.1): the preamble's rule 11 — forwarded content is
+    the ORIGIN's statement, never the sender's; attribute it to
+    the origin ONLY through the verified-origin list of the batch.
+    An origin enters the list ONLY when it is a user-kind forward
+    whose deterministic Person id ALREADY EXISTS in the group
+    graph (assembly-time probe, the 106 (a) mechanism). Forward
+    origins never mint nodes — the option-C design (bind every
+    origin) was rejected on P5 hygiene: an out-of-group or
+    id-less origin has no business in the group graph. An
+    unlisted origin (hidden, chat, channel, automatic, or
+    unverified) is unattributable for PERSON facts; Concepts
+    still extract from forwarded content normally.
+    (e) COLLISION EXCLUSION: an origin label that
+    normalize-matches a batch SENDER's display name leaves the
+    list (review finding — display names collide freely, Chinese
+    ones worst; the exclusion kills the "which person did the
+    model mean" class deterministically). A verified origin binds
+    through a mention-map entry with the NEW source `origin`: the
+    existence probe is exactly what makes the step-1 binding safe
+    (an UNVERIFIED origin in the map would mint a Person node at
+    the MERGE — the second review finding — so the probe gates
+    list entry AND map entry together). No separate rebind pass
+    was needed: the verified binding derives the same person_id.
+    (f) SCOPE CUTS (operator ruling 2026-09-08): the forwarder
+    gets NO content edge from a forwarded message (no weak
+    "shared"/"interested_in" relation in v1); chat/channel author
+    signatures drop at normalization (the display label carries
+    the origin); the original send date is stored but not
+    rendered.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
