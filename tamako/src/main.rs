@@ -1779,6 +1779,16 @@ struct GroupLock {
 /// on exit anyway.
 fn acquire_group_lock(data_root: &Path, chat_id: &str) -> Result<GroupLock> {
     let path = data_root.join(chat_id).join(GROUP_LOCK_FILE_NAME);
+    // Decision 107 (a): the group directory of a never-before-served
+    // group does not exist yet — the store's create_dir_all runs only
+    // when the actor first touches the store, AFTER this lock. Create
+    // the directory here: mutual exclusion is the lock's only job; the
+    // existence check stays with check_merge_group_exists.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create the group directory {}", parent.display())
+        })?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -3134,7 +3144,7 @@ async fn run_live(
                             let lock = match acquire_group_lock(setup.store.data_root(), &chat_id) {
                                 Ok(lock) => lock,
                                 Err(error) => {
-                                    error!(chat_id = %chat_id, %error, "the group lock is held by another process; this group cannot be served");
+                                    error!(chat_id = %chat_id, %error, "failed to acquire the group lock; this group cannot be served");
                                     fatal = Some(error);
                                     break;
                                 }
@@ -4892,6 +4902,21 @@ mod tests {
         file.actions[0].verdict = "maybe".to_string();
         let error = file.into_plan().expect_err("an unknown verdict");
         assert!(format!("{error:#}").contains("unknown verdict"));
+    }
+
+    #[test]
+    fn group_lock_creates_a_missing_group_directory() {
+        // Decision 107 regression pin: the first event of a
+        // never-before-served group acquires the lock BEFORE the
+        // store's create_dir_all runs — the lock path must create the
+        // directory itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let group_dir = dir.path().join("new-group");
+        assert!(!group_dir.exists(), "the group dir starts absent");
+        let guard = acquire_group_lock(dir.path(), "new-group").expect("lock on a missing dir");
+        assert!(group_dir.join(".tamako.lock").is_file());
+        drop(guard);
+        acquire_group_lock(dir.path(), "new-group").expect("reacquirable");
     }
 
     #[test]
