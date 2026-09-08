@@ -201,6 +201,7 @@ mod tests {
             reply_to_platform_msg_id: None,
             mentions_bot: false,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 

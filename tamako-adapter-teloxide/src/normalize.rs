@@ -30,10 +30,12 @@
 //!   note on that function.
 
 use tamako_core::context::MediaKindName;
-use tamako_core::event::{InboundEvent, MemberEvent, NormalizedMessage, ReactionEvent};
+use tamako_core::event::{
+    ForwardKind, ForwardOrigin, InboundEvent, MemberEvent, NormalizedMessage, ReactionEvent,
+};
 use teloxide::types::{
-    Chat, Me, Message, MessageEntityKind, MessageReactionCountUpdated, MessageReactionUpdated,
-    PhotoSize, ReactionType, User,
+    Chat, Me, Message, MessageEntityKind, MessageOrigin, MessageReactionCountUpdated,
+    MessageReactionUpdated, PhotoSize, ReactionType, User,
 };
 use time::OffsetDateTime;
 
@@ -74,6 +76,67 @@ pub fn display_name(user: &User) -> String {
 /// sign is kept.
 pub fn chat_id_string(chat: &Chat) -> String {
     chat.id.0.to_string()
+}
+
+/// The display label of a chat/channel forward origin: the title, then
+/// "@username", then the numeric id (the display-name chain of
+/// `display_name`, adapted to a chat).
+fn chat_label(chat: &Chat) -> String {
+    if let Some(title) = chat.title() {
+        title.to_string()
+    } else if let Some(username) = chat.username() {
+        format!("@{username}")
+    } else {
+        chat.id.0.to_string()
+    }
+}
+
+/// The forward origin of a message (decision 108, specs.md Section
+/// 4.2). `None` when the message is not a forward. Chat/channel author
+/// signatures drop here (operator ruling): the label carries the
+/// origin. The automatic-forward flag rides along — a linked channel's
+/// repost into its discussion group has no sharing member.
+fn normalize_forward(msg: &Message) -> Option<ForwardOrigin> {
+    let origin = msg.forward_origin()?;
+    let automatic = msg.is_automatic_forward();
+    let (kind, label, origin_id, date) = match origin {
+        MessageOrigin::User { date, sender_user } => (
+            ForwardKind::User,
+            display_name(sender_user),
+            Some(sender_user.id.0.to_string()),
+            *date,
+        ),
+        MessageOrigin::HiddenUser {
+            date,
+            sender_user_name,
+        } => (
+            ForwardKind::HiddenUser,
+            sender_user_name.clone(),
+            None,
+            *date,
+        ),
+        MessageOrigin::Chat {
+            date, sender_chat, ..
+        } => (
+            ForwardKind::Chat,
+            chat_label(sender_chat),
+            Some(chat_id_string(sender_chat)),
+            *date,
+        ),
+        MessageOrigin::Channel { date, chat, .. } => (
+            ForwardKind::Channel,
+            chat_label(chat),
+            Some(chat_id_string(chat)),
+            *date,
+        ),
+    };
+    Some(ForwardOrigin {
+        kind,
+        label,
+        origin_id,
+        date: unix_to_offset(date.timestamp()),
+        automatic,
+    })
 }
 
 /// A text message -> `NormalizedMessage`. `None` for messages with no text
@@ -122,6 +185,9 @@ pub fn normalize_message_with_text(
         is_reply_to_bot: reply
             .and_then(|m| m.from.as_ref())
             .is_some_and(|author| author.id.0 == bot.id),
+        // Decision 108: both the message path and the edit path go
+        // through this function, so one capture covers both.
+        forward: normalize_forward(msg),
     }
 }
 
@@ -592,6 +658,167 @@ mod tests {
         assert_eq!(normalized.reply_to_platform_msg_id, None);
         assert!(!normalized.mentions_bot);
         assert!(!normalized.is_reply_to_bot);
+    }
+
+    // Decision 108 (specs.md Section 4.2): a forwarded message carries
+    // its origin kind, label, id (when public), original date, and the
+    // automatic flag. The sender stays the forwarder; the origin never
+    // replaces it.
+    const ORIGIN_DATE: i64 = 1_699_000_000;
+
+    #[test]
+    fn a_user_forward_carries_the_origin_and_keeps_the_forwarder_as_sender() {
+        let msg = message(json!({
+            "text": "look at this",
+            "forward_origin": {
+                "type": "user",
+                "date": ORIGIN_DATE,
+                "sender_user": user_json(7, "Bob", Some("Lee"), Some("bob")),
+            },
+        }));
+        let normalized = normalize_message(&msg, &bot()).expect("a text message");
+        assert_eq!(normalized.sender_id, "42");
+        assert_eq!(normalized.sender_display_name, "Alice Smith");
+        let forward = normalized.forward.expect("a forward origin");
+        assert_eq!(forward.kind, ForwardKind::User);
+        assert_eq!(forward.label, "Bob Lee");
+        assert_eq!(forward.origin_id, Some("7".to_string()));
+        assert_eq!(forward.date, unix_to_offset(ORIGIN_DATE));
+        assert!(!forward.automatic);
+    }
+
+    #[test]
+    fn a_hidden_user_forward_carries_the_name_without_an_id() {
+        let msg = message(json!({
+            "text": "old words",
+            "forward_origin": {
+                "type": "hidden_user",
+                "date": ORIGIN_DATE,
+                "sender_user_name": "张伟",
+            },
+        }));
+        let forward = normalize_message(&msg, &bot())
+            .expect("a text message")
+            .forward
+            .expect("a forward origin");
+        assert_eq!(forward.kind, ForwardKind::HiddenUser);
+        assert_eq!(forward.label, "张伟");
+        assert_eq!(forward.origin_id, None);
+        assert_eq!(forward.date, unix_to_offset(ORIGIN_DATE));
+        assert!(!forward.automatic);
+    }
+
+    #[test]
+    fn a_chat_forward_carries_the_chat_title_and_id() {
+        let msg = message(json!({
+            "text": "from the old group",
+            "forward_origin": {
+                "type": "chat",
+                "date": ORIGIN_DATE,
+                "sender_chat": {
+                    "id": -998_877,
+                    "type": "group",
+                    "title": "Old Squad",
+                },
+            },
+        }));
+        let forward = normalize_message(&msg, &bot())
+            .expect("a text message")
+            .forward
+            .expect("a forward origin");
+        assert_eq!(forward.kind, ForwardKind::Chat);
+        assert_eq!(forward.label, "Old Squad");
+        assert_eq!(forward.origin_id, Some("-998877".to_string()));
+        assert_eq!(forward.date, unix_to_offset(ORIGIN_DATE));
+        assert!(!forward.automatic);
+    }
+
+    #[test]
+    fn a_channel_forward_carries_the_channel_title_and_id() {
+        let msg = message(json!({
+            "text": "breaking news",
+            "forward_origin": {
+                "type": "channel",
+                "date": ORIGIN_DATE,
+                "chat": {
+                    "id": -1_009_876_543_210_i64,
+                    "type": "channel",
+                    "title": "News Room",
+                },
+                "message_id": 77,
+            },
+        }));
+        let forward = normalize_message(&msg, &bot())
+            .expect("a text message")
+            .forward
+            .expect("a forward origin");
+        assert_eq!(forward.kind, ForwardKind::Channel);
+        assert_eq!(forward.label, "News Room");
+        assert_eq!(forward.origin_id, Some("-1009876543210".to_string()));
+        assert_eq!(forward.date, unix_to_offset(ORIGIN_DATE));
+        assert!(!forward.automatic);
+    }
+
+    #[test]
+    fn an_automatic_forward_sets_the_flag() {
+        // A linked channel's repost into its discussion group arrives
+        // with is_automatic_forward; the origin kind still maps
+        // normally.
+        let msg = message(json!({
+            "text": "channel post",
+            "is_automatic_forward": true,
+            "forward_origin": {
+                "type": "channel",
+                "date": ORIGIN_DATE,
+                "chat": {
+                    "id": -1_009_876_543_210_i64,
+                    "type": "channel",
+                    "title": "News Room",
+                },
+                "message_id": 78,
+            },
+        }));
+        let forward = normalize_message(&msg, &bot())
+            .expect("a text message")
+            .forward
+            .expect("a forward origin");
+        assert_eq!(forward.kind, ForwardKind::Channel);
+        assert_eq!(forward.label, "News Room");
+        assert!(forward.automatic);
+    }
+
+    #[test]
+    fn an_edited_autoforward_keeps_its_origin_with_the_edit_date() {
+        // A channel-post edit propagates to the auto-forwarded copy as
+        // an edited message: the origin survives and the timestamp is
+        // the edit date.
+        let msg = message(json!({
+            "text": "channel post (corrected)",
+            "edit_date": DATE + 5,
+            "is_automatic_forward": true,
+            "forward_origin": {
+                "type": "channel",
+                "date": ORIGIN_DATE,
+                "chat": {
+                    "id": -1_009_876_543_210_i64,
+                    "type": "channel",
+                    "title": "News Room",
+                },
+                "message_id": 78,
+            },
+        }));
+        let normalized = normalize_edited_message(&msg, &bot()).expect("a text message");
+        assert_eq!(normalized.timestamp, unix_to_offset(DATE + 5));
+        let forward = normalized.forward.expect("a forward origin");
+        assert_eq!(forward.kind, ForwardKind::Channel);
+        assert!(forward.automatic);
+    }
+
+    #[test]
+    fn a_plain_message_has_no_forward_origin() {
+        let normalized =
+            normalize_message(&text_message("hello", json!([])), &bot()).expect("a text message");
+        assert_eq!(normalized.forward, None);
     }
 
     #[test]

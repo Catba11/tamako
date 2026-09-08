@@ -2299,6 +2299,7 @@ The context section is read-only orientation; the selection names candidate numb
                     reply_to_platform_msg_id: None,
                     mentions_bot: false,
                     is_reply_to_bot: false,
+                    forward: None,
                 },
             )
             .expect("insert the reply target row");

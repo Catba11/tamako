@@ -57,6 +57,7 @@ fn message(id: &str, seconds: i64, sender_id: &str, name: &str, text: &str) -> N
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 
@@ -205,6 +206,7 @@ async fn insert_messages(fixture: &Fixture, offset: usize, texts: &[(&str, &str,
             reply_to_platform_msg_id: None,
             mentions_bot: false,
             is_reply_to_bot: false,
+            forward: None,
         })
         .collect();
     tokio::task::spawn_blocking(move || {

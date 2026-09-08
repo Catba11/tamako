@@ -335,6 +335,7 @@ fn message(id: &str, at: OffsetDateTime, mention: bool) -> NormalizedMessage {
         reply_to_platform_msg_id: None,
         mentions_bot: mention,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 
@@ -1198,6 +1199,7 @@ async fn the_gate_context_view_extends_byte_for_byte_across_consecutive_wakes() 
             false,
             false,
             ReplyRender::None,
+            None,
             &format!("text of {id}"),
         )
     };

@@ -79,6 +79,7 @@ fn message(id: &str, seconds: i64, sender_id: &str, name: &str, text: &str) -> N
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn message_at(id: &str, at: OffsetDateTime, text: &str) -> NormalizedMessage {
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 

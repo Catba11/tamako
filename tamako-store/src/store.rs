@@ -82,6 +82,62 @@ impl EventType {
     }
 }
 
+/// Kind of a forward origin (decision 108, specs.md Section 4.2). The
+/// token mirrors `tamako_core::event::ForwardKind`; the duplication is
+/// deliberate — the store crate sits below core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardKind {
+    User,
+    HiddenUser,
+    Chat,
+    Channel,
+}
+
+impl ForwardKind {
+    /// The storage token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForwardKind::User => "user",
+            ForwardKind::HiddenUser => "hidden_user",
+            ForwardKind::Chat => "chat",
+            ForwardKind::Channel => "channel",
+        }
+    }
+
+    fn from_str(s: &str) -> rusqlite::Result<Self> {
+        match s {
+            "user" => Ok(ForwardKind::User),
+            "hidden_user" => Ok(ForwardKind::HiddenUser),
+            "chat" => Ok(ForwardKind::Chat),
+            "channel" => Ok(ForwardKind::Channel),
+            _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown forward_kind: {s}").into(),
+            )),
+        }
+    }
+}
+
+/// The forward origin of a log row (decision 108). `None` on the
+/// `forward` field means not forwarded; rows written before migration
+/// v14 read as `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRow {
+    pub kind: ForwardKind,
+    /// The origin user's display name, the hidden user's name, or the
+    /// chat/channel title.
+    pub label: String,
+    /// The platform id of the origin when the platform gives one (the
+    /// verified-origin probe of the digest pipeline derives the
+    /// deterministic Person id from it). `None` for hidden users.
+    pub origin_id: Option<String>,
+    /// The ORIGINAL send date.
+    pub date: OffsetDateTime,
+    /// True for the automatic repost of a linked channel.
+    pub automatic: bool,
+}
+
 /// A new log row to append. Rule P1: every inbound message is persisted
 /// before any processing.
 #[derive(Debug, Clone)]
@@ -99,6 +155,8 @@ pub struct NewMessage {
     pub reply_to_platform_msg_id: Option<String>,
     pub mentions_bot: bool,
     pub is_reply_to_bot: bool,
+    /// The forward origin (decision 108). `None` = not forwarded.
+    pub forward: Option<ForwardRow>,
 }
 
 /// A row of the raw message log.
@@ -118,6 +176,9 @@ pub struct MessageRow {
     pub reply_to_platform_msg_id: Option<String>,
     pub mentions_bot: bool,
     pub is_reply_to_bot: bool,
+    /// The forward origin (decision 108). `None` = not forwarded; rows
+    /// written before migration v14 read as `None`.
+    pub forward: Option<ForwardRow>,
 }
 
 /// Resolved reply target of the raw message log. Refer to
@@ -446,12 +507,21 @@ impl Store {
     pub fn insert_message(&self, chat_id: &str, msg: &NewMessage) -> Result<InsertOutcome> {
         self.with_conn(chat_id, |conn| {
             let timestamp = schema::format_rfc3339(msg.timestamp)?;
+            // The forward date formats OUTSIDE the params (a format
+            // failure is a hard error, like the row timestamp — never a
+            // silent NULL on a forwarded row).
+            let forward_date = match &msg.forward {
+                Some(forward) => Some(schema::format_rfc3339(forward.date)?),
+                None => None,
+            };
             let n = conn.execute(
                 "INSERT OR IGNORE INTO messages (
                     platform_msg_id, direction, event_type, timestamp,
                     sender_id, sender_display_name, sender_username, text,
-                    reply_to_platform_msg_id, mentions_bot, is_reply_to_bot
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    reply_to_platform_msg_id, mentions_bot, is_reply_to_bot,
+                    forward_kind, forward_label, forward_origin_id, forward_date,
+                    forward_automatic
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     msg.platform_msg_id,
                     msg.direction.as_str(),
@@ -464,6 +534,11 @@ impl Store {
                     msg.reply_to_platform_msg_id,
                     msg.mentions_bot,
                     msg.is_reply_to_bot,
+                    msg.forward.as_ref().map(|f| f.kind.as_str()),
+                    msg.forward.as_ref().map(|f| f.label.as_str()),
+                    msg.forward.as_ref().and_then(|f| f.origin_id.as_deref()),
+                    forward_date,
+                    msg.forward.as_ref().map(|f| f.automatic),
                 ],
             )?;
             if n == 0 {
@@ -1842,7 +1917,9 @@ impl Store {
 // `list_messages_after`, and `list_messages_in_range` share it.
 const MESSAGE_COLUMNS: &str = "id, platform_msg_id, direction, event_type, timestamp,
         sender_id, sender_display_name, sender_username, text,
-        reply_to_platform_msg_id, mentions_bot, is_reply_to_bot";
+        reply_to_platform_msg_id, mentions_bot, is_reply_to_bot,
+        forward_kind, forward_label, forward_origin_id, forward_date,
+        forward_automatic";
 
 /// Attempts cap of the embedding queue (decision 66). At the cap a row
 /// flips from 'pending' to 'failed' and stays inspectable.
@@ -2030,6 +2107,23 @@ fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     let direction: String = row.get("direction")?;
     let event_type: String = row.get("event_type")?;
     let timestamp: String = row.get("timestamp")?;
+    // Decision 108: the v14 columns are all-NULL for a non-forwarded
+    // row (and for every pre-v14 row) — the Option of the kind column
+    // gates the whole group.
+    let forward_kind: Option<String> = row.get("forward_kind")?;
+    let forward = match forward_kind {
+        Some(kind) => {
+            let forward_date: String = row.get("forward_date")?;
+            Some(ForwardRow {
+                kind: ForwardKind::from_str(&kind)?,
+                label: row.get("forward_label")?,
+                origin_id: row.get("forward_origin_id")?,
+                date: schema::parse_rfc3339(&forward_date)?,
+                automatic: row.get("forward_automatic")?,
+            })
+        }
+        None => None,
+    };
     Ok(MessageRow {
         id: row.get("id")?,
         platform_msg_id: row.get("platform_msg_id")?,
@@ -2043,6 +2137,7 @@ fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         reply_to_platform_msg_id: row.get("reply_to_platform_msg_id")?,
         mentions_bot: row.get("mentions_bot")?,
         is_reply_to_bot: row.get("is_reply_to_bot")?,
+        forward,
     })
 }
 
@@ -2140,6 +2235,7 @@ mod tests {
             reply_to_platform_msg_id: Some("m0".to_string()),
             mentions_bot: true,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 
@@ -3734,6 +3830,27 @@ mod tests {
             .find(|(v, _)| *v == 7)
             .expect("v7 migration entry");
         conn.execute_batch(v7_sql).expect("v7 DDL");
+        // The v7-era messages table (the v1 columns plus v4's
+        // sender_username): migration v14 ALTERs it, so the fixture
+        // must carry it. The stamped-applied v6 index DDL never runs
+        // here; nothing in the pending migrations touches an index.
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform_msg_id         TEXT NOT NULL,
+                direction               TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+                event_type              TEXT NOT NULL CHECK (event_type IN ('message', 'edit')),
+                timestamp               TEXT NOT NULL,
+                sender_id               TEXT NOT NULL,
+                sender_display_name     TEXT NOT NULL,
+                text                    TEXT NOT NULL,
+                reply_to_platform_msg_id TEXT,
+                mentions_bot            INTEGER NOT NULL DEFAULT 0,
+                is_reply_to_bot         INTEGER NOT NULL DEFAULT 0,
+                sender_username         TEXT
+            );",
+        )
+        .expect("v7-era messages table");
 
         // Queue rows in every status: a pending claim, a failed row,
         // and two done-journal rows (decision 66 journal).
@@ -5900,5 +6017,83 @@ mod tests {
                 Ok(())
             })
             .expect("row count");
+    }
+
+    #[test]
+    fn a_forwarded_message_round_trips_its_origin() {
+        // Decision 108, schema v14: the five forward columns persist
+        // and read back exactly.
+        let (_dir, store) = temp_store();
+        let msg = NewMessage {
+            forward: Some(ForwardRow {
+                kind: ForwardKind::User,
+                label: "Bob Lee".to_string(),
+                origin_id: Some("7".to_string()),
+                date: OffsetDateTime::from_unix_timestamp(1_699_000_000).expect("valid timestamp"),
+                automatic: false,
+            }),
+            ..sample_message()
+        };
+        match store.insert_message("c1", &msg).expect("insert") {
+            InsertOutcome::Inserted(_) => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        let forward = rows[0].forward.clone().expect("a forward row");
+        assert_eq!(forward.kind, ForwardKind::User);
+        assert_eq!(forward.label, "Bob Lee");
+        assert_eq!(forward.origin_id, Some("7".to_string()));
+        assert_eq!(
+            forward.date,
+            OffsetDateTime::from_unix_timestamp(1_699_000_000).expect("valid timestamp")
+        );
+        assert!(!forward.automatic);
+    }
+
+    #[test]
+    fn an_automatic_channel_forward_round_trips_with_a_null_origin_id() {
+        // The automatic flag and the NULL origin id both persist (a
+        // hidden-user-style row without an id).
+        let (_dir, store) = temp_store();
+        let msg = NewMessage {
+            forward: Some(ForwardRow {
+                kind: ForwardKind::Channel,
+                label: "News Room".to_string(),
+                origin_id: None,
+                date: OffsetDateTime::from_unix_timestamp(1_699_000_000).expect("valid timestamp"),
+                automatic: true,
+            }),
+            ..sample_message()
+        };
+        match store.insert_message("c1", &msg).expect("insert") {
+            InsertOutcome::Inserted(_) => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+
+        let rows = store.list_messages("c1").expect("list");
+        let forward = rows[0].forward.clone().expect("a forward row");
+        assert_eq!(forward.kind, ForwardKind::Channel);
+        assert_eq!(forward.label, "News Room");
+        assert_eq!(forward.origin_id, None);
+        assert!(forward.automatic);
+    }
+
+    #[test]
+    fn a_plain_message_reads_a_none_forward() {
+        // A non-forwarded row writes the five columns as NULL and reads
+        // back as None; rows written before v14 read the same way.
+        let (_dir, store) = temp_store();
+        match store
+            .insert_message("c1", &sample_message())
+            .expect("insert")
+        {
+            InsertOutcome::Inserted(_) => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].forward, None);
     }
 }

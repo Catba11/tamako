@@ -19,7 +19,7 @@ use tamako_agent::{
 use tamako_core::digest::{DigestOutcome, DigestPipeline};
 use tamako_core::embedding::{EmbeddingError, EmbeddingProvider};
 use tamako_memory::{identifiers, LbugBackend, MemoryBackend, MemoryBatch, MemoryNode, NodeType};
-use tamako_store::{Direction, EventType, NewMessage, Store};
+use tamako_store::{Direction, EventType, ForwardKind, ForwardRow, NewMessage, Store};
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
@@ -53,6 +53,7 @@ fn message(
         reply_to_platform_msg_id: reply_to.map(str::to_string),
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 
@@ -1082,4 +1083,283 @@ async fn an_unmentioned_related_pair_stays_out_of_the_prompt() {
     let row = &store.list_related_pairs().expect("list")[0];
     assert_eq!(row.status, "pending", "the pair stays pending");
     assert_eq!(vector_counter(&store, "related_pairs_promoted_total"), None);
+}
+
+/// A forwarded inbound row (decision 108): the sender is the
+/// forwarder; the origin rides the forward field.
+#[allow(clippy::too_many_arguments)]
+fn forwarded_message(
+    platform_id: &str,
+    sender_id: &str,
+    display_name: &str,
+    text: &str,
+    timestamp_secs: i64,
+    kind: ForwardKind,
+    label: &str,
+    origin_id: Option<&str>,
+    automatic: bool,
+) -> NewMessage {
+    NewMessage {
+        forward: Some(ForwardRow {
+            kind,
+            label: label.to_string(),
+            origin_id: origin_id.map(str::to_string),
+            date: OffsetDateTime::from_unix_timestamp(1_699_000_000).expect("valid timestamp"),
+            automatic,
+        }),
+        ..message(
+            platform_id,
+            Direction::Inbound,
+            sender_id,
+            display_name,
+            text,
+            timestamp_secs,
+            None,
+        )
+    }
+}
+
+/// Decision 108 (d): a VERIFIED user-kind forward origin (its
+/// deterministic Person node already exists) binds through the
+/// mention map with source `origin` and its label rides the rule-11
+/// list. The marker rides the message line.
+#[tokio::test]
+async fn a_verified_forward_origin_binds_through_the_mention_map() {
+    let (_dir, store, memory) = fixtures();
+    let origin_node_id = identifiers::person_id("7");
+    seed_person_node(&memory, &origin_node_id, "Bob Lee", Some("The origin.")).await;
+    insert_all(
+        &store,
+        &[forwarded_message(
+            "m1",
+            "1001",
+            "Alice",
+            "look at this",
+            1_700_000_000,
+            ForwardKind::User,
+            "Bob Lee",
+            Some("7"),
+            false,
+        )],
+    );
+    let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![KnowledgeGraph {
+        nodes: vec![],
+        edges: vec![],
+    }]));
+    let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
+
+    pipeline
+        .run_digest(CHAT, 0)
+        .await
+        .expect("digest")
+        .expect("non-empty tail");
+
+    let inputs = extractor.inputs();
+    assert_eq!(inputs.len(), 1);
+    let input = &inputs[0];
+    // The marker rides the message line, whatever the verification.
+    assert_eq!(
+        input.messages[0].forward,
+        Some(tamako_agent::ForwardMarker {
+            token: "user".to_string(),
+            label: "Bob Lee".to_string(),
+        })
+    );
+    // The label rides the rule-11 list; the binding appends LAST to
+    // the mention map (after the sender binding of the forwarder).
+    assert_eq!(input.origins, vec!["Bob Lee".to_string()]);
+    let binding = input
+        .mention_map
+        .iter()
+        .find(|binding| binding.source == BindingSource::Origin)
+        .expect("an origin binding");
+    assert_eq!(binding.display_name, "Bob Lee");
+    assert_eq!(binding.tg_user_id, "7");
+    assert_eq!(input.mention_map.last(), Some(binding));
+}
+
+/// Decision 108 (d): an origin WITHOUT an existing Person node is
+/// unattributable — no mention-map binding, no rule-11 entry. The
+/// marker still rides the message line.
+#[tokio::test]
+async fn an_unverified_forward_origin_stays_unattributable() {
+    let (_dir, store, memory) = fixtures();
+    insert_all(
+        &store,
+        &[forwarded_message(
+            "m1",
+            "1001",
+            "Alice",
+            "look at this",
+            1_700_000_000,
+            ForwardKind::User,
+            "Bob Lee",
+            Some("7"),
+            false,
+        )],
+    );
+    let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![KnowledgeGraph {
+        nodes: vec![],
+        edges: vec![],
+    }]));
+    let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
+
+    pipeline
+        .run_digest(CHAT, 0)
+        .await
+        .expect("digest")
+        .expect("non-empty tail");
+
+    let inputs = extractor.inputs();
+    assert_eq!(inputs.len(), 1);
+    let input = &inputs[0];
+    assert!(
+        input.messages[0].forward.is_some(),
+        "the marker is verification-independent"
+    );
+    assert!(input.origins.is_empty(), "no rule-11 entry");
+    assert!(
+        !input
+            .mention_map
+            .iter()
+            .any(|binding| binding.source == BindingSource::Origin),
+        "no origin binding"
+    );
+}
+
+/// Decision 108 (e): the collision exclusion — an origin label that
+/// normalize-matches the display name of a DIFFERENT batch sender is
+/// excluded even when its Person node exists (a Chinese display name
+/// collides freely; a false binding would re-create the attribution
+/// pollution this decision removes).
+#[tokio::test]
+async fn a_colliding_origin_label_stays_out() {
+    let (_dir, store, memory) = fixtures();
+    // The origin node EXISTS (id 7) but its label equals the display
+    // name of the forwarder (id 1001) — a different person.
+    let origin_node_id = identifiers::person_id("7");
+    seed_person_node(
+        &memory,
+        &origin_node_id,
+        "Alice",
+        Some("A different Alice."),
+    )
+    .await;
+    insert_all(
+        &store,
+        &[forwarded_message(
+            "m1",
+            "1001",
+            "Alice",
+            "look at this",
+            1_700_000_000,
+            ForwardKind::User,
+            "Alice",
+            Some("7"),
+            false,
+        )],
+    );
+    let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![KnowledgeGraph {
+        nodes: vec![],
+        edges: vec![],
+    }]));
+    let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
+
+    pipeline
+        .run_digest(CHAT, 0)
+        .await
+        .expect("digest")
+        .expect("non-empty tail");
+
+    let inputs = extractor.inputs();
+    assert_eq!(inputs.len(), 1);
+    let input = &inputs[0];
+    assert!(input.origins.is_empty(), "the colliding origin stays out");
+    // The sender binding of the forwarder is untouched; no Origin
+    // binding appears.
+    assert!(
+        !input
+            .mention_map
+            .iter()
+            .any(|binding| binding.source == BindingSource::Origin),
+        "no origin binding"
+    );
+    assert!(
+        input
+            .mention_map
+            .iter()
+            .any(|binding| binding.source == BindingSource::Sender && binding.tg_user_id == "1001"),
+        "the forwarder's sender binding stands"
+    );
+}
+
+/// Decision 108 (d): non-user kinds and the automatic repost are never
+/// verified-origin candidates. The markers still ride the lines.
+#[tokio::test]
+async fn a_non_user_or_automatic_origin_is_never_a_candidate() {
+    let (_dir, store, memory) = fixtures();
+    insert_all(
+        &store,
+        &[
+            forwarded_message(
+                "m1",
+                "1001",
+                "Alice",
+                "old words",
+                1_700_000_000,
+                ForwardKind::HiddenUser,
+                "张伟",
+                None,
+                false,
+            ),
+            forwarded_message(
+                "m2",
+                "1001",
+                "Alice",
+                "channel post",
+                1_700_000_060,
+                ForwardKind::Channel,
+                "News Room",
+                Some("-1009876543210"),
+                true,
+            ),
+        ],
+    );
+    let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![KnowledgeGraph {
+        nodes: vec![],
+        edges: vec![],
+    }]));
+    let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
+
+    pipeline
+        .run_digest(CHAT, 0)
+        .await
+        .expect("digest")
+        .expect("non-empty tail");
+
+    let inputs = extractor.inputs();
+    assert_eq!(inputs.len(), 1);
+    let input = &inputs[0];
+    assert!(input.origins.is_empty(), "no rule-11 entry");
+    assert!(
+        !input
+            .mention_map
+            .iter()
+            .any(|binding| binding.source == BindingSource::Origin),
+        "no origin binding"
+    );
+    assert_eq!(
+        input.messages[0].forward,
+        Some(tamako_agent::ForwardMarker {
+            token: "hidden".to_string(),
+            label: "张伟".to_string(),
+        })
+    );
+    assert_eq!(
+        input.messages[1].forward,
+        Some(tamako_agent::ForwardMarker {
+            token: "auto".to_string(),
+            label: "News Room".to_string(),
+        })
+    );
 }

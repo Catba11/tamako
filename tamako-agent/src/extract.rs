@@ -19,6 +19,19 @@ pub struct BatchMessage {
     /// HH:MM in UTC from the log-row timestamp.
     pub time_hhmm: String,
     pub text: String,
+    /// The forward marker (decision 108): `None` when the message is
+    /// not a forward. The line renders `(fwd {token}:{label})`
+    /// between the speaker label and the text.
+    pub forward: Option<ForwardMarker>,
+}
+
+/// The forward marker of one batch message (decision 108). The token
+/// is the short render form: `user` / `hidden` / `chat` / `channel`,
+/// or `auto` for the automatic repost of a linked channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardMarker {
+    pub token: String,
+    pub label: String,
 }
 
 /// How a display name got bound to a tg_user_id at intake time
@@ -29,6 +42,12 @@ pub enum BindingSource {
     Sender,
     /// The sender of a message that a batch message replies to.
     ReplyTarget,
+    /// The VERIFIED origin of a forwarded message (decision 108): a
+    /// user-kind origin whose Person node already exists in the group
+    /// graph. The existence probe at assembly is what makes this
+    /// binding safe — an unverified origin here would mint a node at
+    /// the resolution MERGE.
+    Origin,
 }
 
 impl BindingSource {
@@ -37,6 +56,7 @@ impl BindingSource {
         match self {
             BindingSource::Sender => "sender",
             BindingSource::ReplyTarget => "reply_target",
+            BindingSource::Origin => "origin",
         }
     }
 }
@@ -62,6 +82,11 @@ pub struct ExtractionInput {
     /// two endpoint names both appear in the batch text. EMPTY renders
     /// the byte-identical pre-106 prompt (replay safety).
     pub related_pairs: Vec<RelatedPairCandidate>,
+    /// Decision 108: the display labels of the VERIFIED forwarded-
+    /// message origins of the batch (rule 11). EMPTY renders nothing —
+    /// a batch without verified origins keeps the byte-identical
+    /// pre-108 prompt.
+    pub origins: Vec<String>,
 }
 
 /// One `related_pairs` row offered to the extraction call (decision
@@ -195,6 +220,7 @@ mod tests {
                 display_name: "Alice".to_string(),
                 time_hhmm: "09:12".to_string(),
                 text: "hello".to_string(),
+                forward: None,
             }],
             mention_map: vec![MentionBinding {
                 display_name: "Alice".to_string(),
@@ -202,6 +228,7 @@ mod tests {
                 source: BindingSource::Sender,
             }],
             related_pairs: vec![],
+            origins: vec![],
         }
     }
 
