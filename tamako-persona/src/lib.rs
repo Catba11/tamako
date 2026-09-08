@@ -88,6 +88,10 @@ pub fn context_format_gloss(pet_tag: &str) -> String {
   to a message several positions back; the attributes always name the
   target explicitly.
 - mention="bot" marks a message that mentions you.
+- fwd="user:NAME", "hidden:NAME", "chat:TITLE", or "channel:TITLE"
+  marks a forwarded message: its text is the origin's words, not the
+  sender's. fwd="auto:TITLE" is a linked channel's automatic repost —
+  no member shared it.
 - <{pet_tag} at="..." id="...">text</{pet_tag}> is your own past
   speech. at is the time (UTC, HH:MM). id is the raw-log row id.
 - <memory>text</memory> is a recalled fact about the group.

@@ -1085,6 +1085,7 @@ mod tests {
             false,
             false,
             crate::context::ReplyRender::None,
+            None,
             "hello",
         );
         let filtered = filter_reply_parrot_lines(&human, &test_fence());

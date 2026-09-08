@@ -23,7 +23,8 @@ use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
 use tamako_store::{
-    ContextSummaryRow, Direction, EventType, InjectedMemoryRow, MessageRow, ReplyTargetRow,
+    ContextSummaryRow, Direction, EventType, ForwardKind as StoreForwardKind, ForwardRow,
+    InjectedMemoryRow, MessageRow, ReplyTargetRow,
 };
 
 /// The UTC HH:MM format of the timestamp attributes (specs.md
@@ -53,6 +54,59 @@ pub(crate) fn escape_xml_text(text: &str) -> String {
 /// Escapes an attribute value: the text set plus `"` → `&quot;`.
 pub(crate) fn escape_xml_attr(text: &str) -> String {
     escape_xml_text(text).replace('"', "&quot;")
+}
+
+/// The forward-origin rendering of one human message (decision 108):
+/// the label after `fwd="..."`. The kind tokens are short render forms
+/// of `tamako_store::ForwardKind` (`hidden_user` renders `hidden`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardRender<'a> {
+    /// `user:{label}` — a user whose account permits public forwards.
+    User(&'a str),
+    /// `hidden:{label}` — a user with forward privacy (name only).
+    Hidden(&'a str),
+    /// `chat:{label}` — a group or supergroup.
+    Chat(&'a str),
+    /// `channel:{label}` — a channel, forwarded by a member.
+    Channel(&'a str),
+    /// `auto:{label}` — the automatic repost of a linked channel; no
+    /// member chose to share this.
+    Auto(&'a str),
+}
+
+impl ForwardRender<'_> {
+    /// Renders ` fwd="{token}:{label}"` onto the output.
+    fn render_onto(self, out: &mut String) {
+        let (token, label) = match self {
+            ForwardRender::User(label) => ("user", label),
+            ForwardRender::Hidden(label) => ("hidden", label),
+            ForwardRender::Chat(label) => ("chat", label),
+            ForwardRender::Channel(label) => ("channel", label),
+            ForwardRender::Auto(label) => ("auto", label),
+        };
+        out.push_str(" fwd=\"");
+        out.push_str(token);
+        out.push(':');
+        out.push_str(&escape_xml_attr(label));
+        out.push('"');
+    }
+}
+
+/// Maps the stored forward origin of a row (decision 108) to its
+/// rendering. The automatic flag overrides the kind: an automatic
+/// repost is always `auto:`.
+pub fn forward_render(forward: Option<&ForwardRow>) -> Option<ForwardRender<'_>> {
+    let forward = forward?;
+    let label = forward.label.as_str();
+    if forward.automatic {
+        return Some(ForwardRender::Auto(label));
+    }
+    Some(match forward.kind {
+        StoreForwardKind::User => ForwardRender::User(label),
+        StoreForwardKind::HiddenUser => ForwardRender::Hidden(label),
+        StoreForwardKind::Chat => ForwardRender::Chat(label),
+        StoreForwardKind::Channel => ForwardRender::Channel(label),
+    })
 }
 
 /// How one human message renders its reply attribute.
@@ -218,6 +272,7 @@ impl LiveContext {
         is_edit: bool,
         mentions_bot: bool,
         reply: ReplyRender,
+        forward: Option<ForwardRender<'_>>,
         text: &str,
     ) {
         self.items.push(ContextItem {
@@ -231,6 +286,7 @@ impl LiveContext {
                 is_edit,
                 mentions_bot,
                 reply,
+                forward,
                 text,
             ),
             range_tag: Some(RangeTag::single(msg_id)),
@@ -498,6 +554,7 @@ impl LiveContext {
                         row.event_type == EventType::Edit,
                         row.mentions_bot,
                         reply,
+                        forward_render(row.forward.as_ref()),
                         &row.text,
                     );
                 }
@@ -651,12 +708,16 @@ pub fn render_media_element(kind: MediaKindName, caption: &str) -> String {
 /// ```text
 /// <msg from="{display_name}"[ user="{username}"] at="{HH:MM}" id="{msg_id}"
 ///      [ kind="edit"][ reply="bot"][ reply="user"[ reply_to_name="{name}"
-///      reply_to_id="{row_id}"]][ mention="bot"]>{text}</msg>
+///      reply_to_id="{row_id}"]][ mention="bot"][ fwd="{origin}"]>{text}</msg>
 /// ```
 ///
 /// Flag precedence when several apply: `kind`, then `reply`, then
-/// `mention` (a message can be both a reply and a mention — both
-/// render).
+/// `mention`, then `fwd` (a message can be both a reply and a mention —
+/// both render). The `fwd` attribute renders only for a forwarded row
+/// (decision 108): `user:{label}`, `hidden:{label}`, `chat:{label}`,
+/// `channel:{label}`, or `auto:{label}` for the automatic repost of a
+/// linked channel. A row without forward data renders byte-identical
+/// to the pre-v14 shape.
 ///
 /// The `text` argument renders through [`render_text_with_media`]:
 /// ordinary text is escaped, but a well-formed `<media>...</media>`
@@ -674,6 +735,7 @@ pub fn render_human_content(
     is_edit: bool,
     mentions_bot: bool,
     reply: ReplyRender,
+    forward: Option<ForwardRender<'_>>,
     text: &str,
 ) -> String {
     let mut out = String::new();
@@ -713,6 +775,9 @@ pub fn render_human_content(
     }
     if mentions_bot {
         out.push_str(" mention=\"bot\"");
+    }
+    if let Some(forward) = forward {
+        forward.render_onto(&mut out);
     }
     out.push('>');
     out.push_str(&render_text_with_media(text));
@@ -905,6 +970,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         context.append_bot_speech(2, at_1307(), "hi there");
@@ -950,6 +1016,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         assert!(human.starts_with(MSG_TAG_OPEN_PREFIX));
@@ -976,6 +1043,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "chunk one",
             );
         }
@@ -993,6 +1061,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "chunk two",
             );
         }
@@ -1025,6 +1094,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hi",
         );
         context.append_bot_speech(2, at_1307(), "hello");
@@ -1052,6 +1122,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "at five",
         );
         context.append_human_message(
@@ -1062,6 +1133,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "at six",
         );
 
@@ -1083,6 +1155,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         context.append_bot_speech(2, at_1307(), "hi");
@@ -1117,6 +1190,7 @@ mod tests {
             reply_to_platform_msg_id: None,
             mentions_bot: false,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 
@@ -1268,6 +1342,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "one",
         );
         live.append_recall_injection(1, "memory at 1".to_string());
@@ -1283,6 +1358,7 @@ mod tests {
             ReplyRender::ToUser {
                 target: Some(target(1, "Alice")),
             },
+            None,
             "reply to one",
         );
         live.append_human_message(
@@ -1293,6 +1369,7 @@ mod tests {
             true,
             false,
             ReplyRender::None,
+            None,
             "edited",
         );
 
@@ -1367,6 +1444,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "tea?",
         );
         live.append_bot_speech(2, at_1307(), "always");
@@ -1706,6 +1784,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "any plans for dinner?",
             ),
             r#"<msg from="Alice" at="13:05" id="41">any plans for dinner?</msg>"#
@@ -1721,6 +1800,7 @@ mod tests {
                 ReplyRender::ToUser {
                     target: Some(target(41, "Alice")),
                 },
+                None,
                 "hotpot?",
             ),
             r#"<msg from="Bob" user="bob_tg" at="13:06" id="42" reply="user" reply_to_name="Alice" reply_to_id="41">hotpot?</msg>"#
@@ -1734,6 +1814,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::ToBot,
+                None,
                 "you pick!",
             ),
             r#"<msg from="Carol" at="13:07" id="43" reply="bot">you pick!</msg>"#
@@ -1747,6 +1828,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::ToUser { target: None },
+                None,
                 "old stuff",
             ),
             r#"<msg from="Dave" at="13:08" id="44" reply="user">old stuff</msg>"#
@@ -1760,6 +1842,7 @@ mod tests {
                 false,
                 true,
                 ReplyRender::None,
+                None,
                 "@tamako hi",
             ),
             r#"<msg from="Dave" at="13:08" id="45" mention="bot">@tamako hi</msg>"#
@@ -1773,6 +1856,7 @@ mod tests {
                 true,
                 false,
                 ReplyRender::None,
+                None,
                 "dinner at 7 (edited)",
             ),
             r#"<msg from="Alice" at="13:09" id="46" kind="edit">dinner at 7 (edited)</msg>"#
@@ -1788,6 +1872,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 r#"a < b & "c""#,
             ),
             r#"<msg from="Ann &quot;Annie&quot; &amp; Co" at="13:10" id="47">a &lt; b &amp; "c"</msg>"#
@@ -1807,9 +1892,162 @@ mod tests {
                 true,
                 true,
                 ReplyRender::ToBot,
+                None,
                 "edited reply mention",
             ),
             r#"<msg from="Eve" at="13:11" id="48" kind="edit" reply="bot" mention="bot">edited reply mention</msg>"#
+        );
+    }
+
+    fn forward_row(kind: StoreForwardKind, automatic: bool) -> ForwardRow {
+        ForwardRow {
+            kind,
+            label: "Alice A".to_string(),
+            origin_id: Some("7".to_string()),
+            date: at_1307(),
+            automatic,
+        }
+    }
+
+    #[test]
+    fn forward_render_maps_each_kind_and_the_auto_override() {
+        // Decision 108 (specs.md Section 7.3): the kind tokens of the
+        // rendering; the automatic flag OVERRIDES the kind — a linked
+        // channel's repost has no sharing member, so it always renders
+        // `auto:`.
+        assert_eq!(forward_render(None), None);
+        assert_eq!(
+            forward_render(Some(&forward_row(StoreForwardKind::User, false))),
+            Some(ForwardRender::User("Alice A"))
+        );
+        assert_eq!(
+            forward_render(Some(&forward_row(StoreForwardKind::HiddenUser, false))),
+            Some(ForwardRender::Hidden("Alice A"))
+        );
+        assert_eq!(
+            forward_render(Some(&forward_row(StoreForwardKind::Chat, false))),
+            Some(ForwardRender::Chat("Alice A"))
+        );
+        assert_eq!(
+            forward_render(Some(&forward_row(StoreForwardKind::Channel, false))),
+            Some(ForwardRender::Channel("Alice A"))
+        );
+        assert_eq!(
+            forward_render(Some(&forward_row(StoreForwardKind::Channel, true))),
+            Some(ForwardRender::Auto("Alice A"))
+        );
+        // The override applies to a non-channel kind as well.
+        assert_eq!(
+            forward_render(Some(&forward_row(StoreForwardKind::User, true))),
+            Some(ForwardRender::Auto("Alice A"))
+        );
+    }
+
+    #[test]
+    fn render_human_content_renders_the_fwd_attribute_byte_exactly() {
+        // Decision 108 (specs.md Section 7.3): `fwd="{kind}:{label}"`
+        // renders after `mention`; `hidden_user` renders `hidden`. A
+        // row without forward data renders byte-identical to the
+        // pre-108 shape (the contract tests above pin that).
+        assert_eq!(
+            render_human_content(
+                50,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                Some(ForwardRender::User("Alice A")),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="50" fwd="user:Alice A">hi</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                51,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                Some(ForwardRender::Hidden("张伟")),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="51" fwd="hidden:张伟">hi</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                52,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                Some(ForwardRender::Chat("Old Squad")),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="52" fwd="chat:Old Squad">hi</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                53,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                Some(ForwardRender::Channel("News Room")),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="53" fwd="channel:News Room">hi</msg>"#
+        );
+        assert_eq!(
+            render_human_content(
+                54,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                Some(ForwardRender::Auto("News Room")),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="54" fwd="auto:News Room">hi</msg>"#
+        );
+        // The attribute order: kind, reply, mention, then fwd.
+        assert_eq!(
+            render_human_content(
+                55,
+                "Bob",
+                None,
+                at_1307(),
+                true,
+                true,
+                ReplyRender::ToBot,
+                Some(ForwardRender::User("Alice A")),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="55" kind="edit" reply="bot" mention="bot" fwd="user:Alice A">hi</msg>"#
+        );
+        // The label is attr-escaped.
+        assert_eq!(
+            render_human_content(
+                56,
+                "Bob",
+                None,
+                at_1307(),
+                false,
+                false,
+                ReplyRender::None,
+                Some(ForwardRender::Channel(r#"A "B" & <C>"#)),
+                "hi"
+            ),
+            r#"<msg from="Bob" at="13:07" id="56" fwd="channel:A &quot;B&quot; &amp; &lt;C&gt;">hi</msg>"#
         );
     }
 
@@ -1836,6 +2074,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         context.append_bot_speech(2, at_1307(), "hi");
@@ -1871,6 +2110,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         context.append_bot_speech(2, at_1307(), "hi");
@@ -2018,6 +2258,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 &text
             ),
             r#"<msg from="Alice" at="13:07" id="1">a &lt; b<media type="image">a cat</media></msg>"#
@@ -2037,6 +2278,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 r#"look <media type="image">x"#
             ),
             r#"<msg from="Alice" at="13:07" id="1">look &lt;media type="image"&gt;x</msg>"#
@@ -2051,6 +2293,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "look </media> x"
             ),
             r#"<msg from="Alice" at="13:07" id="2">look &lt;/media&gt; x</msg>"#
@@ -2075,6 +2318,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 &text
             ),
             r#"<msg from="Alice" at="13:07" id="1">first <media type="image">cat</media> middle <media type="sticker"></media> last</msg>"#
@@ -2099,6 +2343,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 &text
             ),
             r#"<msg from="Alice" at="13:07" id="1">see this<media type="video">a &amp; b</media>done</msg>"#
@@ -2175,6 +2420,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         context.append_bot_speech(2, at_1307(), "hi");
@@ -2223,6 +2469,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "hello",
         );
         context.upsert_summaries(&[
@@ -2281,6 +2528,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "one",
         );
         context.append_bot_speech(2, at_1307(), "two");
@@ -2292,6 +2540,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "four",
         );
 
@@ -2349,6 +2598,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "seven",
         );
         live.append_recall_injection(7, "memory at 7".to_string());
@@ -2428,6 +2678,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "one",
         );
         context.append_bot_speech(2, at_1307(), "two");
@@ -2440,6 +2691,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "three",
         );
 
@@ -2491,6 +2743,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "seven",
         );
 
@@ -2524,6 +2777,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "one",
         );
         assert_eq!(context.gate_context_view(0), "");
@@ -2549,6 +2803,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "before the marker",
         );
         context.append_recall_injection(4, "<memory>earlier recall</memory>".to_string());
@@ -2577,6 +2832,7 @@ mod tests {
             false,
             false,
             ReplyRender::None,
+            None,
             "wake k new",
         );
         context.append_bot_speech(6, at_1307(), "the reply");
@@ -2599,6 +2855,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "wake k new",
             ),
             render_bot_content(6, at_1307(), "the reply", "tamako"),

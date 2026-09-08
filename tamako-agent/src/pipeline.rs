@@ -12,15 +12,15 @@ use std::time::Duration;
 use tamako_core::actor::CoreError;
 use tamako_core::digest::{embedding_content_hash, DigestOutcome, DigestPipeline};
 use tamako_core::embedding::EmbeddingProvider as CoreEmbeddingProvider;
-use tamako_memory::identifiers::{batch_id as message_batch_id, normalize};
+use tamako_memory::identifiers::{batch_id as message_batch_id, normalize, person_id};
 use tamako_memory::{EdgeId, MemoryBackend, MemoryBatch, MemoryEdge, NodeType};
-use tamako_store::{MessageRow, Store, StoreError};
+use tamako_store::{ForwardKind, MessageRow, Store, StoreError};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::extract::{
-    AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,
-    RelatedPairCandidate,
+    AgentError, BatchMessage, BindingSource, ExtractionInput, ForwardMarker, KnowledgeExtractor,
+    MentionBinding, RelatedPairCandidate,
 };
 use crate::graph::KnowledgeGraph;
 use crate::resolve::{
@@ -407,6 +407,64 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             .await;
     }
 
+    /// Decision 108 (d)/(e): the verified forwarded-message origins of
+    /// one batch. A candidate is a user-kind forward origin with an
+    /// origin id; it is VERIFIED when the deterministic Person id of
+    /// the origin already exists in the group graph (the origin is a
+    /// known member) — forward origins never mint nodes. The collision
+    /// exclusion drops a candidate whose label normalize-matches the
+    /// display name of a DIFFERENT batch sender (the ids differ): a
+    /// Chinese display name collides freely, and a false binding would
+    /// re-create the exact attribution pollution this decision exists
+    /// to remove. Non-user kinds (hidden/chat/channel/automatic) are
+    /// never candidates. A probe failure skips the candidate with a
+    /// DEBUG — the batch digests without it, like the 106 (a) pairs.
+    async fn verified_origins(&self, chat_id: &str, rows: &[MessageRow]) -> Vec<MentionBinding> {
+        let mut out: Vec<MentionBinding> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for row in rows {
+            let Some(forward) = &row.forward else {
+                continue;
+            };
+            if forward.kind != ForwardKind::User {
+                continue;
+            }
+            let Some(origin_id) = &forward.origin_id else {
+                continue;
+            };
+            if !seen.insert(normalize(&forward.label)) {
+                continue;
+            }
+            // The collision exclusion: the label matches a batch
+            // sender's display name but the ids differ — ambiguous.
+            let collides = rows.iter().any(|sender_row| {
+                sender_row.sender_id != *origin_id
+                    && normalize(&sender_row.sender_display_name) == normalize(&forward.label)
+            });
+            if collides {
+                continue;
+            }
+            let node_id = person_id(origin_id);
+            match self.memory.node_content(chat_id, &node_id).await {
+                Ok(Some(_)) => out.push(MentionBinding {
+                    display_name: forward.label.clone(),
+                    tg_user_id: origin_id.clone(),
+                    source: BindingSource::Origin,
+                }),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        chat_id,
+                        origin_id,
+                        %error,
+                        "origin verification failed; the origin stays unattributable"
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// The decision-73 step-3 counters (specs.md Section 12 naming
     /// discipline: Prometheus-compatible, `_total` suffix). Best
     /// effort, like every counter of the pipeline.
@@ -631,6 +689,25 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
             // rides the extraction input — pending pairs whose two
             // endpoint names both appear in the batch text.
             input.related_pairs = self.promotion_candidates(chat_id, &rows).await;
+            // Decision 108 (d)/(e): the verified-origin pass — user-kind
+            // forward origins whose Person node already exists bind
+            // through the mention map (source `origin`); the labels go
+            // to the rule-11 list.
+            let origins = self.verified_origins(chat_id, &rows).await;
+            input.origins = origins.iter().map(|b| b.display_name.clone()).collect();
+            for binding in origins {
+                // The origins append LAST (the resolution finds the
+                // FIRST name match) and skip an identical binding — a
+                // member who forwards their own words is already bound
+                // as a sender.
+                let duplicate = input.mention_map.iter().any(|existing| {
+                    existing.tg_user_id == binding.tg_user_id
+                        && normalize(&existing.display_name) == normalize(&binding.display_name)
+                });
+                if !duplicate {
+                    input.mention_map.push(binding);
+                }
+            }
         }
 
         // The retry/dead-letter loop of specs.md Section 10.3. One
@@ -962,6 +1039,26 @@ fn collect_promotion_edges(
     out
 }
 
+/// The decision-108 forward marker of one log row: the short render
+/// token (`auto` overrides the kind) and the origin label.
+fn forward_marker(row: &MessageRow) -> Option<ForwardMarker> {
+    let forward = row.forward.as_ref()?;
+    let token = if forward.automatic {
+        "auto"
+    } else {
+        match forward.kind {
+            ForwardKind::User => "user",
+            ForwardKind::HiddenUser => "hidden",
+            ForwardKind::Chat => "chat",
+            ForwardKind::Channel => "channel",
+        }
+    };
+    Some(ForwardMarker {
+        token: token.to_string(),
+        label: forward.label.clone(),
+    })
+}
+
 /// Batch assembly (Section 7.2): the labeled messages and the
 /// mention/reply map of the batch.
 fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionInput {
@@ -976,6 +1073,7 @@ fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionI
                 .format(HHMM_FORMAT)
                 .unwrap_or_else(|_| "??:??".to_string()),
             text: row.text.clone(),
+            forward: forward_marker(row),
         })
         .collect();
     ExtractionInput {
@@ -984,6 +1082,8 @@ fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionI
         mention_map: assemble_mention_map(rows),
         // Decision 106: filled by `run` after the skeleton check.
         related_pairs: Vec::new(),
+        // Decision 108: filled by `run` after the skeleton check.
+        origins: Vec::new(),
     }
 }
 
@@ -1111,6 +1211,7 @@ mod tests {
             reply_to_platform_msg_id: None,
             mentions_bot: false,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 

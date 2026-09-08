@@ -289,6 +289,7 @@ fn message(id: &str, at: OffsetDateTime, mention: bool) -> NormalizedMessage {
         reply_to_platform_msg_id: None,
         mentions_bot: mention,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 

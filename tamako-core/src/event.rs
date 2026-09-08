@@ -19,6 +19,70 @@ pub struct NormalizedMessage {
     pub reply_to_platform_msg_id: Option<String>,
     pub mentions_bot: bool,
     pub is_reply_to_bot: bool,
+    /// The forward origin (decision 108, specs.md Section 4.2). `None`
+    /// when the message is not a forward.
+    pub forward: Option<ForwardOrigin>,
+}
+
+/// The kind of a forward origin (Telegram `MessageOrigin`, decision
+/// 108).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ForwardKind {
+    /// A user whose account permits public forwards.
+    User,
+    /// A user with forward privacy: only a display name, no id.
+    HiddenUser,
+    /// A group or supergroup.
+    Chat,
+    /// A channel.
+    Channel,
+}
+
+impl ForwardKind {
+    /// The storage and rendering token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForwardKind::User => "user",
+            ForwardKind::HiddenUser => "hidden_user",
+            ForwardKind::Chat => "chat",
+            ForwardKind::Channel => "channel",
+        }
+    }
+
+    /// Parses the storage token back.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(token: &str) -> Option<Self> {
+        match token {
+            "user" => Some(ForwardKind::User),
+            "hidden_user" => Some(ForwardKind::HiddenUser),
+            "chat" => Some(ForwardKind::Chat),
+            "channel" => Some(ForwardKind::Channel),
+            _ => None,
+        }
+    }
+}
+
+/// The origin of a forwarded message (decision 108, specs.md Section
+/// 4.2). The label is display-only; the origin id is what the
+/// verified-origin probe of the digest pipeline derives the
+/// deterministic Person id from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForwardOrigin {
+    pub kind: ForwardKind,
+    /// The origin user's display name, the hidden user's name, or the
+    /// chat/channel title. Chat/channel author signatures drop at
+    /// normalization (operator ruling).
+    pub label: String,
+    /// The platform id of the origin when the platform gives one: the
+    /// Telegram user id (user kind) or chat id (chat/channel kinds).
+    /// `None` for hidden users.
+    pub origin_id: Option<String>,
+    /// The ORIGINAL send date.
+    #[serde(with = "time::serde::rfc3339")]
+    pub date: OffsetDateTime,
+    /// True for the automatic repost of a linked channel into its
+    /// discussion group — no member chose to share this.
+    pub automatic: bool,
 }
 
 /// A reaction on a message. Refer to specs.md Section 4.1, rule A2, and
@@ -112,6 +176,7 @@ mod tests {
             reply_to_platform_msg_id: None,
             mentions_bot: false,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 

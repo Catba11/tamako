@@ -122,6 +122,7 @@ fn message(id: &str, seconds: i64, sender_id: &str, name: &str, text: &str) -> N
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 
@@ -785,6 +786,7 @@ async fn an_injected_edge_is_not_reinjected_in_the_same_chunk() {
             false,
             false,
             ReplyRender::None,
+            None,
             STOPWORD_TEXT,
         )
     };

@@ -137,8 +137,8 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tamako_memory::{MemoryBackend, MemoryError};
 use tamako_store::{
-    Direction, EventType, InsertOutcome, MessageRow, NewMessage, NewReaction, ReplyTargetRow,
-    Store, StoreError,
+    Direction, EventType, ForwardKind as StoreForwardKind, ForwardRow, InsertOutcome, MessageRow,
+    NewMessage, NewReaction, ReplyTargetRow, Store, StoreError,
 };
 use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{mpsc, oneshot};
@@ -148,11 +148,13 @@ use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
 use crate::context::{
-    render_human_content, ContextItem, ContextMessage, ContextRole, LiveContext, RangeTag,
-    ReplyRender,
+    forward_render, render_human_content, ContextItem, ContextMessage, ContextRole, LiveContext,
+    RangeTag, ReplyRender,
 };
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
-use crate::event::{InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent};
+use crate::event::{
+    ForwardKind, ForwardOrigin, InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent,
+};
 use crate::session::{round_to_millis, SessionState};
 use crate::summary::{SummaryError, SummaryProvider};
 use crate::trigger::{digest_should_fire, tail_stats, timer_cadence, WakeScheduler};
@@ -586,6 +588,26 @@ fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Maps the intake forward origin (decision 108) to the stored row
+/// form. The render mapping is [`forward_render`]; both flow from this
+/// single conversion.
+impl From<&ForwardOrigin> for ForwardRow {
+    fn from(origin: &ForwardOrigin) -> Self {
+        ForwardRow {
+            kind: match origin.kind {
+                ForwardKind::User => StoreForwardKind::User,
+                ForwardKind::HiddenUser => StoreForwardKind::HiddenUser,
+                ForwardKind::Chat => StoreForwardKind::Chat,
+                ForwardKind::Channel => StoreForwardKind::Channel,
+            },
+            label: origin.label.clone(),
+            origin_id: origin.origin_id.clone(),
+            date: origin.date,
+            automatic: origin.automatic,
+        }
+    }
+}
+
 /// Builds the raw-log row for one normalized inbound message.
 /// Rule A4: the normalized message carries every field the row needs.
 fn to_new_message(msg: &NormalizedMessage, event_type: EventType) -> NewMessage {
@@ -601,6 +623,7 @@ fn to_new_message(msg: &NormalizedMessage, event_type: EventType) -> NewMessage 
         reply_to_platform_msg_id: msg.reply_to_platform_msg_id.clone(),
         mentions_bot: msg.mentions_bot,
         is_reply_to_bot: msg.is_reply_to_bot,
+        forward: msg.forward.as_ref().map(ForwardRow::from),
     }
 }
 
@@ -1222,6 +1245,8 @@ async fn run_actor<M: MemoryBackend>(
                     }
                 }
                 let row = to_new_message(&msg, EventType::Edit);
+                // Decision 108: same render copy as the message path.
+                let forward = row.forward.clone();
                 let edit_chat_id = chat_id.clone();
                 let outcome = blocking_store(&store, move |store| {
                     store.insert_message(&edit_chat_id, &row)
@@ -1250,6 +1275,7 @@ async fn run_actor<M: MemoryBackend>(
                         true,
                         msg.mentions_bot,
                         reply_render,
+                        forward_render(forward.as_ref()),
                         &msg.text,
                     );
                 }
@@ -1854,6 +1880,10 @@ async fn handle_message(
     // Rule P1 (specs.md Section 8.1): FIRST persist to the raw log. The
     // insert completes before anything else runs.
     let row = to_new_message(&msg, EventType::Message);
+    // Decision 108: the row moves into the blocking closure; the
+    // render side (the context append AND the forcing gate message)
+    // keeps its own copy.
+    let forward = row.forward.clone();
     let intake_chat_id = chat_id.to_string();
     let outcome = blocking_store(store, move |store| {
         store.insert_message(&intake_chat_id, &row)
@@ -1884,6 +1914,7 @@ async fn handle_message(
                 false,
                 msg.mentions_bot,
                 reply_render.clone(),
+                forward_render(forward.as_ref()),
                 &msg.text,
             );
             Some(id)
@@ -1964,6 +1995,7 @@ async fn handle_message(
                 // above: the forcing gate message and the context
                 // item of this row render identically.
                 reply_render.clone(),
+                forward_render(forward.as_ref()),
                 &msg.text,
             ),
             sender_id: msg.sender_id.clone(),
@@ -2565,6 +2597,8 @@ async fn handle_warmup_report(
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        // Outbound speech is never a forward.
+        forward: None,
     };
     let insert_chat_id = chat_id.to_string();
     let outcome = blocking_store(store, move |store| {
@@ -2708,6 +2742,7 @@ async fn start_wake(
                 row.event_type == EventType::Edit,
                 row.mentions_bot,
                 reply_render_from_row(row, &reply_targets),
+                forward_render(row.forward.as_ref()),
                 &row.text,
             ),
             // The recall worker needs the raw fields for deterministic
@@ -3132,6 +3167,8 @@ async fn handle_wake_report(
         reply_to_platform_msg_id: Some(target.platform_msg_id.clone()),
         mentions_bot: false,
         is_reply_to_bot: false,
+        // Outbound speech is never a forward.
+        forward: None,
     };
     let insert_chat_id = chat_id.to_string();
     let outcome = blocking_store(store, move |store| {
@@ -3615,6 +3652,7 @@ mod tests {
             reply_to_platform_msg_id: None,
             mentions_bot,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 
@@ -3637,6 +3675,7 @@ mod tests {
             reply_to_platform_msg_id: reply_to.map(str::to_string),
             mentions_bot: false,
             is_reply_to_bot,
+            forward: None,
         }
     }
 
@@ -6387,6 +6426,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "text of m1",
             ),
             render_human_content(
@@ -6397,6 +6437,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "text of m2",
             ),
             render_human_content(
@@ -6407,6 +6448,7 @@ mod tests {
                 false,
                 false,
                 ReplyRender::None,
+                None,
                 "text of m3",
             ),
         ]
@@ -8077,6 +8119,7 @@ mod tests {
             reply_to_platform_msg_id: None,
             mentions_bot: false,
             is_reply_to_bot: false,
+            forward: None,
         }
     }
 

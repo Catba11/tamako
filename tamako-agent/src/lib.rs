@@ -145,8 +145,8 @@ pub use endpoint::{
     LlmPurpose, StructuredOutputMode, CAPTION_SESSION_PURPOSE, EMBEDDING_SESSION_PURPOSE,
 };
 pub use extract::{
-    AgentError, BatchMessage, BindingSource, ExtractionInput, KnowledgeExtractor, MentionBinding,
-    ScriptedExtractor,
+    AgentError, BatchMessage, BindingSource, ExtractionInput, ForwardMarker, KnowledgeExtractor,
+    MentionBinding, ScriptedExtractor,
 };
 pub use gate::{GateOutput, RigGate, ScriptedGate};
 pub use graph::{ExtractedEdge, ExtractedNode, ExtractedNodeType, KnowledgeGraph};

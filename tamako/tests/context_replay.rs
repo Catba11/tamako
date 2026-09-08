@@ -117,6 +117,7 @@ fn message(id: &str, seconds: i64, sender_id: &str, name: &str, text: &str) -> N
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 
@@ -139,6 +140,7 @@ fn tail_message(
         reply_to_platform_msg_id: None,
         mentions_bot: false,
         is_reply_to_bot: false,
+        forward: None,
     }
 }
 

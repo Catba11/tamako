@@ -24,11 +24,13 @@ async fn the_rig_extractor_returns_a_parseable_graph() {
                 display_name: "Alice".to_string(),
                 time_hhmm: "09:12".to_string(),
                 text: "I finally deployed the migration to staging tonight".to_string(),
+                forward: None,
             },
             BatchMessage {
                 display_name: "Bob".to_string(),
                 time_hhmm: "09:13".to_string(),
                 text: "nice, did the rollback plan work?".to_string(),
+                forward: None,
             },
         ],
         mention_map: vec![
@@ -44,6 +46,7 @@ async fn the_rig_extractor_returns_a_parseable_graph() {
             },
         ],
         related_pairs: vec![],
+        origins: vec![],
     };
     let graph = extractor.extract(&input).await.expect("extraction");
     // Live output is not deterministic; keep the assertions minimal.

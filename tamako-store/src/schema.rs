@@ -424,6 +424,30 @@ CREATE TABLE llm_session_keys (
 );
 ",
     ),
+    (
+        14,
+        "\
+-- Forward origin capture (decision 108, specs.md Sections 4.2 and
+-- 5.2). Five NULL-able columns on the raw log: the origin kind
+-- ('user'/'hidden_user'/'chat'/'channel'), the display label, the
+-- origin id when the platform gives one (the Telegram user id of a
+-- user-kind origin, the chat id of a chat/channel origin — the
+-- digest pipeline's verified-origin probe derives the deterministic
+-- Person id from it), the ORIGINAL send date (RFC 3339 TEXT, the
+-- house idiom), and the automatic-forward flag (a linked channel's
+-- repost into its discussion group). A non-forwarded row writes all
+-- five as NULL; rows written before v14 read as NULL — not
+-- forwarded. The raw log is append-only (Rule P1): no migration
+-- rewrites old rows. The columns stay OUTSIDE the dedup key: a
+-- redelivery carries the same forward data by construction, so the
+-- dedup shape of v6 stands.
+ALTER TABLE messages ADD COLUMN forward_kind TEXT;
+ALTER TABLE messages ADD COLUMN forward_label TEXT;
+ALTER TABLE messages ADD COLUMN forward_origin_id TEXT;
+ALTER TABLE messages ADD COLUMN forward_date TEXT;
+ALTER TABLE messages ADD COLUMN forward_automatic INTEGER;
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.
