@@ -218,7 +218,7 @@ Phase 1 shipped as v0.0.1 (alpha).
   non-zero. Decisions 64+65 deploy in ONE restart = one full
   provider-cache invalidation for all groups (deployed 2026-08-15).
 - Verification: `cargo build --workspace`, `cargo test --workspace`
-  (1052 tests, 0 failures, on main at decision 91; the live-API
+  (1150 tests, 0 failures, on main at decision 108; the live-API
   smoke tests of tamako-agent and the live Telegram smoke test stay
   ignored by default),
   `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -2725,10 +2725,11 @@ feature commit (decision 92).
     scheduled.
 104. (2026-09-07, operator-ruled) Vector-resolution thresholds
     calibrated: the auto-match band is ABOLISHED. The 2026-09-07
-    offline distribution evaluation (untracked, operator-held:
-    eval-81-2026-09-07.md) measured the per-node top-1 nearest-
-    neighbor cosine similarity of the 14,354 embedded nodes of the
-    six active groups. Two structural facts: the distribution mass
+    offline distribution evaluation (the operator-held page
+    eval-81-2026-09-07.md, deleted 2026-09-09 after this entry and
+    decision 105 absorbed its findings and proposals) measured the
+    per-node top-1 nearest-neighbor cosine similarity of the 14,354
+    embedded nodes of the six active groups. Two structural facts: the distribution mass
     PEAKS inside the old gray band ([0.80, 0.85) holds 32%), so the
     0.80 candidate floor fed the confirmation budget mostly noise
     (the live counters agree: 44% of gray-zone confirmations end
@@ -2759,8 +2760,9 @@ feature commit (decision 92).
     before touching the budget.
 105. (2026-09-07, operator-ruled) Identifier normalization extended:
     strip `@`, fold ASCII letter<->digit space boundaries. The
-    decision-81 evaluation (eval-81-2026-09-07.md) showed that
-    deterministic normalization catches name-form variants more
+    decision-81 evaluation (eval-81-2026-09-07.md, since deleted —
+    see decision 104) showed that deterministic normalization
+    catches name-form variants more
     cheaply and more exactly than any vector threshold (the vector
     instrument cannot separate identity from relatedness). The
     extension of `identifiers::normalize`: (a) every `@` is stripped
@@ -2969,7 +2971,9 @@ Deliberately not done, in priority order:
 8. **Concept alias ambiguity collapses to the deterministic id.** An
    alias with several Concept targets falls back to
    `concept_id(normalized_name)` (fragmentation, the accepted Phase 1
-   defect of dev-roadmap.md Section 3). Phase 2 merges — the remedy shipped with decision 74 (the merge tool collapses fragment nodes); this entry is closable.
+   defect of dev-roadmap.md Section 3). DONE (2026-09-09, batch 4):
+   the remedy shipped with decision 74 (the merge tool collapses
+   fragment nodes).
 9. **`ChatMember` updates are ignored.** RE-DEFERRED (M6): the poller
    does not request `chat_member` updates, so Telegram never sends
    them and the adapter has nothing to consume. Membership is
@@ -2985,8 +2989,9 @@ Deliberately not done, in priority order:
 
 ### Known issues under investigation
 
-- **Repeated replies to the same message across two interval wakes**
-  (observed 2026-08-13/14, after the decision-61/62/63 deploy): the
+- **Repeated replies to the same message across two interval wakes:
+  CLOSED (2026-09-09, sunset met).**
+  Observed 2026-08-13/14, after the decision-61/62/63 deploy: the
   operator observed the bot selecting the SAME message for a reply in
   two consecutive interval-triggered wakes. The 2026-08-14 code review
   traced the wake pipeline and refuted the pipeline-level causes
@@ -3013,6 +3018,12 @@ Deliberately not done, in priority order:
   presented-set check dedups an already-replied target, so a marker
   regression would bring K2 back unimpeded. The sunset criterion
   stays marker-focused.
+  CLOSED 2026-09-09 (batch 4, operator-ruled): no recurrence since
+  the 2026-08-15 decision-64/65 deploy — the operator confirmed the
+  clean stretch and ruled the close three days ahead of the
+  four-week mark. The defense-in-depth gap above stands recorded: a
+  marker regression would still reproduce K2, so any recurrence
+  reopens this entry.
 - **Forced-wake chains bypass the floor: RULED (decision 79).** A
   forced wake that produced a reply starts a `forced_wake_cooldown`
   (default 10 s) suppressing new forced wakes; the intake events

@@ -23,8 +23,8 @@ dependency versions are pinned in `[workspace.dependencies]`.
 | `tamako-vision` | The pure media-normalization crate (decision 82): bytes in, normalized JPEG/data-URI out; no I/O, no async, no LLM. | 10 |
 | `tamako-agent` | All LLM concerns: the endpoint layer (per-purpose session affinity, decision 84; the reasoning-markup stripper, decisions 93/96), the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator and the warmup generator (decision 78) with the fence-extraction validation seam (decisions 93/95, decision-96 seam telemetry), the deep/shallow recall worker (decision 76), the Rule C3 summarizer (decision 62), the intake captioner (decision 82), the merge-tool confirmation seam (decision 74). | 311 (+5 ignored live tests) |
 
-Total: 1115 tests (+9 ignored live tests), verified 2026-09-06 @
-decisions 98/99 (re-stamp when re-verified, decision 92). Build, test,
+Total: 1150 tests (+9 ignored live tests), verified 2026-09-09 @
+decision 108 (re-stamp when re-verified, decision 92). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction
