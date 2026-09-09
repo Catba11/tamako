@@ -98,3 +98,45 @@ binary is unaffected; graph-INSPECTION tooling must use Python ladybug
 >= 0.19. Any future Rust-side lbug upgrade keeps the gap-6 discipline:
 verify storage-version compatibility and re-run
 `tamako-memory/tests/lbug_concurrent_access.rs`.
+
+## Addendum 2026-09-09: the crate pin never pinned the C++ core; LBUG_VERSION pins it (decision 109)
+
+lbug's build.rs invokes the prebuilt-download script with NO version
+argument; the upstream script resolves `releases/latest` from the
+GitHub API. The crate pin therefore pinned only the Rust FFI layer —
+the linked C++ core floated to whatever release was latest at build
+time. Evidence: the 0.18.3 crate's prebuilt cache
+(`.cache/lbug-prebuilt/latest/lib/liblbug.a`) carries 0.19.0/0.19.1
+version strings and no 0.18.x, so the shipped binary links the 0.19.1
+core. This also corrects the attribution of the 2026-08-10 addendum:
+the vendored 0.18.3 source is storage v42; the v43 writes came from
+the floating 0.19.1 core, not from the crate. A clean rebuild after
+the 0.20.3 release (2026-09-08) would have silently linked the 0.20.3
+core and stamped NEW group graphs at storage v47.
+
+Ruled (decision 109, 2026-09-09): `.cargo/config.toml` carries
+`[env] LBUG_VERSION = "0.19.1"` — the exact core the live binary
+already runs. Nothing linked changes today; every future clean build
+is reproducible. The variable is not forced: an explicit shell
+LBUG_VERSION overrides it as an escape hatch. Verified by a
+cache-miss rebuild: with the prebuilt cache moved aside the build
+re-downloaded the v0.19.1 archive (the osx-arm64 static asset was
+confirmed present upstream beforehand) and the fresh liblbug.a
+carries 0.19.x strings only.
+
+The 0.20 upgrade is deferred to an early-October 2026 re-evaluation:
+the 0.20 line (0.20.0 of 2026-08-29 through 0.20.3 of 2026-09-08,
+itself a storage-read-compat patch) is in active patch churn, and its
+fixes on our hot path (parameterized re-execution returning stale
+rows, #877, in 0.20.2; a re-execution SIGSEGV in 0.20.1;
+fhSharedMutex hardening around pageStates/addNewPages — the race
+area of the 2026-08-08 addendum) are potential gains, not active
+bugs. Pre-verified for the upgrade: the crate's Rust API files are
+byte-identical from 0.18.3 through 0.20.3; 0.20.3 accepts storage
+versions {40..46, current} and preserves a file's
+savedStorageVersion across CHECKPOINT, so existing v43 graphs stay
+v43 while new graphs stamp v47; Python ladybug 0.20.3 is available
+for the inspection tooling. The gap-6 discipline stands: open a copy
+of a live graph under the new build (read, write, CHECKPOINT; header
+stays v43), re-run `tamako-memory/tests/lbug_concurrent_access.rs`,
+full DoD.
