@@ -2925,6 +2925,34 @@ feature commit (decision 92).
     the origin); the original send date is stored but not
     rendered.
 
+109. (2026-09-09, operator-ruled) The lbug C++ core version is
+    pinned through the build environment; the 0.20 upgrade is
+    deferred to an early-October re-evaluation. The crate pin never
+    pinned the core: build.rs runs the prebuilt-download script with
+    no version argument and the script resolves `releases/latest`, so
+    the linked core floated to whatever was latest at build time
+    (evidence: the 0.18.3 crate's prebuilt cache carries 0.19.0/0.19.1
+    strings and no 0.18.x; the v43 storage writes the ADR 2026-08-10
+    addendum attributed to the crate came from that floating 0.19.1
+    core). (a) PIN: `.cargo/config.toml` sets `[env] LBUG_VERSION =
+    "0.19.1"` — the core the live binary already runs, so nothing
+    linked changes today and every future clean build is
+    reproducible; not forced, an explicit shell LBUG_VERSION stays an
+    escape hatch. Verified by a cache-miss rebuild re-downloading the
+    v0.19.1 prebuilt archive. (b) DEFER 0.20: the 0.20 line is in
+    active patch churn (0.20.3 of 2026-09-08 was itself a
+    read-compat patch); its wins for our hot path (the #877
+    parameterized-re-execution stale-rows fix, a re-execution
+    SIGSEGV fix, fhSharedMutex hardening in the 2026-08-08 race area)
+    are potential gains, not active bugs — the suite is green on
+    0.19.1. Upgrade facts pre-verified for the re-evaluation: the
+    Rust API files are byte-identical 0.18.3..0.20.3; 0.20.3 reads
+    storage {40..46, current} and preserves a file's
+    savedStorageVersion across CHECKPOINT (existing v43 graphs stay
+    v43, new groups would stamp v47); Python ladybug 0.20.3 is on
+    PyPI for the inspection tooling. The gap-6 discipline applies at
+    upgrade time. See ADR-0001 addendum 2026-09-09.
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:
