@@ -1,0 +1,8 @@
+[env]
+# Decision 109 (2026-09-09): the lbug crate pin pins only the Rust FFI
+# layer; the prebuilt-download script resolves `releases/latest` unless
+# LBUG_VERSION is set, so the linked C++ core floated (0.18.3 crate
+# linked the 0.19.1 core — the ADR-0001 2026-09-09 addendum). Pin the
+# core the live binary already runs. Not forced: an explicit shell
+# LBUG_VERSION overrides this as an escape hatch.
+LBUG_VERSION = "0.19.1"
