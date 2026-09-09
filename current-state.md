@@ -2729,13 +2729,14 @@ feature commit (decision 92).
     eval-81-2026-09-07.md, deleted 2026-09-09 after this entry and
     decision 105 absorbed its findings and proposals) measured the
     per-node top-1 nearest-neighbor cosine similarity of the 14,354
-    embedded nodes of the six active groups. Two structural facts: the distribution mass
-    PEAKS inside the old gray band ([0.80, 0.85) holds 32%), so the
-    0.80 candidate floor fed the confirmation budget mostly noise
-    (the live counters agree: 44% of gray-zone confirmations end
-    rejected); and in [0.92, 1.0) the Concept pairs are almost all
-    FALSE duplicates — topical neighbors and antonym/parallel pairs
-    score up to 0.989 while true duplicates sit as low as 0.945 —
+    embedded nodes of the six active groups. Two structural facts:
+    the distribution mass PEAKS inside the old gray band ([0.80,
+    0.85) holds 32%), so the 0.80 candidate floor fed the
+    confirmation budget mostly noise (the live counters agree: 44%
+    of gray-zone confirmations end rejected); and in [0.92, 1.0) the
+    Concept pairs are almost all FALSE duplicates — topical
+    neighbors and antonym/parallel pairs score up to 0.989 while
+    true duplicates sit as low as 0.945 —
     so NO score separates Concept identity from relatedness. Ruled:
     (a) `vector_candidate_threshold` 0.80 -> 0.88, above the
     distribution peak;
@@ -2758,6 +2759,19 @@ feature commit (decision 92).
     falls through to a new node — fragmentation the merge tool
     repairs. Watch the confirmed/rejected rates after the deploy
     before touching the budget.
+    Calibration baseline absorbed from the deleted page
+    (2026-09-09): method — per-node top-1 nearest-neighbor cosine
+    over the six active groups' 14,354 embedded nodes (Alias
+    6,859 / Concept 7,324 / Person 231) of a 2026-09-07 snapshot,
+    KNN k=6 (MERGE_SCAN_KNN_K=5+1); the k cap bounds pair-list
+    completeness only, the top-1 distribution is exact. Top-1
+    distribution: <0.70 1.7%, 0.70-0.75 9.3%, 0.75-0.80 31.1%,
+    0.80-0.85 32.3% (peak), 0.85-0.90 17.3%, 0.90-0.95 7.0%,
+    0.95-1.00 1.4%. Live counters at evaluation: matched 12 /
+    confirmed 226 / rejected 179. The one merge dry run at 0.85
+    yielded 35 candidates = 31 related + 3 different + 1 same. The
+    pair-level evidence named live group content and is
+    deliberately not archived.
 105. (2026-09-07, operator-ruled) Identifier normalization extended:
     strip `@`, fold ASCII letter<->digit space boundaries. The
     decision-81 evaluation (eval-81-2026-09-07.md, since deleted —
