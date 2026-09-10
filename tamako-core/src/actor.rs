@@ -550,9 +550,10 @@ where
 /// marker, so the logs distinguish a panic from a provider failure.
 ///
 /// Mechanism: `futures::FutureExt::catch_unwind` is the textbook
-/// shape, but `futures` is not a dependency of tamako-core (nor of the
-/// workspace) and the std covers the same ground: `poll_fn` +
-/// `std::panic::catch_unwind`, no new dependency. The
+/// shape; `futures` was not a dependency of the workspace when this
+/// was written (decision 113 later added it for the embedding
+/// paths), and the std covers the same ground: `poll_fn` +
+/// `std::panic::catch_unwind`, no new dependency on this path. The
 /// `AssertUnwindSafe` is sound here: after a caught panic the inner
 /// future is NEVER polled again — the wrapper resolves with the error
 /// and drops it — which is exactly the contract `futures`' own
