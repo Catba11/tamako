@@ -107,17 +107,16 @@ pub trait EmbeddingProvider: Send + Sync {
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, EmbeddingError>> + Send + 'a>>;
 
-    /// Embeds a batch of texts, one vector per input in INPUT ORDER
-    /// (decision 73: the entity resolver makes ONE batched embeddings
-    /// call per digest batch for all entities reaching step 3 — the
-    /// embeddings API takes input arrays). Batch semantics: a provider
-    /// with a native batch surface SHOULD override this with one
-    /// provider call; the DEFAULT implementation loops [`embed`]
-    /// sequentially, the correct fallback for any provider (the
-    /// existing worker and its test doubles stay source-compatible).
-    /// The dimension pin (4096) applies per element — the `embed`
-    /// implementations enforce it, and the default loop inherits that
-    /// enforcement.
+    /// Embeds a batch of texts, one vector per input in INPUT ORDER.
+    /// Decision 113: batching means BOUNDED-CONCURRENT SINGLE-TEXT
+    /// posts, never array input (the decision-81 addendum: the ZDR
+    /// route serves single-text only, array input 404s) — the binary's
+    /// adapter overrides this with [`embed_texts_bounded`]; the
+    /// DEFAULT implementation loops [`embed`] sequentially, the
+    /// correct fallback for any provider (the existing worker and its
+    /// test doubles stay source-compatible). The dimension pin (3072,
+    /// decision 81) applies per element — the `embed` implementations
+    /// enforce it, and the default loop inherits that enforcement.
     #[allow(clippy::type_complexity)]
     fn embed_texts<'a>(
         &'a self,
@@ -1146,6 +1145,69 @@ mod tests {
             .done_embedding_hashes()
             .expect("done hashes")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_drain_attributes_per_row_results_across_survivors() {
+        // Decision 113: three survivors, the mid one's embed fails —
+        // the phase-split zips results back to rows in input order, so
+        // exactly n2 records the failed attempt while n1/n3 embed and
+        // journal (exercises the survivors↔vectors alignment no
+        // single-row test can reach).
+        let (_dir, target) = test_target();
+        let memory = ScriptedMemory::with_group(
+            "chat_a",
+            &[
+                ("n1", content("Alpha", "first")),
+                ("n2", content("Beta", "second")),
+                ("n3", content("Gamma", "third")),
+            ],
+        );
+        target
+            .store
+            .enqueue_embeddings(&[
+                ("n1".to_string(), "h1".to_string()),
+                ("n2".to_string(), "h2".to_string()),
+                ("n3".to_string(), "h3".to_string()),
+            ])
+            .expect("enqueue");
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Ok(vec![1.0; EMBEDDING_DIM]),
+                Err(EmbeddingError::Provider("boom".to_string())),
+                Ok(vec![1.0; EMBEDDING_DIM]),
+            ])),
+            ..ScriptedProvider::succeeding()
+        };
+
+        let report = drain_group(&provider, &memory, &target, 4).await;
+
+        assert_eq!(
+            report,
+            DrainReport {
+                claimed: 3,
+                embedded: 2,
+                gone: 0,
+                failed: 1,
+            }
+        );
+        // n1 and n3 journaled with their STORED hashes; n2 is not.
+        assert_eq!(
+            target.store.done_embedding_hashes().expect("done hashes"),
+            vec![
+                ("n1".to_string(), embedding_content_hash("Alpha", "first")),
+                ("n3".to_string(), embedding_content_hash("Gamma", "third")),
+            ]
+        );
+        // n2's row stays claimable with one attempt recorded; the
+        // other two rows closed.
+        let pending = target
+            .store
+            .claim_embedding_batch(EMBEDDING_BATCH_PER_GROUP)
+            .expect("claim");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].node_id, "n2");
+        assert_eq!(pending[0].attempts, 1);
     }
 
     #[tokio::test]

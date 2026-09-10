@@ -3103,16 +3103,25 @@ feature commit (decision 92).
     removed the batch override), with no global limiter anywhere.
     Decision 81's addendum forbids only ARRAY input (the ZDR route
     serves single-text only); concurrent single-text POSTs stay on
-    the ZDR route, and OpenRouter's paid embedding endpoints serve
-    high per-account concurrency. The new `embed_texts_bounded`
-    helper (order-preserving, per-item results, every text attempted
-    even after an error) backs the adapter's `embed_texts` override
-    (pre-screen + deep recall) and the drain tick's embed phase; the
-    drain keeps exact per-row error attribution through a phase
-    split (contents read, bounded-concurrent embed, sequential
-    upsert/done/journal). The tamako-agent seam keeps no
-    `embed_texts` override: single-text only; the decision-81
-    addendum stands.
+    the ZDR route. OpenRouter's paid embedding endpoints are
+    operator-reported to serve high per-account concurrency
+    (UNVERIFIED per §6.7 — never measured; decision 81's addendum
+    measured routing only). The bound applies PER CALL SITE (every
+    pre-screen/deep-recall batch and every drain tick bounds itself;
+    concurrently active groups sum — NOT a process-wide cap). The
+    live value 8 ships with a calibration plan: the drain's attempts
+    cap already absorbs rate-limit failures and the reconciliation
+    re-enqueues un-embedded nodes, so a 429 burst is self-healing;
+    watch the wake and drain paths for 429s and endpoint WARNs and
+    re-tune at the 2026-09-12 window review. The new
+    `embed_texts_bounded` helper (order-preserving, per-item results,
+    every text attempted even after an error) backs the adapter's
+    `embed_texts` override (pre-screen + deep recall) and the drain
+    tick's embed phase; the drain keeps exact per-row error
+    attribution through a phase split (contents read,
+    bounded-concurrent embed, sequential upsert/done/journal). The
+    tamako-agent seam keeps no `embed_texts` override: single-text
+    only; the decision-81 addendum stands.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
