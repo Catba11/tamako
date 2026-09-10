@@ -42,6 +42,13 @@ const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 /// The default probe model: the cheap digest model of the live config.
 const DEFAULT_MODEL: &str = "mimo-v2.5";
 
+/// The session id the probe sends as the `x-opencode-session` /
+/// `x-session-id` header pair (decision 84 (a)): the opencode "go"
+/// router rejects headerless requests with `MissingSessionID`, so the
+/// probe mirrors the production client. Capability probing does not
+/// need the per-(group, purpose) suffix; any well-formed value routes.
+const SESSION_HEADER_VALUE: &str = "tamako-probe";
+
 /// The cap on the printed raw response body. Large enough to hold one
 /// full chat/completions response for a tiny request.
 const BODY_PRINT_CAP: usize = 2000;
@@ -269,6 +276,8 @@ async fn run_mode(
     let response = client
         .post(&url)
         .bearer_auth(&config.api_key)
+        .header("x-opencode-session", SESSION_HEADER_VALUE)
+        .header("x-session-id", SESSION_HEADER_VALUE)
         .json(&request_body(&config.model, mode))
         .send()
         .await
