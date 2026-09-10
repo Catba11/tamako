@@ -3065,6 +3065,19 @@ feature commit (decision 92).
     rebuild parameters (variant=shipped, EXTRAS=1, N, the ctx
     schema id/ts(ISO)/text/dir/name, the verdict semantics); after
     deletion the run is specified but not re-executable.
+    Superseded 2026-09-10 (operator-ruled, same day): (b)'s
+    alias-scoped anchor is replaced by a version pin. Background:
+    at the morning switch the opencode catalog did not serve the
+    versioned id and provider support named `deepseek-flash` the
+    dirty fix; by the afternoon `deepseek-v4.1-flash` was listed,
+    probed 200 with a self-echoing `model` field, and reproduced
+    the alias arm 30/30 on the reply fence contract (N=30,
+    R1/R2=0, every finish=stop). tamako.toml pins
+    `deepseek-v4.1-flash` for gate and reply, effective with the
+    same-day relaunch. Gate-side equivalence stays UNVERIFIED
+    pending the observation window's participation/injection
+    signals; the 2026-09-12 addendum carries the full
+    enshrinement.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
