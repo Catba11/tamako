@@ -1,10 +1,10 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-10 — decision 112 (the worktree rests
-on the live branch; build/launch branch gate), after decision 111
-(gate and reply switched to opencode deepseek-flash, pinned
-v4.1-flash; calibration plan), after decision 110 (the AGENT.md
-lessons round from the full mistake audit).
+A living document. Update it at every milestone. Last update: 2026-09-10 — decision 113 (bounded-concurrent
+embeddings behind `embedding_concurrency`), after decision 112 (the
+worktree rests on the live branch; build/launch branch gate), after
+decision 111 (gate and reply switched to opencode deepseek-flash,
+pinned v4.1-flash; calibration plan).
 Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
 Phase 1 shipped as v0.0.1 (alpha).
 
@@ -3091,6 +3091,28 @@ feature commit (decision 92).
     --show-current` gates every build/launch command for the live
     bot. Ruling: the operator's instruction plus the
     operator-authored `.omp/rules/build-on-production-branch.md`.
+
+113. (2026-09-10, operator-ruled) Bounded-concurrent single-text
+    embedding calls, gated by the new global-only flat key
+    `embedding_concurrency` (default 1 = the byte-identical
+    decision-66 behavior; the live tamako.toml sets 8). Baseline:
+    every embeddings path serialized PER PATH (the drain loop
+    row-by-row; the pre-screen and deep-recall `embed_texts` through
+    the trait defaults' sequential loop — the adapter's decision-73
+    "ONE batched HTTP call" comment was stale since decision 81
+    removed the batch override), with no global limiter anywhere.
+    Decision 81's addendum forbids only ARRAY input (the ZDR route
+    serves single-text only); concurrent single-text POSTs stay on
+    the ZDR route, and OpenRouter's paid embedding endpoints serve
+    high per-account concurrency. The new `embed_texts_bounded`
+    helper (order-preserving, per-item results, every text attempted
+    even after an error) backs the adapter's `embed_texts` override
+    (pre-screen + deep recall) and the drain tick's embed phase; the
+    drain keeps exact per-row error attribution through a phase
+    split (contents read, bounded-concurrent embed, sequential
+    upsert/done/journal). The tamako-agent seam keeps no
+    `embed_texts` override: single-text only; the decision-81
+    addendum stands.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
