@@ -164,8 +164,7 @@ pub struct TriggerConfig {
     pub reply_model: Option<String>,
     /// The model of the Rule C3 segmented summarizer (specs.md
     /// Section 10, keep-two retention). `None` (the default) means the
-    /// agent crate's built-in cheap model. Deviation: specs.md
-    /// Section 13 has no such key; reported for spec backfill.
+    /// agent crate's built-in cheap model.
     pub summary_model: Option<String>,
     /// The embedding model of the Phase 2 sidecar (current-state.md
     /// decision 66). GLOBAL-ONLY and flat: no per-purpose and no
@@ -175,8 +174,6 @@ pub struct TriggerConfig {
     /// `qwen/qwen3-embedding-8b` default); decision 81 re-pins the
     /// default to `google/gemini-embedding-2` (native 3072 dims).
     /// The env var TAMAKO_EMBEDDING_MODEL wins at wiring time.
-    /// Deviation: specs.md Section 13 has no
-    /// embedding keys; reported for spec backfill (Phase 2).
     pub embedding_model: String,
     /// The base URL of the openai-compatible embedding endpoint
     /// (decision 66). Global-only and flat; refer to
@@ -187,17 +184,16 @@ pub struct TriggerConfig {
     /// flat, the same standing as `embedding_model`: `false` disables
     /// the embedding provider build at wiring time (the binary reads
     /// this key; the provider-less worker then runs reconciliation
-    /// only, no drains). Default true. Deviation: specs.md Section 13
-    /// has no such key; reported for spec backfill.
+    /// only, no drains). Default true.
     pub embedding_enabled: bool,
     /// The embedding call concurrency bound (decision 113). GLOBAL-ONLY
     /// and flat, the same standing as `embedding_model`: the maximum
-    /// in-flight single-text embedding POSTs of the shared provider's
-    /// batched calls and the worker's drain phase (concurrent
-    /// single-text requests, NEVER array input — the decision-81
-    /// addendum's ZDR route discipline is unchanged). Default 1 = the
-    /// decision-66 sequential behavior. Deviation: specs.md Section 13
-    /// has no such key; reported for spec backfill.
+    /// in-flight single-text embedding POSTs PER CALL SITE — every
+    /// pre-screen/deep-recall batch and every drain tick bounds itself,
+    /// so concurrently active groups sum (this is NOT a process-wide
+    /// cap). Concurrent single-text requests, NEVER array input — the
+    /// decision-81 addendum's ZDR route discipline is unchanged.
+    /// Default 1 = the decision-66 sequential behavior.
     pub embedding_concurrency: usize,
     /// The media captioning model of decision 82 (c): photos/stickers
     /// are captioned at intake by this vision model. Flat and concrete
@@ -205,8 +201,7 @@ pub struct TriggerConfig {
     /// resolved by the agent layer), but UNLIKE the embedding keys
     /// this key follows the ordinary per-group-override pattern of the
     /// other model keys (`digest_model`, `gate_model`, ...) — a group
-    /// may pin a different caption model. Deviation: specs.md
-    /// Section 13 has no caption keys; reported for spec backfill.
+    /// may pin a different caption model.
     pub caption_model: String,
     /// The base URL of the openai-compatible caption endpoint
     /// (decision 82 (c)). Default `https://openrouter.ai/api/v1` (the
@@ -215,20 +210,19 @@ pub struct TriggerConfig {
     pub caption_llm_base_url: String,
     /// How the structured calls enforce their output shape on the wire:
     /// `schema` (the default), `json_object`, or `prompt_only`. `None`
-    /// means the agent layer resolves the default. Deviation: specs.md
-    /// Section 13 has no such key; reported for spec backfill.
+    /// means the agent layer resolves the default.
     pub structured_output: Option<String>,
     /// The digest-purpose override of `structured_output`. Refer to
-    /// `structured_output` (reported for spec backfill).
+    /// `structured_output`.
     pub digest_structured_output: Option<String>,
     /// The gate-purpose override of `structured_output`. Refer to
-    /// `structured_output` (reported for spec backfill).
+    /// `structured_output`.
     pub gate_structured_output: Option<String>,
     /// The reply-purpose override of `structured_output`. Refer to
-    /// `structured_output` (reported for spec backfill).
+    /// `structured_output`.
     pub reply_structured_output: Option<String>,
     /// The summary-purpose override of `structured_output`. Refer to
-    /// `structured_output` (reported for spec backfill).
+    /// `structured_output`.
     pub summary_structured_output: Option<String>,
     /// specs.md Section 6.2 recency re-check: when more than this many
     /// newer human messages arrived after the target message, the
@@ -599,8 +593,9 @@ impl TriggerConfigToml {
     /// specs.md Section 13 and the `TriggerConfig` key docs:
     /// `llm_session_id` ("one session id per deployment... do not"
     /// override per group), `embedding_model`, `embedding_llm_base_url`
-    /// (both "global only"), and `embedding_enabled` (decision 77,
-    /// M6a). `llm_api`/`llm_base_url` are NOT global-only — Section 13
+    /// (both "global only"), `embedding_enabled` (decision 77, M6a),
+    /// and `embedding_concurrency` (decision 113).
+    /// `llm_api`/`llm_base_url` are NOT global-only — Section 13
     /// resolves LLM access from the per-group effective configuration —
     /// and neither are the per-purpose `*_llm_*` / model /
     /// structured-output keys. The decision-82 (c) caption keys are
@@ -1922,8 +1917,9 @@ embedding_concurrency = 8
     #[test]
     fn global_only_keys_under_a_group_are_a_loud_parse_error() {
         // Decision 77 (S6-F7): the verified global-only set is
-        // llm_session_id, embedding_model, embedding_llm_base_url, and
-        // embedding_enabled. Each one under [groups.*] is a ConfigError
+        // llm_session_id, embedding_model, embedding_llm_base_url,
+        // embedding_enabled, and embedding_concurrency (decision 113).
+        // Each one under [groups.*] is a ConfigError
         // naming the key AND the group.
         for (key, value) in [
             ("llm_session_id", "\"my-deployment\""),

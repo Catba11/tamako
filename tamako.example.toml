@@ -70,11 +70,13 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # embedding_llm_base_url = "https://openrouter.ai/api/v1"
 
 # Embedding call concurrency (global-only; decision 113). Bounds the
-# in-flight SINGLE-TEXT embedding POSTs of the pre-screen/deep-recall
-# batched calls and the worker's drain phase — concurrent requests,
-# never array input (OpenRouter's ZDR vertex route serves single-text
-# only). Default 1 = sequential; raise for paid endpoints with high
-# per-account concurrency.
+# in-flight SINGLE-TEXT embedding POSTs PER CALL SITE — every
+# pre-screen/deep-recall batch and every drain tick bounds itself, so
+# concurrently active groups sum (not a process-wide cap). Concurrent
+# requests, never array input (OpenRouter's ZDR vertex route serves
+# single-text only). Default 1 = sequential; raise for paid endpoints
+# serving high per-account concurrency (unverified here — watch for
+# 429s).
 # embedding_concurrency = 1
 
 # Media captioning at intake (decision 82). Photos and static stickers are
