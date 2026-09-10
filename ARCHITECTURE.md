@@ -15,7 +15,7 @@ dependency versions are pinned in `[workspace.dependencies]`.
 |---|---|---|
 | `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 117 (+3 ignored) |
 | `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 378 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v13), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 98 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v14), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 98 |
 | `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 74 (incl. the concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63; the per-group suffix override loader, decision 98). | 54 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
@@ -430,8 +430,9 @@ crate. Key decisions:
   recall scan could otherwise overlap an in-flight MERGE. Refer to
   `docs/adr-0001-ladybugdb-binding.md` (addendum 2026-08-08); the
   regression test is `tamako-memory/tests/lbug_concurrent_access.rs`.
-- The backend exposes the read path of Section 8 in its Phase 1 form
-  (M5): `MemoryBackend::alias_targets` (entry resolution step 2: the
+- The backend exposes the read path of Section 8 (M5, extended by
+  the decision-76 deep-recall reads): `MemoryBackend::alias_targets`
+  (entry resolution step 2: the
   targets of one alias node, entered through the deterministic alias
   identifier, Rule R5), `MemoryBackend::neighbors` (the Section 8.2
   direct-neighbor fetch: both directions in one query, the filter
@@ -444,6 +445,11 @@ crate. Key decisions:
   `NeighborEdge::edge_id()` renders the edge natural key
   (`{source_id}|{relationship_name}|{target_id}|{valid_at}`); it is the
   Section 9.3 dedup key of the `injected_memories` table.
+  Decision 76 extends the trait with `two_hop_edges` (the Section
+  9.1 two-hop expansion, hop-one/hop-two truncation, the 90-day
+  window) and `edges_by_ids` (candidate hydration); the deep
+  recall's full-text source reads the store's `edge_texts` table
+  (LIKE), not the graph.
 
 ## 8. The digest pipeline (tamako-agent, M1)
 
