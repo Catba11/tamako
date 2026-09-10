@@ -215,7 +215,7 @@ Phase 1 shipped as v0.0.1 (alpha).
   non-zero. Decisions 64+65 deploy in ONE restart = one full
   provider-cache invalidation for all groups (deployed 2026-08-15).
 - Verification: `cargo build --workspace`, `cargo test --workspace`
-  (1150 tests, 0 failures, on main at decision 108; the live-API
+  (1157 tests, 0 failures, on main at decision 113; the live-API
   smoke tests of tamako-agent and the live Telegram smoke test stay
   ignored by default),
   `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -3107,8 +3107,10 @@ feature commit (decision 92).
     operator-reported to serve high per-account concurrency
     (UNVERIFIED per §6.7 — never measured; decision 81's addendum
     measured routing only). The bound applies PER CALL SITE (every
-    pre-screen/deep-recall batch and every drain tick bounds itself;
-    concurrently active groups sum — NOT a process-wide cap). The
+    pre-screen/deep-recall batch bounds itself; concurrently waking
+    groups sum on the recall path. The drain path is ONE shared call
+    site — the worker drains groups sequentially per tick, so the
+    drain never exceeds this bound process-wide). The
     live value 8 ships with a calibration plan: the drain's attempts
     cap already absorbs rate-limit failures and the reconciliation
     re-enqueues un-embedded nodes, so a 429 burst is self-healing;

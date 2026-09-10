@@ -108,11 +108,10 @@ pub struct TriggerConfig {
     pub digest_timeout: Duration,
     /// specs.md Section 10.3. Default 5.
     pub digest_max_retries: u32,
-    /// Extraction model override for the digest pipeline. `None` (the
-    /// default) means the agent crate's built-in default model. The env
-    /// var TAMAKO_DIGEST_MODEL takes precedence at wiring time.
-    /// Deviation: specs.md Section 13 has no LLM keys; this key is
-    /// reported as a deviation of Phase 1 M1.
+    /// Extraction model override for the digest pipeline (specs.md
+    /// Section 13). `None` (the default) means the agent crate's
+    /// built-in default model. The env var TAMAKO_DIGEST_MODEL takes
+    /// precedence at wiring time.
     pub digest_model: Option<String>,
     /// specs.md Section 13: the endpoint family, `anthropic-compatible`
     /// or `openai-compatible`. `None` (the default): the agent layer
@@ -120,14 +119,13 @@ pub struct TriggerConfig {
     pub llm_api: Option<String>,
     /// specs.md Section 13: the base URL of the endpoint.
     pub llm_base_url: Option<String>,
-    /// The session id of the LLM endpoint, sent as the
-    /// `x-opencode-session` header on every request (Opencode Go
+    /// The session id of the LLM endpoint (specs.md Section 13), sent
+    /// as the `x-opencode-session` header on every request (Opencode Go
     /// gateway session affinity; provider prompt-cache affinity).
     /// Global-only (one session id per deployment, no per-purpose or
     /// per-group variant). `None` (the default): the agent layer
     /// resolves the default `"tamako"`; the env var
-    /// TAMAKO_LLM_SESSION_ID wins. Deviation: specs.md Section 13 has
-    /// no such key; reported for spec backfill.
+    /// TAMAKO_LLM_SESSION_ID wins.
     pub llm_session_id: Option<String>,
     /// specs.md Section 13: a purpose (`digest`, `gate`, `reply`) may
     /// override `llm_api` and `llm_base_url` individually. This permits
@@ -189,11 +187,13 @@ pub struct TriggerConfig {
     /// The embedding call concurrency bound (decision 113). GLOBAL-ONLY
     /// and flat, the same standing as `embedding_model`: the maximum
     /// in-flight single-text embedding POSTs PER CALL SITE — every
-    /// pre-screen/deep-recall batch and every drain tick bounds itself,
-    /// so concurrently active groups sum (this is NOT a process-wide
-    /// cap). Concurrent single-text requests, NEVER array input — the
-    /// decision-81 addendum's ZDR route discipline is unchanged.
-    /// Default 1 = the decision-66 sequential behavior.
+    /// pre-screen/deep-recall batch bounds itself (concurrently waking
+    /// groups sum on the recall path), and the drain path is ONE shared
+    /// call site (the worker drains groups sequentially per tick, so
+    /// the drain never exceeds this bound process-wide). Concurrent
+    /// single-text requests, NEVER array input — the decision-81
+    /// addendum's ZDR route discipline is unchanged. Default 1 = the
+    /// decision-66 sequential behavior.
     pub embedding_concurrency: usize,
     /// The media captioning model of decision 82 (c): photos/stickers
     /// are captioned at intake by this vision model. Flat and concrete
@@ -224,11 +224,9 @@ pub struct TriggerConfig {
     /// The summary-purpose override of `structured_output`. Refer to
     /// `structured_output`.
     pub summary_structured_output: Option<String>,
-    /// specs.md Section 6.2 recency re-check: when more than this many
-    /// newer human messages arrived after the target message, the
+    /// specs.md Sections 6.2/13 recency re-check: when more than this
+    /// many newer human messages arrived after the target message, the
     /// generated reply is DISCARDED, not regenerated. Default 20.
-    /// Deviation of Phase 1 M4: this key is not yet in specs.md
-    /// Section 13; it is reported for spec backfill.
     pub reply_staleness_threshold: u32,
     /// specs.md Section 6.2 (decision 70): a NON-forced wake reply
     /// quotes (replies-to) its target message only when MORE than this
@@ -272,9 +270,8 @@ pub struct TriggerConfig {
     /// — one valid fact per subject per predicate. A predicate absent
     /// from the list is multi-value. Default the four of Section 13.
     pub single_value_predicates: Vec<String>,
-    /// The hard cap of injected memories per wake (Section 9.2
-    /// conservative default). Default 5. Deviation: specs.md Section 13
-    /// has no such key; reported for spec backfill (Phase 1 M5).
+    /// The hard cap of injected memories per wake (specs.md Sections
+    /// 9.2/13). Default 5.
     pub recall_injection_cap: u32,
     /// specs.md Sections 9.1/13 (decision 76): the deep-recall switch.
     /// `false` restores the Phase 1 shallow candidate form (direct
@@ -446,18 +443,18 @@ pub struct TriggerConfigToml {
     /// The reply-purpose base URL. Refer to
     /// `TriggerConfig::reply_llm_base_url`.
     pub reply_llm_base_url: Option<String>,
-    /// The summary-purpose endpoint family (reported for spec
-    /// backfill). Refer to `TriggerConfig::reply_llm_api`.
+    /// The summary-purpose endpoint family (specs.md Section 13's
+    /// per-purpose paragraph). Refer to `TriggerConfig::reply_llm_api`.
     pub summary_llm_api: Option<String>,
-    /// The summary-purpose base URL (reported for spec backfill).
-    /// Refer to `TriggerConfig::reply_llm_base_url`.
+    /// The summary-purpose base URL (specs.md Section 13's per-purpose
+    /// paragraph). Refer to `TriggerConfig::reply_llm_base_url`.
     pub summary_llm_base_url: Option<String>,
     /// The gate model override. Refer to `TriggerConfig::gate_model`.
     pub gate_model: Option<String>,
     /// The reply model override. Refer to `TriggerConfig::reply_model`.
     pub reply_model: Option<String>,
-    /// The summary model override (reported for spec backfill). Refer
-    /// to `TriggerConfig::summary_model`.
+    /// The summary model override (specs.md Section 13). Refer to
+    /// `TriggerConfig::summary_model`.
     pub summary_model: Option<String>,
     /// The embedding model (decision 66; global-only, no per-group
     /// machinery). Refer to `TriggerConfig::embedding_model`.
@@ -1151,11 +1148,11 @@ wake_floor_secs = 60
         // cooldown defaults to 10 s.
         assert_eq!(config.forced_wake_cooldown, Duration::from_secs(10));
         // The M4 keys: every Option is None by default; the staleness
-        // threshold is 20 (M4 deviation, reported for spec backfill).
+        // threshold is 20 (specs.md Sections 6.2/13).
         assert_eq!(config.llm_api, None);
         assert_eq!(config.llm_base_url, None);
-        // The session-id key (global-only; reported for spec backfill):
-        // None by default; the agent layer resolves "tamako".
+        // The session-id key (global-only; specs.md Section 13): None
+        // by default; the agent layer resolves "tamako".
         assert_eq!(config.llm_session_id, None);
         assert_eq!(config.digest_llm_api, None);
         assert_eq!(config.digest_llm_base_url, None);
@@ -1197,22 +1194,22 @@ wake_floor_secs = 60
                 "dating".to_string(),
             ]
         );
-        // The structured-output mode keys (reported for spec backfill):
-        // every Option is None by default; the agent layer resolves
-        // the default mode.
+        // The structured-output mode keys (specs.md Section 13): every
+        // Option is None by default; the agent layer resolves the
+        // default mode.
         assert_eq!(config.structured_output, None);
         assert_eq!(config.digest_structured_output, None);
         assert_eq!(config.gate_structured_output, None);
         assert_eq!(config.reply_structured_output, None);
-        // The summary keys (reported for spec backfill): every Option
-        // is None by default; the agent layer resolves the cheap model
-        // and the default mode.
+        // The summary keys (specs.md Section 13): every Option is None
+        // by default; the agent layer resolves the cheap model and the
+        // default mode.
         assert_eq!(config.summary_model, None);
         assert_eq!(config.summary_llm_api, None);
         assert_eq!(config.summary_llm_base_url, None);
         assert_eq!(config.summary_structured_output, None);
-        // The M5 key: the injection cap defaults to 5 (Section 9.2
-        // conservative default; deviation reported for spec backfill).
+        // The M5 key: the injection cap defaults to 5 (specs.md
+        // Sections 9.2/13).
         assert_eq!(config.recall_injection_cap, 5);
         // Decision 76 (specs.md Sections 9.1/13): deep recall defaults
         // ON; the total candidate cap defaults to 40.
@@ -1542,9 +1539,9 @@ reply_structured_output = "json_object"
 
     #[test]
     fn toml_override_sets_the_summary_keys() {
-        // The summary keys (reported for spec backfill) follow the
-        // same per-key overlay pattern as every other key (AGENT.md
-        // Section 6.3: overridable per group).
+        // The summary keys (specs.md Section 13) follow the same
+        // per-key overlay pattern as every other key (AGENT.md Section
+        // 6.3: overridable per group).
         let text = r#"
 [global]
 summary_model = "global-summary-model"

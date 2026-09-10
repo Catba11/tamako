@@ -13,18 +13,18 @@ dependency versions are pinned in `[workspace.dependencies]`.
 
 | Crate | Role | Tests |
 |---|---|---|
-| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 110 (+3 ignored) |
-| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 367 |
-| `tamako-store` | `store.db`: SQLite access, migrations (v1–v13), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 93 |
-| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 73 (incl. the concurrent-access regression test) |
+| `tamako` | Binary. CLI, wiring, the `--replay` demo, the `--live` mode, the `--status` operator modes. | 117 (+3 ignored) |
+| `tamako-core` | Normalized events and actions, the adapter trait, configuration, trigger scheduling, session state, the live context (`context`), the per-group actor, the digest pipeline contract, the wake contracts, the summary contract (decision 62). | 377 |
+| `tamako-store` | `store.db`: SQLite access, migrations (v1–v13), the raw message log, the session-state table, `injected_memories`, `dead_letter`, `reactions`, `context_summaries` (decision 62), the embedding queue and vector sidecar (decisions 66/73/81), `merge_audit` (decision 74), `edge_texts` (decision 76), `related_pairs` (decision 83), `llm_session_keys` (decision 84), the global `media.db` sticker-caption cache (decision 82), the read-only status query. | 98 |
+| `tamako-memory` | The `MemoryBackend` trait, the `lbug` implementation, deterministic identifiers. | 74 (incl. the concurrent-access regression test) |
 | `tamako-persona` | The global persona configuration and the preamble rendering layer (incl. the code-owned context-format gloss, decision 63; the per-group suffix override loader, decision 98). | 54 |
 | `tamako-adapter-mock` | The mock platform adapter and the replay fixture. | 9 |
-| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions, and the decision-82 media enrichment stage (download → `tamako-vision` normalize → caption → `<media>` elements embedded before the IntakeEvent exists). | 88 (+1 ignored live test) |
+| `tamako-adapter-teloxide` | The live Telegram adapter: pure normalization plus polling intake and outbound actions, and the decision-82 media enrichment stage (download → `tamako-vision` normalize → caption → `<media>` elements embedded before the IntakeEvent exists). | 95 (+1 ignored live test) |
 | `tamako-vision` | The pure media-normalization crate (decision 82): bytes in, normalized JPEG/data-URI out; no I/O, no async, no LLM. | 10 |
-| `tamako-agent` | All LLM concerns: the endpoint layer (per-purpose session affinity, decision 84; the reasoning-markup stripper, decisions 93/96), the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator and the warmup generator (decision 78) with the fence-extraction validation seam (decisions 93/95, decision-96 seam telemetry), the deep/shallow recall worker (decision 76), the Rule C3 summarizer (decision 62), the intake captioner (decision 82), the merge-tool confirmation seam (decision 74). | 311 (+5 ignored live tests) |
+| `tamako-agent` | All LLM concerns: the endpoint layer (per-purpose session affinity, decision 84; the reasoning-markup stripper, decisions 93/96), the extraction call (rig), the digest pipeline (assembly, validation, entity resolution, retries, dead-letter), the participation gate, the reply generator and the warmup generator (decision 78) with the fence-extraction validation seam (decisions 93/95, decision-96 seam telemetry), the deep/shallow recall worker (decision 76), the Rule C3 summarizer (decision 62), the intake captioner (decision 82), the merge-tool confirmation seam (decision 74). | 323 (+5 ignored live tests) |
 
-Total: 1150 tests (+9 ignored live tests), verified 2026-09-09 @
-decision 108 (re-stamp when re-verified, decision 92). Build, test,
+Total: 1157 tests (+9 ignored live tests), verified 2026-09-10 @
+decision 113 (re-stamp when re-verified, decision 92). Build, test,
 clippy (`-D warnings`), and fmt are clean.
 
 ## 2. Dependency direction

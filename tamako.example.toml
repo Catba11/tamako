@@ -71,12 +71,12 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 
 # Embedding call concurrency (global-only; decision 113). Bounds the
 # in-flight SINGLE-TEXT embedding POSTs PER CALL SITE — every
-# pre-screen/deep-recall batch and every drain tick bounds itself, so
-# concurrently active groups sum (not a process-wide cap). Concurrent
-# requests, never array input (OpenRouter's ZDR vertex route serves
-# single-text only). Default 1 = sequential; raise for paid endpoints
-# serving high per-account concurrency (unverified here — watch for
-# 429s).
+# pre-screen/deep-recall batch bounds itself (concurrently waking
+# groups sum on the recall path); the drain path is one shared call
+# site (groups drain sequentially per tick). Concurrent requests,
+# never array input (OpenRouter's ZDR vertex route serves single-text
+# only). Default 1 = sequential; raise for paid endpoints serving
+# high per-account concurrency (unverified here — watch for 429s).
 # embedding_concurrency = 1
 
 # Media captioning at intake (decision 82). Photos and static stickers are
