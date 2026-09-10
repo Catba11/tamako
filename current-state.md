@@ -1,9 +1,9 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-09 — decision 110 (the AGENT.md
-lessons round from the full mistake audit), after decision 109
-(the LBUG_VERSION core pin), after decision 108 (forwarded-message
-origin end to end).
+A living document. Update it at every milestone. Last update: 2026-09-10 — decision 111 (gate and reply
+switched to opencode deepseek-flash; calibration plan), after
+decision 110 (the AGENT.md lessons round from the full mistake
+audit), after decision 109 (the LBUG_VERSION core pin).
 Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
 Phase 1 shipped as v0.0.1 (alpha).
 
@@ -2995,6 +2995,76 @@ feature commit (decision 92).
     live-writer-aware; (e) §7 extension — red-first regression
     tests; a hardening change has a test with preconditions unmet;
     suspect pins annotated. Docs-only; the test-count stamps stand.
+
+111. (2026-09-10, operator-ruled) Gate and reply endpoints switched
+    to opencode `deepseek-flash` (the deepseek v4.1-flash alias),
+    with a calibration plan and a 2026-09-12 review point. The
+    operator replaced the gate and reply endpoints (digest stays on
+    OpenRouter glm-5.3-flash); the switch went live with the
+    2026-09-10 restart. The opencode "go" router rejects headerless
+    requests with `MissingSessionID`, so probe_endpoint now sends
+    the `x-opencode-session` / `x-session-id` pair, mirroring the
+    production client (decision 84).
+    (a) Capability probe (2026-09-10, opencode deepseek-flash):
+    `json_object` 200 with valid JSON; `none` 200; `schema` and
+    `graph_schema` rejected with "response_format type is
+    unavailable now" — v4.1-flash keeps v4-flash's json_schema
+    refusal (decision 56). The gate's hard dependency is
+    `json_object` (both gate call sites) and the reply path needs
+    `none`; both confirmed working.
+    (b) Alias anchor (§6.7: a pin locks the effective layer): the
+    response `model` field echoes the alias itself and no
+    versioned id is exposed, so the anchor is alias-scoped; the
+    resolution is re-checked at the 2026-09-12 review point.
+    (c) UNCALIBRATED reset (decision 81 (d) shape): the
+    fence-compliance and gate pass-rate baselines do not transfer
+    across the model switch. Calibration plan: instruments
+    (probe_endpoint; the operator-held replay_reply_fence.rs; the
+    store counters; the seam WARN telemetry), window 2026-09-10
+    to 2026-09-12, review point 2026-09-12.
+    (d) Pre-registered fence benchmark: experiment arm
+    REPLAY_VARIANT=shipped + REPLAY_EXTRAS=1, N=30 on
+    deepseek-flash; control arm glm-5.3-flash, N=20 (decision
+    95's cross-check structure). The metric is harness-FENCED
+    (contains both fence tokens) — the model's contract-following
+    propensity, NOT delivered compliance: the production seam
+    trims outside-fence prose with a WARN and fail-open sends a
+    fence-less reply (trimmed_reply_or_error). `finish=length`
+    rows are void and rerun; HTTP-failed runs are excluded from
+    the denominator (more than 3 failures voids the batch — rate
+    limiting is endpoint behavior, not model behavior). Pass bar:
+    FENCED in at least 85% of valid runs (26/30 at full validity)
+    plus control-arm non-regression.
+    (e) Replay fidelity caveats (the number carries its scope):
+    the harness `render_row` is a local minimal re-implementation
+    — no decision-108 `fwd=` origin labels, no mention/reply
+    attributes; the suffix comes from the persona's global value
+    (per-group overrides unmodeled, currently inactive); the
+    placement is Append shape while the live config runs
+    `suffix_mode = "system"` (decision 95's 18/20 was also
+    measured in Append shape). The replay reads as near-production
+    contract compliance, not byte equivalence.
+    (f) Baseline honesty: the on-record fence measurements are
+    decision 95's treatment 18/20 + 10/10 + 10/10 versus control
+    33/50 on omen-alpha; the "~95% compliance / ~5% WARN" figures
+    in earlier handoffs were monitoring EXPECTATIONS — UNVERIFIED,
+    excluded from the criteria.
+    (g) Observation window to 2026-09-12, measure-only: the gate
+    pass rate (--status-all); the recall injection volume per
+    wake — the relevance gate is the second Gate-purpose call
+    site, fail-closed on parse regression (decision 58), so a
+    silent zero with candidates present is an incident; the seam
+    WARNs stamp purpose=gate for both gate call sites, so volume
+    is the primary recall signal; the warmup opener rides the
+    Reply purpose (quota 1, a missing opener is an anomaly); dead
+    letters and Empty-class errors.
+    (h) Review point 2026-09-12: baseline enshrinement addendum or
+    switch reconsideration; alias resolution re-check;
+    replay_reply_fence.rs deletion evaluation. The addendum names
+    the harness as the operator-held instrument and records the
+    rebuild parameters (variant=shipped, EXTRAS=1, N, the ctx
+    schema id/ts(ISO)/text/dir/name, the verdict semantics); after
+    deletion the run is specified but not re-executable.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
