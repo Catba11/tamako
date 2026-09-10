@@ -1,13 +1,9 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-06 — decision 97 (the wake.rs fence/region
-robustness round: lookalike fence tokens skip instead of disabling
-both fence layers, the inline-pair unwrap and the edge-token strip
-run to a fixpoint, and region openers require a tag delimiter),
-after decision 96 (the seam telemetry and stripper robustness
-round: linear strip, parrot WARNs at the generator seams, purpose
-and model on the seam WARNs), after decision 95 (the unified pet
-speech tag).
+A living document. Update it at every milestone. Last update: 2026-09-09 — decision 110 (the AGENT.md
+lessons round from the full mistake audit), after decision 109
+(the LBUG_VERSION core pin), after decision 108 (forwarded-message
+origin end to end).
 Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
 Phase 1 shipped as v0.0.1 (alpha).
 
@@ -2966,6 +2962,39 @@ feature commit (decision 92).
     v43, new groups would stamp v47); Python ladybug 0.20.3 is on
     PyPI for the inspection tooling. The gap-6 discipline applies at
     upgrade time. See ADR-0001 addendum 2026-09-09.
+
+110. (2026-09-09, operator-ruled) AGENT.md lessons round from the
+    full mistake audit. The audit counted 51 documented mistakes
+    across decisions 1–109 and the K2 known-issue arc, plus one
+    design-stage intercept (decision 66). Root-cause distribution:
+    silent failure 11, prompt/parsing fragility 9, test gaps 9,
+    doc/config drift 7, unverified dependency assumptions 7,
+    concurrency/state 6, process violations 2. Recurrence families:
+    the parrot/output-shape family (decisions 59–97, five rounds),
+    the lbug version-behavior family (47/60/109), the silent-config
+    family (84(e)/94/96). Rules added to AGENT.md: (a) §6.4
+    extension — failures are loud (no silent fallback or log-only
+    degradation without a recorded rationale; `deny_unknown_fields`
+    or a catch-all on new configuration surfaces; WARNs carry
+    attribution), and the unknown-mechanism defect pattern
+    (candidate mechanisms + defense-in-depth gaps + measurable
+    sunset criterion + reopen condition; the K2 pattern);
+    (b) §6.2 extension — model-visible shapes are imitable
+    (forbidden shapes never in high-salience positions; parsers
+    assume adversarial input; the outbound filter is the backstop;
+    a new high-risk outbound format gets its adversarial test plan
+    as an operator discussion); (c) NEW §6.7 — no behavior
+    extrapolation across models/gateways/versions; probe each new
+    endpoint; assumptions are evidenced or labeled UNVERIFIED; a
+    version pin locks the effective layer; an uncalibrated default
+    ships with a calibration plan; a retrievability claim names
+    durable media; (d) NEW §6.8 — advisor notes are input, not
+    rulings (operator-ruled state changes need a fresh ruling);
+    edit anchors byte-exact against a fresh read, rewrites re-emit
+    only matched spans; maintenance commands measured first and
+    live-writer-aware; (e) §7 extension — red-first regression
+    tests; a hardening change has a test with preconditions unmet;
+    suspect pins annotated. Docs-only; the test-count stamps stand.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 

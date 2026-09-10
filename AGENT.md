@@ -69,6 +69,8 @@ A task is done when all four commands pass.
 - Rule A1: platform-specific types stay inside adapter crates. `tamako-core` sees normalized events only.
 - Synchronous storage calls (`rusqlite`, LadybugDB) run inside `tokio::task::spawn_blocking`. Never block the async runtime.
 - All storage writes are idempotent or transactional. Batch identifiers are stable across retries.
+- Every shape rendered into the context is a shape the model can imitate. A forbidden shape never appears in a high-salience position (examples, tail instructions) — that is how the parrot family recurred (decisions 59–97).
+- Parsers over model-visible or model-produced text assume adversarial input: lookalike tokens, truncated structures, nesting (decision 97). The outbound filter is the backstop, not the primary defense. For a new high-risk outbound format, the adversarial test plan is an operator discussion, case by case (decision 110).
 
 ### 6.3 Configuration
 
@@ -79,6 +81,8 @@ A task is done when all four commands pass.
 
 - Library crates return typed errors (`thiserror`). The binary crate uses `anyhow`.
 - A failed digest batch must not block later batches. Refer to `specs.md` Section 10.3.
+- Failures are loud. Never swallow an error, silently fall back to a default, or degrade to a log line unless a decision entry records the rationale. Warn-only observability has demonstrably failed here: the decision-84(e) unknown-key WARN sat unread for weeks. New configuration surfaces use `deny_unknown_fields` or an equivalent catch-all. WARNs carry attribution fields (chat id, purpose, model, key).
+- A live defect with an unknown mechanism is not parked indefinitely: record the candidate mechanisms, the defense-in-depth gaps, a measurable sunset criterion, and the reopen condition in `current-state.md` Section 4 (the K2 pattern, closed 2026-09-09).
 
 ### 6.5 Documentation synchronization
 
@@ -109,9 +113,26 @@ Search scope convention (operator ruling, 2026-09-06): repo-wide searches EXCLUD
 - NEVER `git add -A`, and never stage a directory: untracked never-commit files live in the worktree (the gitignored live config `data/persona.toml` and `tamako.toml`, review/eval notes, scratch examples). Stage explicit file paths.
 - Prompt-tuning content is confidential: it stays on `catball-self-use` and never crosses into a main-bound commit.
 
+### 6.7 Dependencies and external behavior (decision 110)
+
+- Do not extrapolate behavior across models, gateways, or dependency versions. Probe each new model endpoint (`probe_endpoint`) before it serves traffic (decision 56).
+- A behavioral assumption about a dependency either carries measured evidence or is labeled UNVERIFIED where the code relies on it.
+- A version pin must lock the layer that actually takes effect: a crate pin does not pin the artifacts the crate downloads (decision 109: `LBUG_VERSION` pins the lbug C++ core).
+- An uncalibrated default or threshold ships with a stated calibration plan (instrument, window, review point). A placeholder number without a plan is a defect (decisions 81(d) and 104).
+- A retrievability claim names durable media: session context and `/tmp` are not archives. "Recorded" or "reproducible" means a committed file or a named operator-held file; anything else is not archived.
+
+### 6.8 Agent operating discipline (decision 110)
+
+- Advisor notes are input, not operator rulings. Changing operator-ruled state (a closed decision entry, a ruled disposition) requires a fresh operator ruling, even when the change is additive.
+- Edit anchors are verified byte-for-byte against a fresh read. A rewrite re-emits only the spans its match covered.
+- A maintenance command is sized for the actual state (measure first) and accounts for live writers into the target area (example: the rust-analyzer flycheck rebuilds `target/` during a delete).
+
 ## 7. Definition of done
 
 1. The four commands of Section 5 pass.
 2. New behavior has tests. The current phase scope and exit criteria live in `dev-roadmap.md` and `current-state.md`; do not build deferred items (Section 3).
+   - A regression test for a fix first demonstrates that it catches the bug (red-first).
+   - At least one test of a hardening change runs with preconditions unmet (the minimal environment). A test that silently satisfies a precondition hides the regression it guards (decision 107: the lock test pre-created the directory and missed the 18-day ENOENT).
+   - A test that pins suspect behavior is annotated as suspect.
 3. Deviations from the governing documents are reported in the pull request description or the task result, not hidden in code.
 4. The documentation synchronization of Section 6.5 is done (decision 92).
