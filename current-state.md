@@ -1,9 +1,10 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-10 — decision 111 (gate and reply
-switched to opencode deepseek-flash; calibration plan), after
-decision 110 (the AGENT.md lessons round from the full mistake
-audit), after decision 109 (the LBUG_VERSION core pin).
+A living document. Update it at every milestone. Last update: 2026-09-10 — decision 112 (the worktree rests
+on the live branch; build/launch branch gate), after decision 111
+(gate and reply switched to opencode deepseek-flash, pinned
+v4.1-flash; calibration plan), after decision 110 (the AGENT.md
+lessons round from the full mistake audit).
 Phase 2 items 1–8 shipped; the metrics backend (item 9) is parked.
 Phase 1 shipped as v0.0.1 (alpha).
 
@@ -3078,6 +3079,18 @@ feature commit (decision 92).
     pending the observation window's participation/injection
     signals; the 2026-09-12 addendum carries the full
     enshrinement.
+
+112. (2026-09-10, operator-ruled) The worktree rests on the live
+    branch. AGENT.md §6.6's rebase flow ended with `git checkout
+    main`; with HEAD on main, a rebuild produced a main-built
+    binary and the bot served about five minutes without the
+    branch-only tunings before the stop-rebuild-restart (the
+    window's t0b anchors at the branch-built restart, so the
+    segment is excluded). The rebase flow now ends on
+    `catball-self-use`, and a standalone `git branch
+    --show-current` gates every build/launch command for the live
+    bot. Ruling: the operator's instruction plus the
+    operator-authored `.omp/rules/build-on-production-branch.md`.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
