@@ -1062,7 +1062,7 @@ fn deep_recall_store(data_root: &Path, chat_id: &str) -> Option<Arc<Store>> {
 /// embedding seam (the contract-in-core pattern of the digest pipeline:
 /// tamako-core cannot depend on tamako-agent, AGENT.md Section 4, so
 /// the trait lives in tamako-core and the binary bridges it).
-struct AgentEmbeddingProvider(RigEmbeddingProvider);
+struct AgentEmbeddingProvider(RigEmbeddingProvider, usize);
 
 impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
     fn embed<'a>(
@@ -1092,14 +1092,19 @@ impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
                 + 'a,
         >,
     > {
-        // Decision 73: forward to the rig impl's ONE batched HTTP call.
-        // The core trait's default would loop `embed` sequentially —
-        // one HTTP call per text — which would multiply the digest
-        // path's endpoint latency by the unresolved-entity count.
+        // Decision 113: bounded-concurrent SINGLE-TEXT posts via the
+        // core helper (order-preserving, per-item results) — never
+        // array input, so the decision-81 addendum's ZDR route
+        // discipline is unchanged. The first error in input order
+        // fails the call (the sequential-loop contract the pre-screen
+        // and deep recall degrade against).
         Box::pin(async move {
-            tamako_agent::endpoint::EmbeddingProvider::embed_texts(&self.0, texts)
-                .await
-                .map_err(|error| EmbeddingError::Provider(error.to_string()))
+            let results = tamako_core::embedding::embed_texts_bounded(self, texts, self.1).await;
+            let mut vectors = Vec::with_capacity(results.len());
+            for result in results {
+                vectors.push(result?);
+            }
+            Ok(vectors)
         })
     }
 }
@@ -1159,8 +1164,10 @@ fn build_embedding_provider(
         }
     }
     RigEmbeddingProvider::build(&endpoint).map(|provider| {
-        Arc::new(AgentEmbeddingProvider(provider))
-            as Arc<dyn tamako_core::embedding::EmbeddingProvider>
+        Arc::new(AgentEmbeddingProvider(
+            provider,
+            setup.bot_config.global.embedding_concurrency,
+        )) as Arc<dyn tamako_core::embedding::EmbeddingProvider>
     })
 }
 
@@ -1275,7 +1282,13 @@ fn spawn_embedding_worker(
             }
         }
     }
-    EmbeddingWorker::new(provider, Arc::clone(&setup.memory), targets).spawn()
+    EmbeddingWorker::new(
+        provider,
+        Arc::clone(&setup.memory),
+        targets,
+        setup.bot_config.global.embedding_concurrency,
+    )
+    .spawn()
 }
 
 /// The run setup shared by both modes: bot configuration, the rendered

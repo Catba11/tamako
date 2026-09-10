@@ -20,8 +20,10 @@
 //!   [`EMBEDDING_WORKER_INTERVAL`], at most [`EMBEDDING_BATCH_PER_GROUP`]
 //!   rows per group (or [`EMBEDDING_BURST_BATCH`] while the backlog
 //!   exceeds [`EMBEDDING_BURST_THRESHOLD`], decision 77 M13), embedded
-//!   SEQUENTIALLY (the rate limit at our scale). A `None` provider skips
-//!   the drain loop only; reconciliation still runs.
+//!   with the bounded concurrency of [`EmbeddingWorker::new`]'s
+//!   `embedding_concurrency` (decision 113: concurrent single-text
+//!   POSTs, never array input). A `None` provider skips the drain loop
+//!   only; reconciliation still runs.
 //!
 //! Why not a post-digest hook: the hook runs inline on the actor loop
 //! and a 300-second endpoint timeout would stall the inbox (specs.md
@@ -53,7 +55,8 @@ use crate::digest::embedding_content_hash;
 pub const EMBEDDING_WORKER_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The per-group claim limit of one drain tick (decision 66). Embed
-/// calls run sequentially within the batch; the limit paces the
+/// calls within the batch run with the configured bounded concurrency
+/// (decision 113, [`embed_texts_bounded`]); the limit paces the
 /// endpoint.
 pub const EMBEDDING_BATCH_PER_GROUP: usize = 8;
 
@@ -423,11 +426,51 @@ pub async fn reconcile_group<M: MemoryBackend>(
     report
 }
 
+/// Embeds every text with at most `concurrency` calls in flight
+/// (decision 113): concurrent SINGLE-TEXT posts — never array input,
+/// so the decision-81 ZDR route discipline is unchanged. Returns one
+/// entry per input text, in input order; every text is attempted even
+/// after a failure (the per-item [`Result`] carries the error), so a
+/// caller keeps exact per-item attribution. `concurrency = 0` behaves
+/// as 1; `concurrency = 1` is the decision-66 sequential behavior.
+#[allow(clippy::type_complexity)]
+pub fn embed_texts_bounded<'a>(
+    provider: &'a dyn EmbeddingProvider,
+    texts: &'a [String],
+    concurrency: usize,
+) -> Pin<Box<dyn Future<Output = Vec<Result<Vec<f32>, EmbeddingError>>> + Send + 'a>> {
+    // The explicit `+ Send` box is deliberate: as an `async fn` the
+    // Send proof of the boxed per-text futures leaks into every
+    // caller's generic future and rustc's higher-ranked check fails
+    // ("Send is not general enough") at the worker's tokio::spawn.
+    // Boxing here pins the proof to this definition site.
+    Box::pin(async move {
+        use futures::StreamExt;
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        // The explicit loop is deliberate: a `map` closure returning
+        // the boxed per-text future makes rustc demand an
+        // inexpressible higher-ranked closure signature ("FnOnce is
+        // not general enough"); the loop keeps every lifetime
+        // concrete at 'a.
+        let mut calls = Vec::with_capacity(texts.len());
+        for text in texts {
+            calls.push(provider.embed(text));
+        }
+        futures::stream::iter(calls)
+            .buffered(concurrency.max(1))
+            .collect()
+            .await
+    })
+}
+
 /// One drain tick of one group (decision 66): claims the oldest pending
 /// rows (at most [`EMBEDDING_BATCH_PER_GROUP`], or
 /// [`EMBEDDING_BURST_BATCH`] while the backlog exceeds
 /// [`EMBEDDING_BURST_THRESHOLD`] — decision 77, M13) and embeds them
-/// SEQUENTIALLY.
+/// with the bounded concurrency of `embedding_concurrency` (decision
+/// 113; 1 is the decision-66 sequential behavior).
 ///
 /// Per row: the STORED node content is authoritative (pipeline-known
 /// candidate values lose to the MERGE coalesce under alias drift, Rule
@@ -447,6 +490,7 @@ pub async fn drain_group<M: MemoryBackend>(
     provider: &dyn EmbeddingProvider,
     memory: &M,
     target: &GroupEmbeddingTarget,
+    embedding_concurrency: usize,
 ) -> DrainReport {
     let mut report = DrainReport::default();
     // Backlog-burst probe (decision 77, M13): `claim_embedding_batch`
@@ -474,6 +518,11 @@ pub async fn drain_group<M: MemoryBackend>(
     };
     let batch: Vec<_> = probe.into_iter().take(batch_size).collect();
     report.claimed = batch.len();
+    // Phase A (decision 113): read every claimed row's content
+    // sequentially. A read failure leaves the row pending; a gone
+    // node is tombstoned and closed exactly as the decision-66 loop
+    // did. Survivors carry their content into the embed phase.
+    let mut survivors = Vec::new();
     for row in batch {
         let content = match memory.node_content(&target.chat_id, &row.node_id).await {
             Ok(content) => content,
@@ -506,10 +555,27 @@ pub async fn drain_group<M: MemoryBackend>(
             report.gone += 1;
             continue;
         };
-        // The documented text layout; embedded even when the
-        // description is empty — the name alone is meaningful.
-        let text = embedded_text(&content.name, &content.description);
-        match provider.embed(&text).await {
+        survivors.push((row, content));
+    }
+    // Phase B: one bounded-concurrent pass over the survivors' texts
+    // (decision 113). Concurrent single-text POSTs — never array
+    // input, so the decision-81 ZDR route discipline is unchanged.
+    // Every text is attempted even after a failure, so phase C keeps
+    // exact per-row attribution.
+    let texts: Vec<String> = survivors
+        .iter()
+        .map(|(_, content)| embedded_text(&content.name, &content.description))
+        .collect();
+    let vectors = embed_texts_bounded(provider, &texts, embedding_concurrency).await;
+    debug_assert_eq!(
+        vectors.len(),
+        survivors.len(),
+        "embed_texts_bounded returns one entry per input text"
+    );
+    // Phase C: the per-row store writes stay sequential, exactly the
+    // decision-66 order (upsert → mark-done → journal).
+    for ((row, content), result) in survivors.into_iter().zip(vectors) {
+        match result {
             Ok(vector) => {
                 let stored_hash = embedding_content_hash(&content.name, &content.description);
                 let node_id = row.node_id.clone();
@@ -567,6 +633,10 @@ pub struct EmbeddingWorker<M: MemoryBackend> {
     provider: Option<Arc<dyn EmbeddingProvider>>,
     memory: Arc<M>,
     targets: Vec<GroupEmbeddingTarget>,
+    /// The drain tick's embed-phase bound (decision 113,
+    /// [`embed_texts_bounded`]); 1 is the decision-66 sequential
+    /// behavior.
+    embedding_concurrency: usize,
 }
 
 impl<M: MemoryBackend + 'static> EmbeddingWorker<M> {
@@ -574,11 +644,13 @@ impl<M: MemoryBackend + 'static> EmbeddingWorker<M> {
         provider: Option<Arc<dyn EmbeddingProvider>>,
         memory: Arc<M>,
         targets: Vec<GroupEmbeddingTarget>,
+        embedding_concurrency: usize,
     ) -> Self {
         EmbeddingWorker {
             provider,
             memory,
             targets,
+            embedding_concurrency,
         }
     }
 
@@ -605,6 +677,7 @@ impl<M: MemoryBackend + 'static> EmbeddingWorker<M> {
         }
         let memory = self.memory;
         let targets = self.targets;
+        let embedding_concurrency = self.embedding_concurrency;
         Some(tokio::spawn(async move {
             // Startup reconciliation BEFORE the first drain tick
             // (decision 66): backfill, steady-state repair, and
@@ -626,7 +699,7 @@ impl<M: MemoryBackend + 'static> EmbeddingWorker<M> {
                 ticks += 1;
                 if let Some(provider) = &provider {
                     for target in &targets {
-                        drain_group(&**provider, &*memory, target).await;
+                        drain_group(&**provider, &*memory, target, embedding_concurrency).await;
                     }
                 }
                 if ticks.is_multiple_of(RECONCILE_EVERY_N_TICKS) {
@@ -973,7 +1046,7 @@ mod tests {
             .expect("enqueue");
         let provider = ScriptedProvider::succeeding();
 
-        let report = drain_group(&provider, &memory, &target).await;
+        let report = drain_group(&provider, &memory, &target, 4).await;
 
         assert_eq!(
             report,
@@ -1021,7 +1094,7 @@ mod tests {
             .expect("enqueue");
         let provider = ScriptedProvider::succeeding();
 
-        let report = drain_group(&provider, &memory, &target).await;
+        let report = drain_group(&provider, &memory, &target, 4).await;
 
         assert_eq!(report.gone, 1);
         assert_eq!(report.embedded, 0);
@@ -1050,7 +1123,7 @@ mod tests {
         let provider = ScriptedProvider::failing();
 
         for round in 1..=3 {
-            let report = drain_group(&provider, &memory, &target).await;
+            let report = drain_group(&provider, &memory, &target, 4).await;
             assert_eq!(report.failed, 1, "round {round}");
         }
 
@@ -1340,7 +1413,7 @@ mod tests {
         target.store.enqueue_embeddings(&rows).expect("enqueue");
         let provider = ScriptedProvider::succeeding();
 
-        let report = drain_group(&provider, &memory, &target).await;
+        let report = drain_group(&provider, &memory, &target, 4).await;
 
         assert_eq!(report.claimed, EMBEDDING_BURST_BATCH);
         assert!(provider.texts().is_empty(), "gone nodes make no embed call");
@@ -1358,7 +1431,7 @@ mod tests {
         target.store.enqueue_embeddings(&rows).expect("enqueue");
         let provider = ScriptedProvider::succeeding();
 
-        let report = drain_group(&provider, &memory, &target).await;
+        let report = drain_group(&provider, &memory, &target, 4).await;
 
         assert_eq!(report.claimed, EMBEDDING_BATCH_PER_GROUP);
     }
@@ -1373,7 +1446,7 @@ mod tests {
         let memory = ScriptedMemory::with_group("chat_a", &[("p1", content("Tama", "a cat"))])
             .with_kinds("chat_a", &[("p1", NodeType::Person)]);
         let store = Arc::clone(&target.store);
-        let worker = EmbeddingWorker::new(None, Arc::new(memory), vec![target]);
+        let worker = EmbeddingWorker::new(None, Arc::new(memory), vec![target], 1);
 
         let handle = worker
             .spawn()
@@ -1415,7 +1488,7 @@ mod tests {
         store
             .upsert_edge_text("e-orphan", "gone")
             .expect("seed orphan");
-        let worker = EmbeddingWorker::new(None, Arc::clone(&memory), vec![target]);
+        let worker = EmbeddingWorker::new(None, Arc::clone(&memory), vec![target], 1);
         let handle = worker.spawn().expect("spawn");
         let claimed = || {
             store
@@ -1469,5 +1542,134 @@ mod tests {
             claimed().contains("p1"),
             "the Nth tick re-ran the reconciliation"
         );
+    }
+
+    /// The bounded-helper probe (decision 113): records every text at
+    /// call time, tracks the in-flight overlap, optionally delays each
+    /// text "tN" by (5-N)×10 ms (later inputs resolve earlier), and
+    /// optionally fails one text.
+    struct BoundedProbe {
+        calls: Mutex<Vec<String>>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        descending_delays: bool,
+        fail_text: Option<String>,
+    }
+
+    impl BoundedProbe {
+        fn new() -> Self {
+            BoundedProbe {
+                calls: Mutex::new(Vec::new()),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                descending_delays: false,
+                fail_text: None,
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl EmbeddingProvider for BoundedProbe {
+        fn embed<'a>(
+            &'a self,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, EmbeddingError>> + Send + 'a>> {
+            use std::sync::atomic::Ordering;
+            self.calls.lock().expect("calls").push(text.to_string());
+            let text = text.to_string();
+            Box::pin(async move {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                if self.descending_delays {
+                    let index = text
+                        .strip_prefix('t')
+                        .expect("shape")
+                        .parse::<usize>()
+                        .expect("index");
+                    tokio::time::sleep(Duration::from_millis((5 - index) as u64 * 10)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                if Some(text.as_str()) == self.fail_text.as_deref() {
+                    Err(EmbeddingError::Provider("boom".to_string()))
+                } else {
+                    let marker = text
+                        .strip_prefix('t')
+                        .and_then(|rest| rest.parse::<usize>().ok())
+                        .map(|index| index as f32)
+                        .unwrap_or(0.0);
+                    Ok(vec![marker])
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bounded_helper_preserves_input_order_under_concurrency() {
+        // Later inputs resolve EARLIER (descending sleep): the result
+        // vector must still align with the input order.
+        let provider = BoundedProbe {
+            descending_delays: true,
+            ..BoundedProbe::new()
+        };
+        let texts: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let results = embed_texts_bounded(&provider, &texts, 3).await;
+        let markers: Vec<f32> = results
+            .into_iter()
+            .map(|result| result.expect("all succeed")[0])
+            .collect();
+        assert_eq!(markers, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn the_bounded_helper_respects_the_bound_and_overlaps() {
+        let provider = BoundedProbe::new();
+        let texts: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        let results = embed_texts_bounded(&provider, &texts, 2).await;
+        assert!(results.iter().all(|result| result.is_ok()));
+        assert_eq!(provider.peak(), 2, "the bound is the ceiling AND reached");
+    }
+
+    #[tokio::test]
+    async fn the_bounded_helper_attempts_every_text_after_a_failure() {
+        let provider = BoundedProbe {
+            fail_text: Some("bad".to_string()),
+            ..BoundedProbe::new()
+        };
+        let texts: Vec<String> = vec!["t0".to_string(), "bad".to_string(), "t2".to_string()];
+        let results = embed_texts_bounded(&provider, &texts, 3).await;
+        assert_eq!(
+            provider.calls.lock().expect("calls").len(),
+            3,
+            "every text attempted"
+        );
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err(), "the failure lands at ITS position");
+        assert!(results[2].is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_bounded_helper_with_concurrency_one_never_overlaps() {
+        let provider = BoundedProbe::new();
+        let texts: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+        let results = embed_texts_bounded(&provider, &texts, 1).await;
+        assert!(results.iter().all(|result| result.is_ok()));
+        assert_eq!(
+            provider.peak(),
+            1,
+            "concurrency 1 is the sequential behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bounded_helper_embeds_nothing_for_empty_input() {
+        let provider = BoundedProbe::new();
+        let results = embed_texts_bounded(&provider, &[], 4).await;
+        assert!(results.is_empty());
+        assert!(provider.calls.lock().expect("calls").is_empty());
     }
 }

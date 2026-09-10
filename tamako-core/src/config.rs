@@ -190,6 +190,15 @@ pub struct TriggerConfig {
     /// only, no drains). Default true. Deviation: specs.md Section 13
     /// has no such key; reported for spec backfill.
     pub embedding_enabled: bool,
+    /// The embedding call concurrency bound (decision 113). GLOBAL-ONLY
+    /// and flat, the same standing as `embedding_model`: the maximum
+    /// in-flight single-text embedding POSTs of the shared provider's
+    /// batched calls and the worker's drain phase (concurrent
+    /// single-text requests, NEVER array input — the decision-81
+    /// addendum's ZDR route discipline is unchanged). Default 1 = the
+    /// decision-66 sequential behavior. Deviation: specs.md Section 13
+    /// has no such key; reported for spec backfill.
+    pub embedding_concurrency: usize,
     /// The media captioning model of decision 82 (c): photos/stickers
     /// are captioned at intake by this vision model. Flat and concrete
     /// like `embedding_model` (the default is materialized here, not
@@ -363,6 +372,7 @@ impl Default for TriggerConfig {
             embedding_model: "google/gemini-embedding-2".to_string(),
             embedding_llm_base_url: DEFAULT_OPENROUTER_BASE_URL.to_string(),
             embedding_enabled: true,
+            embedding_concurrency: 1,
             caption_model: DEFAULT_CAPTION_MODEL.to_string(),
             caption_llm_base_url: DEFAULT_OPENROUTER_BASE_URL.to_string(),
             structured_output: None,
@@ -464,6 +474,9 @@ pub struct TriggerConfigToml {
     /// The embedding kill switch (decision 77, M6a; global-only).
     /// Refer to `TriggerConfig::embedding_enabled`.
     pub embedding_enabled: Option<bool>,
+    /// The embedding concurrency bound (decision 113; global-only).
+    /// Refer to `TriggerConfig::embedding_concurrency`.
+    pub embedding_concurrency: Option<usize>,
     /// The media captioning model (decision 82 (c); per-group
     /// overridable). Refer to `TriggerConfig::caption_model`.
     pub caption_model: Option<String>,
@@ -607,6 +620,9 @@ impl TriggerConfigToml {
         if self.embedding_enabled.is_some() {
             return Some("embedding_enabled");
         }
+        if self.embedding_concurrency.is_some() {
+            return Some("embedding_concurrency");
+        }
         None
     }
 
@@ -698,6 +714,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.embedding_enabled {
             base.embedding_enabled = value;
+        }
+        if let Some(value) = self.embedding_concurrency {
+            base.embedding_concurrency = value;
         }
         if let Some(value) = &self.caption_model {
             base.caption_model = value.clone();
@@ -1878,6 +1897,29 @@ embedding_enabled = false
     }
 
     #[test]
+    fn embedding_concurrency_defaults_to_one_and_parses_under_global() {
+        // Decision 113: the bound is flat, GLOBAL-ONLY, and concrete —
+        // 1 by default (the decision-66 sequential behavior), a larger
+        // value under [global] applies.
+        let defaults = TriggerConfig::default();
+        assert_eq!(defaults.embedding_concurrency, 1);
+
+        let text = r#"
+[global]
+embedding_concurrency = 8
+"#;
+        let config = BotConfig::from_toml_str(text).expect("the TOML loads");
+        assert_eq!(config.global.embedding_concurrency, 8);
+        // No group override exists (global-only): every group resolves
+        // the global value.
+        assert_eq!(config.for_group("-100999").embedding_concurrency, 8);
+
+        // A key the TOML does not set keeps the default.
+        let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
+        assert_eq!(plain.global.embedding_concurrency, 1);
+    }
+
+    #[test]
     fn global_only_keys_under_a_group_are_a_loud_parse_error() {
         // Decision 77 (S6-F7): the verified global-only set is
         // llm_session_id, embedding_model, embedding_llm_base_url, and
@@ -1891,6 +1933,7 @@ embedding_enabled = false
                 "\"https://embeddings.example/v1\"",
             ),
             ("embedding_enabled", "false"),
+            ("embedding_concurrency", "4"),
         ] {
             let text = format!("[groups.\"-100777\"]\n{key} = {value}\n");
             let error = BotConfig::from_toml_str(&text)
@@ -1917,13 +1960,14 @@ llm_base_url = "https://group.example/v1"
 
     #[test]
     fn global_only_keys_under_global_still_parse() {
-        // The same four keys under [global] parse and apply.
+        // The same keys under [global] parse and apply.
         let text = r#"
 [global]
 llm_session_id = "my-deployment"
 embedding_model = "text-embedding-3-large"
 embedding_llm_base_url = "https://embeddings.example/v1"
 embedding_enabled = false
+embedding_concurrency = 4
 "#;
         let config = BotConfig::from_toml_str(text).expect("the global-only TOML loads");
         assert_eq!(
@@ -1936,6 +1980,7 @@ embedding_enabled = false
             "https://embeddings.example/v1"
         );
         assert!(!config.global.embedding_enabled);
+        assert_eq!(config.global.embedding_concurrency, 4);
     }
 
     #[test]

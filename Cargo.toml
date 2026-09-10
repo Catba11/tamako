@@ -25,6 +25,10 @@ rust-version = "1.96"
 # run inside tokio::task::spawn_blocking.
 tokio = { version = "1", features = ["full"] }
 
+# Stream combinators for bounded-concurrent async work (decision 113,
+# tamako-core's embed_texts_bounded).
+futures = "0.3"
+
 # SQLite for store.db. The bundled feature builds SQLite from source.
 # No system SQLite dependency.
 rusqlite = { version = "0.32", features = ["bundled"] }

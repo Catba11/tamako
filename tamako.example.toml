@@ -69,6 +69,14 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # embedding_model = "google/gemini-embedding-2"
 # embedding_llm_base_url = "https://openrouter.ai/api/v1"
 
+# Embedding call concurrency (global-only; decision 113). Bounds the
+# in-flight SINGLE-TEXT embedding POSTs of the pre-screen/deep-recall
+# batched calls and the worker's drain phase — concurrent requests,
+# never array input (OpenRouter's ZDR vertex route serves single-text
+# only). Default 1 = sequential; raise for paid endpoints with high
+# per-account concurrency.
+# embedding_concurrency = 1
+
 # Media captioning at intake (decision 82). Photos and static stickers are
 # captioned by a vision model as they arrive; the caption rides the message
 # text as a `<media>` element. Keyed by OPENAI_API_KEY, like the embeddings.
