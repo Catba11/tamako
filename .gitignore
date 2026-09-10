@@ -18,3 +18,9 @@
 !.env.example
 tamako.toml
 *.swp
+
+# Runtime and benchmark logs. A scrollback export or a redirected
+# `tamako --live` log can carry launch commands with API keys and
+# bot tokens (2026-09-10 near-miss). Keep logs outside the worktree;
+# this rule is the backstop.
+*.log
