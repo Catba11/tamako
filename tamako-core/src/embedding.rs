@@ -428,15 +428,25 @@ pub async fn reconcile_group<M: MemoryBackend>(
 /// Embeds every text with at most `concurrency` calls in flight
 /// (decision 113): concurrent SINGLE-TEXT posts — never array input,
 /// so the decision-81 ZDR route discipline is unchanged. Returns one
-/// entry per input text, in input order; every text is attempted even
-/// after a failure (the per-item [`Result`] carries the error), so a
-/// caller keeps exact per-item attribution. `concurrency = 0` behaves
+/// entry per input text, in input order. `concurrency = 0` behaves
 /// as 1; `concurrency = 1` is the decision-66 sequential behavior.
+///
+/// `fail_fast` selects the error policy. `false` (the drain path):
+/// every text is attempted even after a failure (the per-item
+/// [`Result`] carries the error), so the caller keeps exact per-item
+/// attribution. `true` (the recall paths, whose caller fails the
+/// whole call on any error): the stream stops after the FIRST error
+/// — the returned vec is truncated (entries up to and including the
+/// first error, in input order), undispatched futures never start
+/// and in-flight ones are dropped, so a failing endpoint receives at
+/// most one in-flight window instead of the whole batch (the
+/// decision-66 sequential loop's failure-path load profile).
 #[allow(clippy::type_complexity)]
 pub fn embed_texts_bounded<'a>(
     provider: &'a dyn EmbeddingProvider,
     texts: &'a [String],
     concurrency: usize,
+    fail_fast: bool,
 ) -> Pin<Box<dyn Future<Output = Vec<Result<Vec<f32>, EmbeddingError>>> + Send + 'a>> {
     // The explicit `+ Send` box is deliberate: as an `async fn` the
     // Send proof of the boxed per-text futures leaks into every
@@ -457,10 +467,18 @@ pub fn embed_texts_bounded<'a>(
         for text in texts {
             calls.push(provider.embed(text));
         }
-        futures::stream::iter(calls)
-            .buffered(concurrency.max(1))
-            .collect()
-            .await
+        let mut results = Vec::with_capacity(calls.len());
+        let mut stream = futures::stream::iter(calls).buffered(concurrency.max(1));
+        while let Some(result) = stream.next().await {
+            let failed = result.is_err();
+            results.push(result);
+            if fail_fast && failed {
+                // Dropping the stream here cancels the in-flight
+                // futures and never starts the undispatched ones.
+                break;
+            }
+        }
+        results
     })
 }
 
@@ -565,7 +583,7 @@ pub async fn drain_group<M: MemoryBackend>(
         .iter()
         .map(|(_, content)| embedded_text(&content.name, &content.description))
         .collect();
-    let vectors = embed_texts_bounded(provider, &texts, embedding_concurrency).await;
+    let vectors = embed_texts_bounded(provider, &texts, embedding_concurrency, false).await;
     debug_assert_eq!(
         vectors.len(),
         survivors.len(),
@@ -1679,7 +1697,7 @@ mod tests {
             ..BoundedProbe::new()
         };
         let texts: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
-        let results = embed_texts_bounded(&provider, &texts, 3).await;
+        let results = embed_texts_bounded(&provider, &texts, 3, false).await;
         let markers: Vec<f32> = results
             .into_iter()
             .map(|result| result.expect("all succeed")[0])
@@ -1691,7 +1709,7 @@ mod tests {
     async fn the_bounded_helper_respects_the_bound_and_overlaps() {
         let provider = BoundedProbe::new();
         let texts: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
-        let results = embed_texts_bounded(&provider, &texts, 2).await;
+        let results = embed_texts_bounded(&provider, &texts, 2, false).await;
         assert!(results.iter().all(|result| result.is_ok()));
         assert_eq!(provider.peak(), 2, "the bound is the ceiling AND reached");
     }
@@ -1703,7 +1721,7 @@ mod tests {
             ..BoundedProbe::new()
         };
         let texts: Vec<String> = vec!["t0".to_string(), "bad".to_string(), "t2".to_string()];
-        let results = embed_texts_bounded(&provider, &texts, 3).await;
+        let results = embed_texts_bounded(&provider, &texts, 3, false).await;
         assert_eq!(
             provider.calls.lock().expect("calls").len(),
             3,
@@ -1715,10 +1733,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_bounded_helper_fail_fast_truncates_after_the_first_error() {
+        // Decision 113 (recall paths): the batch stops at the first
+        // error — the returned vec carries the entries up to and
+        // including it, in input order, and the remaining futures are
+        // dropped (a failing endpoint receives at most one in-flight
+        // window, not the whole batch).
+        let provider = BoundedProbe {
+            fail_text: Some("bad".to_string()),
+            ..BoundedProbe::new()
+        };
+        let texts: Vec<String> = vec!["t0".to_string(), "bad".to_string(), "t2".to_string()];
+        let results = embed_texts_bounded(&provider, &texts, 3, true).await;
+        assert_eq!(results.len(), 2, "truncated at the first error");
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err(), "the failure lands at ITS position");
+    }
+
+    #[tokio::test]
     async fn the_bounded_helper_with_concurrency_one_never_overlaps() {
         let provider = BoundedProbe::new();
         let texts: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
-        let results = embed_texts_bounded(&provider, &texts, 1).await;
+        let results = embed_texts_bounded(&provider, &texts, 1, false).await;
         assert!(results.iter().all(|result| result.is_ok()));
         assert_eq!(
             provider.peak(),
@@ -1730,7 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn the_bounded_helper_embeds_nothing_for_empty_input() {
         let provider = BoundedProbe::new();
-        let results = embed_texts_bounded(&provider, &[], 4).await;
+        let results = embed_texts_bounded(&provider, &[], 4, false).await;
         assert!(results.is_empty());
         assert!(provider.calls.lock().expect("calls").is_empty());
     }

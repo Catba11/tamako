@@ -1095,11 +1095,16 @@ impl tamako_core::embedding::EmbeddingProvider for AgentEmbeddingProvider {
         // Decision 113: bounded-concurrent SINGLE-TEXT posts via the
         // core helper (order-preserving, per-item results) — never
         // array input, so the decision-81 addendum's ZDR route
-        // discipline is unchanged. The first error in input order
-        // fails the call (the sequential-loop contract the pre-screen
-        // and deep recall degrade against).
+        // discipline is unchanged. FAIL-FAST: the first error in
+        // input order fails the call AND truncates the batch (the
+        // pre-screen and deep recall degrade the whole wake on any
+        // error, so dispatching the rest would only amplify load
+        // against a failing endpoint — at most one in-flight window
+        // reaches it, the decision-66 sequential loop's failure-path
+        // profile).
         Box::pin(async move {
-            let results = tamako_core::embedding::embed_texts_bounded(self, texts, self.1).await;
+            let results =
+                tamako_core::embedding::embed_texts_bounded(self, texts, self.1, true).await;
             let mut vectors = Vec::with_capacity(results.len());
             for result in results {
                 vectors.push(result?);

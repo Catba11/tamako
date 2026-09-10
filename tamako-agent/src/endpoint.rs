@@ -146,8 +146,7 @@ pub const GATE_MODEL_ENV_VAR: &str = "TAMAKO_GATE_MODEL";
 /// Environment override of the reply model (specs.md Section 13).
 pub const REPLY_MODEL_ENV_VAR: &str = "TAMAKO_REPLY_MODEL";
 
-/// Environment override of the summary model (specs.md Section 13,
-/// reported for spec backfill with the `summary_*` keys).
+/// Environment override of the summary model (specs.md Section 13).
 pub const SUMMARY_MODEL_ENV_VAR: &str = "TAMAKO_SUMMARY_MODEL";
 
 /// Per-purpose API-key override of the digest purpose (decision 87,
@@ -172,15 +171,15 @@ pub const REPLY_LLM_API_KEY_ENV_VAR: &str = "TAMAKO_REPLY_LLM_API_KEY";
 /// Refer to [`DIGEST_LLM_API_KEY_ENV_VAR`].
 pub const SUMMARY_LLM_API_KEY_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_API_KEY";
 
-/// Environment override of the summary API family (specs.md Section 13,
-/// reported for spec backfill with the `summary_*` keys). The summary
+/// Environment override of the summary API family (specs.md Section
+/// 13). The summary
 /// purpose alone has per-purpose api/base URL env vars (the S3
 /// deployment contract); the other purposes keep the global
 /// `TAMAKO_LLM_API` / `TAMAKO_LLM_BASE_URL` overrides only.
 pub const SUMMARY_LLM_API_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_API";
 
-/// Environment override of the summary base URL (specs.md Section 13,
-/// reported for spec backfill with the `summary_*` keys). Refer to
+/// Environment override of the summary base URL (specs.md Section
+/// 13). Refer to
 /// [`SUMMARY_LLM_API_ENV_VAR`].
 pub const SUMMARY_LLM_BASE_URL_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_BASE_URL";
 
@@ -194,7 +193,7 @@ pub const SUMMARY_LLM_BASE_URL_ENV_VAR: &str = "TAMAKO_SUMMARY_LLM_BASE_URL";
 /// — decision 84 (a).
 pub const LLM_SESSION_ID_ENV_VAR: &str = "TAMAKO_LLM_SESSION_ID";
 
-/// The default session-id PREFIX (reported for spec backfill with
+/// The default session-id PREFIX (specs.md Section 13's
 /// `llm_session_id`). Decision 84 (b)/(d): one deployment, one
 /// operator-chosen prefix; the per-(group, purpose) disambiguation
 /// suffix is machine-generated and persisted.
@@ -266,8 +265,7 @@ pub const DEFAULT_REPLY_MODEL: &str = "claude-sonnet-4-5";
 
 /// The default summary model (cheap tier: the segmented summarizer of
 /// the Rule C3 removed chunk, specs.md Section 10). The same cheap
-/// model as the gate. Reported for spec backfill with the
-/// `summary_*` keys.
+/// model as the gate.
 pub const DEFAULT_SUMMARY_MODEL: &str = anthropic::completion::CLAUDE_HAIKU_4_5;
 
 /// The default embedding model (current-state.md decision 81).
@@ -593,7 +591,7 @@ pub struct LlmConfigValues {
     pub gate_model: Option<String>,
     /// Reply model (`reply_model`).
     pub reply_model: Option<String>,
-    /// Summary model (`summary_model`, reported for spec backfill).
+    /// Summary model (`summary_model`; specs.md Section 13).
     pub summary_model: Option<String>,
     /// Digest-specific API family (`digest_llm_api`).
     pub digest_llm_api: Option<String>,
@@ -624,7 +622,7 @@ pub struct LlmConfigValues {
     /// (`reply_structured_output`).
     pub reply_structured_output: Option<String>,
     /// Summary-specific structured-output mode
-    /// (`summary_structured_output`, reported for spec backfill).
+    /// (`summary_structured_output`; specs.md Section 13).
     pub summary_structured_output: Option<String>,
     /// The embedding model (`embedding_model`; decision 66,
     /// global-only). The binary always maps the resolved config value
@@ -2132,7 +2130,7 @@ mod tests {
         let (_lock, env) = EnvGuard::cleared();
         // Per-group config: the summary purpose overrides family, base
         // URL, and model individually (mixed deployments, specs.md
-        // Section 13; the summary keys are reported for spec backfill).
+        // Section 13).
         let values = LlmConfigValues {
             llm_api: Some("anthropic-compatible".to_string()),
             summary_llm_api: Some("openai-compatible".to_string()),
