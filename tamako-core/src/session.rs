@@ -25,8 +25,8 @@ const KEY_CONSECUTIVE_BOT: &str = "consecutive_bot_msgs";
 const KEY_WAKE_MSGS: &str = "wake_msgs_since_wake";
 const KEY_WAKE_LAST_AT: &str = "wake_last_wake_at";
 const KEY_WAKE_INTERVAL_MS: &str = "wake_current_interval_ms";
-// specs.md Section 5.2 says the state keys "include" the listed ones —
-// an open list. This M4 key extends it (reported for spec backfill).
+// specs.md Section 5.2 lists this M4 key explicitly (its "include"
+// wording stays an open list).
 const KEY_WAKE_LAST_ROW_ID: &str = "wake_last_row_id";
 // specs.md Section 5.2 (decision 78 (b)(d)): the warmup keys.
 const KEY_WARMUP_NEXT_AT: &str = "warmup_next_at";
@@ -62,8 +62,7 @@ pub struct SessionState {
     pub wake: WakeSchedulerState,
     /// The raw-log row id of the tail at the last wake. "The new
     /// messages of this wake" (specs.md Section 9.6) are the rows above
-    /// it. Fresh default 0 (M4 key, reported for spec backfill: Section
-    /// 5.2 lists an open key set).
+    /// it. Fresh default 0 (specs.md Section 5.2).
     pub wake_last_row_id: i64,
     /// specs.md Section 5.2 / 8.4 (decision 78 (b)): the persisted
     /// warmup schedule. Rule P1: a restart never reshuffles it.
@@ -146,8 +145,8 @@ impl SessionState {
     /// `None` encodes as the empty string), `muted_flag` ("0"/"1"),
     /// `consecutive_bot_msgs` (decimal), `wake_msgs_since_wake` (decimal),
     /// `wake_last_wake_at` (RFC 3339), `wake_current_interval_ms` (decimal
-    /// milliseconds), `wake_last_row_id` (decimal; M4 key, reported for
-    /// spec backfill), and the decision-78 warmup keys: `warmup_next_at`,
+    /// milliseconds), `wake_last_row_id` (decimal), and the
+    /// decision-78 warmup keys: `warmup_next_at`,
     /// `warmup_watch_sent_at`, `warmup_watch_expires_at` (RFC 3339; `None`
     /// encodes as the empty string), `warmup_quota_used_today`,
     /// `warmup_backoff_factor` (decimal), `warmup_quota_day` (the date
