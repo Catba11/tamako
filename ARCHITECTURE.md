@@ -479,8 +479,10 @@ built end to end against the replayed log:
    reserved system name (`contains`, `known_as`, `also_known_as`,
    `is_a`, `supersedes`). Violations become `related_to` with the
    original name in the edge properties.
-5. **Entity resolution** (`resolve.rs`, Section 7.4 steps 1, 2, 4
-   only): mention/reply binding to `uuid5("tg_user:{id}")`; exact alias
+5. **Entity resolution** (`resolve.rs`, Section 7.4 steps 1–4;
+   step 3 is the decision-73 vector pre-screen, wired by
+   `with_vector_prescreen` and gated by `vector_resolution`):
+   mention/reply binding to `uuid5("tg_user:{id}")`; exact alias
    match with exactly one target binds to that target; an ambiguous or
    unresolvable person attaches its facts to the Alias node (no
    guessing; the node carries the `"attachment": "fallback"` marker of
@@ -493,8 +495,12 @@ built end to end against the replayed log:
    item 5). Every batch writes its MessageBatch node and `contains`
    provenance edges (Section 6.3).
 6. **Write**: one transactional idempotent `upsert_batch` with
-   `CHECKPOINT`. No embeddings — the Phase 2 hook point is marked in
-   `pipeline.rs`.
+   `CHECKPOINT`. Immediately after the graph commit the pipeline
+   enqueues the (node id, content-hash) pairs into
+   `pending_embeddings` (decision 66 — best-effort through the
+   dedicated one-group embedding store, a failure logs a WARN and
+   the startup reconciliation repairs; the vector write itself is
+   the embedding worker's drain).
 7. **Failure handling** (specs.md Section 10.3): exponential backoff
    (base 2 s, doubling, capped at 60 s) with the same batch id; after
    `digest_max_retries` total attempts (default 5) the skeleton plus
@@ -576,8 +582,8 @@ id has an `injected_memories` row. Zero candidates never call the
 cheap model (Section 9.1). The relevance gate `RigRelevanceGate`
 (Section 9.2) runs on the cheap `gate` endpoint with structured output
 (`RecallSelection`), post-validated in plain Rust (in-range indices
-only, deduped, hard cap `recall_injection_cap`, default 5 — reported
-for spec backfill); conservative by default, and ANY failure means
+only, deduped, hard cap `recall_injection_cap`, default 5,
+specs.md Section 13); conservative by default, and ANY failure means
 inject nothing — a wake never fails on a recall-gate error, and DEBUG
 logs distinguish the three gate outcomes (no candidates — the gate is
 not called, selected none, gate failure with a WARN; decision 58)
