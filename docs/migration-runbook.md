@@ -157,15 +157,15 @@ pipeline or closes first. It closes first.
   startup printing the resolved `suffix_mode` and `timezone`. No
   existing line shows them — the wake wiring banner prints only the
   gate/reply models and the recall cap, the digest/summary models
-  already print their own INFO lines (main.rs:787 "digest pipeline
-  wired", :850 "Rule C3 summarizer wired"; env loss still resolves to
-  the TOML or default value on the success path, so those stay
-  observable), and the persona line prints name/pet_tag/preamble_len/
-  suffix_rules — while a missing `TAMAKO_SUFFIX_MODE`/
-  `TAMAKO_TIMEZONE` silently keeps the TOML value (missing and
-  empty-after-trim both count as UNSET). Without this line the
-  Section 6/8 reconciliation has no target for the silent-fallback
-  class.
+  already print their own INFO lines (`build_digest_pipeline` logs
+  "digest pipeline wired", `build_summary_provider` logs "Rule C3
+  summarizer wired"; env loss still resolves to the TOML or default
+  value on the success path, so those stay observable), and the
+  persona line prints name/pet_tag/preamble_len/suffix_rules — while a
+  missing `TAMAKO_SUFFIX_MODE`/`TAMAKO_TIMEZONE` silently keeps the
+  TOML value (missing and empty-after-trim both count as UNSET).
+  Without this line the Section 6/8 reconciliation has no target for
+  the silent-fallback class.
 - AGENT.md Section 6.5 surface, docs-first: one numbered decision entry
   per behavior change in current-state.md Section 3, the owning specs.md
   sections, ARCHITECTURE.md ("ctrl-c shuts every actor down gracefully"
@@ -561,11 +561,12 @@ rm -rf /tmp/tamako-readback
   `systemctl --user stop`), Section 5 backup step 1, the "same launch
   command" line, and the log-location guidance (journald).
 - ARCHITECTURE.md: the graceful-shutdown paragraph, the timer-driver
-  paragraph (:242-243 "Shutdown is structural: the ticker lives and
-  dies inside the actor task" — the drain-entry dispatch gate reverses
-  it), and the digest-completion paragraph (:275 "then the digest
-  trigger re-evaluates once" — the SummaryCompleted chain the
-  `shutting_down` gate covers) (all milestone 0); specs.md: the
+  paragraph ("Shutdown is structural: the ticker lives and dies inside
+  the actor task" — the drain-entry dispatch gate reverses it), and
+  the digest-completion paragraph ("then the digest trigger
+  re-evaluates once" — a completion-chain dispatch point, the
+  SummaryCompleted → maybe_launch_digest re-evaluation the
+  `shutting_down` gate suppresses) (all milestone 0); specs.md: the
   Section 12 observability surface gains the trigger-config startup
   line and the DEBUG digest-start line.
 - current-state.md: Section 3 decision entries for ALL THREE
