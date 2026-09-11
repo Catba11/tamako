@@ -51,15 +51,28 @@ pipeline or closes first. It closes first.
   path reports through the actor's own bounded inbox, and awaiting with
   the receive loop stopped deadlocks against a full inbox (the
   completion handler also performs the flag resets / boundary advances /
-  marker rollbacks, which must run).
-- **Digest-start INFO line** (follow-up b): one line at dispatch with
-  batch id and range. Observability only; explicitly NOT a
-  "wait-for-idle deploy gate" (check-then-act race — a digest can start
-  between the check and the signal).
+  marker rollbacks, which must run). Main's shutdown side must
+  BROADCAST-then-join: send `Shutdown` to every actor first, then await
+  the joins. Today's serial `shutdown().await` loop (send + join per
+  actor, in turn) leaves groups 2..8 fully alive while group 1 drains —
+  their tickers keep DISPATCHING new digests/wakes, the drain
+  observation set never converges, the total approaches the SUM of
+  per-group drains, and a mid-way `StopTimeout` SIGKILL defeats the
+  drain and lands back in the torn-file window. Broadcast-first makes
+  the total ≈ the MAX.
+- **Digest-start line** (follow-up b): one line at dispatch with batch
+  id and range, at **DEBUG** — README.md Section 6 ("Watching the pet")
+  guarantees exactly one INFO line per wake and one per completed
+  digest, and the guarantee stands (the pipeline's extraction detail
+  line already lives at debug for the same reason). Observability only;
+  explicitly NOT a "wait-for-idle deploy gate" (check-then-act race — a
+  digest can start between the check and the signal), and once the
+  drain lands every stop is unconditionally safe anyway.
 - AGENT.md Section 6.5 surface, docs-first: one numbered decision entry
   per behavior change in current-state.md Section 3, the owning specs.md
   sections, ARCHITECTURE.md ("ctrl-c shuts every actor down gracefully"
-  paragraph), soak-runbook.md, and the Section 4 item-11 update.
+  paragraph), README.md Section 5's ctrl-c line, soak-runbook.md, and
+  the Section 4 item-11 update.
 
 ## 4. Milestone 1: spike (go/no-go)
 
@@ -122,11 +135,13 @@ Exec=--live --config /config/tamako.toml --data-root /data --verbose
 StopSignal=SIGINT
 StopTimeout=120
 
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Install]
 WantedBy=default.target
@@ -142,8 +157,10 @@ Then: `loginctl enable-linger <user>`, `systemctl --user daemon-reload`,
 - `StopTimeout=120` bounds the milestone-0 drain; it does not extend
   process life beyond the drain (that is the drain's job, not the
   timeout's).
-- `StartLimit*` keeps a bad-config fail-fast from crash-looping the LLM
-  endpoints.
+- `StartLimit*` lives under `[Unit]` (they are systemd.unit(5) keys; in
+  `[Service]` systemd warns and IGNORES them, which would silently drop
+  the crash-loop protection) and keeps a bad-config fail-fast from
+  crash-looping the LLM endpoints.
 
 ## 7. CI/CD
 
@@ -169,10 +186,15 @@ Then: `loginctl enable-linger <user>`, `systemctl --user daemon-reload`,
    live config; `data/` moves separately, AFTER the clean stop (a live
    copy carries in-flight WAL files; a stale second data root beside the
    service root is a silent-wrong-data trap for manual probes).
-4. Data root: `rsync -a data/ desktop:/var/lib/tamako/data/`.
-5. Env file: merge `.env` + the three shell vars into
+4. Config dir: `mkdir -p /var/lib/tamako/config && cp
+   ~/Tamako/tamako.toml /var/lib/tamako/config/` (the untracked live
+   config rides the step-3 worktree copy), owned by the service user.
+   `persona.toml` needs NO copy here: it loads from
+   `<data-root>/persona.toml` and arrives with step 5.
+5. Data root: `rsync -a data/ desktop:/var/lib/tamako/data/`.
+6. Env file: merge `.env` + the three shell vars into
    `/var/lib/tamako/env` (0600, service user).
-6. **Readback gate** (all 8 groups, via the freshly built image — this
+7. **Readback gate** (all 8 groups, via the freshly built image — this
    validates the exact lbug core that will serve, not some host binary):
 
 ```bash
@@ -204,10 +226,10 @@ rm -rf /tmp/tamako-readback
    scratch copy into the container namespace (a WAL-mode store needs a
    writable directory even for reads). Failure keeps the scratch and
    blocks the start.
-7. Start: `systemctl --user start tamako`. Verify: wiring banner vs
+8. Start: `systemctl --user start tamako`. Verify: wiring banner vs
    expectations (env silent-fallback check), first gate usage line, one
    real Telegram reply.
-8. Rollback: the Mac stays intact (binary + data) for one week. NEVER
+9. Rollback: the Mac stays intact (binary + data) for one week. NEVER
    run both ends at once — concurrent getUpdates pollers steal each
    other's updates and error on conflicts.
 
@@ -224,7 +246,10 @@ rm -rf /tmp/tamako-readback
   probe passes `--data-root` explicitly.
 
 ## 10. Doc-sync deliverables (switchover, docs-first per Section 6.5)
-
+- README.md: the Section 5 ctrl-c line (shutdown semantics change with
+  the drain and with systemctl replacing ctrl-c on the target) and a
+  Section 6 re-check that no new INFO-level line leaks into the
+  one-line guarantee (the digest-start line is DEBUG).
 - docs/soak-runbook.md: Section 4 stop/restart procedure (ctrl-c →
   `systemctl --user stop`), Section 5 backup step 1, the "same launch
   command" line, and the log-location guidance (journald).
