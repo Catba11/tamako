@@ -145,12 +145,10 @@ pub struct TriggerConfig {
     /// `digest_llm_api`.
     pub reply_llm_base_url: Option<String>,
     /// The summary-purpose override of `llm_api`. Refer to
-    /// `digest_llm_api`. Reported for spec backfill with the
-    /// `summary_*` keys.
+    /// `digest_llm_api`.
     pub summary_llm_api: Option<String>,
     /// The summary-purpose override of `llm_base_url`. Refer to
-    /// `digest_llm_api`. Reported for spec backfill with the
-    /// `summary_*` keys.
+    /// `digest_llm_api`.
     pub summary_llm_base_url: Option<String>,
     /// specs.md Section 13: the model of the participation gate
     /// (Section 9.6). `None` (the default) means the agent crate's
