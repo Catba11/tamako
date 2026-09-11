@@ -154,15 +154,18 @@ pipeline or closes first. It closes first.
   digest can start between the check and the signal), and once the
   drain lands every stop is unconditionally safe anyway.
 - **Resolved trigger-config startup line** (new): one INFO line at
-  startup printing the resolved `suffix_mode`, `timezone`, AND the
-  digest/summary models. No existing line shows any of them — the wake
-  wiring banner prints only the gate/reply models and the recall cap,
-  and the persona line prints name/pet_tag/preamble_len/suffix_rules —
-  while a missing `TAMAKO_SUFFIX_MODE`/`TAMAKO_TIMEZONE`/
-  `TAMAKO_DIGEST_MODEL`/`TAMAKO_SUMMARY_MODEL` silently keeps the TOML
-  value (missing and empty-after-trim both count as UNSET). Without
-  this line the Section 6/8 reconciliation has no target for the
-  silent-fallback class.
+  startup printing the resolved `suffix_mode` and `timezone`. No
+  existing line shows them — the wake wiring banner prints only the
+  gate/reply models and the recall cap, the digest/summary models
+  already print their own INFO lines (main.rs:787 "digest pipeline
+  wired", :850 "Rule C3 summarizer wired"; env loss still resolves to
+  the TOML or default value on the success path, so those stay
+  observable), and the persona line prints name/pet_tag/preamble_len/
+  suffix_rules — while a missing `TAMAKO_SUFFIX_MODE`/
+  `TAMAKO_TIMEZONE` silently keeps the TOML value (missing and
+  empty-after-trim both count as UNSET). Without this line the
+  Section 6/8 reconciliation has no target for the silent-fallback
+  class.
 - AGENT.md Section 6.5 surface, docs-first: one numbered decision entry
   per behavior change in current-state.md Section 3, the owning specs.md
   sections, ARCHITECTURE.md ("ctrl-c shuts every actor down gracefully"
@@ -557,9 +560,14 @@ rm -rf /tmp/tamako-readback
 - docs/soak-runbook.md: Section 4 stop/restart procedure (ctrl-c →
   `systemctl --user stop`), Section 5 backup step 1, the "same launch
   command" line, and the log-location guidance (journald).
-- ARCHITECTURE.md: the graceful-shutdown paragraph (milestone 0);
-  specs.md: the Section 12 observability surface gains the
-  trigger-config startup line and the DEBUG digest-start line.
+- ARCHITECTURE.md: the graceful-shutdown paragraph, the timer-driver
+  paragraph (:242-243 "Shutdown is structural: the ticker lives and
+  dies inside the actor task" — the drain-entry dispatch gate reverses
+  it), and the digest-completion paragraph (:275 "then the digest
+  trigger re-evaluates once" — the SummaryCompleted chain the
+  `shutting_down` gate covers) (all milestone 0); specs.md: the
+  Section 12 observability surface gains the trigger-config startup
+  line and the DEBUG digest-start line.
 - current-state.md: Section 3 decision entries for ALL THREE
   milestone-0 items (drain, digest-start line, resolved trigger-config
   line); Section 4 item 11 marked DONE with the drain's decision
