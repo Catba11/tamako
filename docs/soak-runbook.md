@@ -140,7 +140,12 @@ in the WAL tail only; the last checkpoint covers the rest.
 Per the database spec Section 10: checkpoint, then copy the files.
 
 The graph file `memory.lbug` is checkpointed after every digest batch,
-so the file on disk is consistent whenever no digest is in flight.
+so the file on disk is consistent whenever no digest is in flight. A
+ctrl-c stop does NOT establish that condition: the shutdown does not
+await detached digest/summary/wake tasks, and no log line marks a
+digest start (current-state.md Section 4 item 11). A batch interrupted
+at stop time replays idempotently on the next run; a backup taken
+after such a stop may carry a mid-digest graph file.
 
 The safe procedure (bot stopped):
 
