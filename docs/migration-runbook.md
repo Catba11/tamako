@@ -68,6 +68,15 @@ pipeline or closes first. It closes first.
   explicitly NOT a "wait-for-idle deploy gate" (check-then-act race — a
   digest can start between the check and the signal), and once the
   drain lands every stop is unconditionally safe anyway.
+- **Resolved trigger-config startup line** (new): one INFO line at
+  startup printing the resolved `suffix_mode` and `timezone`. No
+  existing line shows them — the wake wiring banner prints only the
+  gate/reply models and the recall cap, and the persona line prints
+  name/pet_tag/preamble_len/suffix_rules — while a missing
+  `TAMAKO_SUFFIX_MODE`/`TAMAKO_TIMEZONE` silently keeps the TOML value
+  (missing and empty-after-trim both count as UNSET). Without this
+  line the Section 6/8 reconciliation has no target for the
+  silent-fallback class.
 - AGENT.md Section 6.5 surface, docs-first: one numbered decision entry
   per behavior change in current-state.md Section 3, the owning specs.md
   sections, ARCHITECTURE.md ("ctrl-c shuts every actor down gracefully"
@@ -83,10 +92,26 @@ crate's bundled 0.18.3 core — a storage-format drift):
 
 1. Transfer the source (git bundle from the Mac — the branch rides
    along), `cargo build --release --locked`, full workspace test.
-2. Confirm the lbug **0.19.1** prebuilt exists for x86_64-linux and is
+2. Generate the quadlet unit (`podman-system-generator --user --dryrun`)
+   and inspect it; then EMPIRICALLY verify which signal the
+   in-container process receives on `systemctl --user stop`
+   (KillMode=mixed sends the [Service] KillSignal — default SIGTERM —
+   only to the podman process; whether podman converts that into the
+   container's StopSignal=SIGINT is asserted, not yet observed). If the
+   app sees SIGTERM, the entire graceful path never triggers and
+   milestone 0's drain is dead code — stop and fix the unit before
+   proceeding.
+3. Confirm the lbug **0.19.1** prebuilt exists for x86_64-linux and is
    what the build linked (Section 5's assertion).
-3. Record: build time, test total vs the stamped 1158 (9 ignored),
-   prebuilt availability, the exact assertion wiring.
+4. Probe the podman `--env-file` parser with
+   `podman run --rm --env-file <probe> localhost/tamako:<sha> env`:
+   malformed lines, quotes, `#` comments, an `export ` prefix. The
+   observed behavior dictates how the hand-merged env file (Section 6)
+   is written — the `[Container] EnvironmentFile=` line maps to
+   `--env-file`, NOT systemd's EnvironmentFile parser.
+5. Record: build time, test total vs the stamped 1158 (9 ignored),
+   prebuilt availability, the exact assertion wiring, the signal-test
+   and env-file-probe outcomes.
 
 Spike failure pauses the project; do not improvise around the graph
 core.
@@ -97,13 +122,15 @@ core.
   `cargo build --release --locked --bin tamako`; runtime =
   `debian:bookworm-slim` + ca-certificates + libssl3;
   `ENTRYPOINT ["tamako"]`; builder carries curl + bash + ca-certificates
-  + cmake + g++.
-- `.dockerignore` (NEW, required): `target/`, `data/`, `.env*`,
+- `.dockerignore` (NEW, required): `.git/`, `target/`, `data/`, `.env*`,
   `tamako.toml`, `*.log`, `.omp/`, `*decision*.md`, `review-*.md`,
-  `eval-*.md` — and the exception `!.cargo/config.toml`. The
-  decision-109 pin (`LBUG_VERSION = "0.19.1"`) lives in
-  `.cargo/config.toml`; dropping it unpins the C++ core (the download
-  script falls back to `main`).
+  `eval-*.md` — and the exception `!.cargo/config.toml`. `.git/` goes
+  first: the object store holds the confidential branch commits, no
+  workspace crate has a build.rs or git-metadata consumer (the image
+  tag carries the SHA instead), and excluding it keeps the daemon
+  context tarball lean. The decision-109 pin (`LBUG_VERSION = "0.19.1"`)
+  lives in `.cargo/config.toml`; dropping it unpins the C++ core (the
+  download script falls back to `main`).
 - **Fail-closed pin assertion in CI**: the build log must show the
   prebuilt source resolving to the pinned 0.19.1 release; any
   download-fallback warning fails the build. Never trust the warning to
@@ -111,17 +138,28 @@ core.
 - Tag images `localhost/tamako:<git-sha>`; rollback = retag the quadlet
   + restart. Keep the previous N tags.
 
+- `.env.example` (NEW, tracked, placeholders only): the checked-in
+  source of truth for the required env key set — the Section 7
+  assertion and the Section 6 hand-merge both diff against it.
+
 ## 6. Milestone 3: runtime (rootless quadlet)
 
 `/var/lib/tamako/{data,config,env}` owned by the invoking user (rootless
 podman maps container root to that user; or mount `:U`). The env file is
 mode 0600 and is HAND-MERGED from `.env` plus the three operator-shell
-`TAMAKO_*` variables — systemd EnvironmentFile has no shell syntax (no
-`export`, no expansion, no continuations; malformed lines are warned and
-dropped), and the `TAMAKO_*` overrides fail SILENT when absent
-(missing/empty-after-trim both count as UNSET; only missing API keys are
-loud). Reconcile the resolved wiring banner against expectations after
-every start.
+variables `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`,
+`TAMAKO_SUMMARY_MODEL`. `[Container] EnvironmentFile=` maps to podman's
+`--env-file` — NOT systemd's EnvironmentFile parser (that parser only
+applies under `[Service]`, where it would inject the podman client
+process, not the container); its exact rules (quotes, comments,
+malformed lines, `export` prefixes) are verified empirically in spike
+item 4 BEFORE the file is written. The `TAMAKO_*` overrides fail SILENT
+when absent (missing/empty-after-trim both count as UNSET; only missing
+API keys are loud), so the required key set has a checked-in source of
+truth: `.env.example` (Section 5) plus the three shell variables.
+Reconcile after every start: the wiring banner covers the models, and
+the milestone-0 startup line covers the resolved
+`suffix_mode`/`timezone`.
 
 `~/.config/containers/systemd/tamako.container`:
 
@@ -142,6 +180,7 @@ StartLimitBurst=5
 [Service]
 Restart=always
 RestartSec=5
+TimeoutStopSec=150
 
 [Install]
 WantedBy=default.target
@@ -154,13 +193,14 @@ Then: `loginctl enable-linger <user>`, `systemctl --user daemon-reload`,
   under `Restart=always` is invalid (systemd immediately restarts it).
 - `StopSignal=SIGINT` is load-bearing: the default SIGTERM is unhandled
   and hard-kills, skipping the graceful path.
-- `StopTimeout=120` bounds the milestone-0 drain; it does not extend
-  process life beyond the drain (that is the drain's job, not the
-  timeout's).
-- `StartLimit*` lives under `[Unit]` (they are systemd.unit(5) keys; in
-  `[Service]` systemd warns and IGNORES them, which would silently drop
-  the crash-loop protection) and keeps a bad-config fail-fast from
-  crash-looping the LLM endpoints.
+- Two SEPARATE stop budgets: `StopTimeout=120` is quadlet's podman
+  `--stop-timeout` (the container's own stop grace), while systemd's
+  `[Service] TimeoutStopSec` (default 90s) is the cgroup kill budget —
+  quadlet does NOT derive one from the other, so without the explicit
+  `TimeoutStopSec=150` systemd would SIGKILL the cgroup at 90s and
+  silently truncate the drain budget. TimeoutStopSec must exceed
+  StopTimeout. Neither extends process life beyond the drain (that is
+  the drain's job, not the timeouts').
 
 ## 7. CI/CD
 
@@ -169,7 +209,8 @@ Then: `loginctl enable-linger <user>`, `systemctl --user daemon-reload`,
 - Branch lane (`ci-local.sh` on the desktop): fmt, clippy, tests,
   `podman build`, smoke, retag, `systemctl --user restart`, banner
   assertion. The smoke stage is the Section 8 readback against a fixture
-  data root plus an env-key-set assertion (required keys present);
+  data root plus an env-key-set assertion against `.env.example` (+ the
+  three shell variables);
   CI NEVER runs `--live` (double-poll hazard).
 
 ## 8. Milestone 4: switchover
