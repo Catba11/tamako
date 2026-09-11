@@ -3191,6 +3191,21 @@ Deliberately not done, in priority order:
     `append_recall_injection` and the `injected_memories` dedup table;
     the M2 lifecycle (bit-identical rebuild, C3 prune) covers them.
 
+11. **Graceful shutdown does not drain detached tasks.** The digest,
+    summary, wake, and warmup tasks are detached `tokio::spawn`s, and
+    `ActorCommand::Shutdown` breaks the actor loop without awaiting
+    them; main awaits only the actor joins, so a ctrl-c stop can abort
+    an in-flight digest mid-batch. The data paths are covered
+    (idempotent batch replay, the boundary advances only after
+    commit, startup reconciliation), but the lbug file's mid-digest
+    crash consistency is UNVERIFIED (§6.7) — the soak runbook's
+    "consistent whenever no digest is in flight" is a condition
+    ctrl-c does not establish, and no log line marks a digest start,
+    so an interrupted batch is undetectable today. Follow-ups
+    (2026-09-12 review): a shutdown drain of the detached task
+    handles, and a digest-start INFO line (the observability
+    prerequisite for manually avoiding the window).
+
 ### Known issues under investigation
 
 - **Repeated replies to the same message across two interval wakes:
