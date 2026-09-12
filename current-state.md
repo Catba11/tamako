@@ -3129,6 +3129,98 @@ feature commit (decision 92).
     tamako-agent seam keeps no `embed_texts` override: single-text
     only; the decision-81 addendum stands.
 
+114. (2026-09-11, operator-ruled) Shutdown drain of the detached
+    tasks — Section 4 item 11's follow-up (a), pulled forward from the
+    2026-09-12 review because containerized push-to-deploy (the
+    migration runbook) makes restarts frequent and automated: the gap
+    ships with the pipeline or closes first, and it closes first. The
+    actor now TRACKS its detached digest/summary/wake/warmup handles;
+    on `ActorCommand::Shutdown` it keeps selecting on the inbox until
+    every tracked task has reported, then exits — never
+    break-then-await: completions report through the actor's own
+    bounded inbox (awaiting with the receive loop stopped deadlocks
+    against a full inbox), and the completion handlers carry the flag
+    resets / boundary advances / marker rollbacks the drain must
+    observe. A single `shutting_down` flag gates EVERY dispatch
+    point — the tick path AND the completion chains (the
+    SummaryCompleted digest re-evaluation, the digest-completion
+    summarizer spawn) — so the drain finishes in-flight work and never
+    dispatches new; gating only the ticker arm would let completion
+    chains spawn new tracked work and the tracked set would never
+    converge. The gate suppresses ONLY the re-dispatch calls inside
+    the completion handlers; the handlers themselves run during drain.
+    Long tasks pair completion-waiting with a CALL-BOUNDARY cancel:
+    every tracked task polls a cancellation token between its LLM
+    calls — the digest between retry attempts AND between an attempt's
+    initial and repair calls (the two get separate 900 s windows), the
+    unforced wake between its serial recall/gate/reply calls, the
+    summary before its call. FORCED wakes are never cancelled:
+    must-respond IS the forced path and forced bypasses the gate, so a
+    cancelled forced wake would re-present the message only to
+    ordinary gate judgment — the obligation degraded, not preserved; a
+    forced wake in flight at drain entry runs to completion within the
+    stop budget or is SIGKILLed into the documented residual. State
+    safety is by design: nothing lands between calls (the wake's
+    dedup/context/outbound rows live in the completion handler; a
+    failed digest attempt commits nothing and the boundary only
+    advances on commit; a failed repair returns the original error). A
+    cancelled task reports a Cancelled outcome and the handler
+    performs ONLY state restoration: for a digest the batch stays
+    PENDING (no attempt consumed, no failure counter, never the
+    dead-letter branch — its terminal state has no shipped repair
+    tool, specs.md Section 15 item 2); for an unforced wake the
+    handler rolls `wake_last_row_id` back to `pre_wake_row_id` and
+    persists — start_wake advances and persists the marker at wake
+    START, so a cancel without the rollback silently drops the
+    messages. The rollback preserves the MESSAGES (they re-present at
+    the next natural trigger's gate judgment); it does NOT preserve
+    any forcing — forced entries are memory-only, armed at intake or
+    by the decision-65 requeue, and the cancel path arms neither, so a
+    Section-8.1 intent cancelled mid-wake degrades to best-effort gate
+    judgment. That case is narrow by construction (a mention arms a
+    FORCED wake at intake, and forced wakes are never cancelled);
+    documented, not hidden. Main's shutdown side BROADCASTS `Shutdown`
+    to every actor first, then joins — the old serial send+join loop
+    left groups 2..8 fully alive while group 1 drained, their tickers
+    still dispatching, so the total approached the SUM of per-group
+    drains; broadcast-first makes it ≈ the MAX — and the outbound pump
+    stays alive until every actor has joined AND the outbound channel
+    is empty (the pre-drain order killed the intake loop — which
+    hosted the outbound select arm — before the actors, so a wake
+    completing during shutdown pushed its reply into a channel nobody
+    served: the log said the bot spoke, Telegram never received). The
+    one residual no cooperative cancel covers: a hard kill landing
+    mid-wake before any cancel point leaves the marker advanced and
+    the obligation lost — wakes have no replay surface (the
+    idempotent-replay and reconciliation nets cover digest batches
+    only); this matches every pre-drain stop and stays documented.
+    With the cancel, the drain's tail is ONE call window (≤ 900 s)
+    plus wrap-up for cancellable tasks, which is what the migration
+    runbook's stop budget (StopTimeout=1200 s) is sized to; the
+    uncancellable forced wake stands outside that arithmetic.
+115. (2026-09-11, operator-ruled) Digest-start line at DEBUG — item
+    11's follow-up (b). One line at dispatch with the batch id and
+    range, at DEBUG: README.md Section 6's one-line guarantee
+    (exactly one INFO line per wake and one per completed digest)
+    stands, and the pipeline's extraction detail line already lives at
+    debug for the same reason. Observability only — explicitly NOT a
+    wait-for-idle deploy gate (check-then-act race: a digest can start
+    between the check and the signal), and with the drain (decision
+    114) every cooperative stop is unconditionally safe anyway; the
+    line's purpose is post-hoc attribution of a budget-SIGKILLed or
+    crashed stop.
+116. (2026-09-11, operator-ruled) Resolved trigger-config startup
+    line at INFO: one line printing the resolved `suffix_mode` and
+    `timezone`. Neither had any log surface — the wake wiring banner
+    prints only the gate/reply models and the recall cap, the
+    digest/summary models print their own INFO lines in
+    `build_digest_pipeline` / `build_summary_provider`, and the
+    persona line prints name/pet_tag/preamble_len/suffix_rules —
+    while a missing OR empty `TAMAKO_SUFFIX_MODE`/`TAMAKO_TIMEZONE`
+    silently keeps the TOML value (missing and empty-after-trim both
+    count as UNSET). The migration runbook's env reconciliation
+    (Sections 6/8) diffs against this line.
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:
@@ -3191,20 +3283,25 @@ Deliberately not done, in priority order:
     `append_recall_injection` and the `injected_memories` dedup table;
     the M2 lifecycle (bit-identical rebuild, C3 prune) covers them.
 
-11. **Graceful shutdown does not drain detached tasks.** The digest,
-    summary, wake, and warmup tasks are detached `tokio::spawn`s, and
-    `ActorCommand::Shutdown` breaks the actor loop without awaiting
-    them; main awaits only the actor joins, so a ctrl-c stop can abort
-    an in-flight digest mid-batch. The data paths are covered
-    (idempotent batch replay, the boundary advances only after
-    commit, startup reconciliation), but the lbug file's mid-digest
-    crash consistency is UNVERIFIED (§6.7) — the soak runbook's
-    "consistent whenever no digest is in flight" is a condition
-    ctrl-c does not establish, and no log line marks a digest start,
-    so an interrupted batch is undetectable today. Follow-ups
-    (2026-09-12 review): a shutdown drain of the detached task
-    handles, and a digest-start INFO line (the observability
-    prerequisite for manually avoiding the window).
+11. **Graceful shutdown does not drain detached tasks.** DONE
+    (2026-09-11, decisions 114/115): on `ActorCommand::Shutdown` the
+    actor keeps selecting on its inbox until every tracked detached
+    task (digest/summary/wake/warmup) has reported — a
+    `shutting_down` flag gates every dispatch point (the tick path and
+    the completion chains) while the completion handlers keep running
+    for state restoration; long tasks cancel cooperatively at
+    LLM-call boundaries with a Cancelled outcome (digest batches stay
+    PENDING; an unforced wake rolls `wake_last_row_id` back and
+    persists); forced wakes are never cancelled. Main broadcasts
+    `Shutdown` to all actors before joining, and the outbound pump
+    stays alive until every actor has joined and the outbound channel
+    is empty. A clean stop now ESTABLISHES the soak runbook's "no
+    digest in flight" backup precondition. Residuals: a hard kill
+    (budget SIGKILL, crash) landing mid-wake before any cancel point
+    leaves the wake marker advanced and the obligation lost — wakes
+    have no replay surface, matching every pre-drain stop — and the
+    lbug file's mid-digest crash consistency stays UNVERIFIED (§6.7)
+    for that window, bundled with the lbug 0.20 re-evaluation.
 
 ### Known issues under investigation
 

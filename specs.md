@@ -106,6 +106,7 @@ To delete the memory of a group, delete the directory. Both files share one life
 2. LLM calls run concurrently across groups. Inside one group, the following operations are strictly serialized: graph writes, context mutations, session-state mutations.
 3. Graph writes per group are serialized through the actor. LadybugDB permits one writer per database file. A blocked batch must not block the queue. Refer to Section 10.4.
 4. The actor persists the session state after every mutation. On restart, the actor rebuilds the live context from the raw log and  the session state. The decode of the persisted state is a total function (decision 99): a missing key decodes to the fresh default silently (first start is the normal case); a present-but-malformed value decodes to the fresh default of THAT field with one WARN per field — the pre-99 silent default hid operator edits and writer bugs.
+5. Shutdown drains (decision 114): on the shutdown command the actor closes every dispatch point (the tick path and the completion chains) through a `shutting_down` flag and keeps selecting on the inbox until every tracked detached task has reported. Cancellable long tasks stop cooperatively at LLM-call boundaries; the completion handlers keep running during the drain (state restoration only). Forced wakes are never cancelled.
 
 ### 6.2 Trigger ordering
 
@@ -165,6 +166,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 - Fire when the undigested tail reaches the first of: 5000 CJK characters, 100 messages, 2500 words, or 20 kB.
 - Fallback: fire when the tail is non-empty and the last digest is older than the digest timeout (6 h). "Last digest" means the wall-clock completion time of the last successful digest. If no digest has ever run for the group, the fallback does not fire. The tail right after the bot joins grows until it reaches a size threshold.
 - On fire, run the digest pipeline. Refer to Section 10.
+- Shutdown drain (decision 114): while the actor drains, the digest trigger dispatches nothing new — the gate covers both the tick-path evaluation and the completion-chain re-evaluation. An in-flight digest finishes or cancels at a call boundary (Section 10.3 item 4).
 
 ### 8.3 Wake trigger
 
@@ -196,6 +198,7 @@ One wake executes these steps in this sequence:
 3. Participation decision. Refer to Section 9.6.
 4. If the decision is to participate, generate a reply with the main model. The output contract of Section 9.8 applies. Decision 100: a reply longer than the platform limit of 4096 characters is REJECTED before the raw-log write — the SAME wake error as an empty reply: nothing persists, nothing sends, no context append, the marker rolls back, and a forced wake requeues once per the failure handling above (never a truncation: an overlength reply is an incident). Otherwise write the bot's own message to the raw log FIRST, then send it through the adapter, then append it to the context (Rule B1: the log precedes the send, so the log and the group see the same text — the pre-2026-09-06 sentence order of this step read send-then-log; the code was always log-then-send).
 5. Reset the wake counter and the timer with fresh jitter.
+- Shutdown drain (decision 114): an UNFORCED wake cancelled at an LLM-call boundary (between the serial recall/gate/reply calls) rolls `wake_last_row_id` back to `pre_wake_row_id` and persists — the messages re-present at the next natural trigger's gate judgment. Forcing is memory-only and the cancel path does not re-arm it (no intake arming, no decision-65 requeue): a Section-8.1 intent cancelled mid-wake degrades to best-effort gate judgment. A FORCED wake is never cancelled; it runs to completion or dies with the process.
 
 ### 9.1 Recall call
 
@@ -275,6 +278,7 @@ One warmup executes these steps in this sequence (independent of the Wake proced
 1. On failure, retry with exponential backoff. The retry uses the same batch identifier. The `MERGE` operations are idempotent under the deterministic identifiers of `proposed-graph-database-specs.md` Section 7.1.
 2. After `digest_max_retries` total attempts (the count includes the first attempt), write the batch skeleton and the error to a dead-letter table, emit the failure metric, and skip the batch. A failed batch never blocks later batches.
 3. The skipped range stays in the raw log. A later repair tool can reprocess it.
+4. Shutdown drain (decision 114): a digest task cancelled at an LLM-call boundary (between retry attempts, or between an attempt's initial and repair calls) reports Cancelled. The batch stays PENDING — no attempt consumed, no failure counter, never the dead-letter branch — and resumes on the next run.
 
 ### 10.4 Bot self-memory
 
@@ -309,9 +313,13 @@ Metrics per group:
 
 The `tamako --status <chat_id>` command is the metrics access path. It queries the group store read-only and prints the persisted counters (every row above except Vector resolution outcomes and Media captioning, as noted), the derived rates, the boundaries, the session state, and the dead-letter entries. `--status-all` prints every group.
 
+Log surface (decisions 115/116): at INFO the bot emits one line per wake and one per completed digest (the one-line guarantee), plus one startup line with the resolved `suffix_mode` and `timezone` (decision 116). Digest dispatch additionally logs at DEBUG with the batch id and range (decision 115) — the post-hoc attribution surface for a hard-killed stop.
+
 ## 13. Configuration
 
 Global defaults. Every item is overridable per group. Keys below are the exact TOML spellings; the `_secs`-suffixed keys take integer seconds. Config load WARNs on any TOML key that matches no known field — top level, the global table, and per-group tables alike (decision 84(e), extended to the top level in decision 94: a stray key above the first header, or a misspelled table header such as `[group."-1001"]`, WARNs as table `<top-level>` instead of silently applying nothing): one curated WARN per unknown key at startup, never a hard error (forward compatibility: an older binary reading a newer config must not fail).
+
+At startup the resolved `suffix_mode` and `timezone` values print as one INFO line (decision 116; Section 12).
 
 | Key | Default | Section |
 |---|---|---|
