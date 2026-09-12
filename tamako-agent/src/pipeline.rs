@@ -2431,4 +2431,200 @@ mod tests {
         );
         assert_eq!(provider.call_count(), 2);
     }
+    // ---- Decision 114: the drain token through the retry/dead-letter
+    // loop. The actor-level tests prove the boundary/marker rules; these
+    // prove the pipeline-level contract the stop budget rests on: a
+    // cancelled batch consumes no attempt, bumps no failure counter of
+    // its own, and never reaches the dead-letter branch. ----
+
+    /// Fires the drain token MID-CALL — the stand-in for a drain
+    /// arriving while the extractor runs. `ScriptedExtractor` only
+    /// honors a token already fired at ENTRY (extract.rs), which the
+    /// loop-top poll intercepts before any call; the mid-flight paths
+    /// (`AgentError::Cancelled` propagation, the backoff select) need a
+    /// double that cancels inside the call.
+    struct DrainFiringExtractor {
+        calls: std::sync::Mutex<usize>,
+        outcome: DrainFiringOutcome,
+    }
+
+    enum DrainFiringOutcome {
+        /// The well-behaved extractor notices the drain and reports
+        /// Cancelled.
+        Cancelled,
+        /// A REAL extraction failure lands first; the token then
+        /// converts the retry backoff into the exit.
+        Failing,
+    }
+
+    impl DrainFiringExtractor {
+        fn call_count(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+
+    impl KnowledgeExtractor for DrainFiringExtractor {
+        fn extract<'a>(
+            &'a self,
+            _input: &'a ExtractionInput,
+            cancel: Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Result<KnowledgeGraph, AgentError>> + Send + 'a>> {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            if let Some(token) = cancel {
+                token.cancel();
+            }
+            let result = match self.outcome {
+                DrainFiringOutcome::Cancelled => Err(AgentError::Cancelled),
+                DrainFiringOutcome::Failing => Err(AgentError::Extraction("boom".to_string())),
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    /// The decision-114 pipeline fixture: two prose rows (a non-empty
+    /// tail) plus the fast retry config of the enqueue tests.
+    fn drain_fixtures(
+        extractor: Arc<dyn KnowledgeExtractor>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Store>,
+        AgentDigestPipeline<LbugBackend>,
+    ) {
+        let (_dir, store, memory) = enqueue_fixtures();
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m1", "1001", "Alice", "I will deploy the fix tonight"),
+            )
+            .expect("insert");
+        store
+            .insert_message(
+                ENQUEUE_CHAT,
+                &inbound("m2", "2002", "Bob", "the staging deploy is already done"),
+            )
+            .expect("insert");
+        let pipeline = AgentDigestPipeline::new(
+            Arc::clone(&store),
+            Arc::clone(&memory),
+            extractor,
+            PipelineConfig {
+                max_retries: 3,
+                retry_base_delay: Duration::from_millis(1),
+            },
+        );
+        (_dir, store, pipeline)
+    }
+
+    #[tokio::test]
+    async fn a_pre_fired_drain_token_consumes_no_attempt_and_writes_nothing() {
+        // Decision 114 loop-top poll: the cancelled batch stays
+        // PENDING — no attempt consumed, no failure counter, never the
+        // dead-letter branch.
+        let extractor = Arc::new(crate::ScriptedExtractor::with_graphs(vec![
+            alice_deploy_graph(),
+        ]));
+        let (_dir, store, pipeline) = drain_fixtures(extractor.clone());
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let error = pipeline
+            .run_digest(ENQUEUE_CHAT, 0, token)
+            .await
+            .expect_err("a pre-fired token cancels the batch");
+        assert!(matches!(error, CoreError::Cancelled), "got {error:?}");
+
+        assert!(
+            extractor.inputs().is_empty(),
+            "no attempt reached the extractor"
+        );
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "digest_failures_total")
+                .expect("state"),
+            None,
+            "a cancel is not a failure"
+        );
+        assert!(
+            store
+                .list_dead_letters(ENQUEUE_CHAT)
+                .expect("dead letters")
+                .is_empty(),
+            "a cancelled batch never dead-letters"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_flight_drain_cancel_propagates_without_failure_state() {
+        // Decision 114: an extractor observing the drain mid-call
+        // reports Cancelled, and the loop returns BEFORE the failure
+        // counter, the retry accounting, and the dead-letter path.
+        let extractor = Arc::new(DrainFiringExtractor {
+            calls: std::sync::Mutex::new(0),
+            outcome: DrainFiringOutcome::Cancelled,
+        });
+        let (_dir, store, pipeline) = drain_fixtures(extractor.clone());
+
+        let error = pipeline
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
+            .await
+            .expect_err("the mid-flight drain cancels the batch");
+        assert!(matches!(error, CoreError::Cancelled), "got {error:?}");
+
+        assert_eq!(extractor.call_count(), 1, "the cancel landed mid-call");
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "digest_failures_total")
+                .expect("state"),
+            None,
+            "a cancel is not a failure"
+        );
+        assert!(
+            store
+                .list_dead_letters(ENQUEUE_CHAT)
+                .expect("dead letters")
+                .is_empty(),
+            "a cancelled batch never dead-letters"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_during_the_retry_backoff_exits_without_a_second_attempt() {
+        // Decision 114: the backoff itself is a cancel window — the
+        // REAL failure already counted (one attempt consumed), but the
+        // drain ends the loop instead of waiting out the delay: no
+        // second attempt, no dead letter.
+        let extractor = Arc::new(DrainFiringExtractor {
+            calls: std::sync::Mutex::new(0),
+            outcome: DrainFiringOutcome::Failing,
+        });
+        let (_dir, store, pipeline) = drain_fixtures(extractor.clone());
+
+        let error = pipeline
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
+            .await
+            .expect_err("the drain wins the backoff select");
+        assert!(matches!(error, CoreError::Cancelled), "got {error:?}");
+
+        assert_eq!(extractor.call_count(), 1, "the drain preempts the retry");
+        assert_eq!(
+            store
+                .get_state(ENQUEUE_CHAT, "digest_failures_total")
+                .expect("state"),
+            Some("1".to_string()),
+            "the real failure counted exactly once"
+        );
+        assert!(
+            store
+                .list_dead_letters(ENQUEUE_CHAT)
+                .expect("dead letters")
+                .is_empty(),
+            "the cancelled retry never dead-letters"
+        );
+    }
 }
