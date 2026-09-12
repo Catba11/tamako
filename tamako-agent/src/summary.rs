@@ -410,6 +410,7 @@ mod tests {
             schemars::schema_for!(SummaryOutput),
             1024,
             "invalid summary JSON",
+            None,
         )
         .await
         .map_err(|error| SummaryError::Provider(error.to_string()))?;

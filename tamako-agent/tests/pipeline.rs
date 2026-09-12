@@ -159,7 +159,7 @@ async fn a_skeleton_batch_stores_the_skeleton_without_calling_the_extractor() {
     let pipeline = pipeline(&store, &memory, extractor.clone());
 
     let outcome = pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -246,7 +246,7 @@ async fn the_happy_path_extracts_validates_resolves_and_writes() {
     let pipeline = pipeline(&store, &memory, extractor.clone());
 
     let outcome = pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -348,7 +348,7 @@ async fn a_failing_extractor_dead_letters_after_all_retries() {
     let pipeline = pipeline(&store, &memory, extractor.clone());
 
     let outcome = pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("a dead-lettered batch is Ok")
         .expect("non-empty tail");
@@ -430,7 +430,7 @@ async fn running_the_same_range_twice_is_idempotent() {
 
     for run in 1..=2 {
         let outcome = pipeline
-            .run_digest(CHAT, 0)
+            .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -475,7 +475,10 @@ async fn an_empty_tail_returns_none() {
     let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![]));
     let pipeline = pipeline(&store, &memory, extractor.clone());
 
-    let outcome = pipeline.run_digest(CHAT, 1).await.expect("digest");
+    let outcome = pipeline
+        .run_digest(CHAT, 1, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("digest");
     assert_eq!(outcome, None);
     assert!(extractor.inputs().is_empty());
 }
@@ -735,7 +738,7 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
 
     // Run 1.
     let outcome = pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -776,7 +779,7 @@ async fn a_replayed_batch_converges_through_the_prescreen_without_duplicate_node
     // Run 2: the SAME range again (the retry of specs.md Section 10.3,
     // stable batch id included).
     let outcome = pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -877,7 +880,7 @@ async fn the_candidate_band_confirmation_binds_the_candidate_without_a_duplicate
     );
 
     let outcome = pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -1002,7 +1005,7 @@ async fn a_grounded_related_pair_promotes_through_the_digest() {
     let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
 
     pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -1069,7 +1072,7 @@ async fn an_unmentioned_related_pair_stays_out_of_the_prompt() {
     let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
 
     pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -1149,7 +1152,7 @@ async fn a_verified_forward_origin_binds_through_the_mention_map() {
     let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
 
     pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -1205,7 +1208,7 @@ async fn an_unverified_forward_origin_stays_unattributable() {
     let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
 
     pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -1266,7 +1269,7 @@ async fn a_colliding_origin_label_stays_out() {
     let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
 
     pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");
@@ -1332,7 +1335,7 @@ async fn a_non_user_or_automatic_origin_is_never_a_candidate() {
     let pipeline = pipeline(&store, &memory, Arc::clone(&extractor));
 
     pipeline
-        .run_digest(CHAT, 0)
+        .run_digest(CHAT, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("digest")
         .expect("non-empty tail");

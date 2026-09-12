@@ -48,7 +48,7 @@ async fn the_rig_extractor_returns_a_parseable_graph() {
         related_pairs: vec![],
         origins: vec![],
     };
-    let graph = extractor.extract(&input).await.expect("extraction");
+    let graph = extractor.extract(&input, None).await.expect("extraction");
     // Live output is not deterministic; keep the assertions minimal.
     assert!(!graph.nodes.is_empty(), "expected at least one node");
 }

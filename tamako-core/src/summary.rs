@@ -19,6 +19,13 @@ use tamako_store::MessageRow;
 /// Errors of the summary provider.
 #[derive(Debug, thiserror::Error)]
 pub enum SummaryError {
+    /// Cooperative cancellation of the decision-114 shutdown drain:
+    /// the summarizer observed the drain token before its LLM call.
+    /// NEVER a failure — the handler clears `summary_pending` and does
+    /// nothing else: the deferred C3 mutation replays on the next run
+    /// (the boundary never advanced).
+    #[error("cancelled by the shutdown drain")]
+    Cancelled,
     /// The summarizer provider failed (endpoint, model, or transport).
     /// Mirrors the `CoreError::Digest(String)` / `CoreError::Wake(String)`
     /// philosophy: a domain variant carrying the provider's message.

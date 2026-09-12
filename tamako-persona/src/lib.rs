@@ -396,8 +396,10 @@ impl ResolvedTimezone {
     }
 
     /// The config-file spelling of this zone (serde round-trip): the
-    /// IANA name, or the `±HH:MM` offset.
-    fn config_value(&self) -> String {
+    /// IANA name, or the `±HH:MM` offset. Public for the decision-116
+    /// startup line (the resolved-value render matches the config
+    /// file's spelling exactly).
+    pub fn config_value(&self) -> String {
         match self {
             Self::Fixed(offset) => format_offset_hm(*offset),
             Self::Named(tz) => tz.name().to_owned(),

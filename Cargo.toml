@@ -29,6 +29,12 @@ tokio = { version = "1", features = ["full"] }
 # tamako-core's embed_texts_bounded).
 futures = "0.3"
 
+# Cooperative cancellation of the milestone-0 shutdown drain (decision
+# 114): the actor's tracked tasks poll a CancellationToken at LLM-call
+# boundaries. Default features off — the actor needs only the sync
+# component.
+tokio-util = { version = "0.7", default-features = false }
+
 # SQLite for store.db. The bundled feature builds SQLite from source.
 # No system SQLite dependency.
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1183,6 +1183,35 @@ impl EndpointClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        self.complete_structured_cancellable(
+            preamble,
+            messages,
+            schema,
+            max_tokens,
+            error_label,
+            None,
+        )
+        .await
+    }
+
+    /// The decision-114 cancellable variant of [`Self::complete_structured`]:
+    /// the drain token polls BEFORE the initial call and BETWEEN the
+    /// initial call and the one repair retry, so a drain stop never
+    /// waits out more than one in-flight call window. A fired token
+    /// answers [`AgentError::Cancelled`] — never an extraction failure,
+    /// so no attempt is consumed and no repair fires.
+    pub async fn complete_structured_cancellable<T>(
+        &self,
+        preamble: Option<String>,
+        messages: Vec<Message>,
+        schema: schemars::Schema,
+        max_tokens: u64,
+        error_label: &str,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<T, AgentError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         complete_structured_with(
             |call| async move {
                 self.complete(
@@ -1198,6 +1227,7 @@ impl EndpointClient {
             schema,
             max_tokens,
             error_label,
+            cancel,
         )
         .await
     }
@@ -1784,7 +1814,6 @@ pub(crate) struct CompletionCall {
 /// with a closure over `EndpointClient::complete`; tests (of this
 /// module and of the single-purpose providers such as
 /// `crate::summary`) script the closure. Refer to
-/// `complete_structured` for the retry semantics.
 pub(crate) async fn complete_structured_with<T, F, Fut>(
     complete: F,
     preamble: Option<String>,
@@ -1792,12 +1821,19 @@ pub(crate) async fn complete_structured_with<T, F, Fut>(
     schema: schemars::Schema,
     max_tokens: u64,
     error_label: &str,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<T, AgentError>
 where
     T: serde::de::DeserializeOwned,
     F: Fn(CompletionCall) -> Fut,
     Fut: std::future::Future<Output = Result<String, AgentError>>,
 {
+    // Decision 114: a fired drain token answers before either call
+    // starts. The initial call and the repair retry each keep their own
+    // call window; the stop budget is sized to one.
+    if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return Err(AgentError::Cancelled);
+    }
     let first = complete(CompletionCall {
         preamble,
         messages,
@@ -1818,6 +1854,13 @@ where
     // no repair attempt.
     if serde_json::from_str::<serde_json::Value>(&first).is_err() {
         return Err(original);
+    }
+    // Decision 114: the drain token's second poll — BETWEEN the initial
+    // call and the repair retry. A fired token skips the repair and
+    // answers Cancelled, so the stop budget waits out at most the one
+    // in-flight window.
+    if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return Err(AgentError::Cancelled);
     }
     let repaired = complete(CompletionCall {
         preamble: Some(REPAIR_PREAMBLE.to_string()),
@@ -3660,6 +3703,7 @@ mod tests {
                 schema,
                 1024,
                 label,
+                None,
             )
             .await
         }

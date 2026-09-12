@@ -383,7 +383,7 @@ async fn digest_is_idempotent_under_retry() {
     let retry_extractor = Arc::new(ScriptedExtractor::with_graphs(vec![alice_grpo_graph()]));
     let retry = scripted_pipeline(&fixture, retry_extractor, PipelineConfig::default());
     let outcome = retry
-        .run_digest(CHAT_ID, 0)
+        .run_digest(CHAT_ID, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("the retry run succeeds")
         .expect("the tail is non-empty");
@@ -436,7 +436,7 @@ async fn failed_batch_dead_letters_and_later_batches_still_process() {
         },
     );
     let outcome = failing_pipeline
-        .run_digest(CHAT_ID, 0)
+        .run_digest(CHAT_ID, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("the run succeeds at the pipeline level")
         .expect("the tail is non-empty");
@@ -483,7 +483,7 @@ async fn failed_batch_dead_letters_and_later_batches_still_process() {
     let good = Arc::new(ScriptedExtractor::with_graphs(vec![alice_grpo_graph()]));
     let good_pipeline = scripted_pipeline(&fixture, good, PipelineConfig::default());
     let outcome = good_pipeline
-        .run_digest(CHAT_ID, 3)
+        .run_digest(CHAT_ID, 3, tokio_util::sync::CancellationToken::new())
         .await
         .expect("the run succeeds")
         .expect("the tail is non-empty");
@@ -528,7 +528,7 @@ async fn skeleton_batch_stores_only_the_skeleton() {
     let extractor = Arc::new(ScriptedExtractor::with_graphs(vec![alice_grpo_graph()]));
     let pipeline = scripted_pipeline(&fixture, Arc::clone(&extractor), PipelineConfig::default());
     let outcome = pipeline
-        .run_digest(CHAT_ID, 0)
+        .run_digest(CHAT_ID, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("the run succeeds")
         .expect("the tail is non-empty");
@@ -656,7 +656,7 @@ async fn digest_harvests_edge_texts_and_an_identical_replay_converges() {
     };
 
     let outcome = pipeline()
-        .run_digest(CHAT_ID, 0)
+        .run_digest(CHAT_ID, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("the run succeeds")
         .expect("the tail is non-empty");
@@ -725,7 +725,7 @@ async fn digest_harvests_edge_texts_and_an_identical_replay_converges() {
     // fresh pipeline over the same store and backend — the retry shape
     // of `digest_is_idempotent_under_retry`) leaves the rows converged.
     let outcome = pipeline()
-        .run_digest(CHAT_ID, 0)
+        .run_digest(CHAT_ID, 0, tokio_util::sync::CancellationToken::new())
         .await
         .expect("the replay succeeds")
         .expect("the tail is non-empty");
