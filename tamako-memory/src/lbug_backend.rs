@@ -49,6 +49,20 @@ use crate::backend::{
     TopicCandidate, UpsertOutcome, NEIGHBOR_EXPANSION_LIMIT, RECALL_TIME_WINDOW_DAYS,
 };
 
+/// Decision 118: the explicit per-database size cap. Without it the
+/// Rust crate's default (`u32::MAX`) collides with the C++ FFI's
+/// "unset" sentinel (`-1u`), and the core reserves an 8 TiB VM region
+/// PER OPEN DATABASE (DEFAULT_VM_REGION_MAX_SIZE) — refused by the
+/// Linux kernel once a process opens more regions than the 128 TiB
+/// user address space holds (the migration spike: 25 parallel tests
+/// failing `Mmap for size 8796093022208 failed` on the Fedora desktop;
+/// macOS reserves lazily and never noticed). The bot opens one
+/// Database per group in one process. 16 GiB is the crate's own
+/// test-config value, ~500× the largest live graph (33 MiB at the
+/// decision's writing). A hard cap on the graph FILE: hitting it
+/// fails loudly, never corrupts.
+const MAX_DB_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+
 // The DDL of proposed-graph-database-specs.md Section 6.1, verbatim.
 const DDL_NODE: &str = "CREATE NODE TABLE IF NOT EXISTS Node(
     id STRING PRIMARY KEY,
@@ -499,7 +513,8 @@ impl LbugBackend {
         let path = dir.join("memory.lbug");
         let db = tokio::task::spawn_blocking(move || -> Result<Database> {
             std::fs::create_dir_all(&dir)?;
-            let db = Database::new(&path, SystemConfig::default()).map_err(backend)?;
+            let db = Database::new(&path, SystemConfig::default().max_db_size(MAX_DB_SIZE))
+                .map_err(backend)?;
             // Section 6.1. IF NOT EXISTS makes the DDL idempotent.
             let conn = Connection::new(&db).map_err(backend)?;
             conn.query(DDL_NODE).map_err(backend)?;
