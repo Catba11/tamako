@@ -325,8 +325,10 @@ core.
 - **Fail-closed pin assertion in CI** (two parts — the pin arrives via
   `cargo:rustc-env=`, which cargo does NOT echo to the build log, so a
   log grep for the pin would be perma-green): (1) ANY lbug downloader
-  fallback `cargo:warning=` ("download failed … building from source" /
-  "Could not run prebuilt liblbug downloader") fails the build; (2) the
+  fallback fails the build — the two `cargo:warning=`s ("download
+  failed … building from source" / "Could not run prebuilt liblbug
+  downloader") AND the source build's "Downloading ladybug source …"
+  marker, which is a plain println that never becomes a warning; (2) the
   LBUG_VERSION-keyed prebuilt cache artifact must exist post-build at
   `$CARGO_HOME/registry/src/<index>/lbug-0.18.3/.cache/lbug-prebuilt/version-0.19.1/lib/liblbug.a`
   (glob the registry index hash — it is machine-specific). Because build.rs REUSES an existing cache dir
@@ -344,9 +346,10 @@ core.
   attributed to the workspace spec — spike 1(b) finding), so the
   Containerfile deletes `target/release/build/lbug-*` and
   `target/release/.fingerprint/lbug-*` directly; the pin also rides
-  the cook layer via `COPY .cargo/config.toml`. The spike
-  verifies this by building twice (the second build cache-hot) and
-  confirming the assertion still bites. The assertion must
+  the cook layer via `COPY .cargo/config.toml`. Fail-closed is proven
+  by the spike's NEGATIVE probe (a drifted pin downloads a foreign key
+  and guard (2) fires) — NOT by a cache-hot rebuild, which serves the
+  guard steps from the layer cache and runs nothing. The assertion must
   require that post-build the cache holds EXACTLY ONE key,
   `version-0.19.1` — a `latest/` entry marks an unpinned
   pre-decision-109 resolution and fails the build. Exact wiring is a
