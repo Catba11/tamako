@@ -656,12 +656,12 @@ rm -rf /tmp/tamako-readback
 - Observe logs (`journalctl --user -u tamako`) → tune → commit on the
   branch ON THE DESKTOP → (PLANNED) `ci-local.sh` → restart. No
   iteration hop.
-- Closeout record (2026-09-12): the five switchover-closeout batches
-  (ecacbf6…7f10ba3) were committed and rebased ON THE MAC with the
-  desktop ref force-updated by bundle — a one-day deviation from the
-  desktop-only branch rule, executed while the session lived on the
-  Mac. From here the rule stands: branch work happens on the desktop;
-  the Mac pushes main only.
+- Closeout record (2026-09-12): the switchover-closeout batches
+  (ecacbf6 through the present commit, 2026-09-12) were committed and
+  rebased ON THE MAC with the desktop ref force-updated by bundle — a
+  one-day deviation from the desktop-only branch rule, executed while
+  the session lived on the Mac. From here the rule stands: branch work
+  happens on the desktop; the Mac pushes main only.
 - main pushes to origin may happen from either machine (origin is
   main's shared authority); the branch never pushes anywhere.
 - Divergence sentinel: monthly `git bundle` snapshots exchanged between
