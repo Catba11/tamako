@@ -120,7 +120,7 @@ Column definitions:
 | `Node.type` | Node type. Closed set. Refer to Section 6.2. |
 | `Node.properties` | JSON blob. Display fields only. Rule R1 applies. |
 | `EDGE.relationship_name` | System name or open-vocabulary snake_case name. Refer to Section 6.3. |
-| `EDGE.valid_at` | Start of fact validity. Usually the message time. |
+| `EDGE.valid_at` | Start of fact validity. Usually the message time. TIMESTAMP is microsecond-granular (decision 117): a nanosecond-precision value (Linux's CLOCK_REALTIME; macOS is µs already) round-trips TRUNCATED, so every encoded edge id canonicalizes `valid_at` to µs at encode time — the id names the stored key on every platform. |
 | `EDGE.invalid_at` | End of fact validity. NULL means the fact is valid now. |
 | `EDGE.edge_text` | The natural language text of the fact. One sentence. |
 | `EDGE.properties` | JSON blob. Display fields only. |

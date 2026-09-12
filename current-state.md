@@ -3220,6 +3220,26 @@ feature commit (decision 92).
     silently keeps the TOML value (missing and empty-after-trim both
     count as UNSET). The migration runbook's env reconciliation
     (Sections 6/8) diffs against this line.
+117. (2026-09-11, migration spike finding) Edge ids canonicalize
+    `valid_at` to the graph's storage quantum (microseconds) at encode
+    time. lbug's TIMESTAMP column is microsecond-granular, so a
+    nanosecond-precision `valid_at` — which ONLY Linux produces, since
+    macOS's CLOCK_REALTIME is gettimeofday-backed (µs) — round-trips
+    truncated: the digest harvest encodes the batch's in-memory value
+    (ns) while reconciliation and recall read the graph's stored value
+    (µs), and the two id STRINGS diverge (the spike caught it as a
+    recall_replay assertion diff: `...06.004544Z` stored vs
+    `...06.004544367Z` in-memory). Live consequences on Linux without
+    the fix: every restart's reconciliation prunes and re-upserts
+    each freshly harvested edge_texts row (churn, not loss), and a
+    wake between harvest and the next reconciliation cannot join an
+    FTS hit back to its graph edge (the freshly harvested edge never
+    surfaces). `EdgeId::encode` truncates to µs, so every encoded id
+    names the STORED key on every platform. Existing data untouched:
+    the Mac's µs clock already produced canonical ids, so re-encoding
+    the live data root is byte-identical.
+    proposed-graph-database-specs.md Section 6.1's EDGE table gains
+    the TIMESTAMP-quantum note.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
