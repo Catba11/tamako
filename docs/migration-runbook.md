@@ -367,8 +367,10 @@ core.
 - `.env.example` (EXTEND, tracked, placeholders only): the file already
   exists as a secrets template (OPENAI_API_KEY plus commented
   ANTHROPIC_API_KEY/TELOXIDE_TOKEN) and documents a `.env.local`
+  convention while the live run sources `.env` — add the
   `TAMAKO_*` operator-override variables (the executed set: gate/reply
-  API keys, summary/caption models, session id) and reconcile the `.env`/`.env.local` wording,
+  API keys, summary/caption models, session id) and reconcile the
+  `.env`/`.env.local` wording,
   ON THE MAC, committed before the transfer (the desktop is read-only
   from milestone 1; the file is tracked, so it lands on main or the
   branch consistently). It is the checked-in source of truth for the
@@ -578,10 +580,10 @@ then interleave with the real ones.
    sticker-caption cache, whose loss is silent: `MediaStore::open`
    creates an EMPTY database when the file is missing and a failed open
    only WARNs, so it needs an explicit integrity check):
-
 ```bash
-IMG=localhost/tamako:<sha>
+rm -rf /tmp/tamako-readback    # a re-run must not probe stale bytes ("failure keeps the scratch")
 mkdir -p /tmp/tamako-readback   # rsync creates only the LAST component; a fresh host fails without this
+IMG=localhost/tamako:<sha>
 rsync -a /var/lib/tamako/data/ /tmp/tamako-readback/data/
 failed=0
 INVENTORY=${INVENTORY:-/var/lib/tamako/graph-groups.txt}
