@@ -1,9 +1,10 @@
 # Migration runbook: macOS operator machine → Fedora Kinoite, containerized
 
-Status: DECIDED (2026-09-11), pre-spike. The six operator decisions are
-recorded in Section 1; spike outcomes (Section 4) are filled in when the
-spike lands. This runbook covers moving the live bot, its data root, its
-secrets, and the branch-authority workflow to a Fedora Kinoite desktop,
+Status: EXECUTED (2026-09-12). The six operator decisions are recorded
+in Section 1; the spike returned GO (Section 4, 2026-09-12); milestones
+0-4 are complete and the live bot serves from the desktop quadlet
+(`tamako.service`, Section 8). This runbook covers moving the live bot,
+its data root, its secrets, and the branch-authority workflow to a Fedora Kinoite desktop,
 containerized for CI/CD. It supersedes the macOS-specific parts of
 docs/soak-runbook.md Section 4/5 for the target machine (doc-sync list
 in Section 10).
@@ -483,11 +484,12 @@ then interleave with the real ones.
 
 ## 7. CI/CD
 
-- Public lane (PLANNED, NOT YET BUILT — no `.github/` exists; the four
-  2026-09-12 switchover commits ran with NO CI gate and the Mac's
-  local fmt/clippy/test suite is the only backstop until this lands):
-  GitHub Actions, main only: fmt + clippy + the full
-  workspace suite + image build.
+- Public lane (PLANNED, NOT YET BUILT — no `.github/` exists; the
+  2026-09-12 switchover commits ran with NO CI gate; the backstop is
+  the DESKTOP toolbox suite — the operator ruled the desktop the
+  working machine — with fmt/clippy/test pinned to rust 1.98.1 by
+  `rust-toolchain.toml`, decision 119): GitHub Actions, main only:
+  fmt + clippy + the full workspace suite + image build.
 - Branch lane (PLANNED, NOT YET BUILT — no `ci-local.sh` exists yet):
   `ci-local.sh` on the desktop: the branch gate FIRST
   (`git -C ~/Tamako branch --show-current` = `catball-self-use`,
