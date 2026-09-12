@@ -3229,17 +3229,45 @@ feature commit (decision 92).
     (ns) while reconciliation and recall read the graph's stored value
     (µs), and the two id STRINGS diverge (the spike caught it as a
     recall_replay assertion diff: `...06.004544Z` stored vs
-    `...06.004544367Z` in-memory). Live consequences on Linux without
-    the fix: every restart's reconciliation prunes and re-upserts
-    each freshly harvested edge_texts row (churn, not loss), and a
-    wake between harvest and the next reconciliation cannot join an
-    FTS hit back to its graph edge (the freshly harvested edge never
-    surfaces). `EdgeId::encode` truncates to µs, so every encoded id
+    `...06.004544367Z` in-memory). The live consequence on Linux
+    without the fix: every restart's reconciliation string-diff
+    (sidecar id vs re-encoded graph id, embedding.rs) prunes and
+    re-upserts each freshly harvested edge_texts row — churn, not
+    loss. The recall join is NOT affected: `edges_by_ids` binds
+    `valid_at` as a timestamp PARAMETER and the lbug binding truncates
+    parameters to µs (lbug value.rs), so an ns id still matches the µs
+    column. The live ns source is real, not hypothetical: the bot's
+    own outbound rows stamp `now_utc()` (wake reply, warmup send),
+    they sit inside the digest range, and `batch_end` — the LAST row's
+    timestamp — becomes every edge's `valid_at`; a batch ending on a
+    bot reply carries ns on Linux. `link_also_known_as` (merge tool)
+    keys `valid_at = now` likewise.
+    `EdgeId::encode` truncates to µs, so every encoded id
     names the STORED key on every platform. Existing data untouched:
     the Mac's µs clock already produced canonical ids, so re-encoding
     the live data root is byte-identical.
     proposed-graph-database-specs.md Section 6.1's EDGE table gains
     the TIMESTAMP-quantum note.
+118. (2026-09-11, migration spike finding) `LbugBackend` sets an
+    explicit `max_db_size` of 16 GiB per group graph. The spike's
+    desktop test run failed 25 graph-opening tests with `Buffer
+    manager exception: Mmap for size 8796093022208 failed` — a
+    Rust↔C++ sentinel collision: the Rust crate's
+    `SystemConfig::default()` sets `max_db_size = u32::MAX`, the C++
+    FFI guard reads "unset" as `-1u`, so the value is treated as SET,
+    passes through, and database.cpp then substitutes
+    `DEFAULT_VM_REGION_MAX_SIZE` = 1<<43 (8 TiB) as the VM-region
+    reservation PER OPEN DATABASE. macOS reserves the 8 TiB lazily and
+    never noticed; the Fedora host refuses once the parallel test
+    suite opens more regions than the 128 TiB user address space
+    holds (nproc = 24 → up to 24 concurrent DBs ≈ 192 TiB). Production
+    relevance, not just tests: the bot opens one Database PER GROUP in
+    one process — 8 groups × 8 TiB = 64 TiB already walks near the
+    edge, and every future group narrows it. 16 GiB is the crate's
+    own test-config value (SYSTEM_CONFIG_FOR_TESTS), ~500× the largest
+    live graph (33 MiB), and 8 groups × 16 GiB = 128 GiB of
+    reservation is trivial. The cap is a hard limit on the graph FILE
+    size; hitting it fails loudly, never corrupts.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
