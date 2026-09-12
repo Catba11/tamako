@@ -41,6 +41,11 @@ COPY . .
 #     cook snapshot could otherwise smuggle a stale key past both
 #     guards below.
 RUN rm -rf "$CARGO_HOME"/registry/src/*/lbug-*/.cache/lbug-prebuilt
+# cargo caches the build SCRIPT's run across cook → build (inputs
+# unchanged), so a wiped cache would NOT be re-downloaded below and
+# guard (2) would fail on a missing dir instead of a stale key. Force
+# the lbug build script to re-run — the wipe stays load-bearing.
+RUN cargo clean -p lbug
 RUN cargo build --release --locked --bin tamako > /tmp/build.log 2>&1 \
     || { cat /tmp/build.log; exit 1; }
 # (1) ANY downloader fallback cargo:warning= fails the build.
