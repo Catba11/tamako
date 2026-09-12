@@ -1,0 +1,19 @@
+# Build context for the Section-5 Containerfile (migration-runbook.md).
+# .git/ first: the object store holds the confidential branch commits,
+# no workspace crate has a build.rs or git-metadata consumer (the image
+# tag carries the SHA instead), and excluding it keeps the daemon
+# context tarball lean.
+.git/
+target/
+data/
+.env*
+tamako.toml
+*.log
+.omp/
+*decision*.md
+review-*.md
+eval-*.md
+# Exception: the decision-109 pin (LBUG_VERSION = "0.19.1") lives in
+# .cargo/config.toml; dropping it unpins the C++ core (the download
+# script falls back to `main`).
+!.cargo/config.toml
