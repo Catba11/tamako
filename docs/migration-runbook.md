@@ -244,6 +244,47 @@ project:
    prebuilt availability, the exact assertion wiring, the signal-test
    and env-file-probe outcomes.
 
+### Spike results (2026-09-12, Fedora 43 Kinoite x86_64, podman 5.8.4) — GO
+
+- **1(a) toolbox**: `cargo build --release --locked` 1m10s; `cargo test
+  --workspace --no-fail-fast` **1164 passed / 0 failed / 9 ignored / 35
+  suites** (stamped baseline 1158/9; +6 = milestone-0's new tests).
+  Desktop prebuilt cache holds exactly `version-0.19.1` with liblbug.a.
+- **1(b) podman**: full image green (first cold 1m45s builder; 37s with
+  warm dep layers). Cache-hot second build: 17/17 layers cached, 1.3s,
+  byte-identical image id. **Negative probe** (pin drifted to
+  `LBUG_VERSION=0.20.0`): guard (2) fired FAIL-CLOSED ("unexpected
+  prebuilt keys") — the assertion bites. Binary smoke: `--help` runs in
+  the runtime image; ldd resolves libssl.so.3 / libcrypto.so.3 /
+  libstdc++.so.6; the lbug core is statically linked.
+- **1(b) findings folded into main**: (i) trixie bases — the 0.19.1
+  prebuilt's public header includes C++20 `<format>`, which bookworm's
+  g++ 12 lacks (`6e5753a`); (ii) `cargo clean -p lbug` removes 0 files
+  in this layout, so the forced build-script rerun deletes
+  `target/release/build/lbug-*` + `.fingerprint/lbug-*` directly
+  (`d93d335`); (iii) the pin rides the cook layer via
+  `COPY .cargo/config.toml` (`6e5753a`).
+- **Item 2 (signal probe)**: `GOT-SIGINT` in journald, stop in 1.0s —
+  the systemd → podman → container chain converts `StopSignal=SIGINT`;
+  `TimeoutStopSec` never approached. Probe drop-in removed immediately
+  after; post-cleanup dryrun shows the real ExecStart. (Probe drop-in
+  also carried empty `EnvironmentFile=`/`Volume=` resets because the
+  env file does not exist until Section 8 step 6.)
+- **Item 3**: 0.19.1 x86_64 prebuilt assets exist
+  (`liblbug-static-linux-x86_64-{compat,perf}.tar.gz`) and are what the
+  image linked (guard-verified).
+- **Item 4 (env-file parser)**: podman 5.8.4 `--env-file` keeps quotes
+  LITERAL (`A="b"` → value `"b"`), treats an `export ` prefix as part
+  of the NAME, and keeps inline comments LITERAL (`A=b # c` → value
+  `b # c`); only own-line `#` comments are skipped. **The Section 6
+  env file MUST be strict `NAME=value` lines** — no quotes, no
+  `export`, no inline comments.
+- Sequencing-gate adjudication (operator goal supersedes the
+  2026-09-12 review gate for milestones 1-3; the Mac bot stays live
+  until Section 8 step 2's gated SIGINT) and decisions 117 (µs-canonical
+  edge ids) / 118 (explicit max_db_size) are recorded in
+  current-state.md Section 3.
+
 Spike failure pauses the project; do not improvise around the graph
 core.
 
@@ -325,9 +366,12 @@ variables `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`,
 `TAMAKO_SUMMARY_MODEL`. `[Container] EnvironmentFile=` maps to podman's
 `--env-file` — NOT systemd's EnvironmentFile parser (that parser only
 applies under `[Service]`, where it would inject the podman client
-process, not the container); its exact rules (quotes, comments,
-malformed lines, `export` prefixes) are verified empirically in spike
-item 4 BEFORE the file is written. The `TAMAKO_*` overrides fail SILENT
+process, not the container); spike item 4 verified the parser (podman
+5.8.4): quotes stay LITERAL in values, an `export ` prefix becomes part
+of the NAME, and inline comments stay LITERAL — so the hand-merged file
+is written as strict `NAME=value` lines only (no quotes, no `export`,
+no inline comments; `#` comments only on their own lines). The
+`TAMAKO_*` overrides fail SILENT
 when absent (missing/empty-after-trim both count as UNSET; only missing
 API keys are loud), so the required key set has a checked-in source of
 truth: `.env.example` (Section 5) plus the three shell variables.
