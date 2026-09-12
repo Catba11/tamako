@@ -1,0 +1,8 @@
+# Decision 119 (2026-09-12): pin the dev/lane toolchain. Governs every
+# rustup environment (the Mac AND the desktop toolbox, whose cargo is
+# the host user's rustup). The Containerfile chef base pins the same
+# version for the production compiler. MSRV floor stays at
+# Cargo.toml's rust-version = "1.96".
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

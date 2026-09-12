@@ -4,7 +4,7 @@
 # compiled prompts, inherits branch confidentiality, and never leaves
 # operator-controlled hardware (Section 1 item 4).
 
-FROM rust:1-slim-trixie AS chef
+FROM rust:1.98.1-slim-trixie AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 

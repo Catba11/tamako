@@ -3271,6 +3271,20 @@ feature commit (decision 92).
     reservation is trivial. The cap is a hard limit on the graph FILE
     size; hitting it fails loudly, never corrupts.
 
+119. (2026-09-12, migration closeout finding) Dev/lane toolchain
+    pinned at 1.98.1. No pin existed (Cargo.toml carries only the 1.96
+    MSRV floor): the Mac ran rustup 1.97.1 while the desktop toolbox
+    ran rustup 1.98.1, and the Containerfile builder rode the FLOATING
+    `rust:1-slim-trixie` tag — so a 1.98-only clippy lint
+    (chunks_exact_to_as_chunks, tamako-store/src/store.rs) passed the
+    Mac and failed the desktop gate the day the operator ruled the
+    desktop the working machine. The pin: `rust-toolchain.toml`
+    (channel 1.98.1) governs every rustup environment (the Mac AND the
+    toolbox, whose cargo is the host user's rustup, not dnf), and the
+    Containerfile chef base pins to `rust:1.98.1-slim-trixie` so the
+    production compiler stops floating. `as_chunks` is stable since
+    1.88, inside the MSRV.
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:
