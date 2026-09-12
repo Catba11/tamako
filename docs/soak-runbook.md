@@ -123,12 +123,16 @@ criterion). The raw log is the source of truth (Rule P1). The actor
 rebuilds the live context and the session state from the raw log, the
 `injected_memories` table, and the state table.
 
-1. Stop the bot: ctrl-c. The shutdown drains in-flight
+1. Stop the bot: `systemctl --user stop tamako` on the desktop (the
+   quadlet sets StopSignal=SIGINT, so this IS the ctrl-c drain path;
+   pre-container era: ctrl-c). The shutdown drains in-flight
    digest/summary/wake tasks (up to one LLM call window for
    cancellable tasks; forced wakes run out) and flushes the session
    state of every group (decision 114). Wait for the `live run
-   summary` line.
-2. Start the bot again with the same launch command.
+   summary` line (journald: `journalctl --user -u tamako`; pre-journald
+   era: the raw log file — still the Rule P1 source of truth there).
+2. Start the bot again: `systemctl --user start tamako` (pre-container
+   era: the same launch command).
 3. Verify with `--status`: the boundaries and counters continue from
    the pre-restart values.
 
@@ -154,7 +158,8 @@ stop may carry a mid-digest graph file.
 
 The safe procedure (bot stopped):
 
-1. Stop the bot (ctrl-c). On clean shutdown SQLite checkpoints
+1. Stop the bot (`systemctl --user stop tamako`; pre-container era:
+   ctrl-c). On clean shutdown SQLite checkpoints
    `store.db` and removes the WAL files.
 2. Copy the two files of the group:
    `cp ./data/<chat_id>/store.db ./data/<chat_id>/memory.lbug <backup dir>/`

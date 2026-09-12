@@ -100,7 +100,7 @@ async fn openrouter_gemini_embedding_round_trip() {
     // 3-element form 404s, the one-element form 200s).
     let mut vectors = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        let vec = match model.embed_text(*input).await {
+        let vec = match model.embed_text(input).await {
             Ok(vec) => vec,
             Err(error) => panic!(
                 "embedding request failed: {error}; \
@@ -119,7 +119,8 @@ async fn openrouter_gemini_embedding_round_trip() {
 
     // HTTP 200 is implied per call (rig maps non-success statuses to
     // Err above); the hard length pin is the guard.
-    for vec in &vectors {
+    for (input, vec) in inputs.iter().zip(&vectors) {
+        assert_eq!(vec.document, *input, "document echoes the input");
         assert_eq!(
             vec.vec.len(),
             EMBEDDING_DIMS,
