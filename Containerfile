@@ -4,7 +4,7 @@
 # compiled prompts, inherits branch confidentiality, and never leaves
 # operator-controlled hardware (Section 1 item 4).
 
-FROM rust:1-slim-bookworm AS chef
+FROM rust:1-slim-trixie AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -17,9 +17,17 @@ FROM chef AS builder
 # ca-certificates — missing these silently falls back to the crate's
 # bundled 0.18.3 core, a storage-format drift), can source-build
 # (cmake + g++), and pkg-configs openssl to dylib-link ssl/crypto.
+# The builder is TRIXIE, not bookworm: the 0.19.1 prebuilt's public
+# header (lbug.hpp) includes C++20 <format>, which bookworm's g++ 12
+# lacks — trixie's g++ 14 compiles it (spike 1(b) finding). Builder
+# and runtime stay on the SAME Debian release (the linked binary never
+# trips a builder-newer-than-runtime glibc/libssl mismatch).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl bash ca-certificates cmake g++ pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+# The decision-109 pin must govern the COOK layer too (not just the
+# final build): the downloader resolves `releases/latest` without it.
+COPY .cargo/config.toml .cargo/config.toml
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
@@ -58,11 +66,12 @@ RUN set -eu; \
     done; \
     [ "$n" -eq 1 ] || { echo "FAIL-CLOSED: expected exactly one lbug crate dir, found $n"; exit 1; }
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 # The lbug core links statically by default but still dylib-links
-# ssl/crypto and, on Linux, stdc++.
+# ssl/crypto and, on Linux, stdc++. Trixie names the OpenSSL 3
+# runtime libssl3t64 (the 64-bit-time_t transition).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 libstdc++6 \
+        ca-certificates libssl3t64 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/tamako /usr/local/bin/tamako
 ENTRYPOINT ["tamako"]
