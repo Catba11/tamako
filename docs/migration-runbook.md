@@ -481,12 +481,13 @@ then interleave with the real ones.
   the price attached to the Section-1 frequent-reboot decision, weighed
   against the torn-window alternative — visible, not papered over.
 
-## 7. CI/CD
-
-- Public lane (GitHub Actions, main only): fmt + clippy + the full
-  workspace suite + image build. Main carries nothing confidential.
-- Branch lane (`ci-local.sh` on the desktop): the branch gate FIRST
-  (`git -C ~/Tamako branch --show-current` = `catball-self-use`,
+- Public lane (PLANNED, NOT YET BUILT — no `.github/` exists; the four
+  2026-09-12 switchover commits ran with NO CI gate and the Mac's
+  local fmt/clippy/test suite is the only backstop until this lands):
+  GitHub Actions, main only: fmt + clippy + the full
+  workspace suite + image build.
+- Branch lane (PLANNED, NOT YET BUILT — no `ci-local.sh` exists yet):
+  `ci-local.sh` on the desktop: the branch gate FIRST
   Section 8 step 7's analogue), then fmt, clippy, tests,
   `podman build`, smoke, retag, `systemctl --user restart`, banner
   assertion. The smoke stage runs the Section 8 gate against a
@@ -648,7 +649,8 @@ rm -rf /tmp/tamako-readback
 ## 9. Post-switchover workflow
 
 - Observe logs (`journalctl --user -u tamako`) → tune → commit on the
-  branch ON THE DESKTOP → `ci-local.sh` → restart. No iteration hop.
+  branch ON THE DESKTOP → (PLANNED) `ci-local.sh` → restart. No
+  iteration hop.
 - main pushes to origin may happen from either machine (origin is
   main's shared authority); the branch never pushes anywhere.
 - Divergence sentinel: monthly `git bundle` snapshots exchanged between
