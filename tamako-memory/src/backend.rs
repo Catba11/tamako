@@ -211,12 +211,21 @@ pub struct EdgeId {
 
 impl EdgeId {
     /// Renders the opaque edge-id string (compact JSON of the natural
-    /// key).
+    /// key). Decision 117: `valid_at` canonicalizes to the graph's
+    /// storage quantum (microseconds) BEFORE rendering — lbug's
+    /// TIMESTAMP truncates sub-µs digits, so an uncanonicalized id of
+    /// a nanosecond-precision clock (Linux; macOS is µs already) would
+    /// name a row the graph never holds, splitting the harvest id from
+    /// the read-back id.
     pub fn encode(&self) -> String {
-        let valid_at = self
+        let nanos = self.valid_at.nanosecond();
+        let canonical = self
             .valid_at
+            .replace_nanosecond(nanos - nanos % 1_000)
+            .unwrap_or(self.valid_at);
+        let valid_at = canonical
             .format(&Rfc3339)
-            .unwrap_or_else(|_| format!("{:?}", self.valid_at));
+            .unwrap_or_else(|_| format!("{:?}", canonical));
         serde_json::json!({
             "source_id": self.source_id,
             "relationship_name": self.relationship_name,
@@ -1051,6 +1060,28 @@ mod tests {
         async fn close(&self, _chat_id: &str) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn the_edge_id_encode_canonicalizes_valid_at_to_the_storage_quantum() {
+        // Decision 117: lbug's TIMESTAMP is microsecond-granular, so
+        // the encoded id must carry the STORED value regardless of the
+        // platform clock's precision (Linux's CLOCK_REALTIME reaches
+        // ns; macOS is µs). A sub-µs tail truncates.
+        let id = EdgeId {
+            source_id: "a".to_string(),
+            relationship_name: "related_to".to_string(),
+            target_id: "b".to_string(),
+            valid_at: OffsetDateTime::UNIX_EPOCH + time::Duration::nanoseconds(1_757_654_321),
+        };
+        let encoded = id.encode();
+        assert!(
+            encoded.contains("1970-01-01T00:00:01.757654Z"),
+            "sub-µs digits truncate: {encoded}"
+        );
+        // The canonical form round-trips through decode unchanged.
+        let decoded = EdgeId::decode(&encoded).expect("the canonical id parses");
+        assert_eq!(decoded.encode(), encoded);
     }
 
     #[tokio::test]
