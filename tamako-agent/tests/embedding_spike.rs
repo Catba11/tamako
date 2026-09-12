@@ -18,7 +18,10 @@
 //! embedding surface — the SAME client family tamako-agent's endpoint
 //! layer already builds for openai-compatible completions
 //! (`rig::providers::openai::CompletionsClient`), extended with
-//! `rig::client::EmbeddingsClient::embedding_model_with_ndims`. No
+//! `rig::client::EmbeddingsClient::embedding_model_with_ndims`. The
+//! requests go out one text per call — the production seam
+//! (endpoint.rs `embed_text`; multi-element input 404s under the
+//! account's ZDR-only policy, decision 81 addendum). No
 //! production code changes; this file only proves the round-trip.
 
 use rig::client::EmbeddingsClient as _;
@@ -88,38 +91,37 @@ async fn openrouter_gemini_embedding_round_trip() {
         "The compiler rejected the borrow because the referenced value does not live long enough.",
     ];
     let start = std::time::Instant::now();
-    let result = model
-        .embed_texts_with_usage(inputs.iter().map(|text| (*text).to_string()))
-        .await;
+    // Production's shape (endpoint.rs:1533): ONE single-text call per
+    // input. rig serializes every request as `{"input":["…"]}`; the
+    // one-element route is served by the ZDR-compliant google-vertex
+    // endpoints, while multi-element input is google-ai-studio only
+    // and 404s under the account's ZDR-only policy (decision 81
+    // addendum; verified 2026-08-22, re-verified 2026-09-12: the
+    // 3-element form 404s, the one-element form 200s).
+    let mut vectors = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        let vec = match model.embed_text(*input).await {
+            Ok(vec) => vec,
+            Err(error) => panic!(
+                "embedding request failed: {error}; \
+                 provider status: {:?}; provider body: {:?}",
+                error.provider_response_status(),
+                error.provider_response_body()
+            ),
+        };
+        vectors.push(vec);
+    }
     let latency = start.elapsed();
-    // rig only returns Ok on a success status; a non-2xx surfaces as an
-    // EmbeddingError that preserves the provider status and body. Print
-    // both on failure so a live failure is diagnosable.
-    let response = match result {
-        Ok(response) => response,
-        Err(error) => panic!(
-            "embedding request failed after {latency:?}: {error}; \
-             provider status: {:?}; provider body: {:?}",
-            error.provider_response_status(),
-            error.provider_response_body()
-        ),
-    };
     eprintln!(
-        "round-trip latency: {latency:?}; usage: {} input / {} total tokens",
-        response.usage.input_tokens, response.usage.total_tokens
+        "round-trip latency: {latency:?} ({} single-text calls)",
+        inputs.len()
     );
 
-    // Exactly one embedding per input (HTTP 200 is implied: rig maps
-    // non-success statuses to Err above).
-    assert_eq!(
-        response.embeddings.len(),
-        inputs.len(),
-        "expected one embedding per input"
-    );
-    for (input, embedding) in inputs.iter().zip(response.embeddings.iter()) {
-        assert_eq!(embedding.document, *input, "document echoes the input");
+    // HTTP 200 is implied per call (rig maps non-success statuses to
+    // Err above); the hard length pin is the guard.
+    for vec in &vectors {
         assert_eq!(
-            embedding.vec.len(),
+            vec.vec.len(),
             EMBEDDING_DIMS,
             "decision 81 pins the dimension at {EMBEDDING_DIMS}"
         );
@@ -127,8 +129,8 @@ async fn openrouter_gemini_embedding_round_trip() {
 
     // Smoke-level sanity: the two Chinese paraphrases must be closer
     // than a paraphrase and an unrelated English sentence.
-    let sim_zh_zh = cosine_similarity(&response.embeddings[0].vec, &response.embeddings[1].vec);
-    let sim_zh_en = cosine_similarity(&response.embeddings[0].vec, &response.embeddings[2].vec);
+    let sim_zh_zh = cosine_similarity(&vectors[0].vec, &vectors[1].vec);
+    let sim_zh_en = cosine_similarity(&vectors[0].vec, &vectors[2].vec);
     eprintln!("cosine(zh1, zh2) = {sim_zh_zh:.6}");
     eprintln!("cosine(zh1, en)  = {sim_zh_en:.6}");
     assert!(
