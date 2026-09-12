@@ -481,6 +481,8 @@ then interleave with the real ones.
   the price attached to the Section-1 frequent-reboot decision, weighed
   against the torn-window alternative — visible, not papered over.
 
+## 7. CI/CD
+
 - Public lane (PLANNED, NOT YET BUILT — no `.github/` exists; the four
   2026-09-12 switchover commits ran with NO CI gate and the Mac's
   local fmt/clippy/test suite is the only backstop until this lands):
@@ -488,6 +490,7 @@ then interleave with the real ones.
   workspace suite + image build.
 - Branch lane (PLANNED, NOT YET BUILT — no `ci-local.sh` exists yet):
   `ci-local.sh` on the desktop: the branch gate FIRST
+  (`git -C ~/Tamako branch --show-current` = `catball-self-use`,
   Section 8 step 7's analogue), then fmt, clippy, tests,
   `podman build`, smoke, retag, `systemctl --user restart`, banner
   assertion. The smoke stage runs the Section 8 gate against a
@@ -651,6 +654,12 @@ rm -rf /tmp/tamako-readback
 - Observe logs (`journalctl --user -u tamako`) → tune → commit on the
   branch ON THE DESKTOP → (PLANNED) `ci-local.sh` → restart. No
   iteration hop.
+- Closeout record (2026-09-12): the five switchover-closeout batches
+  (ecacbf6…7f10ba3) were committed and rebased ON THE MAC with the
+  desktop ref force-updated by bundle — a one-day deviation from the
+  desktop-only branch rule, executed while the session lived on the
+  Mac. From here the rule stands: branch work happens on the desktop;
+  the Mac pushes main only.
 - main pushes to origin may happen from either machine (origin is
   main's shared authority); the branch never pushes anywhere.
 - Divergence sentinel: monthly `git bundle` snapshots exchanged between
