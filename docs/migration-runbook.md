@@ -303,21 +303,21 @@ core.
 ## 5. Milestone 2: image build
 
 - `Containerfile`: cargo-chef three-stage (planner / builder / runtime),
-  `cargo build --release --locked --bin tamako`;
-  `ENTRYPOINT ["tamako"]`. Builder stage base `rust:1-slim-trixie`
-  (Debian trixie — the SAME release as the runtime, so the linked
-  binary never trips a builder-newer-than-runtime glibc/libssl
-  mismatch, and trixie's g++ 14 compiles the 0.19.1 prebuilt's public
-  header, which includes C++20 `<format>` — bookworm's g++ 12 lacks
-  it; spike 1(b) finding — hence the Debian package names): curl +
-  bash + ca-certificates + cmake + g++ + pkg-config + libssl-dev
-  (download-script deps, the cxx/source-build toolchain, and the
-  openssl probe — lbug's build script pkg-configs openssl and
-  dylib-links ssl/crypto, so the link fails without them). Runtime:
-  `debian:trixie-slim` + ca-certificates + libssl3t64 (the
-  64-bit-time_t rename of libssl3) + libstdc++6 — the lbug core links
-  statically by default but still dylib-links ssl/crypto and, on
-  Linux, stdc++.
+  `cargo build --release --locked --bin tamako`; builder stage base
+  `rust:1.98.1-slim-trixie` (version-pinned per decision 119 — keep in
+  sync with `rust-toolchain.toml`; Debian trixie — the SAME release as
+  the runtime, so the linked binary never trips a
+  builder-newer-than-runtime glibc/libssl mismatch, and trixie's g++ 14
+  compiles the 0.19.1 prebuilt's public header, which includes C++20
+  `<format>` — bookworm's g++ 12 lacks it; spike 1(b) finding — hence
+  the Debian package names): curl + bash + ca-certificates + cmake +
+  g++ + pkg-config + libssl-dev (download-script deps, the
+  cxx/source-build toolchain, and the openssl probe — lbug's build
+  script pkg-configs openssl and dylib-links ssl/crypto, so the link
+  fails without them). Runtime: `debian:trixie-slim` + ca-certificates
+  + libssl3t64 (the 64-bit-time_t rename of libssl3) + libstdc++6 — the
+  lbug core links statically by default but still dylib-links
+  ssl/crypto and, on Linux, stdc++.
 - `.dockerignore` (NEW, required): `.git/`, `target/`, `data/`, `.env*`,
   `tamako.toml`, `*.log`, `.omp/`, `*decision*.md`, `review-*.md`,
   `eval-*.md` — and the exception `!.cargo/config.toml`. `.git/` goes
