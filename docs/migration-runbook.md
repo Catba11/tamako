@@ -367,8 +367,8 @@ core.
 - `.env.example` (EXTEND, tracked, placeholders only): the file already
   exists as a secrets template (OPENAI_API_KEY plus commented
   ANTHROPIC_API_KEY/TELOXIDE_TOKEN) and documents a `.env.local`
-  convention while the live run sources `.env` — add the three
-  `TAMAKO_*` variables and reconcile the `.env`/`.env.local` wording,
+  `TAMAKO_*` operator-override variables (the executed set: gate/reply
+  API keys, summary/caption models, session id) and reconcile the `.env`/`.env.local` wording,
   ON THE MAC, committed before the transfer (the desktop is read-only
   from milestone 1; the file is tracked, so it lands on main or the
   branch consistently). It is the checked-in source of truth for the
@@ -492,7 +492,8 @@ then interleave with the real ones.
   memory.lbug + media.db — a milestone-2 artifact authored on the Mac;
   replay cannot generate a graph offline, and without a graph-bearing
   fixture the inventory guard fails red by design), plus an env-key-set
-  assertion against `.env.example` and the three shell variables. CI
+  assertion against `.env.example` (the checked-in source of truth —
+  the `.env` values plus the operator-shell overrides named there). CI
   NEVER runs `--live` (double-poll hazard).
 
 ## 8. Milestone 4: switchover
@@ -557,9 +558,11 @@ then interleave with the real ones.
    has no memory.lbug and no entry, so the check is an upper bound,
    never equality. The CI smoke derives its fixture inventory the same
    way and applies the same check.
-6. Env file: merge `.env` + the three shell vars into
+6. Env file: merge `.env` + the operator-shell overrides into
    `/var/lib/tamako/env` (0600, service user), written per the spike
-   item-4 probe results.
+   item-4 probe results — the executed seven-key set and its
+   provenance rule are named in Section 6 and templated in
+   `.env.example`.
 7. **Build + readback gate** — FIRST the desktop branch gate:
    `git -C ~/Tamako branch --show-current` MUST print
    `catball-self-use` (the AGENT.md gate's desktop analogue: a
@@ -578,12 +581,12 @@ then interleave with the real ones.
 
 ```bash
 IMG=localhost/tamako:<sha>
+mkdir -p /tmp/tamako-readback   # rsync creates only the LAST component; a fresh host fails without this
 rsync -a /var/lib/tamako/data/ /tmp/tamako-readback/data/
 failed=0
 INVENTORY=${INVENTORY:-/var/lib/tamako/graph-groups.txt}
-IMG=localhost/tamako:<sha>
-mkdir -p /tmp/tamako-readback   # rsync creates only the LAST component; a fresh host fails without this
-rsync -a /var/lib/tamako/data/ /tmp/tamako-readback/data/
+[ -s "$INVENTORY" ] || { echo "READBACK FAIL: inventory missing/empty"; exit 1; }
+run_probe() { podman run --rm \
     -v /tmp/tamako-readback/data:/data:U,z \
     -v /var/lib/tamako/config:/config:Z,ro \
     "$IMG" "$@" --config /config/tamako.toml --data-root /data 2>&1; }
