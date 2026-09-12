@@ -1950,12 +1950,10 @@ fn blob_to_embedding(blob: &[u8]) -> Result<Vec<f32>> {
             value: format!("expected {} bytes, got {}", EMBEDDING_DIM * 4, blob.len()),
         });
     }
-    Ok(blob
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+    let (chunks, remainder) = blob.as_chunks::<4>();
+    debug_assert!(remainder.is_empty(), "length checked above");
+    Ok(chunks.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect())
 }
-
 /// Maps one row of a pending_embeddings SELECT to a `PendingEmbedding`.
 fn pending_embedding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEmbedding> {
     Ok(PendingEmbedding {
