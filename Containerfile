@@ -4,9 +4,9 @@
 # compiled prompts, inherits branch confidentiality, and never leaves
 # operator-controlled hardware (Section 1 item 4).
 
-# Pinned (decision 119): keep in sync with rust-toolchain.toml's channel —
-# the repo's rust-toolchain.toml rides this build context (COPY . .), and
-# rustup proxies honor it, so the two must name the SAME version.
+# Pinned (decision 119/120): bump in step with rust-toolchain.toml's
+# channel (the toml is .dockerignore'd OUT of this context — this FROM
+# pin alone governs the in-image compiler).
 FROM rust:1.98.1-slim-trixie AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app

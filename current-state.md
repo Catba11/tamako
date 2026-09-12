@@ -3285,6 +3285,18 @@ feature commit (decision 92).
     production compiler stops floating. `as_chunks` is stable since
     1.88, inside the MSRV.
 
+120. (2026-09-12, amends 119) `rust-toolchain.toml` is EXCLUDED from
+    the image build context (.dockerignore). The official rust image
+    installs rustup with --profile minimal and sets no
+    RUSTUP_TOOLCHAIN, so rustup shims honor the toml and would
+    auto-fetch the pinned channel + the rustfmt/clippy components on
+    the first cargo call in EACH stage that copies the tree (planner
+    AND builder) — two static.rust-lang.org downloads per image build
+    for tools the image never runs. With the toml out of the context,
+    the FROM pin alone governs the in-image compiler; the two version
+    numbers are still bumped together (119), but the sync is
+    documentation, not mechanism.
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:

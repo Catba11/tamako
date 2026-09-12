@@ -13,6 +13,11 @@ tamako.toml
 *decision*.md
 review-*.md
 eval-*.md
+rust-toolchain.toml
+# ^ decision 120: the dev-lane toolchain pin stays OUT of the image
+#   context — the FROM base pin alone governs the in-image compiler;
+#   carrying the toml would make rustup shims auto-fetch the pinned
+#   channel + fmt/clippy components mid-build (planner AND builder).
 # Exception: the decision-109 pin (LBUG_VERSION = "0.19.1") lives in
 # .cargo/config.toml; dropping it unpins the C++ core (the download
 # script falls back to `main`).
