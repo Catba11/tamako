@@ -251,8 +251,12 @@ core.
 
 - `Containerfile`: cargo-chef three-stage (planner / builder / runtime),
   `cargo build --release --locked --bin tamako`;
-  `ENTRYPOINT ["tamako"]`. Builder stage base `rust:1-slim` (Debian —
-  hence the Debian package names): curl + bash + ca-certificates +
+  `ENTRYPOINT ["tamako"]`. Builder stage base `rust:1-slim-bookworm`
+  (Debian bookworm — the SAME release as the runtime, so the linked
+  binary never trips a builder-newer-than-runtime glibc/libssl
+  mismatch; the sibling `rust:1-slim` alias floats to newer Debian
+  releases — hence the Debian package names): curl + bash +
+  ca-certificates +
   cmake + g++ + pkg-config + libssl-dev (download-script deps, the
   cxx/source-build toolchain, and the openssl probe — lbug's build
   script pkg-configs openssl and dylib-links ssl/crypto, so the link
