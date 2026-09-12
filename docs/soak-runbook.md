@@ -1,3 +1,12 @@
+> RUNTIME MOVED 2026-09-12 (migration-runbook.md): the bot now runs as
+> the systemd --user quadlet `tamako.service` on the Fedora desktop
+> (data root `/var/lib/tamako/data`, config `/var/lib/tamako/config`,
+> logs `journalctl --user -u tamako`). The `cargo run --release --
+> --live` commands below are the pre-container record — running one
+> against the live bot starts a SECOND getUpdates poller (forbidden,
+> migration-runbook.md Section 8 step 9). Stops/starts are
+> `systemctl --user stop|start tamako` (StopSignal=SIGINT = the drain).
+
 # Soak runbook — Phase 1 exit: two weeks in one test group
 
 This runbook tells the operator how to run the two-week Phase 1 soak
