@@ -240,7 +240,13 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   evaluation. The explicit `Tick` command and the timer tick share one
   handler, so the two paths cannot diverge. The driver also evaluates
   the Section 8.2 digest-timeout fallback of a silent group. Shutdown
-  is structural: the ticker lives and dies inside the actor task.
+  is no longer purely structural (decision 114): the ticker still
+  lives and dies inside the actor task, but on `Shutdown` the actor
+  closes every dispatch point (the tick path and the completion
+  chains) through a `shutting_down` flag and drains its tracked
+  detached tasks before the loop exits — completion handlers keep
+  running for state restoration, cancellable tasks stop at LLM-call
+  boundaries, forced wakes run out.
 - On digest completion the actor performs the Rule C3 context removal
   (M2), now with the decision-62 segmented summarization first: every
   context item with a range tag at or below the PREVIOUS boundary
@@ -272,7 +278,8 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   group. A `None` provider keeps the old C3 drop. The session is persisted
   once after all mutations, then the `PostDigestHook` runs (a seam
   for observers that need no actor state; `NoopPostDigestHook` is the
-  default), then the digest trigger re-evaluates once.
+  default), then the digest trigger re-evaluates once (suppressed
+  during a shutdown drain — the decision-114 dispatch gate).
 - The wake scheduler (`tamako-core::trigger`) is pure logic: fire on the
   first of message count or jittered interval, subject to the floor
   (specs.md Section 8.3). The jittered interval is normalized to whole
@@ -679,10 +686,17 @@ flag restores the lenient fallback chain for experiments. An actor spawns lazily
 on the first event of each configured group; events from
 non-configured groups are logged once and ignored (Rule P5). The
 binary routes events by the chat id of `next_group_event`. Ctrl-c
-shuts every actor down gracefully (session flush per group) and prints
-a summary log. An adapter error that escapes `next_group_event` is
-fatal: graceful shutdown, then the error propagates. The config file
-is not watched; restart to pick up new groups.
+shuts every actor down gracefully (decision 114): each actor drains
+its detached digest/summary/wake/warmup tasks before exiting —
+dispatch gates closed, in-flight work runs to completion or cancels
+at LLM-call boundaries with state-restoration-only handlers, forced
+wakes never cancelled — the shutdown is broadcast to all actors
+before joining, the outbound pump stays alive until every actor has
+joined and the outbound channel is empty, and the session flushes per
+group; a summary log prints. An adapter error that escapes
+`next_group_event` is fatal: graceful shutdown, then the error
+propagates. The config file is not watched; restart to pick up new
+groups.
 
 `tamako --status <chat_id>` and `tamako --status-all` (M6) are the
 offline operator modes (specs.md Sections 10.3 and 12): they open the

@@ -123,8 +123,11 @@ criterion). The raw log is the source of truth (Rule P1). The actor
 rebuilds the live context and the session state from the raw log, the
 `injected_memories` table, and the state table.
 
-1. Stop the bot: ctrl-c. The shutdown flushes the session state of
-   every group. Wait for the `live run summary` line.
+1. Stop the bot: ctrl-c. The shutdown drains in-flight
+   digest/summary/wake tasks (up to one LLM call window for
+   cancellable tasks; forced wakes run out) and flushes the session
+   state of every group (decision 114). Wait for the `live run
+   summary` line.
 2. Start the bot again with the same launch command.
 3. Verify with `--status`: the boundaries and counters continue from
    the pre-restart values.
@@ -141,11 +144,13 @@ Per the database spec Section 10: checkpoint, then copy the files.
 
 The graph file `memory.lbug` is checkpointed after every digest batch,
 so the file on disk is consistent whenever no digest is in flight. A
-ctrl-c stop does NOT establish that condition: the shutdown does not
-await detached digest/summary/wake tasks, and no log line marks a
-digest start (current-state.md Section 4 item 11). A batch interrupted
-at stop time replays idempotently on the next run; a backup taken
-after such a stop may carry a mid-digest graph file.
+clean ctrl-c stop ESTABLISHES that condition since decision 114: the
+shutdown drain awaits or cancels in-flight digest work before exit,
+and the digest-start DEBUG line of decision 115 marks dispatch for
+post-hoc attribution. The remaining window is a HARD kill (SIGKILL,
+crash, power loss) landing mid-digest: a batch interrupted that way
+replays idempotently on the next run, and a backup taken after such a
+stop may carry a mid-digest graph file.
 
 The safe procedure (bot stopped):
 

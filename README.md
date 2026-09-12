@@ -186,7 +186,7 @@ Recommended `structured_output` for Opencode Go: `schema`, the default — endpo
   - The message is a plain standalone message (no reply quote, no ping) generated with the reply model; an interest tied to one member is asked as an open group question, never "X likes Y".
   - Engagement: a human reply or a reaction within `warmup_reaction_window_secs` (default 1800 = 30 min); reactions only reach the bot in administrator groups, so non-administrator groups measure replies only. Ignored warmups back off (2× spacing per ignored warmup, effective quota floored at 1, resetting on engagement).
   - `warmup = false` disables warmups entirely. The counters `warmups_total` / `warmup_engaged_total` show in `--status`.
-- Ctrl-c shuts down gracefully and flushes session state; a restart rebuilds identical state.
+- Ctrl-c shuts down gracefully: in-flight digest/summary/wake tasks drain to completion or cancel at LLM-call boundaries (forced wakes always run out) before the session state flushes; a restart rebuilds identical state.
 
 ### 6. Watching the pet
 
@@ -198,6 +198,8 @@ INFO tamako_core::actor: wake chat_id=-1001234567890 trigger="forced" injections
 INFO tamako_core::actor: digest chat_id=-1001234567890 batch_id=e1ba1491-bf91-5853-b0f1-58b24ba26c98 range=(0,101] outcome="written" nodes=19 edges=30
 INFO tamako_core::actor: warmup chat_id=-1001234567890 topic="GRPO" action="sent"
 ```
+
+Startup also prints one INFO line with the resolved trigger config (`suffix_mode`/`timezone`); digest dispatch logs one line at DEBUG (batch id and range), visible with `-v`.
 
 The `wake` fields: `trigger` (`message_count`|`interval`|`forced`), `injections` (recall-memory count, 0 allowed), `gate` (`participate`|`silent`|`bypassed_forced`|`muted`|`in_flight_skipped`), `reason` (the gate's own reason — present only when it gives one), `action` (`reply_sent`|`discarded_stale`|`nothing`), `reply_to` (the target's platform message id — present only on `reply_sent`). A failed wake instead emits one ERROR line `wake procedure failed; skipping this wake`. The `digest` fields: `batch_id`, `range` (the `(old,new]` msg-id range), `outcome` (`written` with `nodes`/`edges` counts, or `skeleton`); a dead-lettered batch keeps the pipeline's ERROR line `digest batch dead-lettered after all retries` as its one line. Note: during a fast catch-up replay thousands of `in_flight_skipped` wake lines can appear (one per suppressed fire while an LLM wake runs); at live tempo they are rare. Summarization failures log at WARN; the circuit-breaker drop (3 consecutive failures) logs one ERROR. A sent warmup is its own one INFO line with `topic` (the sampled Concept node) and `action="sent"`; warmup skips stay at DEBUG.
 
