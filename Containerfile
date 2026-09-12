@@ -55,8 +55,12 @@ RUN cargo build --release --locked --bin tamako > /tmp/build.log 2>&1 \
 #     println, and cargo hides build-script stdout in normal mode (it
 #     lands in target/release/build/lbug-*/output), so the grep covers
 #     BOTH the log (cargo:warning= lines) and that file.
-RUN if grep -E "download failed.*building from source|Could not run prebuilt liblbug downloader|Downloading ladybug source" \
-        /tmp/build.log target/release/build/lbug-*/output; then \
+RUN set -eu; \
+    outputs=$(ls -1 target/release/build/lbug-*/output 2>/dev/null || true); \
+    [ -n "$outputs" ] \
+        || { echo "FAIL-CLOSED: the lbug build-script output file is missing"; exit 1; }; \
+    if grep -E "download failed.*building from source|Could not run prebuilt liblbug downloader|Downloading ladybug source" \
+        /tmp/build.log $outputs; then \
         echo "FAIL-CLOSED: the lbug prebuilt downloader fell back; the linked core is unpinned"; \
         exit 1; \
     fi
