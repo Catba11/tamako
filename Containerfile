@@ -44,8 +44,10 @@ RUN rm -rf "$CARGO_HOME"/registry/src/*/lbug-*/.cache/lbug-prebuilt
 # cargo caches the build SCRIPT's run across cook → build (inputs
 # unchanged), so a wiped cache would NOT be re-downloaded below and
 # guard (2) would fail on a missing dir instead of a stale key. Force
-# the lbug build script to re-run — the wipe stays load-bearing.
-RUN cargo clean -p lbug
+# the rerun by deleting lbug's build-script output + fingerprint dirs
+# (cargo clean -p lbug removes 0 files in this layout — observed in
+# spike 1(b) — so the wipe stays load-bearing via the direct rm).
+RUN rm -rf target/release/build/lbug-* target/release/.fingerprint/lbug-*
 RUN cargo build --release --locked --bin tamako > /tmp/build.log 2>&1 \
     || { cat /tmp/build.log; exit 1; }
 # (1) ANY downloader fallback cargo:warning= fails the build.

@@ -289,10 +289,14 @@ core.
   or a cache-hit build reuses a layer snapshot still holding a stale
   key and both assertions pass over a drifted core. Because cargo
   caches the build SCRIPT's run across cook → build when inputs are
-  unchanged, the wipe is followed by `cargo clean -p lbug` — without
-  it the wiped cache is never re-downloaded and the assertion fails on
-  a MISSING dir instead of a stale key (spike 1(b) finding; the pin
-  also rides the cook layer via `COPY .cargo/config.toml`); the spike
+  unchanged, the wipe is followed by a forced build-script rerun —
+  without it the wiped cache is never re-downloaded and the assertion
+  fails on a MISSING dir instead of a stale key. `cargo clean -p lbug`
+  removes 0 files in this layout (dependency artifacts are not
+  attributed to the workspace spec — spike 1(b) finding), so the
+  Containerfile deletes `target/release/build/lbug-*` and
+  `target/release/.fingerprint/lbug-*` directly; the pin also rides
+  the cook layer via `COPY .cargo/config.toml`. The spike
   verifies this by building twice (the second build cache-hot) and
   confirming the assertion still bites. The assertion must
   require that post-build the cache holds EXACTLY ONE key,
