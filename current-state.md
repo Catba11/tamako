@@ -3259,7 +3259,7 @@ feature commit (decision 92).
     the guard treats the value as UNSET and skips the assignment, and
     the C++ ctor's own default path (`maxDBSize == -1u` →
     `DEFAULT_VM_REGION_MAX_SIZE` = 1<<43) reserves 8 TiB of VM region
-    PER OPEN DATABASE.
+    PER OPEN DATABASE. macOS reserves the 8 TiB lazily and
     never noticed; the Fedora host refuses once the parallel test
     suite opens more regions than the 128 TiB user address space
     holds (nproc = 24 → up to 24 concurrent DBs ≈ 192 TiB). Production

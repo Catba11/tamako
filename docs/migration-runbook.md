@@ -288,7 +288,11 @@ project:
   `export`, no inline comments.
 - Sequencing-gate adjudication (operator goal supersedes the
   2026-09-12 review gate for milestones 1-3; the Mac bot stays live
-  until Section 8 step 2's gated SIGINT) and decisions 117 (µs-canonical
+  until Section 8 step 2's gated SIGINT). Milestone 4's step-2 stop —
+  the act the gate exists for — was separately confirmed by the
+  operator at execution time (2026-09-12: explicit approval, bot
+  stopped cleanly in 2s, `shutdown_failures=0`), closing the gate for
+  the switchover. Decisions 117 (µs-canonical
   edge ids) / 118 (explicit max_db_size) are recorded in
   current-state.md Section 3.
 
@@ -325,10 +329,14 @@ core.
 - **Fail-closed pin assertion in CI** (two parts — the pin arrives via
   `cargo:rustc-env=`, which cargo does NOT echo to the build log, so a
   log grep for the pin would be perma-green): (1) ANY lbug downloader
-  fallback fails the build — the two `cargo:warning=`s ("download
-  failed … building from source" / "Could not run prebuilt liblbug
-  downloader") AND the source build's "Downloading ladybug source …"
-  marker, which is a plain println that never becomes a warning; (2) the
+  fallback fails the build — the grep reads BOTH the build log and the
+  build-script output file (`target/release/build/lbug-*/output`),
+  because cargo hides build-script stdout in normal mode AND
+  suppresses `cargo:warning=` lines from registry dependencies: the
+  two fallback warnings ("download failed … building from source" /
+  "Could not run prebuilt liblbug downloader") and the source build's
+  "Downloading ladybug source …" marker (a plain println) are visible
+  ONLY in the output file; (2) the
   LBUG_VERSION-keyed prebuilt cache artifact must exist post-build at
   `$CARGO_HOME/registry/src/<index>/lbug-0.18.3/.cache/lbug-prebuilt/version-0.19.1/lib/liblbug.a`
   (glob the registry index hash — it is machine-specific). Because build.rs REUSES an existing cache dir
@@ -371,9 +379,21 @@ core.
 
 `/var/lib/tamako/{data,config,env}` owned by the invoking user (rootless
 podman maps container root to that user; or mount `:U`). The env file is
-mode 0600 and is HAND-MERGED from `.env` plus the three operator-shell
-variables `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`,
-`TAMAKO_SUMMARY_MODEL`. `[Container] EnvironmentFile=` maps to podman's
+mode 0600 and is HAND-MERGED from `.env` plus the operator-shell
+overrides — as EXECUTED (2026-09-12), seven keys: `OPENAI_API_KEY`,
+`TELOXIDE_TOKEN`, `TAMAKO_GATE_LLM_API_KEY`, `TAMAKO_REPLY_LLM_API_KEY`,
+`TAMAKO_SUMMARY_MODEL`, `TAMAKO_CAPTION_MODEL`, `TAMAKO_LLM_SESSION_ID`.
+PROVENANCE RULE learned at execution: the live launch line (shell
+history), not `.env`, is authoritative for values the operator overrode
+inline — `.env`'s `OPENAI_API_KEY` held an Opencode-family key while
+the live process ran the OpenRouter key the toml's base URL requires
+(digest/embedding/caption 401 into the retry path otherwise; the
+wiring banner cannot see it). `TAMAKO_CAPTION_MODEL` diverges from the
+compiled default (gemini-3.8-flash vs minimax-m3) and
+`TAMAKO_LLM_SESSION_ID` pins decision 84's cache-affinity prefix;
+`TAMAKO_EMBEDDING_MODEL` equals the compiled default and was omitted;
+`TAMAKO_LIVE_TEST` never crosses. `[Container] EnvironmentFile=` maps
+to podman's
 `--env-file` — NOT systemd's EnvironmentFile parser (that parser only
 applies under `[Service]`, where it would inject the podman client
 process, not the container); spike item 4 verified the parser (podman
@@ -561,8 +581,9 @@ IMG=localhost/tamako:<sha>
 rsync -a /var/lib/tamako/data/ /tmp/tamako-readback/data/
 failed=0
 INVENTORY=${INVENTORY:-/var/lib/tamako/graph-groups.txt}
-[ -s "$INVENTORY" ] || { echo "READBACK FAIL: empty or missing inventory ($INVENTORY)"; exit 1; }
-run_probe() { podman run --rm \
+IMG=localhost/tamako:<sha>
+mkdir -p /tmp/tamako-readback   # rsync creates only the LAST component; a fresh host fails without this
+rsync -a /var/lib/tamako/data/ /tmp/tamako-readback/data/
     -v /tmp/tamako-readback/data:/data:U,z \
     -v /var/lib/tamako/config:/config:Z,ro \
     "$IMG" "$@" --config /config/tamako.toml --data-root /data 2>&1; }
@@ -602,12 +623,17 @@ rm -rf /tmp/tamako-readback
    INVENTORY derived from the fixture itself (the step-5 find); the
    `-s` guard keeps a missing or empty list from passing green having
    probed nothing. Failure keeps the scratch and blocks the start.
-8. Start: first assert the probe drop-in is gone (`systemctl --user cat
-   tamako` shows the real ExecStart — no `sleep` loop), then
-   `systemctl --user unmask tamako` (masked since Section 6 to keep
-   enable-linger's boot pull-in inert) and `systemctl --user start
-   tamako`. Verify against expectations:
-   the wiring banner (models), the milestone-0 startup line (resolved
+8. Start: point the quadlet at the gated image
+   (`Image=localhost/tamako:<step-7-sha>` in
+   `~/.config/containers/systemd/tamako.container` — the spike-era tag
+   predates the rsync), `systemctl --user daemon-reload`, then
+   `systemctl --user unmask tamako` (masked since
+   Section 6 to keep enable-linger's boot pull-in inert — while masked
+   the name resolves to the /dev/null symlink and `cat` cannot print
+   the real ExecStart, so the unmask comes FIRST), then assert the
+   probe drop-in is gone (`systemctl --user cat
+   tamako` shows the real ExecStart — no `sleep` loop), and
+   `systemctl --user start tamako`. Verify against expectations:
    `suffix_mode`/`timezone`), the first gate usage line, and one real
    Telegram reply.
 9. Rollback: the Mac stays intact (binary + data) for one week. NEVER

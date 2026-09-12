@@ -51,10 +51,12 @@ RUN rm -rf target/release/build/lbug-* target/release/.fingerprint/lbug-*
 RUN cargo build --release --locked --bin tamako > /tmp/build.log 2>&1 \
     || { cat /tmp/build.log; exit 1; }
 # (1) ANY downloader fallback fails the build — including the SOURCE
-#     build, whose "Downloading ladybug source …" marker is a plain
-#     println (never a cargo:warning=), so the grep must name it
-#     explicitly (advisory finding; §5's "ANY fallback" intent).
-RUN if grep -E "download failed.*building from source|Could not run prebuilt liblbug downloader|Downloading ladybug source" /tmp/build.log; then \
+#     build. Its "Downloading ladybug source …" marker is a plain
+#     println, and cargo hides build-script stdout in normal mode (it
+#     lands in target/release/build/lbug-*/output), so the grep covers
+#     BOTH the log (cargo:warning= lines) and that file.
+RUN if grep -E "download failed.*building from source|Could not run prebuilt liblbug downloader|Downloading ladybug source" \
+        /tmp/build.log target/release/build/lbug-*/output; then \
         echo "FAIL-CLOSED: the lbug prebuilt downloader fell back; the linked core is unpinned"; \
         exit 1; \
     fi
