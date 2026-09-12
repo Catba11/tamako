@@ -3253,11 +3253,13 @@ feature commit (decision 92).
     desktop test run failed 25 graph-opening tests with `Buffer
     manager exception: Mmap for size 8796093022208 failed` — a
     Rust↔C++ sentinel collision: the Rust crate's
-    `SystemConfig::default()` sets `max_db_size = u32::MAX`, the C++
-    FFI guard reads "unset" as `-1u`, so the value is treated as SET,
-    passes through, and database.cpp then substitutes
-    `DEFAULT_VM_REGION_MAX_SIZE` = 1<<43 (8 TiB) as the VM-region
-    reservation PER OPEN DATABASE. macOS reserves the 8 TiB lazily and
+    `SystemConfig::default()` sets `max_db_size = u32::MAX`, and the
+    C++ FFI guard (`maxDBSize != -1u`) compares against `-1u` — which
+    IS `u32::MAX` promoted — so the Rust default EQUALS the sentinel,
+    the guard treats the value as UNSET and skips the assignment, and
+    the C++ ctor's own default path (`maxDBSize == -1u` →
+    `DEFAULT_VM_REGION_MAX_SIZE` = 1<<43) reserves 8 TiB of VM region
+    PER OPEN DATABASE.
     never noticed; the Fedora host refuses once the parallel test
     suite opens more regions than the 128 TiB user address space
     holds (nproc = 24 → up to 24 concurrent DBs ≈ 192 TiB). Production

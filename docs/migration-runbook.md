@@ -208,10 +208,14 @@ project:
    systemd → podman → container chain (KillMode=mixed sends KillSignal
    to the podman process only), which `podman stop` never exercises:
    override the Exec with a drop-in
-   (`~/.config/containers/systemd/tamako.container.d/99-probe.conf`
-   carrying `Exec=sh -c 'trap "echo GOT-SIGINT; exit 0" INT; trap "echo
-   GOT-SIGTERM; exit 0" TERM; while :; do sleep 1; done'`, same
-   `Image=`), `systemctl --user daemon-reload && systemctl --user start
+   (`~/.config/containers/systemd/tamako.container.d/99-probe.conf`)
+   carrying THREE keys: `Entrypoint=/bin/sh` (quadlet `Exec=` appends
+   to the image's `ENTRYPOINT ["tamako"]` — without the override the
+   probe runs `tamako sh -c …` and clap-errors into the null-signal
+   reading below), `Exec=-c 'trap "echo GOT-SIGINT; exit 0" INT; trap
+   "echo GOT-SIGTERM; exit 0" TERM; while :; do sleep 1; done'` (the
+   script becomes /bin/sh's `-c` argument), and the empty resets below;
+   `systemctl --user daemon-reload && systemctl --user start
    tamako`, then `systemctl --user stop tamako`, and read the captured
    signal name from journald. Two failure readings to distinguish:
    GOT-SIGTERM (StopSignal not converted) or NO line with the stop
@@ -220,11 +224,14 @@ project:
    and milestone 0's drain is dead code — stop and fix the unit before
    proceeding. The probe runs WITHOUT launching the bot (the Mac owns
    the Telegram token until Section 8 step 8; a live probe would
-   double-poll). The probe drop-in OMITS `EnvironmentFile` (the probe
-   needs no secrets and the env file does not exist until Section 8
-   step 6 — podman errors on a missing `--env-file`; also create the
-   `/var/lib/tamako/{data,config}` skeleton now, since bind sources
-   auto-create but env files do not). The drop-in must not outlive the
+   double-poll). The probe drop-in RESETS `EnvironmentFile=` and
+   `Volume=` to EMPTY (systemd ini semantics: an empty assignment
+   clears the base's value) — the probe needs no secrets and the env
+   file does not exist until Section 8 step 6 (podman errors on a
+   missing `--env-file`), and the resets also free the probe from the
+   `/var/lib/tamako/{data,config}` skeleton, which is created at the
+   same point but requires root (bind sources auto-create only when
+   their parent is writable). The drop-in must not outlive the
    test: `rm ~/.config/containers/systemd/tamako.container.d/99-probe.conf`
    + `daemon-reload` immediately after (a leftover probe Exec would
    silently replace the real service at Section 8 step 8, which asserts
@@ -405,8 +412,14 @@ WantedBy=default.target
 ```
 
 Then: `loginctl enable-linger <user>`, `systemctl --user daemon-reload`,
-and STATIC verification ONLY (`podman-system-generator --user
---dryrun`, `systemd-analyze --user verify`). The first `start` is
+`systemctl --user mask tamako`, and STATIC verification ONLY
+(`podman-system-generator --user --dryrun`, `systemd-analyze --user
+verify`). The mask is load-bearing: enable-linger +
+`WantedBy=default.target` materialize a boot pull-in the moment the
+unit exists, and once Section 8 step 6 has written the env file a
+reboot would boot-start the bot OUTSIDE the step-8 gate (before that,
+the missing `--env-file` fails the start by accident, not by design).
+Section 8 step 8 unmasks. The first `start` is
 Section 8 step 8, never here: the Mac bot keeps polling until
 switchover step 2, and starting now would double-poll Telegram (both
 ends steal each other's getUpdates), answer groups from an EMPTY data
@@ -588,7 +601,9 @@ rm -rf /tmp/tamako-readback
    probed nothing. Failure keeps the scratch and blocks the start.
 8. Start: first assert the probe drop-in is gone (`systemctl --user cat
    tamako` shows the real ExecStart — no `sleep` loop), then
-   `systemctl --user start tamako`. Verify against expectations:
+   `systemctl --user unmask tamako` (masked since Section 6 to keep
+   enable-linger's boot pull-in inert) and `systemctl --user start
+   tamako`. Verify against expectations:
    the wiring banner (models), the milestone-0 startup line (resolved
    `suffix_mode`/`timezone`), the first gate usage line, and one real
    Telegram reply.
