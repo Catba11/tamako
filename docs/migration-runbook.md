@@ -287,9 +287,14 @@ core.
   `.cache/lbug-prebuilt/` before the build — and the wipe must land
   AFTER any cargo-chef cook layer that caches the registry-src tree,
   or a cache-hit build reuses a layer snapshot still holding a stale
-  key and both assertions pass over a drifted core; the spike verifies
-  this by building twice (the second build cache-hot) and confirming
-  the assertion still bites. The assertion must
+  key and both assertions pass over a drifted core. Because cargo
+  caches the build SCRIPT's run across cook → build when inputs are
+  unchanged, the wipe is followed by `cargo clean -p lbug` — without
+  it the wiped cache is never re-downloaded and the assertion fails on
+  a MISSING dir instead of a stale key (spike 1(b) finding; the pin
+  also rides the cook layer via `COPY .cargo/config.toml`); the spike
+  verifies this by building twice (the second build cache-hot) and
+  confirming the assertion still bites. The assertion must
   require that post-build the cache holds EXACTLY ONE key,
   `version-0.19.1` — a `latest/` entry marks an unpinned
   pre-decision-109 resolution and fails the build. Exact wiring is a
