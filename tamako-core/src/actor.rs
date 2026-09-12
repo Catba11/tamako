@@ -144,6 +144,7 @@ use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
@@ -170,6 +171,13 @@ use crate::warmup::{
 /// Errors of tamako-core.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
+    /// Cooperative cancellation of the decision-114 shutdown drain: a
+    /// tracked task observed the drain token at an LLM-call boundary
+    /// and reported Cancelled instead of completing. NEVER a failure:
+    /// the completion handlers restore state only (no failure
+    /// counters, no dead letters, no requeues).
+    #[error("cancelled by the shutdown drain")]
+    Cancelled,
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("memory error: {0}")]
@@ -413,19 +421,32 @@ impl GroupActorHandle {
         rx.await.map_err(|_| CoreError::InboxClosed)
     }
 
-    /// Sends Shutdown and awaits the task. Graceful.
+    /// Sends Shutdown without awaiting the task (decision 114, the
+    /// broadcast step). The actor drains its in-flight tasks before the
+    /// loop exits, so the caller MUST `join` afterwards to observe the
+    /// outcome.
+    pub async fn initiate_shutdown(&self) {
+        // A failed send means the task already ended; the join still
+        // reports the outcome.
+        let _ = self.inbox.send(ActorCommand::Shutdown).await;
+    }
+
+    /// Awaits the actor task (decision 114, the join step).
     ///
     /// A startup failure aborts the actor task before the loop runs. Such a
     /// failure surfaces here through the JoinHandle: the send fails (the
     /// receiver is gone) and the join returns the startup error.
-    pub async fn shutdown(self) -> Result<(), CoreError> {
-        // A failed send means the task already ended; the join below still
-        // reports the outcome.
-        let _ = self.inbox.send(ActorCommand::Shutdown).await;
+    pub async fn join(self) -> Result<(), CoreError> {
         match self.join.await {
             Ok(result) => result,
             Err(error) => Err(CoreError::Join(error.to_string())),
         }
+    }
+
+    /// Sends Shutdown and awaits the task. Graceful.
+    pub async fn shutdown(self) -> Result<(), CoreError> {
+        self.initiate_shutdown().await;
+        self.join().await
     }
 }
 
@@ -868,7 +889,15 @@ async fn maybe_launch_digest(
     summary_pending: bool,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     now: OffsetDateTime,
+    shutting_down: bool,
+    drain_token: &CancellationToken,
 ) -> Result<(), CoreError> {
+    // Decision 114: the drain gate. Every dispatch point closes on
+    // Shutdown — the drain finishes in-flight work and never
+    // dispatches new.
+    if shutting_down {
+        return Ok(());
+    }
     let Some(pipeline) = digest else {
         return Ok(());
     };
@@ -902,15 +931,22 @@ async fn maybe_launch_digest(
     let pipeline = Arc::clone(pipeline);
     let chat_id = chat_id.to_string();
     let sender = inbox_sender.clone();
+    let cancel = drain_token.clone();
     tokio::spawn(async move {
         // H4a panic containment: a panicking pipeline reports a
         // synthetic failure through the inbox (the same failure class
         // as an infrastructure error), so the completion handler runs
-        // and `digest_in_flight` ALWAYS resets.
+        // and `digest_in_flight` ALWAYS resets. Decision 114: the
+        // token rides into the pipeline, which polls it between retry
+        // attempts, between an attempt's initial and repair calls, and
+        // during the backoff — a cancelled batch reports Cancelled and
+        // stays PENDING.
         let result =
-            contain_task_panic(async move { pipeline.run_digest(&chat_id, boundary).await })
-                .await
-                .unwrap_or_else(|message| Err(CoreError::Digest(message)));
+            contain_task_panic(
+                async move { pipeline.run_digest(&chat_id, boundary, cancel).await },
+            )
+            .await
+            .unwrap_or_else(|message| Err(CoreError::Digest(message)));
         // A failed send means the actor is shutting down. The result is
         // dropped; the boundary did not advance, so the next run redoes
         // the batch (the MERGEs are idempotent, Section 10.3).
@@ -1152,6 +1188,17 @@ async fn run_actor<M: MemoryBackend>(
     // ALWAYS resets it.
     let mut warmup_in_flight = false;
 
+    // --- Decision 114: the shutdown drain ---
+    // Set by the Shutdown command. While draining, EVERY dispatch point
+    // is gated (the tick path AND the completion chains), the
+    // completion handlers keep running (they carry the flag resets /
+    // boundary advances / marker rollbacks the drain must observe),
+    // and the loop exits only when every tracked task has reported.
+    let mut shutting_down = false;
+    // The cooperative-cancel token the tracked tasks poll at LLM-call
+    // boundaries. Fired once by the Shutdown command.
+    let drain_token = CancellationToken::new();
+
     // --- The M4 timer driver (known gap 2) ---
     // `MissedTickBehavior::Delay`: a delayed tick loses at most cadence
     // time; Burst could storm the FIFO evaluation after a long blockage.
@@ -1193,6 +1240,8 @@ async fn run_actor<M: MemoryBackend>(
                     forced_cooldown_until,
                     &inbox_sender,
                     msg,
+                    shutting_down,
+                    &drain_token,
                 )
                 .await?;
             }
@@ -1313,6 +1362,8 @@ async fn run_actor<M: MemoryBackend>(
                     &inbox_sender,
                     now,
                     local_offset,
+                    shutting_down,
+                    &drain_token,
                 )
                 .await?;
             }
@@ -1323,6 +1374,16 @@ async fn run_actor<M: MemoryBackend>(
             } => {
                 wake_in_flight = false;
                 match *result {
+                    // Decision 114: the cooperative cancel of the drain.
+                    // The marker rollback is MANDATORY (start_wake
+                    // advanced and persisted it at wake START), but the
+                    // cancel is NOT a failure: no ERROR line, no
+                    // decision-65 requeue (the dispatch gate is closed).
+                    Err(CoreError::Cancelled) => {
+                        session.wake_last_row_id = pre_wake_row_id;
+                        persist_session(&store, &chat_id, &session).await?;
+                        debug!(chat_id = %chat_id, "wake cancelled by the shutdown drain; the marker rolled back and the messages re-present at the next natural trigger");
+                    }
                     Err(error) => {
                         // Decision 65 (amending decision 33's
                         // reset-at-start): roll `wake_last_row_id` back
@@ -1425,6 +1486,8 @@ async fn run_actor<M: MemoryBackend>(
                                 Some(entry),
                                 forced_at,
                                 "forced",
+                                shutting_down,
+                                &drain_token,
                             )
                             .await?;
                         }
@@ -1437,6 +1500,13 @@ async fn run_actor<M: MemoryBackend>(
                 // one).
                 warmup_in_flight = false;
                 match *result {
+                    // Decision 114: cancelled by the drain BEFORE the
+                    // generation call. The slot was consumed at fire
+                    // time (unchanged); nothing sent, nothing else
+                    // persisted. NOT a failure: no ERROR line.
+                    Err(CoreError::Cancelled) => {
+                        debug!(chat_id = %chat_id, "warmup cancelled by the shutdown drain; the slot stays consumed and the next slot is the natural retry");
+                    }
                     Err(error) => {
                         // The slot was consumed at fire time, so there is
                         // nothing to reschedule: the next slot is the
@@ -1517,7 +1587,7 @@ async fn run_actor<M: MemoryBackend>(
                         // summarizer the old C3 behavior applies
                         // EXACTLY (drop without a summary).
                         let mut defer_to_summary = false;
-                        if b_old > 0 {
+                        if b_old > 0 && !shutting_down {
                             if let Some(provider) = summary_provider.as_ref() {
                                 let lower = session.prev_digest_boundary_msg_id.unwrap_or(0);
                                 // Check-before-call (replay idempotency): a
@@ -1585,7 +1655,26 @@ async fn run_actor<M: MemoryBackend>(
                                     let summary_chat_id = chat_id.clone();
                                     let sender = inbox_sender.clone();
                                     let report_outcome = outcome.clone();
+                                    let cancel = drain_token.clone();
                                     tokio::spawn(async move {
+                                        // Decision 114: the drain
+                                        // token's poll BEFORE the call —
+                                        // a cancelled summarizer reports
+                                        // Cancelled and the deferred C3
+                                        // mutation replays next run (the
+                                        // boundary never advanced).
+                                        if cancel.is_cancelled() {
+                                            let _ = sender
+                                                .send(ActorCommand::SummaryCompleted {
+                                                    outcome: report_outcome,
+                                                    first_msg_id: lower,
+                                                    last_msg_id: b_old,
+                                                    new_boundary: b_new,
+                                                    result: Err(SummaryError::Cancelled),
+                                                })
+                                                .await;
+                                            return;
+                                        }
                                         // H4a panic containment (the
                                         // digest-task pattern): a
                                         // panicking summarizer reports a
@@ -1622,36 +1711,62 @@ async fn run_actor<M: MemoryBackend>(
                             }
                         }
                         if !defer_to_summary {
-                            finalize_digest_completion(
-                                &store,
-                                &chat_id,
-                                &mut session,
-                                &mut context,
-                                b_old,
-                                b_new,
-                                &outcome,
-                                &post_digest_hook,
-                            )
-                            .await?;
-                            // Re-evaluate once: the tail can still
-                            // exceed the thresholds (it grew during a
-                            // long extraction).
-                            maybe_launch_digest(
-                                &store,
-                                &chat_id,
-                                &config,
-                                &session,
-                                digest.as_ref(),
-                                &mut digest_in_flight,
-                                summary_pending,
-                                &inbox_sender,
-                                OffsetDateTime::now_utc(),
-                            )
-                            .await?;
+                            if shutting_down && b_old > 0 && summary_provider.is_some() {
+                                // Decision 114: the summarizer spawn is
+                                // gated during the drain, so the deferred
+                                // C3 mutation of decision 62 cannot land
+                                // here. Leave the boundary UN-advanced:
+                                // the next run replays the (idempotent)
+                                // batch and summarizes the chunk — no
+                                // memory loss, one re-extraction of token
+                                // cost, exactly the pre-drain outcome of
+                                // a stop in this window.
+                                debug!(
+                                    chat_id = %chat_id,
+                                    range = %range,
+                                    "digest completed during the drain; the C3 finalization defers to the next run"
+                                );
+                            } else {
+                                finalize_digest_completion(
+                                    &store,
+                                    &chat_id,
+                                    &mut session,
+                                    &mut context,
+                                    b_old,
+                                    b_new,
+                                    &outcome,
+                                    &post_digest_hook,
+                                )
+                                .await?;
+                                // Re-evaluate once: the tail can still
+                                // exceed the thresholds (it grew during a
+                                // long extraction).
+                                maybe_launch_digest(
+                                    &store,
+                                    &chat_id,
+                                    &config,
+                                    &session,
+                                    digest.as_ref(),
+                                    &mut digest_in_flight,
+                                    summary_pending,
+                                    &inbox_sender,
+                                    OffsetDateTime::now_utc(),
+                                    shutting_down,
+                                    &drain_token,
+                                )
+                                .await?;
+                            }
                         }
                     }
                     // The tail was empty; no state change.
                     Ok(None) => {}
+                    // Decision 114: the cooperative cancel of the drain.
+                    // The batch stays PENDING (the pipeline consumed no
+                    // attempt, wrote no dead letter); the next run
+                    // retries with the full budget. NOT an error.
+                    Err(CoreError::Cancelled) => {
+                        debug!(chat_id = %chat_id, "digest cancelled by the shutdown drain; the batch stays pending for the next run");
+                    }
                     Err(error) => {
                         // The pipeline dead-letters extraction failures
                         // itself; an escaping Err is an infrastructure
@@ -1672,6 +1787,18 @@ async fn run_actor<M: MemoryBackend>(
                 // The deferred C3 mutation of decision 62 lands here.
                 summary_pending = false;
                 match result {
+                    // Decision 114: the summarizer observed the drain
+                    // token BEFORE its call. NOT a failure: no breaker
+                    // increment, no counter, no finalization — the
+                    // deferred C3 mutation replays on the next run (the
+                    // boundary never advanced).
+                    Err(SummaryError::Cancelled) => {
+                        debug!(
+                            chat_id = %chat_id,
+                            range = %format!("({first_msg_id},{last_msg_id}]"),
+                            "context summarization cancelled by the shutdown drain; the chunk replays on the next run"
+                        );
+                    }
                     Ok(text) => {
                         // A success resets the decision-65 circuit
                         // breaker's consecutive-failure count.
@@ -1795,6 +1922,8 @@ async fn run_actor<M: MemoryBackend>(
                     summary_pending,
                     &inbox_sender,
                     OffsetDateTime::now_utc(),
+                    shutting_down,
+                    &drain_token,
                 )
                 .await?;
             }
@@ -1825,7 +1954,31 @@ async fn run_actor<M: MemoryBackend>(
                     "persona preamble reloaded (in-memory item-0 swap)"
                 );
             }
-            ActorCommand::Shutdown => break,
+            ActorCommand::Shutdown => {
+                // Decision 114: the drain. Close every dispatch point and
+                // fire the cooperative-cancel token; the loop keeps
+                // selecting until every tracked task has reported — the
+                // completion handlers carry the state restoration and
+                // are the drain's only completion signal. Never
+                // break-then-await: completions report through this
+                // bounded inbox, and awaiting with the receive loop
+                // stopped deadlocks against a full inbox.
+                shutting_down = true;
+                drain_token.cancel();
+                debug!(chat_id = %chat_id, "shutdown received; draining the tracked tasks");
+            }
+        }
+        // Decision 114: the drain exit check. The four in-flight
+        // flags ARE the tracked set (the H4a containment guarantee:
+        // every spawned task reports back, even a panicking or
+        // cancelled one), and the drain ends only when it is empty.
+        if shutting_down
+            && !digest_in_flight
+            && !summary_pending
+            && !wake_in_flight
+            && !warmup_in_flight
+        {
+            break;
         }
     }
     Ok(())
@@ -1877,6 +2030,10 @@ async fn handle_message(
     forced_cooldown_until: Option<OffsetDateTime>,
     inbox_sender: &mpsc::Sender<ActorCommand>,
     msg: NormalizedMessage,
+    // Decision 114: the drain state, threaded into the three dispatch
+    // sites (the digest evaluation, the forced wake, the natural wake).
+    shutting_down: bool,
+    drain_token: &CancellationToken,
 ) -> Result<(), CoreError> {
     // Rule P1 (specs.md Section 8.1): FIRST persist to the raw log. The
     // insert completes before anything else runs.
@@ -1951,6 +2108,8 @@ async fn handle_message(
         summary_pending,
         inbox_sender,
         now,
+        shutting_down,
+        drain_token,
     )
     .await?;
     let Some(services) = wake_services else {
@@ -2044,6 +2203,8 @@ async fn handle_message(
                 }),
                 now,
                 "forced",
+                shutting_down,
+                drain_token,
             )
             .await?;
         }
@@ -2077,6 +2238,8 @@ async fn handle_message(
                 None,
                 now,
                 reason.as_str(),
+                shutting_down,
+                drain_token,
             )
             .await?;
         }
@@ -2111,6 +2274,10 @@ async fn handle_tick<M: MemoryBackend>(
     inbox_sender: &mpsc::Sender<ActorCommand>,
     now: OffsetDateTime,
     local_offset: UtcOffset,
+    // Decision 114: the drain state, threaded into the three dispatch
+    // sites (the digest evaluation, the natural wake, the warmup tick).
+    shutting_down: bool,
+    drain_token: &CancellationToken,
 ) -> Result<(), CoreError> {
     maybe_launch_digest(
         store,
@@ -2122,6 +2289,8 @@ async fn handle_tick<M: MemoryBackend>(
         summary_pending,
         inbox_sender,
         now,
+        shutting_down,
+        drain_token,
     )
     .await?;
     // Decision 78: NO early return on the disabled-wake path — the
@@ -2157,6 +2326,8 @@ async fn handle_tick<M: MemoryBackend>(
                     None,
                     now,
                     reason.as_str(),
+                    shutting_down,
+                    drain_token,
                 )
                 .await?;
             }
@@ -2187,6 +2358,8 @@ async fn handle_tick<M: MemoryBackend>(
         inbox_sender,
         now,
         local_offset,
+        shutting_down,
+        drain_token,
     )
     .await?;
     Ok(())
@@ -2240,7 +2413,15 @@ async fn handle_warmup_tick<M: MemoryBackend>(
     inbox_sender: &mpsc::Sender<ActorCommand>,
     now: OffsetDateTime,
     local_offset: UtcOffset,
+    shutting_down: bool,
+    drain_token: &CancellationToken,
 ) -> Result<(), CoreError> {
+    // Decision 114: the drain gate, checked FIRST — a drain never
+    // dispatches a warmup and never consumes the slot (no state
+    // mutation at all; the next run's tick sees the same due slot).
+    if shutting_down {
+        return Ok(());
+    }
     // Unwired services (replay mode, or no provider key) disable the
     // trigger entirely; the startup WARN of the binary covers the
     // unwired state, so this stays silent. The `warmup` master switch
@@ -2420,7 +2601,19 @@ async fn handle_warmup_tick<M: MemoryBackend>(
     let topic_name = topic.name;
     let sender = inbox_sender.clone();
     let chat_id_owned = chat_id.to_string();
+    let cancel = drain_token.clone();
     tokio::spawn(async move {
+        // Decision 114: the poll BEFORE the generation call — the drain
+        // can arrive while this task waited on a spawn slot.
+        if cancel.is_cancelled() {
+            let _ = sender
+                .send(ActorCommand::WarmupCompleted {
+                    result: Box::new(Err(CoreError::Cancelled)),
+                    topic: topic_name,
+                })
+                .await;
+            return;
+        }
         // H4a panic containment (the wake-task pattern): a panicking
         // generator reports a synthetic `CoreError::Warmup` failure, so
         // the completion handler runs and `warmup_in_flight` ALWAYS
@@ -2695,7 +2888,19 @@ async fn start_wake(
     forced: Option<ForcedWakeEntry>,
     now: OffsetDateTime,
     trigger: &'static str,
+    shutting_down: bool,
+    drain_token: &CancellationToken,
 ) -> Result<(), CoreError> {
+    // Decision 114: the drain gate. A wake NEVER starts during the
+    // drain — the marker was not advanced (that happens at wake START
+    // below), so the messages re-present at the next run's natural
+    // trigger; a dropped forced queue entry degrades to best-effort
+    // gate judgment (documented in decision 114: forcing is
+    // memory-only and the cancel path arms neither the intake arming
+    // nor the decision-65 requeue).
+    if shutting_down {
+        return Ok(());
+    }
     // Step 1 (Sections 9 and 8.5): the monologue lock suppresses an
     // unforced wake. A forced wake is never suppressed (Section 8.1).
     // `wake_last_row_id` is deliberately NOT advanced here: messages
@@ -2818,6 +3023,17 @@ async fn start_wake(
     let pre_wake_row_id = after_id;
     let failure_forced = forced.clone();
     let run_forced = forced.map(|entry| entry.forcing);
+    // Decision 114: the drain token rides into the UNFORCED wake's
+    // call sequence (polled between the serial recall/gate/reply
+    // calls). A FORCED wake never receives it: must-respond IS the
+    // forced path and forced bypasses the gate — a cancelled forced
+    // wake would re-present the message only to ordinary gate
+    // judgment, the obligation degraded instead of preserved.
+    let task_cancel = if run_forced.is_some() {
+        None
+    } else {
+        Some(drain_token.clone())
+    };
     tokio::spawn(async move {
         // H4a panic containment (the digest-task pattern): a panicking
         // recall/gate/reply call reports a synthetic failure, so the
@@ -2835,6 +3051,7 @@ async fn start_wake(
                 trigger,
                 context_view,
                 pet_tag,
+                task_cancel,
             )
             .await
         })
@@ -2883,6 +3100,11 @@ async fn run_wake_calls(
     // actor state, so the unified speech tag travels as a value; the
     // parrot filter below builds the reply fence from it.
     pet_tag: String,
+    // Decision 114: `Some(token)` on an unforced wake, `None` on a
+    // forced one. The polls below sit between the serial calls, so a
+    // cancelled wake leaves only the in-flight request running out the
+    // drain; a forced wake never polls.
+    cancel: Option<CancellationToken>,
 ) -> Result<WakeReport, CoreError> {
     // Step 2 (Sections 9.1-9.5): recall before the gate. The rendered
     // injection texts enter the gate input (Section 9.6: the recall
@@ -2893,6 +3115,11 @@ async fn run_wake_calls(
     // completion handler (Section 9.3), regardless of the gate
     // outcome. Decision 72: the relevance gate receives the shared
     // context view ahead of its per-call sections (Section 9.2).
+    // Decision 114: the cooperative-cancel poll of the drain, between
+    // the serial calls. `None` (a forced wake) never polls.
+    if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return Err(CoreError::Cancelled);
+    }
     let recall_outcome = recall
         .recall_with_context(chat_id, &new_messages, context_view.as_deref())
         .await?;
@@ -2906,6 +3133,11 @@ async fn run_wake_calls(
             role: ContextRole::Assistant,
             content: text.clone(),
         });
+    }
+    // Decision 114: between the recall call and the participation
+    // gate.
+    if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return Err(CoreError::Cancelled);
     }
     let forced_flag = forced.is_some();
     // Step 3 (Section 9.6). Forced wakes BYPASS the gate (Section 8.1):
@@ -2965,6 +3197,11 @@ async fn run_wake_calls(
         }
         resolved
     };
+    // Decision 114: between the participation gate and the reply
+    // call.
+    if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return Err(CoreError::Cancelled);
+    }
     // Step 4: the reply generation with the reply model over the context
     // snapshot. Skipped when the decision is no-participation.
     let reply_text = match &target {
@@ -3392,6 +3629,7 @@ mod tests {
             &'a self,
             chat_id: &'a str,
             last_digest_boundary_msg_id: i64,
+            _cancel: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>
         {
             Box::pin(async move {
@@ -3448,6 +3686,7 @@ mod tests {
             &'a self,
             chat_id: &'a str,
             last_digest_boundary_msg_id: i64,
+            _cancel: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>
         {
             *self
@@ -3469,8 +3708,82 @@ mod tests {
             if panic_now {
                 return Box::pin(async move { panic!("the digest extractor exploded") });
             }
-            self.fallback
-                .run_digest(chat_id, last_digest_boundary_msg_id)
+            self.fallback.run_digest(
+                chat_id,
+                last_digest_boundary_msg_id,
+                CancellationToken::new(),
+            )
+        }
+    }
+
+    /// A digest pipeline double gated on external signals (the drain
+    /// tests of decision 114): the call counts itself, then blocks on
+    /// `release` before producing the scripted outcome.
+    struct GatedDigest {
+        store: Arc<Store>,
+        release: tokio::sync::Notify,
+        calls: Mutex<usize>,
+    }
+
+    impl DigestPipeline for GatedDigest {
+        fn run_digest<'a>(
+            &'a self,
+            chat_id: &'a str,
+            last_digest_boundary_msg_id: i64,
+            _cancel: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>
+        {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            Box::pin(async move {
+                self.release.notified().await;
+                let store = Arc::clone(&self.store);
+                let chat_id = chat_id.to_string();
+                let rows = tokio::task::spawn_blocking(move || {
+                    store.list_messages_after(&chat_id, last_digest_boundary_msg_id)
+                })
+                .await
+                .map_err(|error| CoreError::Join(error.to_string()))?
+                .map_err(CoreError::Store)?;
+                let Some(last) = rows.last() else {
+                    return Ok(None);
+                };
+                Ok(Some(DigestOutcome::Extracted {
+                    batch_id: format!("batch-{}", last.id),
+                    new_boundary: last.id,
+                    node_count: 0,
+                    edge_count: 0,
+                }))
+            })
+        }
+    }
+
+    /// A digest pipeline double that cancels itself on the drain token
+    /// (the cancel test of decision 114): the call starts, waits for
+    /// the token, then reports `Cancelled` — the scripted stand-in for
+    /// the real pipeline's between-attempts poll.
+    struct CancellingDigest {
+        calls: Mutex<usize>,
+    }
+
+    impl DigestPipeline for CancellingDigest {
+        fn run_digest<'a>(
+            &'a self,
+            _chat_id: &'a str,
+            _last_digest_boundary_msg_id: i64,
+            cancel: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>
+        {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Err(CoreError::Cancelled)
+            })
         }
     }
 
@@ -5126,6 +5439,180 @@ mod tests {
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
+    #[tokio::test]
+    async fn the_drain_finishes_an_in_flight_digest_and_dispatches_nothing_new() {
+        // Decision 114: Shutdown during an in-flight digest waits for
+        // the completion, and the dispatch gate closes — a tail that
+        // grew past the threshold during the drain does NOT start a
+        // second digest (the join would hang on the gated double if it
+        // did).
+        let fixture = make_fixture();
+        let digest = Arc::new(GatedDigest {
+            store: Arc::clone(&fixture.store),
+            release: tokio::sync::Notify::new(),
+            calls: Mutex::new(0),
+        });
+        let handle = spawn_with_digest(&fixture, digest_config(), digest.clone());
+
+        // The trigger trips on the second message; the digest blocks.
+        send_pair(&handle, 1).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while *digest
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the digest never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Shutdown during the in-flight digest: the drain starts.
+        handle.initiate_shutdown().await;
+        // Intake continues during the drain; the tail exceeds the
+        // threshold again, but the gate must NOT dispatch.
+        send_pair(&handle, 3).await;
+        // The actor is alive while the drain waits (a snapshot answers)
+        // and the boundary has not advanced yet.
+        let session = handle
+            .snapshot()
+            .await
+            .expect("the actor answers during the drain");
+        assert_eq!(session.last_digest_boundary_msg_id, 0);
+
+        // Release the digest; the completion ends the drain.
+        digest.release.notify_one();
+        handle.join().await.expect("the drain converges");
+
+        assert_eq!(
+            *digest
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            1,
+            "no new digest dispatch after Shutdown"
+        );
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 4, "the drained intake persisted");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_digest_leaves_the_batch_pending() {
+        // Decision 114: the digest cancelled by the drain reports
+        // Cancelled — the completion handler touches no failure state
+        // and the boundary does NOT advance, so the next run replays
+        // the batch with its full budget.
+        let fixture = make_fixture();
+        let digest = Arc::new(CancellingDigest {
+            calls: Mutex::new(0),
+        });
+        let handle = spawn_with_digest(&fixture, digest_config(), digest.clone());
+
+        send_pair(&handle, 1).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while *digest
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the digest never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Shutdown: the token fires, the digest reports Cancelled, the
+        // drain ends.
+        handle.initiate_shutdown().await;
+        handle.join().await.expect("the drain converges");
+
+        // A restarted actor on the same store finds the batch PENDING
+        // and replays it (the scripted pipeline is idempotent).
+        let restarted = spawn_with_scripted_digest(&fixture, digest_config());
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.last_digest_boundary_msg_id, 0);
+        // A fresh message drives the intake-time trigger evaluation:
+        // the restarted actor replays the pending batch (the scripted
+        // pipeline is idempotent) and the boundary advances past it.
+        restarted
+            .send_event(InboundEvent::Message(message("m3", 3, false)))
+            .await
+            .expect("send succeeds");
+        wait_for_boundary(&restarted, 2).await;
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_unforced_wake_rolls_the_marker_back() {
+        // Decision 114: the drain token rides into an unforced wake;
+        // the poll between the recall and gate calls turns the wake
+        // into Cancelled — the handler rolls `wake_last_row_id` back
+        // (the messages re-present at the next natural trigger) and
+        // the gate/reply calls never run.
+        let fixture = make_fixture();
+        let recall = Arc::new(GatedRecall {
+            release: tokio::sync::Notify::new(),
+            calls: Mutex::new(0),
+        });
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("never used");
+        let (handle, _outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(1),
+            recall.clone(),
+            gate.clone(),
+            reply,
+        );
+
+        // One message trips the count trigger; the wake task blocks
+        // inside the recall call.
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while *recall
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recall never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Shutdown during the recall; the release lets the between-
+        // calls poll fire.
+        handle.initiate_shutdown().await;
+        recall.release.notify_one();
+        handle.join().await.expect("the drain converges");
+
+        // The between-calls poll fired: the gate never ran.
+        assert_eq!(gate.call_count(), 0);
+        // The marker rolled back to its pre-wake value (start_wake had
+        // advanced and persisted it past the presented row).
+        let restarted_gate = ScriptedGate::no();
+        let restarted_reply = ScriptedReply::new("never used either");
+        let (restarted, _outbound) = spawn_with_wake(
+            &fixture,
+            wake_config(1),
+            ScriptedRecall::with_outcomes(vec![]),
+            restarted_gate,
+            restarted_reply,
+        );
+        let session = restarted.snapshot().await.expect("snapshot succeeds");
+        assert_eq!(session.wake_last_row_id, 0);
+        restarted.shutdown().await.expect("shutdown succeeds");
+    }
+
     /// A summarizer double whose first `panics` calls panic INSIDE the
     /// returned future (the H4a containment tests: an LLM task panics
     /// mid-flight, not at call time); later calls delegate to the
@@ -6019,6 +6506,43 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(context_view.map(str::to_string));
+            self.recall(chat_id, new_messages)
+        }
+    }
+
+    /// A recall double gated on external signals (the wake-cancel test
+    /// of decision 114): the call counts itself, then blocks on
+    /// `release` before answering the empty outcome. The wake task's
+    /// between-calls cancel poll is what the test exercises.
+    struct GatedRecall {
+        release: tokio::sync::Notify,
+        calls: Mutex<usize>,
+    }
+
+    impl RecallProvider for GatedRecall {
+        fn recall<'a>(
+            &'a self,
+            _chat_id: &'a str,
+            _new_messages: &'a [GateMessage],
+        ) -> Pin<Box<dyn Future<Output = Result<crate::wake::RecallOutcome, CoreError>> + Send + 'a>>
+        {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            Box::pin(async move {
+                self.release.notified().await;
+                Ok(crate::wake::RecallOutcome::default())
+            })
+        }
+
+        fn recall_with_context<'a>(
+            &'a self,
+            chat_id: &'a str,
+            new_messages: &'a [GateMessage],
+            _context_view: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::wake::RecallOutcome, CoreError>> + Send + 'a>>
+        {
             self.recall(chat_id, new_messages)
         }
     }

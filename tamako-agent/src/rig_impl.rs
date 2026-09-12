@@ -121,6 +121,7 @@ impl KnowledgeExtractor for RigExtractor {
     fn extract<'a>(
         &'a self,
         input: &'a ExtractionInput,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<KnowledgeGraph, AgentError>> + Send + 'a>,
     > {
@@ -128,15 +129,18 @@ impl KnowledgeExtractor for RigExtractor {
             // The shared structured flow of the endpoint layer: one
             // completion with the schema (the resolved mode decides
             // how it reaches the wire) plus the one-shot repair retry
-            // on a schema validation failure.
+            // on a schema validation failure. Decision 114: the drain
+            // token polls BETWEEN the two calls (each keeps its own
+            // 900 s window; the stop budget covers one).
             self.client
-                .complete_structured::<KnowledgeGraph>(
+                .complete_structured_cancellable::<KnowledgeGraph>(
                     // The preamble becomes the system message.
                     Some(EXTRACTION_PREAMBLE.to_string()),
                     vec![Message::user(render_extraction_prompt(input))],
                     schemars::schema_for!(KnowledgeGraph),
                     self.max_tokens,
                     "invalid graph JSON",
+                    cancel,
                 )
                 .await
         })

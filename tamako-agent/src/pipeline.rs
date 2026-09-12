@@ -18,6 +18,8 @@ use tamako_store::{ForwardKind, MessageRow, Store, StoreError};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::extract::{
     AgentError, BatchMessage, BindingSource, ExtractionInput, ForwardMarker, KnowledgeExtractor,
     MentionBinding, RelatedPairCandidate,
@@ -494,8 +496,12 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         chat_id: &str,
         input: &ExtractionInput,
         frame: &BatchFrame,
+        cancel: &CancellationToken,
     ) -> Result<(usize, usize, VectorResolutionStats), AgentError> {
-        let graph = self.extractor.extract(input).await?;
+        // Decision 114: the token rides into the extractor, which polls
+        // it between the initial call and the one repair retry — the
+        // two calls get separate windows, the stop budget covers one.
+        let graph = self.extractor.extract(input, Some(cancel.clone())).await?;
         // Section 6.3: post-validation in plain Rust. Never trust the
         // prompt.
         let validated_names: Vec<_> = graph
@@ -664,6 +670,7 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         &self,
         chat_id: &str,
         last_digest_boundary_msg_id: i64,
+        cancel: CancellationToken,
     ) -> Result<Option<DigestOutcome>, CoreError> {
         // specs.md Section 10.1: the raw log range (boundary, tail].
         let chat_id_owned = chat_id.to_string();
@@ -680,6 +687,17 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         // Batch assembly.
         let frame = BatchFrame::of_rows(&rows);
         let mut input = assemble_extraction_input(&frame.batch_id, &rows);
+
+        // Decision 115: one digest-start line at DEBUG with the batch id
+        // and range — post-hoc attribution of a hard-killed stop (the
+        // one-line guarantee keeps INFO clean; the completion line of
+        // the actor is its INFO counterpart).
+        tracing::debug!(
+            chat_id,
+            batch_id = %frame.batch_id,
+            range = %format!("({},{}]", frame.first_msg_id, frame.last_msg_id),
+            "digest batch started"
+        );
         let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
         // Section 7.2 rule 5: the skeleton check. The extractor is never
         // called for a skeleton batch.
@@ -718,19 +736,28 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
         let mut attempt = 0_u32;
         let last_error: AgentError;
         loop {
+            // Decision 114: the drain token polls BETWEEN attempts — a
+            // cancelled batch stays PENDING (no attempt consumed, no
+            // failure counter, never the dead-letter branch) and
+            // resumes on the next run.
+            if cancel.is_cancelled() {
+                return Err(CoreError::Cancelled);
+            }
             attempt += 1;
             let result: Result<AttemptSuccess, AgentError> = if skeleton {
                 self.store_skeleton(chat_id, &frame)
                     .await
                     .map(|()| AttemptSuccess::Skeleton)
             } else {
-                self.extract_and_write(chat_id, &input, &frame).await.map(
-                    |(node_count, edge_count, vector_stats)| AttemptSuccess::Extracted {
-                        node_count,
-                        edge_count,
-                        vector_stats,
-                    },
-                )
+                self.extract_and_write(chat_id, &input, &frame, &cancel)
+                    .await
+                    .map(
+                        |(node_count, edge_count, vector_stats)| AttemptSuccess::Extracted {
+                            node_count,
+                            edge_count,
+                            vector_stats,
+                        },
+                    )
             };
             match result {
                 Ok(AttemptSuccess::Skeleton) => {
@@ -768,6 +795,12 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                     }));
                 }
                 Err(error) => {
+                    // Decision 114: the cooperative cancel is NOT a
+                    // batch failure — return before the failure counter,
+                    // the retry accounting, and the dead-letter path.
+                    if matches!(error, AgentError::Cancelled) {
+                        return Err(CoreError::Cancelled);
+                    }
                     // The metric of specs.md Section 12, reachable here.
                     self.bump_counter(chat_id, "digest_failures_total").await;
                     if attempt >= self.config.max_retries {
@@ -783,7 +816,15 @@ impl<M: MemoryBackend> AgentDigestPipeline<M> {
                         error = %error,
                         "digest attempt failed; retry scheduled"
                     );
-                    tokio::time::sleep(delay).await;
+                    // Decision 114: the backoff itself is a cancel
+                    // window — a drain stop never waits out a retry
+                    // delay.
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel.cancelled() => {
+                            return Err(CoreError::Cancelled);
+                        }
+                    }
                 }
             }
         }
@@ -949,9 +990,12 @@ fn edge_text_upsert_items(batch: &MemoryBatch) -> Vec<(String, String)> {
 
 /// Maps the crate error to the core error (the `DigestPipeline`
 /// contract). Store/Memory/Join map to their CoreError counterparts;
-/// Extraction/ProviderConfig become CoreError::Digest.
+/// Extraction/ProviderConfig become CoreError::Digest; Cancelled
+/// passes through as the drain's cooperative-cancel outcome (decision
+/// 114) — never a batch failure.
 fn core_error(error: AgentError) -> CoreError {
     match error {
+        AgentError::Cancelled => CoreError::Cancelled,
         AgentError::Store(error) => CoreError::Store(error),
         AgentError::Memory(error) => CoreError::Memory(error),
         AgentError::Join(error) => CoreError::Join(error),
@@ -966,8 +1010,9 @@ impl<M: MemoryBackend> DigestPipeline for AgentDigestPipeline<M> {
         &'a self,
         chat_id: &'a str,
         last_digest_boundary_msg_id: i64,
+        cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>> {
-        Box::pin(async move { self.run(chat_id, last_digest_boundary_msg_id).await })
+        Box::pin(async move { self.run(chat_id, last_digest_boundary_msg_id, cancel).await })
     }
 }
 
@@ -1311,7 +1356,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -1369,7 +1414,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("the digest is Ok despite the enqueue failure")
             .expect("non-empty tail");
@@ -1413,7 +1458,7 @@ mod tests {
 
         for run in 1..=2 {
             let outcome = pipeline
-                .run_digest(ENQUEUE_CHAT, 0)
+                .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
                 .await
                 .expect("digest")
                 .expect("non-empty tail");
@@ -1477,7 +1522,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -1527,7 +1572,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("the digest is Ok with the enqueue disabled")
             .expect("non-empty tail");
@@ -1777,7 +1822,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -1838,7 +1883,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -1933,7 +1978,7 @@ mod tests {
         .with_single_value_predicates(vec!["works_at".to_string()]);
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -1974,7 +2019,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -2057,7 +2102,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -2106,7 +2151,7 @@ mod tests {
 
         for run in 1..=2 {
             let outcome = pipeline
-                .run_digest(ENQUEUE_CHAT, 0)
+                .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
                 .await
                 .expect("digest")
                 .expect("non-empty tail");
@@ -2152,7 +2197,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("digest")
             .expect("non-empty tail");
@@ -2199,7 +2244,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("the digest is Ok despite the harvest failure")
             .expect("non-empty tail");
@@ -2362,7 +2407,7 @@ mod tests {
         );
 
         let outcome = pipeline
-            .run_digest(ENQUEUE_CHAT, 0)
+            .run_digest(ENQUEUE_CHAT, 0, CancellationToken::new())
             .await
             .expect("the digest succeeds on the second attempt")
             .expect("non-empty tail");

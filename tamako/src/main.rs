@@ -1352,6 +1352,23 @@ fn shared_setup(cli: &Cli) -> Result<SharedSetup> {
     // Decision 94 (d): the suffix rule count rides the startup line, so
     // a silently empty suffix is one log read away.
     info!(persona = %persona.name, pet_tag = %pet_tag, preamble_len = preamble.len(), suffix_rules = persona.suffix.len(), "persona preamble rendered");
+    // Decision 116 (specs.md Section 13): the RESOLVED suffix placement
+    // and timezone, once at startup, at INFO. The persona reload lines
+    // carry the persona's own fields; these two resolved trigger keys
+    // decide every rendered timestamp and the suffix's slot, and a
+    // wrong value is otherwise visible only inside a model request.
+    info!(
+        suffix_mode = %match bot_config.global.suffix_mode {
+            tamako_persona::SuffixMode::System => "system",
+            tamako_persona::SuffixMode::Append => "append",
+        },
+        timezone = %bot_config
+            .global
+            .timezone
+            .map(|zone| zone.config_value())
+            .unwrap_or_else(|| "unset".to_owned()),
+        "resolved trigger settings"
+    );
     Ok(SharedSetup {
         bot_config,
         // Decision 80: updatable in live mode; the startup render is the
@@ -3421,15 +3438,37 @@ async fn run_live(
     }
 
     let groups_served = actors.len();
-    // The shutdown is the session-state flush: the actor persists the
-    // session after every mutation, and shutdown lets the FIFO drain and
-    // surfaces task errors. A failed shutdown logs at error level; the
-    // other actors still shut down.
+    // Decision 114: broadcast Shutdown to EVERY actor first, then join.
+    // Each actor drains its in-flight work (the wake reply of group A
+    // can still send while group B's digest runs out), so a serial
+    // per-group shutdown would serialize the drains pointlessly and a
+    // cross-group send into a stopped actor's loop would silently
+    // drop the reply. The broadcast starts all drains together.
+    for handle in actors.values() {
+        handle.initiate_shutdown().await;
+    }
+    // A failed shutdown logs at error level; the other actors still
+    // join.
     let mut shutdown_failures = 0_usize;
     for (chat_id, handle) in actors {
-        if let Err(error) = handle.shutdown().await {
+        if let Err(error) = handle.join().await {
             error!(chat_id = %chat_id, %error, "group actor shutdown failed");
             shutdown_failures += 1;
+        }
+    }
+    // Decision 114: after every actor joined, the outbound channel can
+    // still hold drained replies (a wake completing into the drain
+    // sends its reply; nothing consumed it after the loop broke).
+    // Flush them best-effort — the raw-log rows persisted actor-side
+    // (Rules B1/P1), so a failed send loses only the delivery.
+    while let Ok(action) = outbound_rx.try_recv() {
+        let action_chat_id = match &action {
+            OutboundAction::SendText { chat_id, .. }
+            | OutboundAction::SendMedia { chat_id, .. }
+            | OutboundAction::React { chat_id, .. } => chat_id.clone(),
+        };
+        if let Err(error) = adapter.execute(action).await {
+            warn!(chat_id = %action_chat_id, %error, "outbound action failed during the shutdown flush");
         }
     }
     info!(

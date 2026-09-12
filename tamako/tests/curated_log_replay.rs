@@ -191,6 +191,7 @@ impl DigestPipeline for ScriptedDigest {
         &'a self,
         chat_id: &'a str,
         last_digest_boundary_msg_id: i64,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>> {
         Box::pin(async move {
             let store = Arc::clone(&self.store);

@@ -50,11 +50,18 @@ impl DigestOutcome {
 /// The digest pipeline. Object-safe; the actor holds an
 /// `Arc<dyn DigestPipeline>`. Returns `Ok(None)` when the tail is empty
 /// (nothing to digest).
+///
+/// `cancel` is the decision-114 drain token: the implementation polls
+/// it between retry attempts, between an attempt's initial call and
+/// its repair call, and during the retry backoff; a fired token returns
+/// [`CoreError::Cancelled`] with the batch left PENDING (no attempt
+/// consumed, no failure counter, no dead letter).
 pub trait DigestPipeline: Send + Sync {
     fn run_digest<'a>(
         &'a self,
         chat_id: &'a str,
         last_digest_boundary_msg_id: i64,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<Option<DigestOutcome>, CoreError>> + Send + 'a>>;
 }
 

@@ -115,6 +115,13 @@ pub struct RelatedPairCandidate {
 /// Errors of tamako-agent.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    /// Cooperative cancellation of the decision-114 shutdown drain:
+    /// the task observed the drain token at an LLM-call boundary
+    /// (between digest retry attempts, or between an attempt's initial
+    /// call and its repair call). NEVER a batch failure: no attempt is
+    /// consumed, no failure counter, no dead letter.
+    #[error("cancelled by the shutdown drain")]
+    Cancelled,
     #[error("store error: {0}")]
     Store(#[from] tamako_store::StoreError),
     #[error("memory error: {0}")]
@@ -130,9 +137,15 @@ pub enum AgentError {
 /// The extraction stage. Tests use a scripted implementation; the live
 /// rig implementation is `RigExtractor`. Object-safe.
 pub trait KnowledgeExtractor: Send + Sync {
+    /// Runs the extraction. `cancel` is the decision-114 drain token:
+    /// a cancellable implementation polls it between the initial call
+    /// and the one repair retry and answers
+    /// [`AgentError::Cancelled`]; scripted doubles answer Cancelled
+    /// only when the token is already cancelled at entry.
     fn extract<'a>(
         &'a self,
         input: &'a ExtractionInput,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Pin<Box<dyn Future<Output = Result<KnowledgeGraph, AgentError>> + Send + 'a>>;
 }
 
@@ -189,6 +202,7 @@ impl KnowledgeExtractor for ScriptedExtractor {
     fn extract<'a>(
         &'a self,
         input: &'a ExtractionInput,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Pin<Box<dyn Future<Output = Result<KnowledgeGraph, AgentError>> + Send + 'a>> {
         // Lock, record, and decide synchronously; the future only
         // carries the result. A poisoned mutex is recovered; the
@@ -197,6 +211,11 @@ impl KnowledgeExtractor for ScriptedExtractor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(input.clone());
+        // Decision 114: the scripted double honors the drain token at
+        // entry, so drain tests drive the real Cancelled path.
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Box::pin(async move { Err(AgentError::Cancelled) });
+        }
         let result = {
             let mut mode = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
             match &mut *mode {
@@ -246,9 +265,15 @@ mod tests {
     #[tokio::test]
     async fn with_graphs_pops_fifo_then_returns_empty_graphs() {
         let extractor = ScriptedExtractor::with_graphs(vec![sample_graph()]);
-        let first = extractor.extract(&sample_input()).await.expect("first");
+        let first = extractor
+            .extract(&sample_input(), None)
+            .await
+            .expect("first");
         assert_eq!(first, sample_graph());
-        let second = extractor.extract(&sample_input()).await.expect("second");
+        let second = extractor
+            .extract(&sample_input(), None)
+            .await
+            .expect("second");
         assert_eq!(second, KnowledgeGraph::default());
         assert_eq!(extractor.inputs().len(), 2);
     }
@@ -257,7 +282,7 @@ mod tests {
     async fn failing_mode_fails_every_call_and_records_inputs() {
         let extractor = ScriptedExtractor::failing("boom");
         for _ in 0..2 {
-            match extractor.extract(&sample_input()).await {
+            match extractor.extract(&sample_input(), None).await {
                 Err(AgentError::Extraction(message)) => assert_eq!(message, "boom"),
                 other => panic!("expected Extraction error, got {other:?}"),
             }
