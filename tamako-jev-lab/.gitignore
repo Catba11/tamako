@@ -1,9 +1,10 @@
 fixtures/
 runs/
-tamako-jev-lab/fixtures-smoke/
-tamako-jev-lab/main.rs
-tamako-jev-lab/driver/dump_unlabeled_*.csv
-tamako-jev-lab/driver/probe_times.txt
-tamako-jev-lab/driver/probe*.log
-tamako-jev-lab/driver/runs_full1.log
+fixtures-smoke/
+main.rs
+driver/dump_unlabeled_*.csv
+driver/labels_all.csv
+driver/probe_times.txt
+driver/probe*.log
+driver/runs_full1.log
 __pycache__/

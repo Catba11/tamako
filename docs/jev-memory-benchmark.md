@@ -29,7 +29,7 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
 
 | 群 | messages | edge_texts | injected_memories | merge_audit |
 |---|---|---|---|---|
-| -1001234567890 | 11 | 0 | 0 | 0 |
+| g0 | 11 | 0 | 0 | 0 |
 | g1 | 3,087 | 3,863 | 4 | 0 |
 | g2 | 32,860 | 29,015 | 13 | 0 |
 | g3 | 177 | 269 | 2 | 0 |
@@ -42,11 +42,12 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
 标签资产结论：
 
 - **merge_audit 全空**：无历史 merge 裁决标签 → UC-1/UC-2 的参照标签只能
-  来自 (a) haiku 实时重判（参照，非真值），(b) 人工标注子集（金标）。
+  来自 (a) 参照模型实时重判（glm-5.3-flash / deepseek-v4.1-flash 复刻生产
+  preamble；参照非真值），(b) 标注子集（金标）。
 - **injected_memories 76 条正例**：生产真实注入记录（edge_id +
   injection_position + range_tag + created_at + content）。只有正例、无
   候选全集，不能直接算 precision/recall，但可作为 UC-3 重放的**命中
-  校验点**（Jev/haiku 重放到同一时刻是否也会选中这些边）。
+  校验点**（Jev/参照模型重放到同一时刻是否也会选中这些边）。
 - **向量资产**：node_embeddings（vec0，float[3072]，cosine 距离，
   schema v11）覆盖全部实体节点；全量相似度可离线计算，无需重新 embedding。
 
@@ -86,11 +87,11 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
 - **数据集**：离线计算快照内全部同-kind 节点对 cosine 相似度，取
   sim ∈ [0.88, 1.0) 的对（即生产中会触发 haiku 确认的对）。预计几十~
   几百对，全量跑。
-- **参照/金标**：haiku 实时重判（同 CONFIRMATION_PREAMBLE）为参照；
-  分层抽样 ≥60 对人工标注为金标。
+- **参照/金标**：glm-5.3-flash 实时重判（同 CONFIRMATION_PREAMBLE）为参照；
+  分层抽样 60 对标注为金标。
 - **指标**：accuracy/F1@0.5（对金标与对参照各一份）、AUROC、ECE/Brier、
   标定阈值下的 accuracy-coverage 曲线（AURC 思路，用 noul 概率自身）、
-  与 haiku 一致率、单判成本/延迟、确定性（×3 重复 flip rate）。
+  与参照模型一致率、单判成本/延迟、确定性（×3 重复 flip rate）。
 - **价值假设**：noul 概率替代 0.88 一刀切 → 高概率自动并、中间带交
   haiku 复核、低概率新建（confidence-gated routing 模式）。
 
@@ -98,8 +99,8 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
 - **Jev mock**：同 UC-1a 的 noul，跑 sim ∈ [0.75, 0.88) 的节点对
   （生产中直接新建、从不确认——潜在的重复节点来源）。
 - **数据集**：随机抽样 ≤300 对（全量预计数千对）。
-- **参照/金标**：Jev P(same) ≥ 0.8 的对交 haiku 复核 + 全部抽样人工
-  标注。
+- **参照/金标**：Jev P(same) ≥ 0.8 的对交参照模型复核 + 抽样标注（执行
+  为全带分层抽样 60 对）。
 - **指标**：带内真重复率（金标）、Jev 在该带的 AUROC/ECE、
   「若按 P≥τ 合并」在不同 τ 下的精度/召回曲线。
 - **价值假设**：若带内真重复率可观且 Jev 能校准地挑出，则
@@ -110,11 +111,11 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
   J2 三方语义（related 不建边）。
 - **数据集**：快照内 KNN(k=5 复刻) ≥0.90 的节点对（merge_audit 为空，
   无历史标签，全部现场判）。
-- **参照/金标**：haiku merge confirmation 实时重判为参照；人工标注
-  ≤80 对为金标。
+- **参照/金标**：glm-5.3-flash merge confirmation（同 MERGE preamble）重判
+  为参照；标注 60 对为金标。
 - **指标**：macro-F1、per-class accuracy、same↔related 混淆率（最危险
   方向：related 误判 same 会错并）、ECE（multiclass confidence）、AURC、
-  与 haiku 三方一致率、成本。
+  与参照模型三方一致率、成本。
 - **价值假设**：choice 的 confidence 可直接驱动「自动并 / 人工复核 /
   跳过」三档路由。
 
@@ -128,11 +129,11 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
   created_at 对齐的消息窗（76 条正例所属窗口，含真值命中校验）；
   (b) 随机活跃窗。合计 ≤60 窗。候选集离线复刻 recall.rs 组装（向量
   KNN + FTS + 两跳，同一 cap 40）。
-- **参照/金标**：haiku gate 对同一 prompt 实时选择为参照；
-  injected_memories 对齐窗做命中校验；≤20 窗人工标注相关集为金标。
-- **指标**：set-level P/R/F1（对参照与金标）、P 排序 vs haiku 排序的
+- **参照/金标**：deepseek-v4.1-flash gate（复刻生产 prompt）对同一 prompt
+  实时选择为参照；injected_memories 对齐窗做命中校验；12 窗标注相关集为金标。
+- **指标**：set-level P/R/F1（对参照与金标）、P 排序 vs 参照排序的
   Spearman、ECE、注入条数分布对比、单窗延迟/成本对比（fan-out 一次 vs
-  haiku 一次）。
+  生产 gate 一次）。
 - **价值假设**：每候选独立概率 → 注入数自适应（不再固定 top-5 再 cap），
   且低概率候选可省掉 haiku 调用。
 
@@ -140,7 +141,7 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
 - **Jev mock**：单 noul「这些候选中是否有任何一条值得注入」（rule 3
   「不选是常态」的反面利用）。
 - **数据集**：复用 UC-3 的窗口与候选。
-- **参照**：haiku gate 空/非空结果。
+- **参照**：参照 gate 空/非空结果。
 - **指标**：accuracy、AUROC、ECE；运营成本估算 = 可跳过的 gate 调用比例
   × 误杀率（假阴性率）。
 - **价值假设**：若校准良好，可作为 haiku gate 前的廉价熔断器。
@@ -151,6 +152,28 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
   英文重写，比较概率偏移）——直接回应 guidebook §3.6 的 CJK 警示。
 - **产出**：「Jev 能否用于中文群聊记忆判断」的实证结论 + 若可用的
   推荐阈值区间。
+
+### UC-1s：合成实体对（规则造标，金标规模化）
+- **动机**：真实对无历史标签（merge_audit 全空），人工标注量有限。
+  以真实节点为种子**规则化合成**已知标签的对，金标规模不再受限。
+- **合成规则**（以真实节点的 name+description 为种子）：
+  - same（正例）： nickname 化/缩写/中英互译/描述换述（同实体不同表面
+    形式——对齐 CONFIRMATION_PREAMBLE rule 2）；
+  - hard-different（难负例）：同领域不同实体（真实图中取同 kind 且
+    sim ∈ [0.60, 0.75) 的对——相似但非同一）；
+  - easy-different（易负例）：随机跨群配对。
+- **指标**：同 UC-1a，但标签为构造金标 → accuracy/ECE/AUROC 全部严格。
+- **边界**：合成难度分布 ≠ 真实分布；结论用于校准与阈值标定，不用于
+  估计生产准确率。
+
+### UC-3s：合成注入窗（构造已知相关性）
+- **合成**：取真实 edge_text 为「埋藏事实」，模板化生成两种窗：
+  (a) 新消息明显需要该事实（提问/接续该话题）→ 金标相关；
+  (b) 新消息为无关闲聊 → 金标不相关。候选列表 = 埋藏边 + 从真实图
+  随机抽取的干扰边（对齐 40 cap）。
+- **指标**：per-candidate accuracy/ECE、top-k 命中构造金标的比例。
+- **边界**：模板消息的分布狭窄；只用于验证「语义明显时 Jev 是否
+  稳定选出」，不用于估计在线 F1。
 
 ### 明确排除（附理由）
 - **supersedure / single-value invalidation**：机械 last-write-wins 注册表
@@ -164,13 +187,14 @@ tamako 群聊几乎全中文，这正是本实验要回答的核心问题之一�
 accuracy / macro-F1 / AUROC（rank-based）/ ECE / Brier / 可靠性分箱 /
 AURC（risk-coverage）/ Spearman / flip rate / mean pairwise deviation /
 延迟分位 / 成本（按 usage.input_tokens × $0.042/Mtok）。金标与参照标签
-**分别出表**，不混用（参照是 haiku 判断，非真值）。
+**分别出表**，不混用（参照是 glm/deepseek 判断，非真值）。
 
 ## 6. Baselines
 
 1. **向量阈值规则**（现状的硬门槛部分）：sim≥0.88 即并 / sim≥0.90 即
    候选——展示「一刀切」在各 τ 下的 P/R 曲线作为地板。
-2. **haiku 现状**（J1/J2/J3 的现行实现）：实时重判作为 ceiling 参照。
+2. **haiku 现状**（J1/J2/J3 的现行实现）：以 glm-5.3-flash / deepseek-v4.1-flash
+   复刻生产 preamble 实时重判作为参照（非真值；生产 haiku 的成本/可用性替代）。
 3. **Jev**：挑战者。所有指标三方并列。
 
 ## 7. Harness 架构（本分支新增）
@@ -187,7 +211,7 @@ tamako-jev-lab/                # workspace member（仅本分支）
     client.py                  # 移植 jev-demo OpenRouterBackend（重试/退避）
     metrics.py                 # 移植 jev_bench/metrics.py（注明出处）
     suites.py                  # UC-1a/1b/2/3/4/5 任务构建器（fixtures → tasks）
-    haiku_ref.py               # haiku 参照判定（OPENROUTER_API_KEY 直连）
+    reference.py               # 参照判定：glm(uc1/uc2/zh_en 翻译) + deepseek(uc3/uc4)，磁盘缓存
     run.py                     # 编排：--suites --mock --limit --out runs/<ts>/
   fixtures/                    # .gitignore（含私密群聊内容，永不提交）
   runs/                        # .gitignore（raw.jsonl 含原文，永不提交）
@@ -208,14 +232,14 @@ docs/jev-memory-report.md      # 交付物 2：实验报告（仅聚合指标，
 | UC-3 | 60 窗 × ≤40 noul = ≤2400（60 请求） | ~4k tok | < $0.02 |
 | UC-4 | 60 noul | ~4k tok | < $0.01 |
 | UC-5 | 复用 + 30 对照 | — | < $0.01 |
-| haiku 参照 | ~800 调用 | — | < $1 |
+| 参照模型（glm/deepseek） | ~900 调用 | — | < $1 |
 | **合计** | | | **< $1.5** |
 
 ## 9. 风险与解读边界
 
 1. **CJK 准确率**：guidebook 明示非英语负载需自有数据验证——UC-5 专答。
-2. **参照标签非真值**：haiku 重判自身有误差；金标仅人工子集，结论以
-   金标为准、参照为辅。
+2. **参照标签非真值**：参照模型重判自身有误差，且执行中参照由 glm/deepseek
+   承担而非生产 haiku-4-5（OpenRouter 成本/可用性）；结论以金标为准、参照为辅。
 3. **alpha 端点**：OpenRouter decisions 为 alpha，行为可能与原生 API 有
    差异；响应 model 字段逐请求记录以便版本审计。
 4. **快照时效**：数据冻结于 2026-09-12；retrieval 重放的候选组装是
@@ -223,3 +247,7 @@ docs/jev-memory-report.md      # 交付物 2：实验报告（仅聚合指标，
    已知偏差，结论表述为「候选质量层」而非「端到端」。
 5. **结构恒等式不成立**（jev-demo 实测复现）：不假设 P(¬q)=1−P(q)，
    阈值不跨原语搬运（guidebook §6.4）。
+6. **执行偏差记录**（相对本方案）：(a) 参照模型 haiku→glm-5.3-flash /
+   deepseek-v4.1-flash，见 §6；(b) 金标由分析者（LLM）逐条阅读原文标注
+   192 条，未经人类复核；(c) UC-3 标注窗 12 个（计划 ≤20）；(d) 群 ID 在
+   本文档中以 g0–g7 假名化。
