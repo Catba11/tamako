@@ -105,9 +105,15 @@ async fn main() -> Result<()> {
         "refusing to run against the production data root without --allow-production"
     );
 
+    // A group directory is one holding a store.db (the canonical group
+    // marker, main.rs). The production data root also holds non-group
+    // dirs (Frameworks/, bugscope/) that must NOT be probed:
+    // LbugBackend's database() CREATES a memory.lbug where none exists,
+    // so probing a non-group dir writes a junk database into the data
+    // root.
     let mut chat_ids: Vec<String> = std::fs::read_dir(&data_root)?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| entry.path().join("store.db").is_file())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     chat_ids.sort();
