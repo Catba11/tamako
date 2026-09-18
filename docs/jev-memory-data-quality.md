@@ -83,10 +83,15 @@ spec §6.3/§8.2 明示 provenance-only，recall 白名单已排除（spec:276�
 | 加固 1 | `ALIAS_TARGETS → RETURN DISTINCT`：重复行再现也不再打破单目标匹配 | tamako-memory |
 | 加固 2 | `TWO_HOP_EDGES` 时间窗豁免 `also_known_as`：哨兵 valid_at + created_at 只写一次，否则超窗（90 天）的跨语言桥会静默掉出深召回（decision 74/76） | tamako-memory |
 
-**D2 的 spec 定性**：spec:210-213 谓词注册表默认 multi-value，`known_as`/`also_known_as`
-不在 `single_value_predicates`（decision 75）——故"结构绑定单值化"是对 spec 默认类的偏离，
-合入主线时须补：current-state.md 决策条目 + specs.md §13 注册表说明；7,649 行去重 +
-8,412 行哨兵对齐按**存量数据迁移**对待（本报告 §4 即迁移记录与验证）。
+**D2 的 spec 定性（须经独立 spec 修正，非复用单值注册表）**：spec:210-213 谓词注册表默认
+multi-value，`known_as`/`also_known_as` 不在 `single_value_predicates`（decision 75）。注意
+**不可**走"把别名谓词登记进 `single_value_predicates`"这条路：spec:212 的单值语义是"每个
+(subject, predicate) 只许一条有效边"，§7.5:215-218 的失效动作会给同 subject 同 predicate 的
+其它有效边置 `invalid_at`——套到别名边上即"每实体只准一个别名"，直接毁掉多表层形式（正是
+§6.3 跨语言桥要保的结构）。D2 因此需要一条**独立的 spec 修正**：新增"**结构绑定**"谓词类——
+valid_at 取批次无关哨兵、不参与多值累加、不适用 §7.5 单值失效语义。合入主线时的文档义务：
+current-state.md 决策条目 + specs.md 新增结构绑定类条文（而非 §13 注册表登记）；7,649 行
+去重 + 8,412 行哨兵对齐按**存量数据迁移**对待（本报告 §4 即迁移记录与验证）。
 
 **回归测试（7 个，全部具名通过）**：
 - `resolve::tests::a_mention_binding_renders_the_canonical_alias_text`（D3/L1）
@@ -128,8 +133,8 @@ toolbox run -c tamako-spike cargo build -p tamako-jev-lab --bin alias_backfill
 陈述，任何回填都无法也无须消除。判据就地修订为"**事实性过期文本 = 0**"（已达成），
 剩余真实同义 8,269 行属设计内。此修订经由本报告向运营者明示，非静默替换。
 
-**采纳的复核意见**：D1 改定性为 spec 冲突（spec:119）；D2 补 spec 注册表路径与迁移定性
-（:210-213）；D2 初版只堵 step-2 路径的缺陷改为哨兵 valid_at；哨兵对深召回时间窗的副作用
+**采纳的复核意见**：D1 改定性为 spec 冲突（spec:119）；D2 的 spec 路径从"注册表登记"
+更正为独立 spec 修正（新增结构绑定谓词类，:212/:215-218 单值语义会毁多表层形式）与迁移定性；D2 初版只堵 step-2 路径的缺陷改为哨兵 valid_at；哨兵对深召回时间窗的副作用
 以谓词豁免修复；step-1 规范名改读存名；store.db 旁表纳入同步；工具护栏与 §7 的矛盾以
 `--allow-production` 解决；§3 表格补单位；DoD 四件套（fmt/clippy/build/test --workspace）
 纳入交付门禁。
