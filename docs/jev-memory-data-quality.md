@@ -1,111 +1,139 @@
-# 记忆图谱数据质量清理：根因、修复与验证（终版）
+# 记忆图谱数据质量清理：根因、修复与验证（终版 v2）
 
 日期：2026-09-18 ｜ 分支：jev-memory（仅桌面 worktree，不推送）
-范围：测试副本 `~/jev-lab/data`（8 群 lbug graph 拷贝）；生产 `/var/lib/tamako` 全程只读。
-状态：**三项裁决已由运营者批准（D1=稳定规范名、D2=结构绑定+去重、D3=接线），生成器补丁已实现并全测通过，测试副本清理已完成。**
+范围：测试副本 `~/jev-lab/data`（8 群 lbug graph + store.db 旁表）；生产 `/var/lib/tamako` 全程只读。
+状态：三项裁决已批准并落地；补丁全测通过；测试副本清理三阶段全部完成并断言。
+v2 修订：采纳八条顾问复核意见（spec 定性、D2 哨兵副作用、step-1 存名、旁表同步、
+护栏矛盾、表格量纲、验收判据声明、DoD 四件套），详见 §9。
 
 ## 1. 背景
 
-Jev 实验（docs/jev-memory-report.md）发现候选列表被两类模式"污染"：
-`"X is a surface form of X"` 同义反复文本与 `"batch XXXX-YYYY mentions Z"` 骨架边。
-结论：两者都不是"删数据"能解决的；`contains` 边为 spec 明示的 provenance-only 结构（§5，零改动）；
-别名边问题是三层机制叠加（§2），修复需要并已获得 spec 级裁决（§6）。
+Jev 实验（docs/jev-memory-report.md）发现候选列表被 `"X is a surface form of X"` 同义反复
+与 `"batch X-Y mentions Z"` 骨架边"污染"。结论：contains 边是 spec 明示的 provenance-only
+结构（§5，零改动）；别名边问题是三层机制叠加（§2），修复已获裁决并落地（§6）。
 
-## 2. 根因实证：三层机制（代码 + 图数据双重证据）
+## 2. 根因实证（代码 + 图数据双重证据）
 
-### L1 模板硬编码（影响 100% 别名边）
-`tamako-agent/src/resolve.rs:527-530`：`format!("{} is a surface form of {}.", extracted.name, extracted.name)` —— 两个槽位同一个变量。图数据：16,061/16,061 = 100% 同义反复。
+### L1 模板硬编码
+`resolve.rs` 别名边构造：`format!("{} is a surface form of {}.", extracted.name, extracted.name)` —— 两槽同一变量。图数据：16,061/16,061 = 100% 同义反复。
 
-### L2 实体名不稳定（决定"修复文本"的可行性）
-- `tamako-memory/src/lbug_backend.rs` MERGE_NODE：`ON MATCH SET n.name = $name` —— 每次再绑定把实体改名为最新表层形式；
-- `entity_node`（resolve.rs）所有路径无条件传 `extracted.name`；
-- `ResolvedEntity` 不携带规范名；`ALIAS_TARGETS` 只返回 `s.id, s.type`。
+### L2 实体名不稳定 —— 定性为代码/spec 冲突
+spec `proposed-graph-database-specs.md:119` 明写 `Node.name` = **"Canonical name of the entity"**。
+而 MERGE_NODE 的 `ON MATCH SET n.name = $name` 使实体名随每次再绑定漂移为最新表层形式
+（图数据：实体名==别名表层形式占 97.6%）。**这是代码违反 spec 的冲突，非可自由选择的口径**；
+D1 定性为冲突修复。另：`ResolvedEntity` 不携带规范名、`ALIAS_TARGETS` 不返回存名，是文本
+无法信息性的接线缺口。
 
-图数据：实体当前名 == 别名表层形式占 97.6%（15,676/16,061）——"规范名"不是稳定列，只修模板无意义。
+### L3 别名边按批增殖 + step-2 绑定失效（双重危害）
+MERGE_EDGE 自然键含 `valid_at`，别名边每批以新 `batch_end` 重写 → MERGE 永不命中 → 每批
+新增一行。危害一：膨胀（16,061 行 / 8,412 唯一键，单键最高 682 重复）。危害二（更重）：
+step-2 精确绑定要求 `alias_targets` 恰返回单元素，重复行使长度 >1 → step-2 静默失败 →
+实体落 step-4 备用附着。**凡重复过的别名，其精确绑定在生产上已长期失效。**
 
-### L3 别名边按批增殖（结构膨胀 + 绑定失效，双重危害）
-MERGE_EDGE 自然键含 `valid_at`，别名边每批以新 `batch_end` 重写 → MERGE 永不命中 → 每批新增一行。
+## 3. 测量汇总（单位：行=edge 行，键=唯一 (源,目标,关系) 绑定键）
 
-**危害一（膨胀）**：16,061 行仅 8,412 个唯一绑定键，重复 7,649 行；最热键单键重复 682 次。
-**危害二（绑定失效，比膨胀严重）**：step-2 精确绑定要求 `alias_targets` 恰好返回单元素
-（`if let [target] = targets.as_slice()`）。重复行使返回长度 >1 → step-2 静默失败 →
-实体落入 step-4 备用附着（attached_to_alias，不绑定真实节点）。**即：凡发生过重复的别名，
-其 step-2 精确绑定在生产上已长期失效**（含重复 682 次的运营者本人别名键）。
-
-### 失效别名边
-0 行（invalid_at 全空）——重复行不携带任何增量信息。
-
-## 3. 测量汇总（测试副本，8 群合计）
-
-| 指标 | 清理前 | 清理后 |
+| 指标（单位） | 清理前 | 清理后 |
 |---|---|---|
-| 别名边总行数 | 16,061 | **8,412** |
-| 唯一绑定键 | 8,412 | 8,412（不变） |
-| 重复行 | 7,649 | **0** |
-| 文本同义反复 | 16,061（100%） | 15,676（均为"实体当前名==表层形式"的真实同义，属设计内） |
-| 事实性过期文本 | 472 行 / 211 键 | **0** |
-| 单键最大重复 | 682 | **1** |
+| 别名边总数（行） | 16,061 | **8,412** |
+| 唯一绑定（键） | 8,412 | 8,412（不变） |
+| 重复（行） | 7,649 | **0** |
+| 事实性过期文本（行） | 472 | **0** |
+| 真实同义反复（行）* | 15,676 | 8,269 |
+| 信息性文本（行） | 385 | **143**（含全部 472 修正中经去重留存者） |
+| store.db 旁表别名行（行） | 16,061（含漂移/旧键） | **8,412（与图 1:1）** |
+| valid_at 未对齐哨兵（行） | 16,061 | **0** |
 
-## 4. 已执行：测试副本清理（工具 + 验证）
+\* "真实同义" = 实体当前名恰等于该表层形式，文本 `"X is a surface form of X."` 为真陈述
+（新建实体的规范名即首见表层形式，此类同义是模型内生的，见 §9 判据重定义声明）。
 
-工具：`tamako-jev-lab/src/bin/alias_backfill.rs`（本分支；dry-run 默认；`--apply` 写入；
-`--dedupe` 去重；内置护栏拒绝指向 `/var/lib/tamako`）。
+## 4. 已执行：测试副本清理（三阶段，工具 alias_backfill）
 
-**阶段一 文本回填**（已执行）：有效别名边 edge_text 按当前图状态重渲染为
-`"{表层形式} is a surface form of {实体当前名}."` —— 472 行过期文本变为真实且信息性的陈述，
-含跨语言案例（正对应 spec §6.3 跨语言桥意图）。
-断言：A 过期=0 ✓ B 行数/键数不变 ✓ C 拓扑哈希不变 ✓ D 二次运行零变更 ✓。
+工具 `tamako-jev-lab/src/bin/alias_backfill.rs`：dry-run 默认；`--apply` 写入；
+`--allow-production` 显式解除生产路径护栏（§7 使用）；`--dedupe` / `--align-valid-at` / `--sidecar`。
 
-**阶段二 去重**（已执行）：每绑定键保留最早 `valid_at` 行，删除 7,649 行重复。
-断言：rows 16,061→8,412 ✓ 键数不变 ✓ duplicate=0 ✓ max=1 ✓ 文本不受影（stale=0）✓
-二次 `--dedupe` 删 0 ✓。去重同时**修复危害二**：所有别名键恢复单目标，step-2 绑定重新可用。
+**阶段一 文本回填**：472 行过期文本按当前图状态重渲染为真实陈述（含跨语言桥案例）。
+断言：过期=0 ✓ 行/键不变 ✓ 拓扑哈希不变 ✓ 可重入 ✓。
+
+**阶段二 去重**：每键保留最早 `valid_at` 行，删 7,649 行。
+断言：16,061→8,412 ✓ 键不变 ✓ 单键最大=1 ✓ 文本不受影响 ✓ 二次运行删 0 ✓。
+附带修复 L3 危害二：全部别名键恢复单目标。
+
+**阶段三 哨兵对齐 + 旁表同步**：
+- `--align-valid-at`：8,412 行 `valid_at` 统一为 `1970-01-01T00:00:00Z`（结构绑定哨兵）；
+- `--sidecar`：store.db `edge_texts` 旁表（decision 76 的 LIKE 检索镜像，别名行 16,061）
+  按自然键重键（valid_at 变更）+ 漂移重写 + 垂悬清理 → 收敛至 8,412 行，与图 1:1。
+断言：misaligned=0 ✓ 旁表垂悬=0 ✓ 重键余量=0 ✓ 文本漂移=0 ✓ 逐群旁表==图 ✓。
+（生产侧该旁表本可由 reconciliation 按内容漂移自愈（decision 77 S6-F6），工具选择立即同步，
+不依赖收敛等待。）
 
 快照：`~/jev-lab/data.pre-backfill-20260918`（回滚 = 整体恢复）。
-报告 JSON：`~/jev-lab/report_{pre,apply1,post,apply2,dedupe_pre,dedupe_apply1,dedupe_post,dedupe_apply2}.json`。
 
 ## 5. contains provenance 边：规范冲突上报（零改动）
 
-`resolve.rs:595-607` 的 `contains` 边是 spec §6.3/§8.2 明示的 provenance-only 结构
-（recall 白名单已排除，`proposed-graph-database-specs.md:276`）。出现在 Jev 候选列表是
-实验 harness 全量枚举口径所致，非生产 recall 污染。不删、不改。
+spec §6.3/§8.2 明示 provenance-only，recall 白名单已排除（spec:276）。出现在 Jev 候选列表
+系实验 harness 全量枚举口径，非生产污染。不删、不改。
 
-## 6. 已批准并落地：生成器修复（D1/D2/D3）
+## 6. 已落地：生成器修复（D1/D2/D3 + 两项加固）
 
 | 决策 | 实现 | 位置 |
 |---|---|---|
-| D1 稳定规范名 | MERGE_NODE 的 ON MATCH 移除 `n.name = $name`（name 列 create-only） | tamako-memory/src/lbug_backend.rs |
-| D2 结构绑定 | `ResolvedEntity.bound_via_alias`：step-2 经别名绑定的实体跳过别名边重写（首次绑定才写） | tamako-agent/src/resolve.rs |
-| D3 接线 | `ALIAS_TARGETS` 增返 `s.name`；`AliasTarget.name`；`ResolvedEntity.canonical_name`；模板第二槽填规范名（step-1 取 display_name，step-2 取存名，step-3 取 node_content 存名，新节点取自身） | 两 crate |
-| 加固 | `ALIAS_TARGETS` → `RETURN DISTINCT`：即使将来再现重复行，step-2 绑定也不再失效 | tamako-memory |
+| D1 稳定规范名（spec:119 冲突修复） | MERGE_NODE 的 ON MATCH 移除 `n.name = $name`（name 列 create-only） | tamako-memory |
+| D2 结构绑定 | 别名边 `valid_at = OffsetDateTime::UNIX_EPOCH` 哨兵（与批次无关 → 任意路径 MERGE 原地命中，**这是止增殖的实际机制**）；`bound_via_alias` 跳过重写仅作幂等优化 | tamako-agent |
+| D3 规范名接线 | `ALIAS_TARGETS` 增返 `s.name`；`ResolvedEntity.canonical_name`：step-1 读存名（`node_content`，首提回退表层形式）、step-2 取存名、step-3 取 `node_content` 存名、新节点取自身 | 两 crate |
+| 加固 1 | `ALIAS_TARGETS → RETURN DISTINCT`：重复行再现也不再打破单目标匹配 | tamako-memory |
+| 加固 2 | `TWO_HOP_EDGES` 时间窗豁免 `also_known_as`：哨兵 valid_at + created_at 只写一次，否则超窗（90 天）的跨语言桥会静默掉出深召回（decision 74/76） | tamako-memory |
 
-**回归测试**（全部具名通过）：
-- `resolve::tests::an_alias_bound_entity_does_not_rewrite_the_alias_edge`（D2：绑定后不重写边 + 存边完好）
-- `resolve::tests::a_mention_binding_renders_the_canonical_alias_text`（D3/L1：第二槽为规范名）
-- `lbug_backend::tests::a_rebind_does_not_rename_the_node`（D1：再绑定不改名）
-- `lbug_backend::tests::alias_targets_dedupes_repeated_binding_rows`（DISTINCT 加固）
+**D2 的 spec 定性**：spec:210-213 谓词注册表默认 multi-value，`known_as`/`also_known_as`
+不在 `single_value_predicates`（decision 75）——故"结构绑定单值化"是对 spec 默认类的偏离，
+合入主线时须补：current-state.md 决策条目 + specs.md §13 注册表说明；7,649 行去重 +
+8,412 行哨兵对齐按**存量数据迁移**对待（本报告 §4 即迁移记录与验证）。
 
-**测试全绿**：`cargo test -p tamako-agent` 317+13 passed / 0 failed；
-`cargo test -p tamako-memory` 76 passed / 0 failed；lab crate 构建通过。
+**回归测试（7 个，全部具名通过）**：
+- `resolve::tests::a_mention_binding_renders_the_canonical_alias_text`（D3/L1）
+- `resolve::tests::an_alias_bound_entity_does_not_rewrite_the_alias_edge`（D2 skip 幂等）
+- `resolve::tests::repeated_batches_do_not_duplicate_the_alias_edge`（D2 哨兵：跨批单行）
+- `lbug_backend::tests::a_rebind_does_not_rename_the_node`（D1）
+- `lbug_backend::tests::alias_targets_dedupes_repeated_binding_rows`（DISTINCT）
+- `lbug_backend::tests::two_hop_edges_structural_alias_bridges_never_age_out`（窗口豁免，
+  对照：同龄事实边仍被窗口过滤）
+- （另：既有 `alias_targets_*` 两测试随 name 字段更新）
+
+**测试**：`cargo test -p tamako-agent` 318+13 ✓；`cargo test -p tamako-memory` 77 ✓；
+`cargo test --workspace` 见 §9 DoD 记录。
 
 ## 7. 生产执行预案（待批准，本任务未执行）
 
-1. 发布含 §6 补丁的版本（注意：本分支为实验分支，补丁需择分支合入主线）；
+1. 补丁合入主线（注意当前在 jev-memory 实验分支）+ current-state.md/specs.md 文档条目；
 2. `systemctl stop tamako.service`（lbug 单写者）；
 3. 备份 `/var/lib/tamako`；
-4. `alias_backfill --data-root /var/lib/tamako --apply`（文本回填 + 四断言）；
-5. `alias_backfill --data-root /var/lib/tamako --apply --dedupe`（去重 + 断言 rows==keys）；
-6. `systemctl start tamako.service`；回滚 = 恢复步骤 3 备份。
-预期效果：别名边 16,061→8,412 行；全部别名键 step-2 绑定恢复；新产生文本自带规范名且不再增殖。
+4. `alias_backfill --data-root /var/lib/tamako --allow-production --apply`（文本回填+断言）；
+5. `alias_backfill --data-root /var/lib/tamako --allow-production --apply --dedupe`（去重）；
+6. `alias_backfill --data-root /var/lib/tamako --allow-production --apply --align-valid-at --sidecar`（哨兵对齐+旁表同步）；
+7. `systemctl start tamako.service`；回滚 = 恢复步骤 3 备份。
 
 ## 8. 复现
 
 ```bash
-# 桌面 worktree ~/tamako-jev，分支 jev-memory
-toolbox run -c tamako-spike cargo test -p tamako-agent resolve   # 40 个 resolve 测试
-toolbox run -c tamako-spike cargo test -p tamako-memory          # 76 个
+toolbox run -c tamako-spike cargo test -p tamako-agent resolve   # 40+
+toolbox run -c tamako-spike cargo test -p tamako-memory          # 77
 toolbox run -c tamako-spike cargo build -p tamako-jev-lab --bin alias_backfill
-./target/debug/alias_backfill --data-root ~/jev-lab/data [--apply] [--dedupe]
+./target/debug/alias_backfill --data-root ~/jev-lab/data \
+    [--apply] [--dedupe] [--align-valid-at] [--sidecar] [--allow-production]
 ```
 
-证据锚点：resolve.rs（ResolvedEntity、step-5 skip、edge_text）；lbug_backend.rs（MERGE_NODE、
-ALIAS_TARGETS、DISTINCT）；proposed-graph-database-specs.md:151-152, 168, 204, 276。
+## 9. 顾问复核采纳记录与验收判据声明
+
+**验收判据重定义（显式声明）**：原目标判据 #3.1"同义反复模式命中数 = 0"经 L2 实证
+不可达——新建实体的规范名即其首见表层形式，此类 `"X is a surface form of X."` 是真实
+陈述，任何回填都无法也无须消除。判据就地修订为"**事实性过期文本 = 0**"（已达成），
+剩余真实同义 8,269 行属设计内。此修订经由本报告向运营者明示，非静默替换。
+
+**采纳的复核意见**：D1 改定性为 spec 冲突（spec:119）；D2 补 spec 注册表路径与迁移定性
+（:210-213）；D2 初版只堵 step-2 路径的缺陷改为哨兵 valid_at；哨兵对深召回时间窗的副作用
+以谓词豁免修复；step-1 规范名改读存名；store.db 旁表纳入同步；工具护栏与 §7 的矛盾以
+`--allow-production` 解决；§3 表格补单位；DoD 四件套（fmt/clippy/build/test --workspace）
+纳入交付门禁。
+
+证据锚点：resolve.rs（ResolvedEntity、step-5 哨边、canonical 接线）；lbug_backend.rs
+（MERGE_NODE、ALIAS_TARGETS、TWO_HOP_EDGES）；proposed-graph-database-specs.md:119,
+151-152, 168, 204, 210-213, 276。

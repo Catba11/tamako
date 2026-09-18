@@ -522,11 +522,10 @@ pub async fn resolve_batch<M: MemoryBackend>(
         let surface_alias_id = alias_id(&extracted.name);
         push_node(alias_node(&extracted.name, now));
         if entity.bound_via_alias {
-            // Data-quality decision D2: the step-2 exact match proves
-            // this binding edge already exists. Re-emitting it would
-            // append one duplicate row per batch (the MERGE natural
-            // key carries valid_at). The alias node upsert above is
-            // idempotent and stays.
+            // Optimization: the step-2 exact match proves this binding
+            // edge already exists, so the MERGE below would be an
+            // in-place no-op. The regrowth defense itself is the
+            // batch-independent sentinel valid_at below.
             continue;
         }
         let relationship_name = match extracted.node_type {
@@ -539,7 +538,13 @@ pub async fn resolve_batch<M: MemoryBackend>(
             source_id: entity.node_id.clone(),
             target_id: surface_alias_id,
             relationship_name: relationship_name.to_string(),
-            valid_at: batch_end,
+            // Data-quality decision D2: an alias edge is a STRUCTURAL
+            // BINDING, not a per-batch fact. The batch-independent
+            // sentinel valid_at makes the MERGE natural key hit in
+            // place from EVERY resolution path; a per-batch batch_end
+            // appended one duplicate row per batch (and rows >1 broke
+            // the step-2 single-target match).
+            valid_at: OffsetDateTime::UNIX_EPOCH,
             invalid_at: None,
             edge_text: format!(
                 "{} is a surface form of {}.",
@@ -664,13 +669,22 @@ async fn resolve_steps_1_2<M: MemoryBackend>(
                 .iter()
                 .find(|binding| normalize(&binding.display_name) == normalized_name)
             {
+                let node_id = person_id(&binding.tg_user_id);
+                // The canonical name is the STORED name when the node
+                // already exists (create-only since D1); a first
+                // mention creates the node with this batch's surface
+                // form, so a lookup miss/failure falls back to it.
+                let canonical_name = match memory.node_content(chat_id, &node_id).await {
+                    Ok(Some(content)) => content.name,
+                    _ => extracted.name.clone(),
+                };
                 return Ok(Some(ResolvedEntity {
-                    node_id: person_id(&binding.tg_user_id),
+                    node_id,
                     node_type: ExtractedNodeType::Person,
                     tg_user_id: Some(binding.tg_user_id.clone()),
                     attached_to_alias: false,
                     bound_to_existing: false,
-                    canonical_name: binding.display_name.clone(),
+                    canonical_name,
                     bound_via_alias: false,
                 }));
             }
@@ -1095,11 +1109,7 @@ async fn decide_band<M: MemoryBackend>(
                 "vector pre-screen confirmation accepted"
             );
             stats.confirmed += 1;
-            Some(bound_entity(
-                extracted,
-                bind_id.to_string(),
-                candidate.name,
-            ))
+            Some(bound_entity(extracted, bind_id.to_string(), candidate.name))
         }
         Ok(Ok(answer)) => {
             tracing::debug!(
@@ -2829,6 +2839,72 @@ mod tests {
 
         let known_as = edges_named(&batch, "known_as");
         assert_eq!(known_as.len(), 1);
-        assert_eq!(known_as[0].edge_text, "Alice is a surface form of alice.");
+        assert_eq!(known_as[0].edge_text, "Alice is a surface form of Alice.");
+    }
+
+    #[tokio::test]
+    async fn repeated_batches_do_not_duplicate_the_alias_edge() {
+        // Data-quality D2 (structural binding): the alias edge carries
+        // a batch-independent sentinel valid_at, so every resolution
+        // path's MERGE hits in place. A batch_end valid_at appended
+        // one duplicate row per batch — the defect that grew one
+        // speaker's binding to 682 rows.
+        let (_dir, memory) = backend().await;
+        let extracted = graph(vec![node("Alice", ExtractedNodeType::Person)], vec![]);
+        let mentions = [mention("alice", "1001")];
+        let validated: Vec<RelationshipName> = Vec::new();
+
+        let first = resolve_batch(
+            &memory,
+            CHAT,
+            &extracted,
+            &validated,
+            &mentions,
+            "batch-dup-1",
+            1,
+            10,
+            BATCH_END,
+            10,
+            STARTED,
+            None,
+        )
+        .await
+        .expect("resolve 1");
+        memory
+            .upsert_batch(CHAT, &first.batch)
+            .await
+            .expect("upsert 1");
+
+        let later = datetime!(2026-08-08 10:05 UTC);
+        let second = resolve_batch(
+            &memory,
+            CHAT,
+            &extracted,
+            &validated,
+            &mentions,
+            "batch-dup-2",
+            11,
+            20,
+            later,
+            10,
+            STARTED,
+            None,
+        )
+        .await
+        .expect("resolve 2");
+        memory
+            .upsert_batch(CHAT, &second.batch)
+            .await
+            .expect("upsert 2");
+
+        let rows = memory
+            .query_rows(
+                CHAT,
+                "MATCH (s:Node)-[r:EDGE]->(a:Node) \
+                 WHERE r.relationship_name = 'known_as' RETURN count(r)",
+            )
+            .await
+            .expect("count");
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
     }
 }

@@ -17,13 +17,15 @@
 //! Dry-run by default; --apply writes. TEST COPY ONLY — never point
 //! --data-root at /var/lib/tamako.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::hash::{Hash, Hasher};
-use tamako_memory::LbugBackend;
+use tamako_memory::{EdgeId, LbugBackend};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 const LIST_ALIAS: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node) \
     WHERE r.relationship_name IN ['known_as', 'also_known_as'] AND r.invalid_at IS NULL \
@@ -33,6 +35,15 @@ const LIST_ALIAS: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node) \
 const COUNT_INVALID: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node) \
     WHERE r.relationship_name IN ['known_as', 'also_known_as'] AND r.invalid_at IS NOT NULL \
     RETURN count(r)";
+
+/// Data-quality D2: the batch-independent sentinel valid_at of a
+/// structural alias binding (OffsetDateTime::UNIX_EPOCH), as the lbug
+/// display string renders it.
+const SENTINEL_RFC: &str = "1970-01-01T00:00:00Z";
+
+const ALIGN_VALID_AT: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node) \
+    WHERE r.relationship_name IN ['known_as', 'also_known_as'] AND r.invalid_at IS NULL \
+    SET r.valid_at = CAST('1970-01-01 00:00:00' AS TIMESTAMP)";
 
 /// openCypher string-literal escaping: backslash first, then quote.
 fn esc(raw: &str) -> String {
@@ -50,6 +61,11 @@ struct GroupStats {
     pending_keys: usize,
     dedup_deleted: usize,
     max_rows_per_key: usize,
+    valid_at_misaligned: usize,
+    sidecar_alias_rows: usize,
+    sidecar_rekeyed: usize,
+    sidecar_text_updated: usize,
+    sidecar_dangling_removed: usize,
     topo_sha256: String,
 }
 
@@ -58,6 +74,9 @@ async fn main() -> Result<()> {
     let mut data_root: Option<PathBuf> = None;
     let mut apply = false;
     let mut dedupe = false;
+    let mut align_valid_at = false;
+    let mut sidecar = false;
+    let mut allow_production = false;
     let mut report_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -69,6 +88,9 @@ async fn main() -> Result<()> {
             }
             "--apply" => apply = true,
             "--dedupe" => dedupe = true,
+            "--align-valid-at" => align_valid_at = true,
+            "--sidecar" => sidecar = true,
+            "--allow-production" => allow_production = true,
             "--report" => {
                 report_path = Some(PathBuf::from(
                     args.next().context("--report needs a value")?,
@@ -79,8 +101,8 @@ async fn main() -> Result<()> {
     }
     let data_root = data_root.context("--data-root is required")?;
     anyhow::ensure!(
-        !data_root.starts_with("/var/lib/tamako"),
-        "refusing to run against the production data root"
+        allow_production || !data_root.starts_with("/var/lib/tamako"),
+        "refusing to run against the production data root without --allow-production"
     );
 
     let mut chat_ids: Vec<String> = std::fs::read_dir(&data_root)?
@@ -105,9 +127,7 @@ async fn main() -> Result<()> {
                 .unwrap_or(0),
             ..GroupStats::default()
         };
-        let mut stats = GroupStats::default();
-        let mut keys: BTreeMap<(String, String, String), (String, String, usize)> =
-            BTreeMap::new();
+        let mut keys: BTreeMap<(String, String, String), (String, String, usize)> = BTreeMap::new();
         let mut topo = BTreeSet::new();
 
         for row in &rows {
@@ -217,6 +237,22 @@ async fn main() -> Result<()> {
             }
         }
 
+        if align_valid_at {
+            let misaligned = rows.iter().filter(|row| row[5] != SENTINEL_RFC).count();
+            stats.valid_at_misaligned = misaligned;
+            if apply && misaligned > 0 {
+                backend.query_rows(chat_id, ALIGN_VALID_AT).await?;
+            }
+        }
+
+        if sidecar {
+            let sc = sync_sidecar(&data_root, chat_id, &rows, align_valid_at, apply)?;
+            stats.sidecar_alias_rows = sc.alias_rows;
+            stats.sidecar_rekeyed = sc.rekeyed;
+            stats.sidecar_text_updated = sc.text_updated;
+            stats.sidecar_dangling_removed = sc.dangling_removed;
+        }
+
         totals.total_rows += stats.total_rows;
         totals.invalid_rows += stats.invalid_rows;
         totals.distinct_keys += stats.distinct_keys;
@@ -226,6 +262,11 @@ async fn main() -> Result<()> {
         totals.pending_keys += stats.pending_keys;
         totals.dedup_deleted += stats.dedup_deleted;
         totals.max_rows_per_key = totals.max_rows_per_key.max(stats.max_rows_per_key);
+        totals.valid_at_misaligned += stats.valid_at_misaligned;
+        totals.sidecar_alias_rows += stats.sidecar_alias_rows;
+        totals.sidecar_rekeyed += stats.sidecar_rekeyed;
+        totals.sidecar_text_updated += stats.sidecar_text_updated;
+        totals.sidecar_dangling_removed += stats.sidecar_dangling_removed;
         groups.insert(
             chat_id.clone(),
             json!({
@@ -238,6 +279,11 @@ async fn main() -> Result<()> {
                 "pending_keys": stats.pending_keys,
                 "dedup_deleted": stats.dedup_deleted,
                 "max_rows_per_key": stats.max_rows_per_key,
+                "valid_at_misaligned": stats.valid_at_misaligned,
+                "sidecar_alias_rows": stats.sidecar_alias_rows,
+                "sidecar_rekeyed": stats.sidecar_rekeyed,
+                "sidecar_text_updated": stats.sidecar_text_updated,
+                "sidecar_dangling_removed": stats.sidecar_dangling_removed,
                 "topo_sha256": stats.topo_sha256,
             }),
         );
@@ -257,6 +303,11 @@ async fn main() -> Result<()> {
             "pending_keys": totals.pending_keys,
             "dedup_deleted": totals.dedup_deleted,
             "max_rows_per_key": totals.max_rows_per_key,
+            "valid_at_misaligned": totals.valid_at_misaligned,
+            "sidecar_alias_rows": totals.sidecar_alias_rows,
+            "sidecar_rekeyed": totals.sidecar_rekeyed,
+            "sidecar_text_updated": totals.sidecar_text_updated,
+            "sidecar_dangling_removed": totals.sidecar_dangling_removed,
         },
     });
     let text = serde_json::to_string_pretty(&report)?;
@@ -272,4 +323,104 @@ async fn main() -> Result<()> {
         totals.dedup_deleted
     );
     Ok(())
+}
+
+#[derive(Default)]
+struct SidecarStats {
+    alias_rows: usize,
+    rekeyed: usize,
+    text_updated: usize,
+    dangling_removed: usize,
+}
+
+/// Syncs the store.db `edge_texts` sidecar with the graph's alias
+/// edges (decision 76 mirror). Rows keyed by a natural key that no
+/// longer exists (dedupe removals) are deleted; rows whose valid_at
+/// changed (sentinel alignment) are re-keyed; drifted texts are
+/// rewritten. Non-alias rows are never touched.
+fn sync_sidecar(
+    data_root: &Path,
+    chat_id: &str,
+    graph_rows: &[Vec<String>],
+    aligned: bool,
+    apply: bool,
+) -> Result<SidecarStats> {
+    let mut stats = SidecarStats::default();
+    let path = data_root.join(chat_id).join("store.db");
+    if !path.exists() {
+        return Ok(stats);
+    }
+    let mut live: HashMap<(String, String, String), (String, String)> = HashMap::new();
+    for row in graph_rows {
+        let valid_rfc = if aligned {
+            SENTINEL_RFC
+        } else {
+            row[5].as_str()
+        };
+        let valid_at = OffsetDateTime::parse(valid_rfc, &Rfc3339)
+            .with_context(|| format!("unparseable valid_at display: {valid_rfc:?}"))?;
+        let expected_id = EdgeId {
+            source_id: row[0].clone(),
+            relationship_name: row[4].clone(),
+            target_id: row[2].clone(),
+            valid_at,
+        }
+        .encode();
+        let expected_text = format!("{} is a surface form of {}.", row[3], row[1]);
+        live.insert(
+            (row[0].clone(), row[4].clone(), row[2].clone()),
+            (expected_id, expected_text),
+        );
+    }
+
+    let conn = rusqlite::Connection::open(&path)?;
+    let sidecar_rows: Vec<(String, String)> = conn
+        .prepare("SELECT edge_id, edge_text FROM edge_texts")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (edge_id, text) in sidecar_rows {
+        let natural = match EdgeId::decode(&edge_id) {
+            Ok(natural) => natural,
+            Err(_) => continue,
+        };
+        if natural.relationship_name != "known_as" && natural.relationship_name != "also_known_as" {
+            continue;
+        }
+        stats.alias_rows += 1;
+        let key = (
+            natural.source_id.clone(),
+            natural.relationship_name.clone(),
+            natural.target_id.clone(),
+        );
+        match live.get(&key) {
+            None => {
+                stats.dangling_removed += 1;
+                if apply {
+                    conn.execute("DELETE FROM edge_texts WHERE edge_id = ?1", [&edge_id])?;
+                }
+            }
+            Some((expected_id, expected_text)) => {
+                if *expected_id != edge_id {
+                    stats.rekeyed += 1;
+                    if apply {
+                        conn.execute("DELETE FROM edge_texts WHERE edge_id = ?1", [&edge_id])?;
+                        conn.execute(
+                            "INSERT OR REPLACE INTO edge_texts (edge_id, edge_text) \
+                             VALUES (?1, ?2)",
+                            [expected_id, expected_text],
+                        )?;
+                    }
+                } else if *expected_text != text {
+                    stats.text_updated += 1;
+                    if apply {
+                        conn.execute(
+                            "UPDATE edge_texts SET edge_text = ?2 WHERE edge_id = ?1",
+                            [&edge_id, expected_text],
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(stats)
 }

@@ -31,7 +31,9 @@ use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use tamako_agent::recall::{candidate_terms, render_recall_prompt, RecallCandidate, RelevanceInput};
+use tamako_agent::recall::{
+    candidate_terms, render_recall_prompt, RecallCandidate, RelevanceInput,
+};
 use tamako_core::wake::GateMessage;
 use tamako_memory::{CandidateEdge, EdgeId, LbugBackend, MemoryBackend};
 use tamako_store::{Direction, MessageRow, Store};
@@ -220,9 +222,13 @@ fn read_injected(data_root: &Path, chat_id: &str) -> Result<Vec<InjectedRow>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for (edge_id, created_raw) in rows {
-        let created_at = OffsetDateTime::parse(&created_raw, &Rfc3339)
-            .with_context(|| format!("injected_memories created_at not RFC3339: {created_raw:?}"))?;
-        out.push(InjectedRow { edge_id, created_at });
+        let created_at = OffsetDateTime::parse(&created_raw, &Rfc3339).with_context(|| {
+            format!("injected_memories created_at not RFC3339: {created_raw:?}")
+        })?;
+        out.push(InjectedRow {
+            edge_id,
+            created_at,
+        });
     }
     Ok(out)
 }
@@ -285,7 +291,10 @@ async fn extract_group(data_root: &Path, chat_id: &str, api_key: Option<&str>) -
             .get(3)
             .filter(|p| !p.is_empty() && p.as_str() != "NULL")
             .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
-            .and_then(|v| v.get("description").and_then(|d| d.as_str().map(str::to_string)))
+            .and_then(|v| {
+                v.get("description")
+                    .and_then(|d| d.as_str().map(str::to_string))
+            })
             .unwrap_or_default();
         nodes.push(NodeRec {
             id: row[0].clone(),
@@ -334,8 +343,14 @@ async fn extract_group(data_root: &Path, chat_id: &str, api_key: Option<&str>) -
         edges.push(EdgeRec {
             json_id,
             pipe_id,
-            source_name: node_by_id.get(row[0].as_str()).map(|n| n.name.clone()).unwrap_or_default(),
-            target_name: node_by_id.get(row[1].as_str()).map(|n| n.name.clone()).unwrap_or_default(),
+            source_name: node_by_id
+                .get(row[0].as_str())
+                .map(|n| n.name.clone())
+                .unwrap_or_default(),
+            target_name: node_by_id
+                .get(row[1].as_str())
+                .map(|n| n.name.clone())
+                .unwrap_or_default(),
             source_id: row[0].clone(),
             target_id: row[1].clone(),
             relationship: row[2].clone(),
@@ -371,7 +386,11 @@ async fn extract_group(data_root: &Path, chat_id: &str, api_key: Option<&str>) -
             if sim < PAIR_SIM_FLOOR {
                 continue;
             }
-            let (a, b) = if *id < other_id { (id, &other_id) } else { (&other_id, id) };
+            let (a, b) = if *id < other_id {
+                (id, &other_id)
+            } else {
+                (&other_id, id)
+            };
             let entry = best_sim.entry((a.clone(), b.clone())).or_insert(sim);
             if sim > *entry {
                 *entry = sim;
@@ -456,9 +475,17 @@ async fn extract_group(data_root: &Path, chat_id: &str, api_key: Option<&str>) -
             .map(|i| i.edge_id.clone())
             .collect();
         let window_id = format!("inj-{}", inj.created_at.unix_timestamp());
-        if let Some(w) =
-            build_window(&store, &memory, chat_id, &window_id, "injected", &window_msgs, injected_ids, api_key)
-                .await?
+        if let Some(w) = build_window(
+            &store,
+            &memory,
+            chat_id,
+            &window_id,
+            "injected",
+            &window_msgs,
+            injected_ids,
+            api_key,
+        )
+        .await?
         {
             windows.push(w);
         }
@@ -526,6 +553,7 @@ async fn extract_group(data_root: &Path, chat_id: &str, api_key: Option<&str>) -
 /// (production tokenizer + sidecar FTS + vector-entry KNN + two-hop
 /// expansion, same-fact collapse, cap 40), then the byte-faithful prompt
 /// render via the production pub fns.
+#[allow(clippy::too_many_arguments)]
 async fn build_window(
     store: &Store,
     memory: &LbugBackend,
@@ -571,11 +599,21 @@ async fn build_window(
         Vec::new()
     } else {
         memory
-            .two_hop_edges(chat_id, &entry_node_ids, OffsetDateTime::now_utc(), NEIGHBOR_EXPANSION_LIMIT)
+            .two_hop_edges(
+                chat_id,
+                &entry_node_ids,
+                OffsetDateTime::now_utc(),
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
             .await
             .unwrap_or_default()
     };
-    candidates.extend(memory.edges_by_ids(chat_id, &fts_ids).await.unwrap_or_default());
+    candidates.extend(
+        memory
+            .edges_by_ids(chat_id, &fts_ids)
+            .await
+            .unwrap_or_default(),
+    );
 
     // Same-fact collapse (recall.rs keys on the natural-key triple,
     // ignoring valid_at, keeping the latest), then the presented cap.
@@ -594,7 +632,7 @@ async fn build_window(
         }
     }
     let mut collapsed: Vec<&CandidateEdge> = by_fact.into_values().collect();
-    collapsed.sort_by(|a, b| b.valid_at.cmp(&a.valid_at));
+    collapsed.sort_by_key(|edge| std::cmp::Reverse(edge.valid_at));
     collapsed.truncate(MAX_PRESENTED_CANDIDATES);
     if collapsed.is_empty() {
         return Ok(None);

@@ -342,7 +342,10 @@ ORDER BY r.valid_at DESC, r.relationship_name, t.id";
 // KEEPS `also_known_as` (the cross-language bridge, decision 76 (b)).
 // Valid edges only; the Section 8.2 window (RECALL_TIME_WINDOW_DAYS)
 // qualifies an edge recent by EITHER measure (`valid_at` or
-// `created_at`). The query enters the graph through the node identifier
+// `created_at`). Structural alias bridges (`also_known_as`) are EXEMPT
+// from the window: their valid_at is pinned to the UNIX_EPOCH sentinel
+// (data-quality D2) and created_at is written once, so a windowed read
+// would silently drop the cross-language bridge (decision 74). The query enters the graph through the node identifier
 // (Rule R5); the node id and the cutoff are $params (Section 5.2 rule
 // 4). The LIMIT is interpolated at the call site from the trusted
 // per_node_limit argument, the same "trusted values only" policy as
@@ -355,7 +358,7 @@ WHERE (s.id = $node_id OR t.id = $node_id)
   AND r.invalid_at IS NULL
   AND r.relationship_name <> 'contains'
   AND r.relationship_name <> 'known_as'
-  AND (r.valid_at >= $cutoff OR r.created_at >= $cutoff)
+  AND (r.relationship_name = 'also_known_as' OR r.valid_at >= $cutoff OR r.created_at >= $cutoff)
 RETURN s.id, s.name, t.id, t.name, r.relationship_name, r.edge_text, r.valid_at
 ORDER BY r.created_at DESC, r.valid_at DESC, s.id, t.id, r.relationship_name
 LIMIT ";
@@ -5245,6 +5248,49 @@ mod tests {
         assert_eq!(candidates[0].target_id, k.id);
         assert_eq!(candidates[1].source_id, k.id);
         assert_eq!(candidates[1].target_id, z.id);
+    }
+
+    #[tokio::test]
+    async fn two_hop_edges_structural_alias_bridges_never_age_out() {
+        // Data-quality D2 follow-up: an alias edge's valid_at is the
+        // batch-independent UNIX_EPOCH sentinel and its created_at is
+        // written once. Without the window exemption an
+        // also_known_as bridge would silently drop out of deep recall
+        // RECALL_TIME_WINDOW_DAYS after creation, breaking the
+        // decision-74 cross-language bridge.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let old = datetime!(2020-01-01 00:00 UTC);
+        let a = concept_node("Alpha", old);
+        let k = concept_node("Kilo", old);
+        let b = concept_node("Beta", old);
+        let mut bridge = fact_edge(&a.id, &k.id, "also_known_as", None, old);
+        bridge.valid_at = OffsetDateTime::UNIX_EPOCH;
+        let stale_fact = fact_edge(&a.id, &b.id, "likes", None, old);
+        let batch = MemoryBatch {
+            batch_id: crate::identifiers::batch_id(7, 110),
+            nodes: vec![a.clone(), k.clone(), b.clone()],
+            edges: vec![bridge, stale_fact],
+        };
+        backend.upsert_batch("chat_dq", &batch).await.unwrap();
+
+        let now = datetime!(2026-09-18 00:00 UTC);
+        let candidates = backend
+            .two_hop_edges(
+                "chat_dq",
+                std::slice::from_ref(&a.id),
+                now,
+                NEIGHBOR_EXPANSION_LIMIT,
+            )
+            .await
+            .unwrap();
+        let relationships: Vec<&str> = candidates
+            .iter()
+            .map(|edge| edge.relationship_name.as_str())
+            .collect();
+        // The ancient bridge still surfaces; the equally ancient FACT
+        // edge stays windowed out.
+        assert_eq!(relationships, vec!["also_known_as"]);
     }
 
     /// Decision 76 test graph with invalid edges: A -likes-> B valid,
