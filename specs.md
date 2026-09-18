@@ -157,7 +157,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 ### 8.1 Message intake
 
 - Every inbound message: append to the raw log, append to the live context, increment the wake counter. No LLM call.
-- Member join/leave events (decision 123) are the exception: append to the raw log (event_type `join`/`leave`, composite platform id `{service_message_id}:{user_id}`), append to the live context — but never the wake counter, never the digest trigger counts, and never the staleness distance of Section 6.2 (passive, like reactions).
+- Member join/leave events (decision 123) are the exception: append to the raw log (event_type `join`/`leave`, composite platform id `{service_message_id}:{user_id}`), append to the live context — but never the wake counter, never the digest trigger counts, and never the staleness distance of Section 6.2 (passive, like reactions). The warmup silence gate (Section 8.4) and the topic-exclusion tail (Section 9.7 step 2) skip them too: an arrival or departure neither resets the group-silence clock nor narrows the topic window.
 - Duplicate deliveries: the raw log insert is idempotent. The wake counter counts each delivery. The counter is a scheduling hint; the log row is the source of truth. Rule P1 applies.
 - An edited message appends a new log row with the edit time as its timestamp. An edit whose text is identical to the latest stored row of that message appends nothing: it is not an event (Section 4.2 lists the platform causes). Extracted facts are not retracted. Refer to Section 15.
 - A mention of the bot or a reply to the bot triggers a forced `Wake`. The bot must respond when addressed directly. The `muted` state does not suppress a forced wake. Refer to Section 8.5.

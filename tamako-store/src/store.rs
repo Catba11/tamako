@@ -616,11 +616,16 @@ impl Store {
     /// 50-row raw-log tail with this method, and the Section 8.4
     /// silence gate reads it with `limit = 1` — the newest row of ANY
     /// direction resets the silence clock: the bot's own speech also
-    /// breaks group silence for warmup purposes.
+    /// breaks group silence for warmup purposes. Member join/leave rows
+    /// are excluded (decision 123): an arrival or departure neither
+    /// resets the silence clock nor narrows the topic window — both
+    /// readers track conversational activity only.
     pub fn list_latest_messages(&self, chat_id: &str, limit: u32) -> Result<Vec<MessageRow>> {
         self.with_conn(chat_id, |conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY id DESC LIMIT ?1"
+                "SELECT {MESSAGE_COLUMNS} FROM messages
+                WHERE event_type NOT IN ('join', 'leave')
+                ORDER BY id DESC LIMIT ?1"
             ))?;
             let rows = stmt
                 .query_map(rusqlite::params![limit], message_row)?
@@ -3252,6 +3257,46 @@ mod tests {
         // Rule P5: one group's data never crosses into another group.
         let other = store.list_latest_messages("c2", 3).expect("other group");
         assert!(other.is_empty());
+    }
+    #[test]
+    fn list_latest_messages_excludes_member_rows() {
+        // Decision 123: a join/leave must not reset the Section 8.4
+        // silence clock nor consume a Section 9.7 topic-window slot.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let message = NewMessage {
+            platform_msg_id: "m1".to_string(),
+            ..base.clone()
+        };
+        let join = NewMessage {
+            platform_msg_id: "42:10".to_string(),
+            event_type: EventType::Join,
+            text: String::new(),
+            ..base.clone()
+        };
+        let leave = NewMessage {
+            platform_msg_id: "43:10".to_string(),
+            event_type: EventType::Leave,
+            text: String::new(),
+            ..base.clone()
+        };
+        let mut ids = Vec::new();
+        for msg in [&message, &join, &leave] {
+            match store.insert_message("c1", msg).expect("insert") {
+                InsertOutcome::Inserted(id) => ids.push(id),
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+        // The newest row for the silence gate is the MESSAGE, not the
+        // later join/leave.
+        let newest = store.list_latest_messages("c1", 1).expect("newest");
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].id, ids[0]);
+        // The 50-row topic window skips member rows rather than
+        // spending slots on them.
+        let tail = store.list_latest_messages("c1", 50).expect("tail");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, ids[0]);
     }
 
     #[test]
