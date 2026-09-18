@@ -1,6 +1,7 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-10 — decision 113 (bounded-concurrent
+A living document. Update it at every milestone. Last update: 2026-09-18 — decision 121 (alias-edge structural-binding
+fix and the tamako-jev-lab lab crate), after decision 113 (bounded-concurrent
 embeddings behind `embedding_concurrency`), after decision 112 (the
 worktree rests on the live branch; build/launch branch gate), after
 decision 111 (gate and reply switched to opencode deepseek-flash,
@@ -229,8 +230,8 @@ Phase 1 shipped as v0.0.1 (alpha).
 
 ## 2. What exists and is tested
 
-Test counts below are a snapshot, verified 2026-09-10 @ decision 113
-(1158 on main, 1160 on `catball-self-use`; +9 ignored live tests).
+Test counts below are a snapshot, verified 2026-09-18 @ decision 121
+(1171 on main, 1173 on `catball-self-use`; +9 ignored live tests).
 They drift between audits — re-stamp when re-verified, not on every
 feature commit (decision 92).
 
@@ -245,6 +246,7 @@ feature commit (decision 92).
 | `tamako-adapter-mock` | JSON replay fixture format (optional `username` field since decision 61 — old fixtures keep working), `MockAdapter` (event replay, action recording), 14-event demo fixture. | 9 |
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide 0.17). Pure `normalize` module (bot identity from get_me, display-name fallback chain, message/service/reaction/count normalization incl. `username` from `User.username` (decision 61); synthetic `chat:{id}` for anonymous actors; decision 65 K3: a separate pure `normalize_edited_message` entry point carries `edit_date` into edit rows — pre-fix rows keep the original send date, mixed semantics documented) plus the live `TeloxideAdapter` (polling task + bounded mpsc channel of 100, `next_group_event() -> GroupEvent { chat_id, event }` for multi-group routing per Rule P5, `PlatformAdapter` impl as the Rule A5 substitutability proof). Capability model (specs.md Section 4.2): `bot_chat_status` classifies the per-group membership (`BotChatStatus`: `Administrator` — owner counts as administrator — `Member`, `RestrictedOrOther`, `Unknown`; query failures map to `Unknown`). Outbound: `SendText` (optional reply via ReplyParameters), `React` (setMessageReaction); `SendMedia` → `AdapterError::Unsupported` (Phase 3). Outbound permission failures (missing rights or access) are tolerated: logged with the chat id, never fatal. Live Telegram smoke test ignored by default (`TAMAKO_LIVE_TELEGRAM=1` + `TELOXIDE_TOKEN`). | 95 (+1 ignored) |
 | `tamako-agent` | All LLM concerns (the only rig consumer). `KnowledgeGraph` extraction types (serde + schemars 1.x, conservative field-name aliases, decision 48), `KnowledgeExtractor` trait with the live `RigExtractor` (rig-core 0.41 completion + `output_schema`, Anthropic native structured output, default model `claude-haiku-4-5`) and the scripted `ScriptedExtractor`, conservative emoji/greeting skeleton detector (Section 7.2 rule 5), plain-Rust relationship-name validation (Section 6.3), entity resolution steps 1/2/4 with the Alias-node fallback (Section 7.4), `AgentDigestPipeline` with exponential backoff and dead-letter (Section 10.3). M4: the `endpoint` module (specs.md Section 13 endpoint portability: `LlmConfigValues` → `LlmEndpoints::resolve` with env-wins precedence and per-purpose overrides, `EndpointClient` over the two API families — Anthropic Messages and OpenAI chat completions — with base-URL and model overrides; the global-only `llm_session_id` resolves to the `x-opencode-session` default header on every request of both families through rig's `ClientBuilder::http_headers` (gateway session affinity, decision 57) and every successful completion logs the rig `Usage` fields (incl. `cached_input_tokens`) at DEBUG (decision 53's curated INFO lines untouched); a missing family API key is `AgentError::ProviderConfig`; robustness fix, decisions 48/50/52: per-purpose `structured_output` modes `schema`/`json_object`/`prompt_only` with default `schema` — `json_object` via rig `additional_params` on the OpenAI family only, Anthropic degrades to prompt-only — and ONE shared repair retry for every structured call: preamble field-name skeletons, exact JSON, one repair completion on a schema-invalid-but-JSON response, then the original error class), the participation gate `RigGate` (structured output, post-validated in plain Rust; Section 9.6) with its scripted double, and the reply generator `RigReplyGenerator` (the M2 context→rig conversion seam; Section 9 step 4; the reply-text validation seam `trimmed_reply_or_error` runs the decision-93/95 fence extraction and the decision-59 parrot filter (decision 96: its WARNs carry the purpose and the resolved model name), and the ephemeral tail instruction carries the decision-59 "memories are context, never speech" sentence) with its scripted double. Decision 86: the reply assembly extracts the pure seam `assemble_reply_messages` (context messages, then the ephemeral reply instruction, then the decision-86 suffix appended as a REAL system-role message STRICTLY LAST — never persisted, never in the context list, attached at request-assembly time from a hot-reloaded `Arc<RwLock<String>>` slot, past the cached prefix so suffix edits invalidate nothing; empty suffix = byte-identical pre-86 message list; ordering pinned by tests). Decision 88: `suffix_mode` configuration support in `RigReplyGenerator` and `assemble_reply_messages` (`System` appends trailing system message; `Append` merges suffix into the tail user message for endpoint compatibility); prompt injection hardening in `render_reply_instruction` (escaping `<`, `>`, `&`, and `"` in `target.text`). M5: the `recall` module — `ShallowRecall` (deterministic candidate extraction: sender/reply-target Person entries per Section 8.1 step 1, exact alias matches per step 2, the pure candidate-term tokenizer with documented Phase 1 limits — two paths since decision 58: alphanumeric tokens with the 20-term budget, CJK n-grams of every maximal run (n 2..=5, 40-term budget, longer-first); the same-fact collapse by fact key (latest `valid_at` wins, decision 58) BEFORE the Section 9.3 dedup against `injected_memories`; zero candidates never call the cheap model; DEBUG logs distinguish the three gate outcomes — no candidates, selected none, gate failure with a WARN (decision 58)), the conservative relevance gate `RigRelevanceGate` (Section 9.2, structured output, post-validated in plain Rust, hard cap) with its scripted double, and the Section 9.4 render of exactly one `<memory>...</memory>` injection (through the shared `render_injection_content`, decisions 59/61). Decision 62: `LlmPurpose::Summary` joins the per-purpose endpoint family (`summary_model` default `claude-haiku-4-5` + `summary_llm_api`/`summary_llm_base_url`/`summary_structured_output`, `TAMAKO_SUMMARY_*` env) and `RigSummary` implements the core `SummaryProvider` contract over `EndpointClient::complete_structured` with its one-repair-retry machinery (decision 56; one-field schema, conservative aliases, 262144 max_tokens). Decision 63: the gate and recall relevance-gate preambles append the shared `CONTEXT_FORMAT_GLOSS` (the digest extraction prompts stay gloss-free, decision 61 divergence), and the F2 ephemeral tail instruction forbids `<summary>` blocks. Decision 64: the F2 tail also names `<msg>`/`<you>` blocks and the reply target embed is non-XML (`Reply to THIS message (id N), from NAME at HH:MM: "text"` — it no longer teaches the shape it forbids). Decision 65: every completion attempt has a 300 s timeout (`ENDPOINT_TIMEOUT`, per attempt, cfg(test)-injectable, mapped to `AgentError::Extraction` with a stable prefix); json_object mode attaches `response_format` only with a schema (M1);     the recall preamble renders the configured `recall_injection_cap` per call and the recall prompt drops the duplicated row-id prefix (index-based contract; the gate keeps it). Decision 72: both gates render the shared context view ahead of the per-call sections (new messages, injections, instruction tail) — the byte-prefix-extension property across consecutive wakes is pinned by test; the targetable set stays the wake's new messages (out-of-set targets rejected by the existing post-validation); `gate_context=false` restores the byte-identical pre-72 prompts. Decision 66: the `EmbeddingProvider` seam (`RigEmbeddingProvider` over rig's `embedding_model_with_ndims`, 4096 dims at introduction — re-pinned to the native 3072 by decision 81) and the best-effort enqueue after the graph commit. Decision 73: resolution step 3 inside `resolve_batch` — the vector pre-screen with the `ResolutionConfirmer` seam (`EndpointResolutionConfirmer` over `complete_structured` with the decision-56 one-repair machinery; the `{same, reason}` schema rides the digest purpose), budget-capped per batch, feeding the `vector_resolution_*` counters.     Decision 74: the `MergeConfirmer` seam — three-way verdict `{same, related, different}` over `complete_structured` (cross-language synonyms are `related`, never `same`). Decision 75: the registry wiring (per-call `&[String]`, additive `*_with_registry` variants with empty-registry delegates). Decision 76: the DeepRecall candidate pipeline (shallow → vector entry → two-hop expansion → edge-text LIKE, dedup by the M5 pipe-shaped edge id, capped, per-source failure degrade) on a dedicated one-group recall store, plus the post-commit edge_texts harvest at the decision-66 seam. Decision 77: panic isolation on the inline provider awaits, prompt delimiter framing on both confirmers, post-commit counter semantics, collapse-before-cap. Decision 78: the `WarmupGenerator` sibling seam (`RigWarmupGenerator` over the reply endpoint; the ephemeral instruction names the topic and carries the decision-69 framing rule and the F2 sentence, drift-test-caught). Decision 79 (b): `decide_band` takes the binding target's kind — a top-band PERSON binding (direct or through an Alias target) falls into the budget-capped confirmation path (accepted counts `confirmed`, never `auto_matched`); Concept/Alias-of-Concept auto-match unchanged. Decision 95: the gate, reply, warmup, and recall generators share one hot-reloadable pet-tag slot (`with_pet_tag_slot`, default `you`); `gate_system_preamble`/`recall_system_preamble` render the gloss for the current tag; the reply fence sentence, the fence extraction, and both validation seams run on the pet tag (the F2 tail drops `<you> blocks`). Live-API smoke tests ignored by default (`TAMAKO_LIVE_TEST=1`). | 323 (+5 ignored) |
+| `tamako-jev-lab` | Lab tooling (decision 121): the Jev benchmark harness (extractor + Python driver) and `alias_backfill` (alias-edge text backfill, dedupe, sentinel `valid_at` alignment, `edge_texts` sidecar sync; dry-run default, `--allow-production` gate). | 0 (coverage in tamako-agent/tamako-memory) |
 
 ## 3. Key decisions and deviations so far
 
@@ -3296,6 +3298,46 @@ feature commit (decision 92).
     the FROM pin alone governs the in-image compiler; the two version
     numbers are still bumped together (119), but the sync is
     documentation, not mechanism.
+
+121. (2026-09-18) Alias-edge degeneration: three-layer root cause,
+    fixed on the Jev benchmark branch and merged here. L1: the
+    generator hardcoded `extracted.name` into both slots of the alias
+    edge text (16,061/16,061 tautological rows). L2: MERGE_NODE's
+    `ON MATCH SET n.name = $name` renamed entities to the latest
+    surface form on every rebind — a code/spec conflict, since
+    `Node.name` IS the canonical name (proposed-graph-database-specs
+    Section 3). L3: alias edges carried the batch end in `valid_at`,
+    so MERGE never hit and every batch appended a row; the duplicates
+    silently broke resolution step 2 (`alias_targets` must return
+    exactly one row; >1 falls through to fallback attachment). Fix:
+    D1 the node name is create-only; D2 alias edges are a new
+    STRUCTURAL-BINDING predicate class (graph spec Section 7.5) —
+    a batch-independent sentinel `valid_at` (1970-01-01T00:00:00Z)
+    merges in place from every resolution path; NOT the single-value
+    registry, whose one-valid-edge-per-(subject, predicate)
+    invalidation would cap every entity at one alias and destroy the
+    multi-surface-form design (graph spec Section 6.3); D3 the
+    canonical name threads through resolution (`ALIAS_TARGETS`
+    returns the stored name; steps 1/2/3 read the stored name).
+    Hardening: `ALIAS_TARGETS` returns DISTINCT rows; the deep-recall
+    time window exempts `also_known_as` (sentinel `valid_at` plus
+    write-once `created_at` would otherwise age cross-language
+    bridges out of recall). Stock migration (production pending an
+    operator window; verified on a test copy of the 8-group graph):
+    16,061 -> 8,412 alias rows, 472 stale texts re-rendered to the
+    stored canonical name, the `edge_texts` sidecar re-keyed 1:1 with
+    the graph. Tool: `alias_backfill` in tamako-jev-lab (dry-run
+    default, `--allow-production` gate). Regression tests:
+    `repeated_batches_do_not_duplicate_the_alias_edge`,
+    `a_rebind_does_not_rename_the_node`,
+    `alias_targets_dedupes_repeated_binding_rows`,
+    `two_hop_edges_structural_alias_bridges_never_age_out`, plus
+    three resolve.rs tests (canonical alias text, alias-bound
+    no-rewrite, updated alias_targets decoders). The same merge
+    lands the Jev benchmark harness itself (tamako-jev-lab crate,
+    docs/jev-memory-benchmark.md, docs/jev-memory-report.md,
+    docs/jev-memory-data-quality.md) — lab tooling, excluded from
+    the production wiring.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 

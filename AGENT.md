@@ -42,8 +42,9 @@ The workspace is a Cargo workspace at the repository root. Crates:
 | `tamako-adapter-teloxide` | Live Telegram adapter (teloxide). Pure normalization plus polling intake and outbound actions. |
 | `tamako-vision` | Pure media normalization for intake captioning (decision 82): byte-level allowlist sniffing, JPEG/PNG/WebP dimension extraction, resize and re-encode to the 2048-px JPEG cap, base64 data-URI output. No LLM, no I/O. |
 | `tamako-agent` | All LLM concerns: the extraction call (rig) and the digest pipeline. The only crate that depends on rig. |
+| `tamako-jev-lab` | Lab tooling (decision 121): the Jev memory benchmark harness (fixture extractor + Python driver) and the `alias_backfill` graph-maintenance tool. Not part of the production binary. |
 
-Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, `tamako-memory`, and `tamako-persona` (the shared context-format gloss). `tamako-vision` is a pure leaf: `tamako-adapter-teloxide` (the intake enrichment stage) and the `tamako-agent` caption tests depend on it; `tamako-core` deliberately does not. No cycles.
+Dependency direction: `tamako` depends on all crates. `tamako-core` depends on `tamako-store`, `tamako-memory`, and `tamako-persona` through traits. The adapter crates (`tamako-adapter-mock`, `tamako-adapter-teloxide`) depend on `tamako-core` types only. `tamako-agent` depends on `tamako-core` (the digest contract), `tamako-store`, `tamako-memory`, and `tamako-persona` (the shared context-format gloss). `tamako-vision` is a pure leaf: `tamako-adapter-teloxide` (the intake enrichment stage) and the `tamako-agent` caption tests depend on it; `tamako-core` deliberately does not. No cycles. `tamako-jev-lab` is lab tooling that depends on `tamako-core`, `tamako-store`, `tamako-memory`, and `tamako-agent`; `tamako` does not depend on it.
 
 ## 5. Commands
 

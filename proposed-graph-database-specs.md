@@ -201,16 +201,17 @@ Do these steps in this sequence for each extracted entity:
 
    Historical: the pre-decision-104 design had a `vector_match_threshold` (0.92) auto-match band that rebound Concept/Alias/Topic candidates directly; the evaluation showed false Concept pairs up to 0.989, so the band was abolished rather than re-raised. The `vector_resolution_matched_total` counter of that band stays in existing stores as history.
 4. If two or more persons in the group share the alias, use the context: recent speakers and topic relevance. If the ambiguity remains, attach the fact to the Alias node. Do not guess. A wrong binding is worse than a missing fact. A person with no mention binding and no alias match (zero-target person) receives the same treatment: attach the fact to the Alias node with an `attachment: "fallback"` mark. This rate feeds the fallback attachment metric of Section 10.
-5. After the binding or the creation, add new surface forms as Alias nodes with alias edges.
+5. After the binding or the creation, add new surface forms as Alias nodes with alias edges. The alias edge predicates are structural bindings (Section 7.5).
 
 NOTE: The vector pre-screen at write time is the primary defense against graph fragmentation. Without this step, one concept becomes many isolated nodes with different surface forms.
 
 ### 7.5 Fact validity
 
-The predicate registry has two classes. The registry is the configuration key `single_value_predicates` (current-state.md decision 75); a predicate absent from the list is multi-value:
+The predicate registry has three classes. The registry is the configuration key `single_value_predicates` (current-state.md decision 75); a predicate absent from the list is multi-value:
 
 - Single-value predicates (default): `currently_playing`, `works_at`, `lives_in`, `dating`. One valid edge is permitted for each pair of subject and predicate.
 - Multi-value predicates: `likes`, `knows`, `has_pet`. Edges accumulate. This is the default class.
+- Structural-binding predicates (code-owned, not configurable): `known_as`, `also_known_as`. One edge per (subject, predicate, target) binding. `valid_at` is a batch-independent sentinel (`1970-01-01T00:00:00Z`), so a repeated binding merges in place instead of accumulating one row per batch. The single-value invalidation steps below do NOT apply to this class: an entity carries many aliases by design (Section 6.3). The recall time window (Section 8.2) does not filter these edges.
 
 For a new single-value fact, do these steps in one transaction:
 
@@ -273,7 +274,7 @@ Do these steps in this sequence:
 - The expansion limit for one node is 500 edges. Above this limit, truncate by `created_at` descending.
 - Mark each node with a degree above 1000 as `hub`. Truncation is mandatory for hub nodes.
 - For the query pattern "who discussed X in the group", use the sidecar full-text or vector index on `edge_text` first. Use the graph traversal as a supplement. The sidecar is the plain `edge_texts` table of `specs.md` Section 5.2, scanned with parameterized LIKE — scale-appropriate at thousands of edges. The FTS5 upgrade path needs the trigram tokenizer for CJK coverage; note its limitation: trigram cannot match terms shorter than three characters, which excludes two-character Chinese words. Adopt FTS5 only when edge counts justify it.
-- Recall applies these rules with TWO hops. The relationship whitelist for recall excludes `contains` (provenance only) and `known_as` (surface forms, already resolved at entry); `also_known_as` is INCLUDED — it is the cross-language bridge (Section 7.1 CAUTION, decision 74). Entry resolution on the read path accepts vector candidates at or above `vector_candidate_threshold` without a confirmation call; confirmation is write-path only (Section 7.4).
+- Recall applies these rules with TWO hops. The relationship whitelist for recall excludes `contains` (provenance only) and `known_as` (surface forms, already resolved at entry); `also_known_as` is INCLUDED — it is the cross-language bridge (Section 7.1 CAUTION, decision 74). Entry resolution on the read path accepts vector candidates at or above `vector_candidate_threshold` without a confirmation call; confirmation is write-path only (Section 7.4). Structural-binding alias edges (`known_as`, `also_known_as`) are exempt from this window.
 
 ### 8.3 Cache
 

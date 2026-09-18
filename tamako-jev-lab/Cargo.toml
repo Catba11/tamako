@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 # Offline benchmark fixture extractor for the jev-memory experiment
-# (docs/jev-memory-benchmark.md). Lab-only crate, branch jev-memory;
-# never shipped, never merged into the production binary. Reads a COPY
+# (docs/jev-memory-benchmark.md). Lab-only tooling crate (decision
+# 121): never wired into the production binary. Reads a COPY
 # of the data root (read-only store opens; lbug opens run idempotent
 # DDL only) and writes JSONL fixtures for the Python driver.
 
