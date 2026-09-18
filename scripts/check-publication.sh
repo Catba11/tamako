@@ -16,17 +16,25 @@ mode="${1:---staged}"
 ref="${2:-}"
 fail=0
 
+# The four pattern classes, defined once so the candidate selection (git log -G)
+# and the extraction (git grep) below cannot drift. Each pattern is written so
+# this script's own text does not match it.
+IDPAT='-100[0-9]{10}'
+TOKPAT='[0-9]{9,10}:[A-Za-z0-9_-]{35}'
+KEYPAT='sk-[A-Za-z0-9_-]{20,}'
+PKPAT='PRIVATE KEY-----'
+GATE_PAT="$IDPAT|$TOKPAT|$KEYPAT|$PKPAT"
+
 scan_stream() { # $1 = label; content on stdin
   local label="$1" text hits
   text="$(tr -d '\0')"
-  hits="$(printf '%s' "$text" | grep -oE -- '-100[0-9]{10}' | grep -vxF -e '-1001234567890' -e '-1009876543210' | sort -u || true)"
+  hits="$(printf '%s' "$text" | grep -oE -- "$IDPAT" | grep -vxF -e '-1001234567890' -e '-1009876543210' | sort -u || true)"
   if [ -n "$hits" ]; then echo "GATE HIT ($label): live Telegram group id: $hits"; fail=1; fi
-  if printf '%s' "$text" | grep -qE '[0-9]{9,10}:[A-Za-z0-9_-]{35}'; then
+  if printf '%s' "$text" | grep -qE "$TOKPAT"; then
     echo "GATE HIT ($label): Telegram bot token shape"; fail=1
   fi
-  hits="$(printf '%s' "$text" | grep -oE 'sk-[A-Za-z0-9_-]{20,}' | sort -u || true)"
+  hits="$(printf '%s' "$text" | grep -oE "$KEYPAT" | sort -u || true)"
   if [ -n "$hits" ]; then echo "GATE HIT ($label): API key shape: $hits"; fail=1; fi
-  # The pattern below is written so this script's own text does not match it.
   if printf '%s' "$text" | grep -qE -- '-----BEGIN [A-Z]+ PRIVATE KEY-----'; then
     echo "GATE HIT ($label): private key block"; fail=1
   fi
@@ -38,10 +46,10 @@ case "$mode" in
     ;;
   --history)
     ref="${ref:-main}"
-    commits="$(git log --format=%H -G'-100[0-9]{10}|[0-9]{9,10}:[A-Za-z0-9_-]{35}|sk-[A-Za-z0-9_-]{20,}|PRIVATE KEY-----' "$ref" -- || true)"
+    commits="$(git log --format=%H -G"$GATE_PAT" "$ref" -- || true)"
     if [ -n "$commits" ]; then
       # shellcheck disable=SC2086
-      scan_stream "history of $ref" < <(git grep -h -oE -- '-100[0-9]{10}|[0-9]{9,10}:[A-Za-z0-9_-]{35}|PRIVATE KEY-----' $commits -- 2>/dev/null || true)
+      scan_stream "history of $ref" < <(git grep -h -oE -- "$GATE_PAT" $commits -- 2>/dev/null || true)
     fi
     ;;
   --tree)
