@@ -68,6 +68,10 @@ impl NodeType {
 pub struct AliasTarget {
     pub node_id: String,
     pub node_type: NodeType,
+    /// The STORED display name of the target (create-only canonical
+    /// name since data-quality decision D1). Feeds the Section 6.3
+    /// alias edge_text.
+    pub name: String,
 }
 
 /// One node of a digest batch.

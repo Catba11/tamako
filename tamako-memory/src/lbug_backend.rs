@@ -93,10 +93,14 @@ ON MATCH SET b.updated_at = $now";
 
 // Node upsert. MERGE by the deterministic identifier. Rule R4: on match,
 // update scalar columns only. A NULL properties parameter keeps the stored
-// value through coalesce.
+// value through coalesce. The name is CREATE-ONLY (data-quality decision
+// D1, stable canonical name): the first-seen surface form stays the
+// canonical display name; a re-bind with a newer surface form must not
+// rename the node, or every alias edge text naming the canonical form
+// goes stale on the next digest.
 const MERGE_NODE: &str = "MERGE (n:Node {id: $id})
 ON CREATE SET n.name = $name, n.type = $type, n.created_at = $created_at, n.updated_at = $updated_at, n.properties = $properties
-ON MATCH SET n.name = $name, n.updated_at = $updated_at, n.properties = coalesce($properties, n.properties)";
+ON MATCH SET n.updated_at = $updated_at, n.properties = coalesce($properties, n.properties)";
 
 // Edge upsert. The MERGE pattern carries the natural key of the edge:
 // (source, target, relationship_name, valid_at). The endpoints match by
@@ -128,7 +132,7 @@ ON MATCH SET r.edge_text = $edge_text, r.invalid_at = coalesce($invalid_at, r.in
 // identifier (Rule R5); the alias id is a $param (Section 5.2 rule 4).
 const ALIAS_TARGETS: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node {id: $alias_id})
 WHERE r.relationship_name IN ['known_as', 'also_known_as']
-RETURN s.id, s.type";
+RETURN DISTINCT s.id, s.type, s.name";
 
 // Read path, Section 8.2: the valid direct neighbors of one entry node,
 // both directions in one query. The filter drops invalid edges and the
@@ -868,11 +872,18 @@ fn read_alias_targets(conn: &Connection, alias_node_id: &str) -> Result<Vec<Alia
     let mut targets = Vec::new();
     for row in result {
         let mut columns = row.into_iter();
-        if let (Some(Value::String(node_id)), Some(Value::String(type_string))) =
-            (columns.next(), columns.next())
+        if let (
+            Some(Value::String(node_id)),
+            Some(Value::String(type_string)),
+            Some(Value::String(name)),
+        ) = (columns.next(), columns.next(), columns.next())
         {
             if let Some(node_type) = NodeType::from_str(&type_string) {
-                targets.push(AliasTarget { node_id, node_type });
+                targets.push(AliasTarget {
+                    node_id,
+                    node_type,
+                    name,
+                });
             }
         }
     }
@@ -2560,6 +2571,7 @@ mod tests {
             vec![crate::backend::AliasTarget {
                 node_id: person.id.clone(),
                 node_type: NodeType::Person,
+                name: person.name.clone(),
             }]
         );
     }
@@ -2577,6 +2589,78 @@ mod tests {
             .await
             .unwrap();
         assert!(targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn alias_targets_dedupes_repeated_binding_rows() {
+        // Pre-dedupe graphs carry one row per batch for the same
+        // binding (the MERGE natural key carries valid_at). Without
+        // DISTINCT every such alias looks multi-target and the
+        // step-2 exact match silently stops binding.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let (batch, person, alias) = alias_batch();
+        backend.upsert_batch("chat_dup", &batch).await.unwrap();
+        // The same binding again with a LATER valid_at: a second row
+        // for the same (source, target, relationship).
+        let mut replay = alias_batch().0;
+        replay.batch_id = crate::identifiers::batch_id(11, 20);
+        for edge in &mut replay.edges {
+            edge.valid_at = datetime!(2026-08-08 10:00 UTC);
+        }
+        backend.upsert_batch("chat_dup", &replay).await.unwrap();
+
+        let targets = backend.alias_targets("chat_dup", &alias.id).await.unwrap();
+        assert_eq!(
+            targets,
+            vec![crate::backend::AliasTarget {
+                node_id: person.id.clone(),
+                node_type: NodeType::Person,
+                name: person.name.clone(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebind_does_not_rename_the_node() {
+        // Data-quality D1 (stable canonical name): the name column is
+        // create-only; a re-bind carrying a newer surface form keeps
+        // the first-seen name, so alias edge texts naming the
+        // canonical form never go stale.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LbugBackend::new(dir.path());
+        let stamp = datetime!(2026-08-07 10:00 UTC);
+        let node = |name: &str| MemoryNode {
+            id: crate::identifiers::person_id("1001"),
+            name: name.to_string(),
+            node_type: NodeType::Person,
+            created_at: stamp,
+            updated_at: stamp,
+            properties: None,
+        };
+        let batch = |name: &str, bid: &str| MemoryBatch {
+            batch_id: bid.to_string(),
+            nodes: vec![node(name)],
+            edges: vec![],
+        };
+        backend
+            .upsert_batch("chat_stable", &batch("Tama", "batch-1"))
+            .await
+            .unwrap();
+        backend
+            .upsert_batch("chat_stable", &batch("tama-chan", "batch-2"))
+            .await
+            .unwrap();
+
+        let id = crate::identifiers::person_id("1001");
+        let rows = backend
+            .query_rows(
+                "chat_stable",
+                &format!("MATCH (n:Node {{id: '{id}'}}) RETURN n.name"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![vec!["Tama".to_string()]]);
     }
 
     fn concept_node(name: &str, created_at: OffsetDateTime) -> MemoryNode {

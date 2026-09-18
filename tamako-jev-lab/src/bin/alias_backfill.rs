@@ -27,7 +27,8 @@ use tamako_memory::LbugBackend;
 
 const LIST_ALIAS: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node) \
     WHERE r.relationship_name IN ['known_as', 'also_known_as'] AND r.invalid_at IS NULL \
-    RETURN s.id, s.name, a.id, a.name, r.relationship_name, r.valid_at, r.edge_text";
+    RETURN s.id, s.name, a.id, a.name, r.relationship_name, r.valid_at, r.edge_text, \
+    CAST(r.valid_at AS STRING)";
 
 const COUNT_INVALID: &str = "MATCH (s:Node)-[r:EDGE]->(a:Node) \
     WHERE r.relationship_name IN ['known_as', 'also_known_as'] AND r.invalid_at IS NOT NULL \
@@ -47,6 +48,8 @@ struct GroupStats {
     tautological_rows: usize,
     stale_rows: usize,
     pending_keys: usize,
+    dedup_deleted: usize,
+    max_rows_per_key: usize,
     topo_sha256: String,
 }
 
@@ -54,6 +57,7 @@ struct GroupStats {
 async fn main() -> Result<()> {
     let mut data_root: Option<PathBuf> = None;
     let mut apply = false;
+    let mut dedupe = false;
     let mut report_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -64,6 +68,7 @@ async fn main() -> Result<()> {
                 ))
             }
             "--apply" => apply = true,
+            "--dedupe" => dedupe = true,
             "--report" => {
                 report_path = Some(PathBuf::from(
                     args.next().context("--report needs a value")?,
@@ -106,7 +111,7 @@ async fn main() -> Result<()> {
         let mut topo = BTreeSet::new();
 
         for row in &rows {
-            anyhow::ensure!(row.len() == 7, "unexpected row shape: {row:?}");
+            anyhow::ensure!(row.len() == 8, "unexpected row shape: {row:?}");
             let (s_id, s_name, a_id, a_name, rel, valid_at) = (
                 row[0].as_str(),
                 row[1].as_str(),
@@ -164,6 +169,54 @@ async fn main() -> Result<()> {
             }
         }
 
+        if dedupe {
+            // Data-quality D2: keep the EARLIEST row of each binding
+            // key, delete the later batch-duplicates. Rows sharing the
+            // keeper's display timestamp are indistinguishable and are
+            // left in place (reported via max_rows_per_key).
+            let mut per_key: BTreeMap<(String, String, String), Vec<(String, String)>> =
+                BTreeMap::new();
+            for row in &rows {
+                per_key
+                    .entry((row[0].clone(), row[2].clone(), row[4].clone()))
+                    .or_default()
+                    .push((row[5].clone(), row[7].clone()));
+            }
+            for ((s_id, a_id, rel), vals) in &per_key {
+                stats.max_rows_per_key = stats.max_rows_per_key.max(vals.len());
+                if vals.len() < 2 {
+                    continue;
+                }
+                let keeper = vals.iter().min().expect("nonempty");
+                let doomed: Vec<&String> = vals
+                    .iter()
+                    .map(|(_rfc, native)| native)
+                    .filter(|native| *native != &keeper.1)
+                    .collect();
+                if doomed.is_empty() {
+                    continue;
+                }
+                if apply {
+                    let list = doomed
+                        .iter()
+                        .map(|cell| format!("'{}'", esc(cell)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let delete = format!(
+                        "MATCH (s:Node {{id: '{}'}})-[r:EDGE]->(a:Node {{id: '{}'}}) \
+                         WHERE r.relationship_name = '{}' AND r.invalid_at IS NULL \
+                         AND CAST(r.valid_at AS STRING) IN [{}] DELETE r",
+                        esc(s_id),
+                        esc(a_id),
+                        esc(rel),
+                        list
+                    );
+                    backend.query_rows(chat_id, &delete).await?;
+                }
+                stats.dedup_deleted += doomed.len();
+            }
+        }
+
         totals.total_rows += stats.total_rows;
         totals.invalid_rows += stats.invalid_rows;
         totals.distinct_keys += stats.distinct_keys;
@@ -171,6 +224,8 @@ async fn main() -> Result<()> {
         totals.tautological_rows += stats.tautological_rows;
         totals.stale_rows += stats.stale_rows;
         totals.pending_keys += stats.pending_keys;
+        totals.dedup_deleted += stats.dedup_deleted;
+        totals.max_rows_per_key = totals.max_rows_per_key.max(stats.max_rows_per_key);
         groups.insert(
             chat_id.clone(),
             json!({
@@ -181,6 +236,8 @@ async fn main() -> Result<()> {
                 "tautological_rows": stats.tautological_rows,
                 "stale_rows": stats.stale_rows,
                 "pending_keys": stats.pending_keys,
+                "dedup_deleted": stats.dedup_deleted,
+                "max_rows_per_key": stats.max_rows_per_key,
                 "topo_sha256": stats.topo_sha256,
             }),
         );
@@ -188,6 +245,7 @@ async fn main() -> Result<()> {
 
     let report = json!({
         "applied": apply,
+        "dedupe": dedupe,
         "groups": groups,
         "totals": {
             "total_rows": totals.total_rows,
@@ -197,6 +255,8 @@ async fn main() -> Result<()> {
             "tautological_rows": totals.tautological_rows,
             "stale_rows": totals.stale_rows,
             "pending_keys": totals.pending_keys,
+            "dedup_deleted": totals.dedup_deleted,
+            "max_rows_per_key": totals.max_rows_per_key,
         },
     });
     let text = serde_json::to_string_pretty(&report)?;
@@ -205,10 +265,11 @@ async fn main() -> Result<()> {
         None => println!("{text}"),
     }
     eprintln!(
-        "alias_backfill: applied={apply} groups={} stale_rows={} pending_keys={}",
+        "alias_backfill: applied={apply} dedupe={dedupe} groups={} stale_rows={} pending_keys={} dedup_deleted={}",
         groups.len(),
         totals.stale_rows,
-        totals.pending_keys
+        totals.pending_keys,
+        totals.dedup_deleted
     );
     Ok(())
 }

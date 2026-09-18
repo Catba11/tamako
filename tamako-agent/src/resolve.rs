@@ -370,6 +370,15 @@ struct ResolvedEntity {
     /// identity blob (tg_user_id, display_name). An overwrite would
     /// drop the identity data.
     bound_to_existing: bool,
+    /// The canonical display name of the bound node: its STORED name
+    /// (create-only since data-quality decision D1). For a brand-new
+    /// node this equals the extracted name. Feeds the alias edge_text.
+    canonical_name: String,
+    /// True when the entity bound THROUGH this surface form's alias
+    /// (step 2 exact match). The alias edge then already exists and
+    /// step 5 must not write it again (data-quality decision D2:
+    /// alias bindings are structural, not per-batch facts).
+    bound_via_alias: bool,
 }
 
 /// RFC 3339 or the debug form as a last resort. The Rfc3339 format only
@@ -512,6 +521,14 @@ pub async fn resolve_batch<M: MemoryBackend>(
         }
         let surface_alias_id = alias_id(&extracted.name);
         push_node(alias_node(&extracted.name, now));
+        if entity.bound_via_alias {
+            // Data-quality decision D2: the step-2 exact match proves
+            // this binding edge already exists. Re-emitting it would
+            // append one duplicate row per batch (the MERGE natural
+            // key carries valid_at). The alias node upsert above is
+            // idempotent and stays.
+            continue;
+        }
         let relationship_name = match extracted.node_type {
             // Section 6.3: Person -> Alias is known_as, Concept -> Alias
             // is also_known_as.
@@ -526,7 +543,7 @@ pub async fn resolve_batch<M: MemoryBackend>(
             invalid_at: None,
             edge_text: format!(
                 "{} is a surface form of {}.",
-                extracted.name, extracted.name
+                extracted.name, entity.canonical_name
             ),
             created_at: now,
             updated_at: now,
@@ -653,6 +670,8 @@ async fn resolve_steps_1_2<M: MemoryBackend>(
                     tg_user_id: Some(binding.tg_user_id.clone()),
                     attached_to_alias: false,
                     bound_to_existing: false,
+                    canonical_name: binding.display_name.clone(),
+                    bound_via_alias: false,
                 }));
             }
 
@@ -662,14 +681,17 @@ async fn resolve_steps_1_2<M: MemoryBackend>(
             let targets = memory.alias_targets(chat_id, &surface_alias_id).await?;
             if let [target] = targets.as_slice() {
                 if target.node_type == NodeType::Person {
-                    // Bind to the existing node id; MERGE updates name
-                    // and description.
+                    // Bind to the existing node id. The name column is
+                    // create-only (D1): the stored canonical name is
+                    // kept and feeds the alias edge_text.
                     return Ok(Some(ResolvedEntity {
                         node_id: target.node_id.clone(),
                         node_type: ExtractedNodeType::Person,
                         tg_user_id: None,
                         attached_to_alias: false,
                         bound_to_existing: true,
+                        canonical_name: target.name.clone(),
+                        bound_via_alias: true,
                     }));
                 }
             }
@@ -689,6 +711,8 @@ async fn resolve_steps_1_2<M: MemoryBackend>(
                         tg_user_id: None,
                         attached_to_alias: false,
                         bound_to_existing: true,
+                        canonical_name: target.name.clone(),
+                        bound_via_alias: true,
                     }));
                 }
             }
@@ -718,6 +742,8 @@ fn step_4_fallback(extracted: &ExtractedNode) -> ResolvedEntity {
             tg_user_id: None,
             attached_to_alias: true,
             bound_to_existing: false,
+            canonical_name: extracted.name.clone(),
+            bound_via_alias: false,
         },
         ExtractedNodeType::Concept => ResolvedEntity {
             node_id: concept_id(&extracted.name),
@@ -725,6 +751,8 @@ fn step_4_fallback(extracted: &ExtractedNode) -> ResolvedEntity {
             tg_user_id: None,
             attached_to_alias: false,
             bound_to_existing: false,
+            canonical_name: extracted.name.clone(),
+            bound_via_alias: false,
         },
     }
 }
@@ -1067,7 +1095,11 @@ async fn decide_band<M: MemoryBackend>(
                 "vector pre-screen confirmation accepted"
             );
             stats.confirmed += 1;
-            Some(bound_entity(extracted, bind_id.to_string()))
+            Some(bound_entity(
+                extracted,
+                bind_id.to_string(),
+                candidate.name,
+            ))
         }
         Ok(Ok(answer)) => {
             tracing::debug!(
@@ -1112,13 +1144,19 @@ async fn decide_band<M: MemoryBackend>(
 /// (an Alias hit binds to its alias target). Like the step-2 exact
 /// alias match the node update carries NO properties: the MERGE
 /// coalesce keeps the stored identity blob.
-fn bound_entity(extracted: &ExtractedNode, node_id: String) -> ResolvedEntity {
+fn bound_entity(
+    extracted: &ExtractedNode,
+    node_id: String,
+    canonical_name: String,
+) -> ResolvedEntity {
     ResolvedEntity {
         node_id,
         node_type: extracted.node_type,
         tg_user_id: None,
         attached_to_alias: false,
         bound_to_existing: true,
+        canonical_name,
+        bound_via_alias: false,
     }
 }
 
@@ -2752,5 +2790,45 @@ mod tests {
         assert_eq!(bound.node_type, NodeType::Person);
         assert_eq!(resolved.vector_stats.confirmed, 1);
         assert_eq!(confirmer.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_alias_bound_entity_does_not_rewrite_the_alias_edge() {
+        // Data-quality D2 (structural binding): a step-2 exact alias
+        // match proves the binding edge already exists; re-emitting
+        // it would append one duplicate row per batch (the MERGE
+        // natural key carries valid_at).
+        let (_dir, memory) = backend().await;
+        seed_person_alias(&memory, "1001", "Tama", "tama").await;
+        let extracted = graph(vec![node("Tama", ExtractedNodeType::Person)], vec![]);
+        let batch = resolve(&memory, &extracted, &[]).await;
+
+        // The entity bound (the person node is in the batch) but NO
+        // new known_as edge is emitted; the alias node upsert stays
+        // (idempotent), and the STORED binding is intact.
+        assert!(find_node(&batch, &person_id("1001")).is_some());
+        assert!(edges_named(&batch, "known_as").is_empty());
+        assert!(find_node(&batch, &alias_id("Tama")).is_some());
+        let targets = memory
+            .alias_targets(CHAT, &alias_id("Tama"))
+            .await
+            .expect("alias targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, person_id("1001"));
+        assert_eq!(targets[0].name, "Tama");
+    }
+
+    #[tokio::test]
+    async fn a_mention_binding_renders_the_canonical_alias_text() {
+        // Data-quality D3/L1: the alias edge text names the CANONICAL
+        // display name in its second slot instead of repeating the
+        // surface form.
+        let (_dir, memory) = backend().await;
+        let extracted = graph(vec![node("Alice", ExtractedNodeType::Person)], vec![]);
+        let batch = resolve(&memory, &extracted, &[mention("alice", "1001")]).await;
+
+        let known_as = edges_named(&batch, "known_as");
+        assert_eq!(known_as.len(), 1);
+        assert_eq!(known_as[0].edge_text, "Alice is a surface form of alice.");
     }
 }
