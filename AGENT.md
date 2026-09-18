@@ -129,6 +129,12 @@ Search scope convention (operator ruling, 2026-09-06): repo-wide searches EXCLUD
 - Edit anchors are verified byte-for-byte against a fresh read. A rewrite re-emits only the spans its match covered.
 - A maintenance command is sized for the actual state (measure first) and accounts for live writers into the target area (example: the rust-analyzer flycheck rebuilds `target/` during a delete).
 
+### 6.9 Publication hygiene (decision 122)
+- `main` is public (GitHub). A main-bound commit never carries: a live Telegram group id (`-100` plus 10 digits), a bot token, API-key material, chat content, or a private key block. Prompt-tuning content is already barred by Section 6.6.
+- Sanctioned placeholder group ids for docs, fixtures, and tests: `-1001234567890` and `-1009876543210`. No other string may match the id pattern.
+- Pre-push gate: `scripts/check-publication.sh --history main` must pass before EVERY push of main. Run `--staged` before committing whenever the worktree holds never-commit files; staging stays by explicit paths (Section 6.6).
+- Leak protocol: bundle backup (`git bundle create ... --all`), rewrite with `git filter-repo --replace-text`, verify zero hits across `--all`, force push, rebase the live branch, re-sync every other checkout. Executed 2026-09-18 for the decision-60 group id (decision 122).
+
 ## 7. Definition of done
 
 1. The four commands of Section 5 pass.

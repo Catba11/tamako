@@ -1,6 +1,7 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-18 — decision 121 (alias-edge structural-binding
+A living document. Update it at every milestone. Last update: 2026-09-18 — decision 122 (publication hygiene gate:
+history scrub plus the executable pre-push check), after decision 121 (alias-edge structural-binding
 fix and the tamako-jev-lab lab crate), after decision 113 (bounded-concurrent
 embeddings behind `embedding_concurrency`), after decision 112 (the
 worktree rests on the live branch; build/launch branch gate), after
@@ -3338,6 +3339,22 @@ feature commit (decision 92).
     docs/jev-memory-benchmark.md, docs/jev-memory-report.md,
     docs/jev-memory-data-quality.md) — lab tooling, excluded from
     the production wiring.
+
+122. (2026-09-18) Publication hygiene gate. Incident: a live Telegram
+    group id sat in current-state.md since decision 60 and rode main to
+    GitHub (found during the decision-121 merge audit). Scrub:
+    git filter-repo --replace-text across every local ref (bundle
+    backup first), force push, the live branch rebased onto the
+    rewritten main, every other checkout re-synced; the placeholder
+    fixtures (-1001234567890, -1009876543210) are sanctioned and were
+    left untouched. Prevention: AGENT.md Section 6.9 codifies what
+    never crosses into main and the pre-push gate
+    scripts/check-publication.sh (--staged / --history / --tree);
+    WATCHDOG.yml adds a publication-hygiene pattern class to the
+    Boundary lane; WATCHDOG.md documents the publication boundary.
+    A same-day near-miss (git add -A against Section 6.6, caught by
+    an advisor and verified harmless) folds into the same rule:
+    staging by explicit paths only.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 

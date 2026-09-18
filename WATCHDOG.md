@@ -6,7 +6,7 @@ pattern lists live in `WATCHDOG.yml` under each roster entry.
 ## What this project is
 
 Tamako is a Telegram group-pet bot with persistent memory. Rust workspace,
-nine `tamako*` crates at the repository root. The bot lives in chat groups,
+ten `tamako*` crates at the repository root. The bot lives in chat groups,
 speaks rarely, and keeps per-group memories in SQLite (`store.db`) plus a
 LadybugDB graph (`memory.lbug`), under a per-group data directory.
 
@@ -38,6 +38,15 @@ that skip silently: a green run does not prove those paths ran.
 
 Repo-wide searches exclude `./data` (live data) and `./target` (build
 output). Pass explicit paths to search tools.
+
+## Publication boundary
+`main` is public (GitHub). Never crosses into a main-bound change: live
+Telegram group ids (only the sanctioned placeholders `-1001234567890` and
+`-1009876543210` may match the id pattern), bot tokens, API-key material,
+chat content, prompt-tuning content (lives on `catball-self-use`), private
+key blocks. The executable gate is `scripts/check-publication.sh`; the rule
+text is AGENT.md Section 6.9 (decision 122). Staging is by explicit paths
+only.
 
 ## How to read your pattern list
 
