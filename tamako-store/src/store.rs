@@ -632,14 +632,16 @@ impl Store {
         })
     }
 
-    /// Counts the INBOUND raw-log rows with `id > after_id`. The M4
-    /// recency re-check (specs.md Section 6.2) uses it: newer human
-    /// messages after the target decide whether a generated reply is
-    /// stale.
+    /// Counts the INBOUND raw-log rows with `id > after_id`, member
+    /// join/leave rows excluded (decision 123: an arrival or departure
+    /// is not conversational progression). The M4 recency re-check
+    /// (specs.md Section 6.2) uses it: newer human messages after the
+    /// target decide whether a generated reply is stale.
     pub fn count_inbound_after(&self, chat_id: &str, after_id: i64) -> Result<u32> {
         self.with_conn(chat_id, |conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE id > ?1 AND direction = 'inbound'",
+                "SELECT COUNT(*) FROM messages WHERE id > ?1 AND direction = 'inbound'
+                 AND event_type NOT IN ('join', 'leave')",
                 rusqlite::params![after_id],
                 |row| row.get(0),
             )?;
@@ -2287,6 +2289,31 @@ mod tests {
         assert_eq!(store.count_inbound_after("c1", ids[2]).expect("count"), 0);
         // The outbound tail row counts nothing.
         assert_eq!(store.count_inbound_after("c1", ids[3]).expect("count"), 0);
+    }
+    #[test]
+    fn count_inbound_after_excludes_member_rows() {
+        // Decision 123: a member join/leave after the reply target must
+        // NOT make the pending reply stale nor force a quote — the
+        // recency distance counts conversational messages only.
+        let (_dir, store) = temp_store();
+        let base = sample_message();
+        let mut message = base.clone();
+        message.platform_msg_id = "m1".to_string();
+        let mut join = base.clone();
+        join.platform_msg_id = "42:10".to_string();
+        join.event_type = EventType::Join;
+        join.text = String::new();
+        let mut leave = base.clone();
+        leave.platform_msg_id = "43:10".to_string();
+        leave.event_type = EventType::Leave;
+        leave.text = String::new();
+        for msg in [&message, &join, &leave] {
+            match store.insert_message("c1", msg).expect("insert") {
+                InsertOutcome::Inserted(_) => {}
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        }
+        assert_eq!(store.count_inbound_after("c1", 0).expect("count"), 1);
     }
 
     #[test]

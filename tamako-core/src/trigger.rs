@@ -202,6 +202,16 @@ pub fn tail_stats(
         ..TailStats::default()
     };
     for row in rows {
+        // Decision 123: member join/leave rows are PASSIVE — they enter
+        // the digest BATCH (the range read includes them, rendered as
+        // the canonical markers) but never the trigger counts, exactly
+        // like they never advance the wake counter.
+        if matches!(
+            row.event_type,
+            tamako_store::EventType::Join | tamako_store::EventType::Leave
+        ) {
+            continue;
+        }
         // Counters saturate; a counter overflow must never panic.
         stats.messages = stats.messages.saturating_add(1);
         stats.bytes = stats.bytes.saturating_add(row.text.len());
@@ -281,6 +291,19 @@ mod tests {
             is_reply_to_bot: false,
             forward: None,
         }
+    }
+
+    #[test]
+    fn tail_stats_skips_member_rows() {
+        // Decision 123: a join/leave burst must never push the digest
+        // trigger over its message threshold.
+        let mut join = row(2, "");
+        join.event_type = EventType::Join;
+        let mut leave = row(3, "");
+        leave.event_type = EventType::Leave;
+        let stats = tail_stats(&[row(1, "hello world"), join, leave], Some(now()));
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.words, 2);
     }
 
     #[test]
