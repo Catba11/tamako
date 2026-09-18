@@ -12,6 +12,7 @@ members = [
     "tamako-adapter-mock",
     "tamako-adapter-teloxide",
     "tamako-vision",
+    "tamako-jev-lab",
 ]
 
 [workspace.package]
