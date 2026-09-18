@@ -22,7 +22,7 @@
 use rig::completion::Message;
 
 use tamako_core::summary::{SummaryError, SummaryProvider};
-use tamako_store::MessageRow;
+use tamako_store::{EventType, MessageRow};
 use time::macros::format_description;
 use time::UtcOffset;
 
@@ -84,7 +84,8 @@ const HHMM_FORMAT: &[time::format_description::FormatItem<'_>] =
 /// dialect, NOT the XML dialogue dialect. Outbound rows are bot
 /// speech; their `sender_display_name` already carries the bot name
 /// (the actor writes it at intake, Rule B1), so the renderer needs no
-/// direction special case.
+/// direction special case. Member join/leave rows (decision 123) carry
+/// an empty raw-log text and render the canonical marker instead.
 pub fn render_summary_prompt(first_msg_id: i64, last_msg_id: i64, rows: &[MessageRow]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -101,11 +102,12 @@ pub fn render_summary_prompt(first_msg_id: i64, last_msg_id: i64, rows: &[Messag
             .to_offset(UtcOffset::UTC)
             .format(HHMM_FORMAT)
             .unwrap_or_else(|_| "??:??".to_string());
-        let _ = writeln!(
-            out,
-            "[{} {}] {}",
-            row.sender_display_name, time_hhmm, row.text
-        );
+        let text = match row.event_type {
+            EventType::Join => "(joined the group)",
+            EventType::Leave => "(left the group)",
+            _ => row.text.as_str(),
+        };
+        let _ = writeln!(out, "[{} {}] {}", row.sender_display_name, time_hhmm, text);
     }
     out
 }
@@ -292,6 +294,23 @@ mod tests {
         let prompt = render_summary_prompt(9, 11, &sample_rows());
         assert!(prompt.contains("[Alice 13:01] has anyone tried the new cafe?"));
         assert!(prompt.contains("[Tamako 13:02] the espresso there is great"));
+    }
+
+    #[test]
+    fn a_member_row_renders_the_canonical_marker() {
+        // Decision 123: the raw-log text of a join/leave row is empty;
+        // the summary prompt renders the canonical marker instead, so
+        // the chunk summary can note arrivals and departures.
+        let mut join = row(
+            12,
+            Direction::Inbound,
+            "Carol",
+            "",
+            datetime!(2026-08-07 13:03 UTC),
+        );
+        join.event_type = EventType::Join;
+        let prompt = render_summary_prompt(11, 12, &[join]);
+        assert!(prompt.contains("[Carol 13:03] (joined the group)"));
     }
 
     #[test]

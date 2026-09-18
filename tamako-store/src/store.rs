@@ -59,6 +59,11 @@ impl Direction {
 pub enum EventType {
     Message,
     Edit,
+    /// A member joined the group (decision 123): a raw-log row whose
+    /// sender is the joining member, with an empty text.
+    Join,
+    /// A member left the group (decision 123). Same row shape as Join.
+    Leave,
 }
 
 impl EventType {
@@ -66,6 +71,8 @@ impl EventType {
         match self {
             EventType::Message => "message",
             EventType::Edit => "edit",
+            EventType::Join => "join",
+            EventType::Leave => "leave",
         }
     }
 
@@ -73,6 +80,8 @@ impl EventType {
         match s {
             "message" => Ok(EventType::Message),
             "edit" => Ok(EventType::Edit),
+            "join" => Ok(EventType::Join),
+            "leave" => Ok(EventType::Leave),
             _ => Err(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,
@@ -2442,6 +2451,131 @@ mod tests {
     }
 
     #[test]
+    fn migration_v15_widens_the_event_type_check_and_preserves_rows() {
+        // A v14-shaped database with one raw-log row: v15 REBUILDS the
+        // messages table, so the pre-v15 row must survive byte-identical,
+        // the widened CHECK must admit join/leave through the real insert
+        // path, and a reopen must be a no-op.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = shaped_db_up_to(dir.path(), 14);
+        conn.execute(
+            "INSERT INTO messages (
+                platform_msg_id, direction, event_type, timestamp,
+                sender_id, sender_display_name, sender_username, text,
+                reply_to_platform_msg_id, mentions_bot, is_reply_to_bot
+            ) VALUES ('m1', 'inbound', 'message', '2026-08-16T00:00:00Z',
+                      'u1', 'Ann', NULL, 'hello', NULL, 0, 0)",
+            [],
+        )
+        .expect("v14 row");
+        drop(conn);
+
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("c1").expect("open_group runs v15");
+        let store2 = Store::new(dir.path().to_path_buf());
+        store2.open_group("c1").expect("reopen after v15");
+
+        // The pre-v15 row survived the rebuild, row id included (every
+        // id-keyed side table depends on that).
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].platform_msg_id, "m1");
+        assert_eq!(rows[0].text, "hello");
+
+        // The widened CHECK admits a join row through the real insert
+        // path, and the copied row id sequence continues above the max.
+        let mut join = sample_message();
+        join.platform_msg_id = "42:10".to_string();
+        join.event_type = EventType::Join;
+        join.text = String::new();
+        assert!(matches!(
+            store.insert_message("c1", &join).expect("join insert"),
+            InsertOutcome::Inserted(2)
+        ));
+
+        // A value outside the widened set still fails the CHECK loudly.
+        store
+            .with_conn("c1", |conn| {
+                let err = conn
+                    .execute(
+                        "INSERT INTO messages (
+                            platform_msg_id, direction, event_type, timestamp,
+                            sender_id, sender_display_name, text
+                        ) VALUES ('x', 'inbound', 'bogus', '2026-08-16T00:00:00Z',
+                                  'u1', 'Ann', 'x')",
+                        [],
+                    )
+                    .expect_err("a value outside the widened CHECK set must fail");
+                assert!(
+                    err.to_string().contains("CHECK"),
+                    "expected a CHECK constraint violation, got {err}"
+                );
+                Ok(())
+            })
+            .expect("check assertion");
+
+        // The dedup index survived the rebuild at the v6 shape.
+        let conn = Connection::open(dir.path().join("c1").join("store.db")).expect("open db");
+        assert_eq!(
+            index_columns(&conn, "messages_dedup"),
+            vec![
+                "platform_msg_id",
+                "direction",
+                "event_type",
+                "timestamp",
+                "text"
+            ]
+        );
+    }
+
+    #[test]
+    fn join_and_leave_rows_round_trip() {
+        // insert_message + list_messages preserve the join/leave event
+        // types. The composite platform id of a multi-user join service
+        // message dedups PER USER: the two members of one service
+        // message both land, and a redelivery of one collapses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().to_path_buf());
+        store.open_group("c1").expect("open_group");
+
+        let mut first = sample_message();
+        first.platform_msg_id = "42:10".to_string();
+        first.event_type = EventType::Join;
+        first.sender_id = "10".to_string();
+        first.text = String::new();
+        let mut second = first.clone();
+        second.platform_msg_id = "42:11".to_string();
+        second.sender_id = "11".to_string();
+        let mut leave = first.clone();
+        leave.platform_msg_id = "43:10".to_string();
+        leave.event_type = EventType::Leave;
+
+        assert!(matches!(
+            store.insert_message("c1", &first).expect("join 1"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &second).expect("join 2"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &leave).expect("leave"),
+            InsertOutcome::Inserted(_)
+        ));
+        assert!(matches!(
+            store.insert_message("c1", &first).expect("redelivery"),
+            InsertOutcome::Duplicate
+        ));
+
+        let rows = store.list_messages("c1").expect("list");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].event_type, EventType::Join);
+        assert_eq!(rows[1].event_type, EventType::Join);
+        assert_eq!(rows[2].event_type, EventType::Leave);
+    }
+
+    #[test]
     fn migrations_run_on_first_open_and_are_idempotent_on_reopen() {
         let (dir, store) = temp_store();
         store.open_group("c1").expect("first open");
@@ -3835,7 +3969,9 @@ mod tests {
         // The v7-era messages table (the v1 columns plus v4's
         // sender_username): migration v14 ALTERs it, so the fixture
         // must carry it. The stamped-applied v6 index DDL never runs
-        // here; nothing in the pending migrations touches an index.
+        // here; migration v15 rebuilds this table and creates the
+        // dedup index fresh (no DROP INDEX statement, so the absent
+        // v6 index is not a problem).
         conn.execute_batch(
             "CREATE TABLE messages (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,

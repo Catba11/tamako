@@ -293,6 +293,26 @@ impl LiveContext {
         });
     }
 
+    /// Appends one member join/leave event at the tail (Rule C1,
+    /// decision 123). Role User, kind HumanMessage: the C3 removal and
+    /// the gate view treat the item exactly like a human message. The
+    /// content is the XML item rendering of [`render_member_content`].
+    pub fn append_member_event(
+        &mut self,
+        msg_id: i64,
+        display_name: &str,
+        username: Option<&str>,
+        timestamp: OffsetDateTime,
+        is_join: bool,
+    ) {
+        self.items.push(ContextItem {
+            kind: ContextItemKind::HumanMessage,
+            role: ContextRole::User,
+            content: render_member_content(msg_id, display_name, username, timestamp, is_join),
+            range_tag: Some(RangeTag::single(msg_id)),
+        });
+    }
+
     /// Appends one message of the bot at the tail (Rule C1). Rule B1: the
     /// bot's own speech is part of the raw log. The model sees its own
     /// speech as plain assistant text; the unified speech tag element
@@ -485,7 +505,9 @@ impl LiveContext {
     ///
     /// Edit rows render `kind="edit"` from `row.event_type` (this
     /// amends the earlier "edits render identically" behavior
-    /// deliberately). Injections land directly after the row whose id
+    /// deliberately). Member join/leave rows (decision 123) render as
+    /// member-event items (`kind="join"` / `kind="leave"`), bit-identical
+    /// to the intake append. Injections land directly after the row whose id
     /// equals `injection_position` (Rule C2), content verbatim from the
     /// persisted row. Leftover injections (position matches no row id,
     /// e.g. a position beyond the current tail) are appended at the tail
@@ -531,32 +553,46 @@ impl LiveContext {
         for row in rows {
             match row.direction {
                 Direction::Inbound => {
-                    // Rules A3/B1: a reply to the bot renders `reply="bot"`
-                    // with no target name/id — outbound rows carry
-                    // synthetic `bot-out:{nanos}` ids, so the real
-                    // platform id of the bot's message can never resolve
-                    // to a stored row. Do not fake a resolution.
-                    let reply = if row.is_reply_to_bot {
-                        ReplyRender::ToBot
+                    // Member join/leave rows (decision 123) render as
+                    // member-event items; a reply/mention/forward never
+                    // applies by construction.
+                    if let Some(is_join) = member_event_kind(row.event_type) {
+                        context.append_member_event(
+                            row.id,
+                            &row.sender_display_name,
+                            row.sender_username.as_deref(),
+                            row.timestamp,
+                            is_join,
+                        );
                     } else {
-                        match &row.reply_to_platform_msg_id {
-                            Some(pid) => ReplyRender::ToUser {
-                                target: reply_targets.get(pid).cloned(),
-                            },
-                            None => ReplyRender::None,
-                        }
-                    };
-                    context.append_human_message(
-                        row.id,
-                        &row.sender_display_name,
-                        row.sender_username.as_deref(),
-                        row.timestamp,
-                        row.event_type == EventType::Edit,
-                        row.mentions_bot,
-                        reply,
-                        forward_render(row.forward.as_ref()),
-                        &row.text,
-                    );
+                        // Rules A3/B1: a reply to the bot renders
+                        // `reply="bot"` with no target name/id — outbound
+                        // rows carry synthetic `bot-out:{nanos}` ids, so
+                        // the real platform id of the bot's message can
+                        // never resolve to a stored row. Do not fake a
+                        // resolution.
+                        let reply = if row.is_reply_to_bot {
+                            ReplyRender::ToBot
+                        } else {
+                            match &row.reply_to_platform_msg_id {
+                                Some(pid) => ReplyRender::ToUser {
+                                    target: reply_targets.get(pid).cloned(),
+                                },
+                                None => ReplyRender::None,
+                            }
+                        };
+                        context.append_human_message(
+                            row.id,
+                            &row.sender_display_name,
+                            row.sender_username.as_deref(),
+                            row.timestamp,
+                            row.event_type == EventType::Edit,
+                            row.mentions_bot,
+                            reply,
+                            forward_render(row.forward.as_ref()),
+                            &row.text,
+                        );
+                    }
                 }
                 Direction::Outbound => context.append_bot_speech(row.id, row.timestamp, &row.text),
             }
@@ -696,6 +732,72 @@ pub fn render_media_element(kind: MediaKindName, caption: &str) -> String {
 
 /// Renders one human message as the XML item of specs.md Section 7.2
 /// step 4 (the approved XML context rendering). This one helper serves
+/// Maps a raw-log event type to the member-event direction: `Some(true)`
+/// for a join, `Some(false)` for a leave, `None` for every other row
+/// kind (decision 123). The intake path, the rebuild, and the wake
+/// gather share this classification.
+pub fn member_event_kind(event_type: EventType) -> Option<bool> {
+    match event_type {
+        EventType::Join => Some(true),
+        EventType::Leave => Some(false),
+        _ => None,
+    }
+}
+
+/// The canonical body text of a member-event item (decision 123). The
+/// row text stays EMPTY in the raw log; every render site derives the
+/// body from the event type, so the phrasing cannot drift.
+pub fn member_event_body(is_join: bool) -> &'static str {
+    if is_join {
+        "joined the group"
+    } else {
+        "left the group"
+    }
+}
+
+/// Renders one member join/leave event (decision 123) in the `<msg>`
+/// grammar of [`render_human_content`]: the `kind` attribute carries
+/// the machine signal (`join` / `leave`), the body the canonical
+/// phrase. A member event never carries a reply, a mention, or a
+/// forward, so those flags never render.
+///
+/// ```text
+/// <msg from="{display_name}"[ user="{username}"] at="{HH:MM}" id="{msg_id}"
+///      kind="join|leave">joined the group</msg>
+/// ```
+pub fn render_member_content(
+    msg_id: i64,
+    display_name: &str,
+    username: Option<&str>,
+    timestamp: OffsetDateTime,
+    is_join: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str(MSG_TAG_OPEN_PREFIX);
+    out.push_str("from=\"");
+    out.push_str(&escape_xml_attr(display_name));
+    out.push('"');
+    if let Some(username) = username {
+        out.push_str(" user=\"");
+        out.push_str(&escape_xml_attr(username));
+        out.push('"');
+    }
+    out.push_str(" at=\"");
+    out.push_str(&hhmm_of(timestamp));
+    out.push('"');
+    out.push_str(" id=\"");
+    out.push_str(&msg_id.to_string());
+    out.push('"');
+    out.push_str(if is_join {
+        " kind=\"join\">"
+    } else {
+        " kind=\"leave\">"
+    });
+    out.push_str(member_event_body(is_join));
+    out.push_str(MSG_TAG_CLOSE);
+    out
+}
+
 /// `append_human_message`, `rebuild`, and the M4 gate input
 /// (`wake::GateMessage::content`): one render helper keeps the gate
 /// input consistent with the live context, and makes the rebuild
@@ -1216,6 +1318,72 @@ mod tests {
             last_msg_id,
             content: content.to_string(),
         }
+    }
+
+    #[test]
+    fn member_event_render_carries_the_kind_and_escapes() {
+        assert_eq!(
+            render_member_content(7, "Ca<rol", Some("d&ve"), at_1307(), true),
+            "<msg from=\"Ca&lt;rol\" user=\"d&amp;ve\" at=\"13:07\" id=\"7\" kind=\"join\">joined the group</msg>"
+        );
+        assert_eq!(
+            render_member_content(8, "Eve", None, at_1307(), false),
+            "<msg from=\"Eve\" at=\"13:07\" id=\"8\" kind=\"leave\">left the group</msg>"
+        );
+    }
+
+    #[test]
+    fn rebuild_renders_member_rows_like_the_incremental_append() {
+        // Rule P1 bit-identity for member events (decision 123): the
+        // rebuild of a join/leave row pair produces the same items as
+        // the intake appends, in raw-log order between human messages.
+        let rows = vec![
+            row(
+                1,
+                Direction::Inbound,
+                EventType::Message,
+                "Alice",
+                None,
+                "hi",
+            ),
+            row(
+                2,
+                Direction::Inbound,
+                EventType::Join,
+                "Carol",
+                Some("carol"),
+                "",
+            ),
+            row(3, Direction::Inbound, EventType::Leave, "Dave", None, ""),
+        ];
+        let rebuilt = LiveContext::rebuild(
+            "preamble".to_string(),
+            "pet".to_string(),
+            &rows,
+            &[],
+            &HashMap::new(),
+            &[],
+        );
+
+        let mut live = LiveContext::new("preamble".to_string(), "pet".to_string());
+        live.append_human_message(
+            1,
+            "Alice",
+            None,
+            at_1307(),
+            false,
+            false,
+            ReplyRender::None,
+            None,
+            "hi",
+        );
+        live.append_member_event(2, "Carol", Some("carol"), at_1307(), true);
+        live.append_member_event(3, "Dave", None, at_1307(), false);
+
+        assert_eq!(rebuilt, live);
+        assert_eq!(rebuilt.items()[2].kind, ContextItemKind::HumanMessage);
+        assert!(rebuilt.items()[2].content.contains("kind=\"join\""));
+        assert!(rebuilt.items()[3].content.contains("kind=\"leave\""));
     }
 
     #[test]

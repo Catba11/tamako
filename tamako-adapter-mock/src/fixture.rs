@@ -204,6 +204,7 @@ mod tests {
             "timestamp": "2026-08-01T13:00:00Z",
             "user_id": "100003",
             "display_name": "Carol",
+            "platform_msg_id": "40:100003",
         }))
         .expect("member event must deserialize");
         let converted = InboundEvent::from(FixtureEvent::MemberJoin(member.clone()));
@@ -213,6 +214,7 @@ mod tests {
         assert_eq!(got.timestamp, member.timestamp);
         assert_eq!(got.user_id, member.user_id);
         assert_eq!(got.display_name, member.display_name);
+        assert_eq!(got.platform_msg_id, member.platform_msg_id);
 
         let converted = InboundEvent::from(FixtureEvent::MemberLeave(member));
         assert!(matches!(converted, InboundEvent::MemberLeave(_)));

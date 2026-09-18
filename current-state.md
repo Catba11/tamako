@@ -1,6 +1,7 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-18 — decision 122 (publication hygiene gate:
+A living document. Update it at every milestone. Last update: 2026-09-18 — decision 123 (member join/leave events
+persist and render into the live context), after decision 122 (publication hygiene gate:
 history scrub plus the executable pre-push check), after decision 121 (alias-edge structural-binding
 fix and the tamako-jev-lab lab crate), after decision 113 (bounded-concurrent
 embeddings behind `embedding_concurrency`), after decision 112 (the
@@ -102,7 +103,9 @@ Phase 1 shipped as v0.0.1 (alpha).
     startup (`getChatMember`, in-memory cache, never persisted —
     re-evaluated on each startup) and degrades to
     no-reaction-collection with one warning per non-administrator
-    group.
+    group. Member join/leave events stayed debug-only at the core
+    until decision 123 wired raw-log persistence and live-context
+    visibility.
   - **M4 (wake procedure + timer driver + counters): COMPLETE.** The
     wake procedure of specs.md Section 9 is live: a wake gathers the new
     messages above `wake_last_row_id`, runs recall (the M4 seam —
@@ -3356,6 +3359,30 @@ feature commit (decision 92).
     an advisor and verified harmless) folds into the same rule:
     staging by explicit paths only.
 
+123. (2026-09-18) Member join/leave events persist and render into
+    the live context. Gap item 5, closed. The adapter normalized
+    Telegram's join/leave service messages since M3, but the core
+    dropped them after a debug log: the pet never saw who joined or
+    left. Now (operator ruling: context-visible, raw-log event types):
+    the events persist as first-class raw-log rows — migration v15
+    widens the event_type CHECK to 'join'/'leave' via a table rebuild;
+    the sender is the member, the text stays empty, and the composite
+    platform id {service_message_id}:{user_id} dedups the members of
+    one multi-user service message per user. The live context renders
+    them as <msg ... kind="join|leave"> items with a canonical body
+    (Rule C1; the rebuild is bit-identical, Rule P1). Passive like
+    reactions: no wake-counter advance, no trigger evaluation — the
+    next natural wake presents them through the Section 9.6 gather
+    range. The digest batch and the chunk summarizer render the
+    canonical "(joined the group)"/"(left the group)" marker for the
+    empty-text rows, and the extraction mention map gains the Sender
+    binding of a member who never spoke. Two advisories folded in:
+    the mock replay fixtures carry the composite id (Boundary), and
+    the send-time quote decision skips a target whose platform id
+    carries the composite-form colon — quoting one would fail the
+    adapter's numeric parse and sink the reply AFTER the outbound row
+    persisted (Runtime).
+
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 
 Deliberately not done, in priority order:
@@ -3381,8 +3408,10 @@ Deliberately not done, in priority order:
    `--allow-default-persona` as the escape hatch and the lenient
    chain kept for `--replay`.
 5. **Member join/leave events have no consumer** and are not stored.
-   RE-DEFERRED (M6): no spec requirement exists; the events stay
-   debug-only. Revisit if the digest needs membership history.
+   DONE (2026-09-18, decision 123): the events persist as raw-log
+   rows (migration v15, event_type `join`/`leave`) and render into
+   the live context, passively — the next natural wake presents them,
+   and the digest batch sees the canonical markers.
 6. **lbug 0.19 upgrade check.** RE-DEFERRED (M6): the workspace stays
    on `lbug = "0.18"`. Before any upgrade, verify storage-version
    compatibility and re-run the concurrent-access regression test

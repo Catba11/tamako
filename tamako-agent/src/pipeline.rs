@@ -14,7 +14,7 @@ use tamako_core::digest::{embedding_content_hash, DigestOutcome, DigestPipeline}
 use tamako_core::embedding::EmbeddingProvider as CoreEmbeddingProvider;
 use tamako_memory::identifiers::{batch_id as message_batch_id, normalize, person_id};
 use tamako_memory::{EdgeId, MemoryBackend, MemoryBatch, MemoryEdge, NodeType};
-use tamako_store::{ForwardKind, MessageRow, Store, StoreError};
+use tamako_store::{EventType, ForwardKind, MessageRow, Store, StoreError};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
@@ -1105,7 +1105,10 @@ fn forward_marker(row: &MessageRow) -> Option<ForwardMarker> {
 }
 
 /// Batch assembly (Section 7.2): the labeled messages and the
-/// mention/reply map of the batch.
+/// mention/reply map of the batch. Member join/leave rows (decision
+/// 123) carry an empty raw-log text and enter the batch with the
+/// canonical marker, and their Sender binding lets a member who never
+/// spoke resolve by name.
 fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionInput {
     let messages = rows
         .iter()
@@ -1117,7 +1120,11 @@ fn assemble_extraction_input(batch_id: &str, rows: &[MessageRow]) -> ExtractionI
                 .to_offset(UtcOffset::UTC)
                 .format(HHMM_FORMAT)
                 .unwrap_or_else(|_| "??:??".to_string()),
-            text: row.text.clone(),
+            text: match row.event_type {
+                EventType::Join => "(joined the group)".to_string(),
+                EventType::Leave => "(left the group)".to_string(),
+                _ => row.text.clone(),
+            },
             forward: forward_marker(row),
         })
         .collect();
@@ -1214,6 +1221,41 @@ mod tests {
         assert_eq!(pipeline.retry_delay(3), Duration::from_secs(4));
         assert_eq!(pipeline.retry_delay(7), Duration::from_secs(60));
         assert_eq!(pipeline.retry_delay(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn member_rows_render_the_canonical_marker_and_bind_the_sender() {
+        // Decision 123: a join/leave row enters the extraction batch
+        // with the canonical marker text (the raw-log text stays
+        // empty), and its Sender binding lets a member who never spoke
+        // resolve by name.
+        let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let row = |id: i64, event_type: EventType, name: &str| MessageRow {
+            id,
+            platform_msg_id: format!("p{id}"),
+            direction: Direction::Inbound,
+            event_type,
+            timestamp: ts,
+            sender_id: format!("u{id}"),
+            sender_display_name: name.to_string(),
+            sender_username: None,
+            text: String::new(),
+            reply_to_platform_msg_id: None,
+            mentions_bot: false,
+            is_reply_to_bot: false,
+            forward: None,
+        };
+        let rows = vec![
+            row(1, EventType::Join, "Carol"),
+            row(2, EventType::Leave, "Dave"),
+        ];
+        let input = assemble_extraction_input("b1", &rows);
+        assert_eq!(input.messages[0].text, "(joined the group)");
+        assert_eq!(input.messages[1].text, "(left the group)");
+        assert!(input
+            .mention_map
+            .iter()
+            .any(|b| b.display_name == "Carol" && b.tg_user_id == "u1"));
     }
 
     #[test]

@@ -44,12 +44,17 @@ fn message_count(events: &[FixtureEvent]) -> u32 {
 
 /// Counts the events that become rows of the raw log: messages and edits.
 fn log_row_count(events: &[FixtureEvent]) -> usize {
+    // Decision 123: member join/leave events persist as raw-log rows
+    // too (the wake counter above still counts only human messages).
     events
         .iter()
         .filter(|event| {
             matches!(
                 event,
-                FixtureEvent::Message(_) | FixtureEvent::EditedMessage(_)
+                FixtureEvent::Message(_)
+                    | FixtureEvent::EditedMessage(_)
+                    | FixtureEvent::MemberJoin(_)
+                    | FixtureEvent::MemberLeave(_)
             )
         })
         .count()

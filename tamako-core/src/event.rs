@@ -112,6 +112,15 @@ pub struct MemberEvent {
     pub timestamp: OffsetDateTime,
     pub user_id: String,
     pub display_name: String,
+    /// The member's username, when the platform provides one. Renders as
+    /// the `user` attribute of the context item, like a human message.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The dedup key of the persisted raw-log row (decision 123). One
+    /// join service message can carry SEVERAL new members, so the key is
+    /// the composite `{service_message_id}:{user_id}` — unique per event
+    /// and stable under redelivery.
+    pub platform_msg_id: String,
 }
 
 /// Rule A2: inbound events.

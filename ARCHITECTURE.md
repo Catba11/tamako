@@ -155,7 +155,11 @@ never fatal. `TELOXIDE_API_URL` is honored only by
   first into the `reactions` table (Rule P1, idempotent under
   redelivery through the dedup unique index). No context item, no
   wake-counter advance, no session mutation. Member join/leave events
-  stay debug-only.
+  (decision 123) persist as raw-log rows (event_type `join`/`leave`)
+  and append to the live context as `<msg ... kind="join|leave">`
+  items; passive like reactions — no wake-counter advance, no trigger
+  evaluation — the next natural wake presents them through the
+  Section 9.6 gather range.
 - Trigger evaluation (specs.md Section 6.2: Digest before Wake). The
   digest trigger of Section 8.2 is live (M1): on fire, the actor spawns
   the digest pipeline as a task that reports back through the inbox

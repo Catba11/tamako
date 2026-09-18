@@ -383,6 +383,10 @@ fn select_photo_size(sizes: &[PhotoSize]) -> Option<&PhotoSize> {
 /// Service messages -> `MemberJoin` / `MemberLeave`. One event per user in
 /// `new_chat_members` (it is a list). An empty vec for non-service messages.
 ///
+/// The `platform_msg_id` is the composite `{service_message_id}:{user_id}`
+/// (decision 123): one service message can carry SEVERAL new members and
+/// the raw-log dedup key must stay per-event.
+///
 /// Note: the bot itself can appear in `new_chat_members`. The event is
 /// emitted anyway; the core decides what to do with it.
 pub fn normalize_service(msg: &Message) -> Vec<InboundEvent> {
@@ -396,6 +400,8 @@ pub fn normalize_service(msg: &Message) -> Vec<InboundEvent> {
                     timestamp,
                     user_id: user.id.0.to_string(),
                     display_name: display_name(user),
+                    username: user.username.clone(),
+                    platform_msg_id: format!("{}:{}", msg.id.0, user.id.0),
                 })
             })
             .collect();
@@ -406,6 +412,8 @@ pub fn normalize_service(msg: &Message) -> Vec<InboundEvent> {
             timestamp,
             user_id: user.id.0.to_string(),
             display_name: display_name(user),
+            username: user.username.clone(),
+            platform_msg_id: format!("{}:{}", msg.id.0, user.id.0),
         })];
     }
 
@@ -1053,6 +1061,10 @@ mod tests {
                 assert_eq!(member.user_id, "10");
                 assert_eq!(member.display_name, "Carol Jones");
                 assert_eq!(member.timestamp, unix_to_offset(DATE));
+                assert_eq!(member.username, None);
+                // The composite id keeps the two members of ONE service
+                // message distinct in the raw-log dedup key (decision 123).
+                assert_eq!(member.platform_msg_id, "1:10");
             }
             other => panic!("expected MemberJoin, got {other:?}"),
         }
@@ -1060,6 +1072,8 @@ mod tests {
             InboundEvent::MemberJoin(member) => {
                 assert_eq!(member.user_id, "11");
                 assert_eq!(member.display_name, "@dave");
+                assert_eq!(member.username.as_deref(), Some("dave"));
+                assert_eq!(member.platform_msg_id, "1:11");
             }
             other => panic!("expected MemberJoin, got {other:?}"),
         }
@@ -1076,6 +1090,7 @@ mod tests {
             InboundEvent::MemberLeave(member) => {
                 assert_eq!(member.user_id, "12");
                 assert_eq!(member.display_name, "12");
+                assert_eq!(member.platform_msg_id, "1:12");
             }
             other => panic!("expected MemberLeave, got {other:?}"),
         }

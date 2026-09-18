@@ -448,6 +448,65 @@ ALTER TABLE messages ADD COLUMN forward_date TEXT;
 ALTER TABLE messages ADD COLUMN forward_automatic INTEGER;
 ",
     ),
+    (
+        15,
+        "\
+-- Member join/leave events as raw-log rows (decision 123). The adapter
+-- has normalized Telegram's service messages since M3, but the core had
+-- no consumer: the events were dropped after a debug log, so the pet
+-- never saw who joined or left. The events now persist as first-class
+-- raw-log rows, rendered into the live context (and, at the next
+-- natural wake, into the reply model's presented set).
+--
+-- SQLite cannot ALTER a CHECK constraint, so the messages table is
+-- REBUILT with the widened event_type set ('message', 'edit', 'join',
+-- 'leave'). Rows copy verbatim by explicit column list; row ids are
+-- preserved by the explicit id copy, so every id-keyed side table
+-- (injected_memories.injection_position, context_summaries ranges, the
+-- session markers) stays valid. The old dedup index drops with the old
+-- table and is recreated at the v6 shape. sqlite_sequence follows the
+-- RENAME, so AUTOINCREMENT continues above the copied max id.
+CREATE TABLE messages_new (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform_msg_id         TEXT NOT NULL,
+    direction               TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+    event_type              TEXT NOT NULL CHECK (event_type IN ('message', 'edit', 'join', 'leave')),
+    timestamp               TEXT NOT NULL,
+    sender_id               TEXT NOT NULL,
+    sender_display_name     TEXT NOT NULL,
+    text                    TEXT NOT NULL,
+    reply_to_platform_msg_id TEXT,
+    mentions_bot            INTEGER NOT NULL DEFAULT 0,
+    is_reply_to_bot         INTEGER NOT NULL DEFAULT 0,
+    sender_username         TEXT,
+    forward_kind            TEXT,
+    forward_label           TEXT,
+    forward_origin_id       TEXT,
+    forward_date            TEXT,
+    forward_automatic       INTEGER
+);
+
+INSERT INTO messages_new (
+    id, platform_msg_id, direction, event_type, timestamp,
+    sender_id, sender_display_name, text, reply_to_platform_msg_id,
+    mentions_bot, is_reply_to_bot, sender_username,
+    forward_kind, forward_label, forward_origin_id, forward_date,
+    forward_automatic
+) SELECT
+    id, platform_msg_id, direction, event_type, timestamp,
+    sender_id, sender_display_name, text, reply_to_platform_msg_id,
+    mentions_bot, is_reply_to_bot, sender_username,
+    forward_kind, forward_label, forward_origin_id, forward_date,
+    forward_automatic
+FROM messages;
+
+DROP TABLE messages;
+ALTER TABLE messages_new RENAME TO messages;
+
+CREATE UNIQUE INDEX messages_dedup
+    ON messages (platform_msg_id, direction, event_type, timestamp, text);
+",
+    ),
 ];
 
 /// Applies all pending migrations. Each version runs in one transaction.

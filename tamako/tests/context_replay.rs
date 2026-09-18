@@ -288,10 +288,13 @@ fn expected_label(row: &MessageRow) -> String {
         .to_offset(UtcOffset::UTC)
         .format(HHMM_FORMAT)
         .expect("the replay timestamps format");
-    let kind = if row.event_type == EventType::Edit {
-        " kind=\"edit\""
-    } else {
-        ""
+    let kind = match row.event_type {
+        EventType::Edit => " kind=\"edit\"",
+        // Decision 123: member rows render their own kind attribute
+        // with the canonical body (the raw-log text stays empty).
+        EventType::Join => " kind=\"join\"",
+        EventType::Leave => " kind=\"leave\"",
+        _ => "",
     };
     let reply = if row.is_reply_to_bot {
         " reply=\"bot\""
@@ -303,9 +306,14 @@ fn expected_label(row: &MessageRow) -> String {
     } else {
         ""
     };
+    let body = match row.event_type {
+        EventType::Join => "joined the group",
+        EventType::Leave => "left the group",
+        _ => row.text.as_str(),
+    };
     format!(
         "<msg from=\"{}\" at=\"{}\" id=\"{}\"{}{}{}>{}</msg>",
-        row.sender_display_name, hhmm, row.id, kind, reply, mention, row.text
+        row.sender_display_name, hhmm, row.id, kind, reply, mention, body
     )
 }
 
@@ -399,9 +407,10 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
     let chat_id = recording.chat_id.clone();
     assert_eq!(chat_id, CHAT_ID);
     // The fixture composition: 10 messages, 1 edit, 1 reaction, 1
-    // member_join, 1 member_leave (14 events). The messages and the edit
-    // become raw-log rows 1..=11 in replay order; the reaction and the
-    // member events have no Phase 1 consumer.
+    // member_join, 1 member_leave (14 events). The messages, the edit,
+    // and the member events (decision 123) become raw-log rows 1..=13
+    // in replay order (join = row 1, the leave = row 13); the reaction
+    // still lands in the reactions table, not the raw log.
     assert_eq!(recording.events.len(), 14);
     let log_event_count = recording
         .events
@@ -409,11 +418,14 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
         .filter(|event| {
             matches!(
                 event,
-                FixtureEvent::Message(_) | FixtureEvent::EditedMessage(_)
+                FixtureEvent::Message(_)
+                    | FixtureEvent::EditedMessage(_)
+                    | FixtureEvent::MemberJoin(_)
+                    | FixtureEvent::MemberLeave(_)
             )
         })
         .count();
-    assert_eq!(log_event_count, 11);
+    assert_eq!(log_event_count, 13);
 
     let fixture = make_fixture();
     // The test holds the gate from before the spawn: the first digest
@@ -442,7 +454,7 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
     replay(&handle, &chat_id, recording.events).await;
 
     // Digest 1. The pipeline read the tail at execution time (specs.md
-    // Section 10.1): B1 is the id of some log row in 4..=11.
+    // Section 10.1): B1 is the id of some log row in 4..=13.
     let first = wait_for_first_outcome(&hook, DIGEST_TIMEOUT).await;
     let b1 = first.new_boundary();
     assert!(
@@ -450,7 +462,7 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
         "the fixture prose is extracted, got {first:?}"
     );
     assert!(
-        (4..=11).contains(&b1),
+        (4..=13).contains(&b1),
         "the first batch covers log rows 1..=b1, got {b1}"
     );
 
@@ -488,16 +500,30 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
     assert_eq!(session.last_digest_boundary_msg_id, b1);
 
     let rows = store_rows_after(&fixture, 0).await;
-    assert_eq!(rows.len(), 11, "10 messages and 1 edit");
+    assert_eq!(
+        rows.len(),
+        13,
+        "10 messages, 1 edit, and the 2 member events"
+    );
     assert!(
         rows.iter().any(|row| row.event_type == EventType::Edit),
         "the edit is a raw-log row too"
+    );
+    assert_eq!(
+        rows[0].event_type,
+        EventType::Join,
+        "the member_join replays first"
+    );
+    assert_eq!(
+        rows[12].event_type,
+        EventType::Leave,
+        "the member_leave replays last"
     );
     let items = restarted
         .context_snapshot()
         .await
         .expect("the context snapshot succeeds");
-    assert_eq!(items.len(), 12, "the preamble and every log row above id 0");
+    assert_eq!(items.len(), 14, "the preamble and every log row above id 0");
     assert_preamble(&items[0]);
     // Every log row above id 0 appears as a User item with the exact
     // speaker label — the edit row included (an edit is just a new row,
@@ -507,10 +533,10 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
     }
 
     // --- Digest 2 over the tail (b1, b2]. ---
-    // Four more messages (rows 12..=15). The trigger fires when the tail
-    // above b1 reaches four rows — at row 12 when b1 <= 8, at row b1+4
-    // otherwise — and the pipeline reads at least up to the fire point:
-    // b2 >= max(12, b1+4). The tail above b2 then holds at most three
+    // Four more messages (rows 14..=17). The trigger fires when the
+    // tail above b1 reaches four rows — at row 14 when b1 <= 10, at row
+    // b1+4 otherwise — and the pipeline reads at least up to the fire
+    // point: b2 >= max(14, b1+4). The tail above b2 then holds at most three
     // rows, so NO third digest can follow and the observations below are
     // stable.
     for msg in [
@@ -538,12 +564,12 @@ async fn context_grows_on_intake_and_lags_out_after_two_digests() {
     }
     let b2 = wait_for_boundary(&restarted, b1 + 1, DIGEST_TIMEOUT).await;
     assert!(
-        (12..=15).contains(&b2) && b2 >= b1 + 4,
-        "the second batch covers (b1, b2] with b2 >= max(12, b1+4), got b1={b1} b2={b2}"
+        (14..=17).contains(&b2) && b2 >= b1 + 4,
+        "the second batch covers (b1, b2] with b2 >= max(14, b1+4), got b1={b1} b2={b2}"
     );
 
     let rows = store_rows_after(&fixture, 0).await;
-    assert_eq!(rows.len(), 15);
+    assert_eq!(rows.len(), 17);
     let items = restarted
         .context_snapshot()
         .await

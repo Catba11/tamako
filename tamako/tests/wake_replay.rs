@@ -344,13 +344,16 @@ fn message(id: &str, at: OffsetDateTime, mention: bool) -> NormalizedMessage {
 /// before feeding more events; that makes the raw-log row ids
 /// deterministic:
 ///
-/// - rows 1-4: messages 41, 43, 44, 45 (45 is a mention, forced wake);
-/// - row 5: the outbound row of reply r1 (Rule B1);
-/// - rows 6-8: messages 46, 47, 48 (48 is a reply to the bot, forced);
-/// - row 9: the outbound row of reply r2;
-/// - rows 10-12: messages 49, 50, 51; message 51 completes the count
-///   threshold (wake_msg_count = 3) and the gate targets row 12;
-/// - row 13: the trailing edit.
+/// - row 1: the member_join (decision 123: member events are raw-log
+///   rows now);
+/// - rows 2-5: messages 41, 43, 44, 45 (45 is a mention, forced wake);
+/// - row 6: the outbound row of reply r1 (Rule B1);
+/// - rows 7-9: messages 46, 47, 48 (48 is a reply to the bot, forced);
+/// - row 10: the outbound row of reply r2;
+/// - rows 11-13: messages 49, 50, 51; message 51 completes the count
+///   threshold (wake_msg_count = 3) and the gate targets row 13;
+/// - row 14: the trailing edit;
+/// - row 15: the member_leave.
 ///
 /// The unforced count fire at message 44 stays blocked: `started_at`
 /// is one day in the future, so the elapsed time of the Section 8.3
@@ -369,7 +372,7 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
     };
     let gate = Arc::new(ScriptedGate::with_decisions(vec![GateDecision {
         participate: true,
-        target_row_id: Some(12),
+        target_row_id: Some(13),
         reason: Some("a question the pet can answer".to_string()),
     }]));
     let reply = Arc::new(ScriptedReplyGenerator::with_replies(vec![
@@ -475,29 +478,30 @@ async fn threshold_wake_over_the_replay_fixture_end_to_end() {
             .iter()
             .map(|msg| msg.row_id)
             .collect::<Vec<_>>(),
-        vec![10, 11, 12]
+        vec![11, 12, 13]
     );
     assert!(!inputs[0].forced);
     // Decision 72: with `gate_context` on (the default) the gate also
     // received the shared context view, rendered from the PRE-advance
-    // marker (row 8, the tail of the second forced wake's gather):
-    // every item at or below the bound — messages 41-48 (rows 1-4 and
-    // 6-8) plus the r1 bot speech (row 5) — and NEVER the wake's own
-    // new messages (rows 10-12) nor the rows written after the marker
-    // (the r2 row 9, the edit row 13). The per-call section above
-    // still carries exactly the new messages.
+    // marker (row 9, the tail of the second forced wake's gather):
+    // every item at or below the bound — the join (row 1), messages
+    // 41-48 (rows 2-5 and 7-9) plus the r1 bot speech (row 6) — and
+    // NEVER the wake's own new messages (rows 11-13) nor the rows
+    // written after the marker (the r2 row 10, the edit row 14, the
+    // leave row 15). The per-call section above still carries exactly
+    // the new messages.
     let views = harness.gate.context_views();
     assert_eq!(views.len(), 1);
     let view = views[0]
         .as_deref()
         .expect("gate_context defaults to true: the gate receives Some(view)");
-    for row in 1..=8 {
+    for row in 1..=9 {
         assert!(
             view.contains(&format!("id=\"{row}\"")),
             "the view covers the pre-marker row {row}"
         );
     }
-    for row in 9..=13 {
+    for row in 10..=15 {
         assert!(
             !view.contains(&format!("id=\"{row}\"")),
             "the view excludes the post-marker row {row}"

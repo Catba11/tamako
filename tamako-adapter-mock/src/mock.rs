@@ -119,6 +119,7 @@ mod tests {
                     "timestamp": "2026-08-01T13:02:00Z",
                     "user_id": "100003",
                     "display_name": "Carol",
+                    "platform_msg_id": "2:100003",
                 },
             ],
         }))

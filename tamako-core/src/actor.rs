@@ -149,12 +149,13 @@ use tracing::{debug, info};
 
 use crate::config::TriggerConfig;
 use crate::context::{
-    forward_render, render_human_content, ContextItem, ContextMessage, ContextRole, LiveContext,
-    RangeTag, ReplyRender,
+    forward_render, member_event_kind, render_human_content, render_member_content, ContextItem,
+    ContextMessage, ContextRole, LiveContext, RangeTag, ReplyRender,
 };
 use crate::digest::{DigestOutcome, DigestPipeline, PostDigestHook};
 use crate::event::{
-    ForwardKind, ForwardOrigin, InboundEvent, NormalizedMessage, OutboundAction, ReactionEvent,
+    ForwardKind, ForwardOrigin, InboundEvent, MemberEvent, NormalizedMessage, OutboundAction,
+    ReactionEvent,
 };
 use crate::session::{round_to_millis, SessionState};
 use crate::summary::{SummaryError, SummaryProvider};
@@ -1333,12 +1334,15 @@ async fn run_actor<M: MemoryBackend>(
             ActorCommand::Inbound(InboundEvent::Reaction(reaction)) => {
                 handle_reaction(&store, &chat_id, reaction).await?;
             }
-            // Member join/leave events have no consumer yet (Phase 1
-            // collects reactions only). They stay debug-only.
-            ActorCommand::Inbound(
-                event @ (InboundEvent::MemberJoin(_) | InboundEvent::MemberLeave(_)),
-            ) => {
-                debug!(chat_id = %chat_id, event = ?event, "member event ignored (no consumer yet)");
+            // Decision 123: member join/leave events persist as raw-log
+            // rows (Rule P1) and append to the live context. Passive,
+            // like the reaction path: no wake counter, no trigger
+            // evaluation — the next natural wake presents them.
+            ActorCommand::Inbound(InboundEvent::MemberJoin(member)) => {
+                handle_member_event(&store, &chat_id, &mut context, member, true).await?;
+            }
+            ActorCommand::Inbound(InboundEvent::MemberLeave(member)) => {
+                handle_member_event(&store, &chat_id, &mut context, member, false).await?;
             }
             ActorCommand::Tick(now) => {
                 // One shared handler for the explicit Tick command and
@@ -2005,6 +2009,63 @@ async fn handle_reaction(
         // redeliver the same reaction update. The dedup index makes the
         // second insert a Duplicate. That is not an error.
         debug!(chat_id = %chat_id, platform_msg_id = %reaction.platform_msg_id, "duplicate reaction delivery");
+    }
+    Ok(())
+}
+
+/// Member join/leave intake (decision 123). Rule P1: the raw-log row
+/// persists FIRST (the sender is the joining/leaving member; the text
+/// stays empty — every render site derives the canonical body from the
+/// event type). The context append follows a successful insert. Passive
+/// like the reaction path: no wake-counter advance, no session
+/// mutation, no trigger evaluation — the event presents at the next
+/// natural wake through the Section 9.6 gather range.
+async fn handle_member_event(
+    store: &Arc<Store>,
+    chat_id: &str,
+    context: &mut LiveContext,
+    member: MemberEvent,
+    is_join: bool,
+) -> Result<(), CoreError> {
+    let row = NewMessage {
+        platform_msg_id: member.platform_msg_id.clone(),
+        direction: Direction::Inbound,
+        event_type: if is_join {
+            EventType::Join
+        } else {
+            EventType::Leave
+        },
+        timestamp: member.timestamp,
+        sender_id: member.user_id.clone(),
+        sender_display_name: member.display_name.clone(),
+        sender_username: member.username.clone(),
+        text: String::new(),
+        reply_to_platform_msg_id: None,
+        mentions_bot: false,
+        is_reply_to_bot: false,
+        forward: None,
+    };
+    let member_chat_id = chat_id.to_string();
+    let outcome = blocking_store(store, move |store| {
+        store.insert_message(&member_chat_id, &row)
+    })
+    .await?;
+    match outcome {
+        InsertOutcome::Inserted(id) => {
+            context.append_member_event(
+                id,
+                &member.display_name,
+                member.username.as_deref(),
+                member.timestamp,
+                is_join,
+            );
+        }
+        InsertOutcome::Duplicate => {
+            // Idempotent intake (AGENT.md Section 6.2): a reconnect can
+            // redeliver the same service message. The composite
+            // platform id makes the second delivery a Duplicate.
+            debug!(chat_id = %chat_id, platform_msg_id = %member.platform_msg_id, "duplicate member event delivery");
+        }
     }
     Ok(())
 }
@@ -2940,17 +3001,29 @@ async fn start_wake(
         .map(|row| GateMessage {
             row_id: row.id,
             platform_msg_id: row.platform_msg_id.clone(),
-            content: render_human_content(
-                row.id,
-                &row.sender_display_name,
-                row.sender_username.as_deref(),
-                row.timestamp,
-                row.event_type == EventType::Edit,
-                row.mentions_bot,
-                reply_render_from_row(row, &reply_targets),
-                forward_render(row.forward.as_ref()),
-                &row.text,
-            ),
+            content: match member_event_kind(row.event_type) {
+                // A member event renders its canonical item (decision
+                // 123): the gate and the reply model see who joined or
+                // left in the presented set.
+                Some(is_join) => render_member_content(
+                    row.id,
+                    &row.sender_display_name,
+                    row.sender_username.as_deref(),
+                    row.timestamp,
+                    is_join,
+                ),
+                None => render_human_content(
+                    row.id,
+                    &row.sender_display_name,
+                    row.sender_username.as_deref(),
+                    row.timestamp,
+                    row.event_type == EventType::Edit,
+                    row.mentions_bot,
+                    reply_render_from_row(row, &reply_targets),
+                    forward_render(row.forward.as_ref()),
+                    &row.text,
+                ),
+            },
             // The recall worker needs the raw fields for deterministic
             // candidate extraction (proposed-graph-database-specs.md
             // Section 8.1 step 1); the gate prompt keeps `content`.
@@ -3378,11 +3451,22 @@ async fn handle_wake_report(
     // target (MORE than `reply_quote_threshold` newer human messages).
     // A recent target gets a plain standalone message: a Telegram reply
     // notifies the author, and a recent target needs no context anchor.
-    let quote_target = if report.forced || newer > config.reply_quote_threshold {
-        Some(target.platform_msg_id.clone())
-    } else {
-        None
-    };
+    // Decision 123: a member join/leave row is a valid gate target (the
+    // pet may greet a newcomer), but its composite platform id
+    // (`{service_message_id}:{user_id}`) is NOT a Telegram message id —
+    // quoting it would fail the adapter's numeric parse and sink the
+    // whole send AFTER the outbound row persisted (a reply the log
+    // claims and the group never saw). Telegram message ids are decimal,
+    // so the colon is the exact marker of the composite form: a target
+    // id carrying one skips the quote and the reply goes out as a
+    // standalone message.
+    let target_is_quotable = !target.platform_msg_id.contains(':');
+    let quote_target =
+        if (report.forced || newer > config.reply_quote_threshold) && target_is_quotable {
+            Some(target.platform_msg_id.clone())
+        } else {
+            None
+        };
     // a. Rules B1/P1: persist the outbound raw-log row FIRST — the log
     // is the source of truth; never speak without logging. The
     // synthetic id: the adapter contract (Rule A3) returns no platform
@@ -7739,6 +7823,117 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[3].direction, Direction::Outbound);
         assert_eq!(rows[3].reply_to_platform_msg_id, Some("m3".to_string()));
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_member_event_target_sends_without_a_quote() {
+        // Decision 123: the gate targets a member join row (the pet
+        // greets the newcomer) and the conversation moved past it
+        // (`reply_quote_threshold = 0`). The composite platform id of
+        // the row is NOT a Telegram message id, so the send must SKIP
+        // the quote — quoting it would fail the adapter's numeric parse
+        // and sink the reply AFTER the outbound row persisted.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::First);
+        let reply = ScriptedReply::new("welcome reply");
+        let mut config = wake_config(2);
+        config.reply_quote_threshold = 0;
+        let (handle, mut outbound) = spawn_with_wake(
+            &fixture,
+            config,
+            Arc::new(NoopRecall),
+            Arc::clone(&gate),
+            Arc::clone(&reply),
+        );
+        // The gather range of the wake: the join row first (member
+        // events do not advance the wake counter), then the two human
+        // messages whose count fires the wake.
+        handle
+            .send_event(InboundEvent::MemberJoin(MemberEvent {
+                timestamp: t0(),
+                user_id: "100003".to_string(),
+                display_name: "Carol".to_string(),
+                username: None,
+                platform_msg_id: "40:100003".to_string(),
+            }))
+            .await
+            .expect("send succeeds");
+        for index in 1..=2 {
+            handle
+                .send_event(InboundEvent::Message(message(
+                    &format!("m{index}"),
+                    index,
+                    false,
+                )))
+                .await
+                .expect("send succeeds");
+        }
+
+        let (chat_id, text, reply_to) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(chat_id, CHAT_ID);
+        assert_eq!(text, "welcome reply");
+        assert_eq!(reply_to, None);
+        wait_for_counter(&fixture.store, "participations_total", 1).await;
+
+        // The outbound raw-log row still names the INTERNAL target (the
+        // same rule as any unquoted send): the quote decision touches
+        // only the platform send.
+        let rows = list_messages(&fixture.store).await;
+        let outbound_row = rows.last().expect("rows");
+        assert_eq!(outbound_row.direction, Direction::Outbound);
+        assert_eq!(
+            outbound_row.reply_to_platform_msg_id,
+            Some("40:100003".to_string())
+        );
+        handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn member_events_persist_without_advancing_the_wake_counter() {
+        // Decision 123: a member event persists as a raw-log row
+        // (event_type join/leave, empty text, the member as sender) and
+        // is PASSIVE — it never advances the wake counter, so it cannot
+        // fire a wake by itself. A redelivery dedups on the composite
+        // platform id.
+        let fixture = make_fixture();
+        let gate = ScriptedGate::yes(GateTarget::Last);
+        let reply = ScriptedReply::new("ack");
+        let (handle, mut outbound) =
+            spawn_with_wake(&fixture, wake_config(1), Arc::new(NoopRecall), gate, reply);
+        let join = || {
+            InboundEvent::MemberJoin(MemberEvent {
+                timestamp: t0(),
+                user_id: "100003".to_string(),
+                display_name: "Carol".to_string(),
+                username: None,
+                platform_msg_id: "40:100003".to_string(),
+            })
+        };
+        handle.send_event(join()).await.expect("send succeeds");
+        handle.send_event(join()).await.expect("redelivery");
+        // A count-1 configuration would have fired on the event if
+        // member events counted.
+        assert_no_action(&mut outbound, Duration::from_millis(200)).await;
+
+        // One count-1 human message fires the wake; the join row is in
+        // the gather range (it presents at the next natural wake).
+        handle
+            .send_event(InboundEvent::Message(message("m1", 1, false)))
+            .await
+            .expect("send succeeds");
+        let (_, text, _) = expect_send_text(next_action(&mut outbound).await);
+        assert_eq!(text, "ack");
+
+        // The deduplicated join row, the human message, the outbound
+        // reply — nothing else.
+        let rows = list_messages(&fixture.store).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].event_type, EventType::Join);
+        assert_eq!(rows[0].sender_display_name, "Carol");
+        assert_eq!(rows[0].text, "");
+        assert_eq!(rows[1].event_type, EventType::Message);
+        assert_eq!(rows[2].direction, Direction::Outbound);
         handle.shutdown().await.expect("shutdown succeeds");
     }
 
