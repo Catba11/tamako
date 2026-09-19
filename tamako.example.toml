@@ -139,6 +139,7 @@ reply_model = "claude-sonnet-4-5"  # reply generation (9, step 4)
 # single_value_predicates = ["currently_playing", "works_at", "lives_in", "dating"]
 # deep_recall = true                # false restores the Phase 1 shallow recall (9.1)
 # recall_candidate_cap = 40         # per wake, before the relevance gate
+# recall_wake_quota = 24            # wake-person share of the candidate cap (9.1)
 
 # -------------------------------------------- Warmup (P2, 8.4/8.5) ----
 # All optional, all per-group overridable like the trigger keys.

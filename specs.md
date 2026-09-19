@@ -209,6 +209,7 @@ One wake executes these steps in this sequence:
 - With `deep_recall` set to false, candidate generation is the Phase 1 shallow form: direct neighbors only, one hop, entry by mentions/replies and exact alias match only.
 - If the decision at step 3 is negative, the main model is never called. The recall cost is the fixed cost of every wake.
 
+- The presented candidate list is source-partitioned (decision 124): of the `recall_candidate_cap` candidates, the wake-person sources (the senders' and reply targets' entries and the two-hop expansion from them) fill at most `recall_wake_quota` (default 24); the term-driven sources (alias-term and vector entries, their expansion, and the `edge_texts` full-text source) are guaranteed the remaining slots. An unused share backfills. The presentation order is the wake block, then the term block, then the backfill tail.
 ### 9.2 Relevance gate
 
 - The recall returns memories only if an omitted memory would materially reduce the reply quality or the participation decision quality. When in doubt, inject nothing.
@@ -353,6 +354,7 @@ At startup the resolved `suffix_mode` and `timezone` values print as one INFO li
 | `warmup_topic_cooldown_days` | 3 | 9.7 |
 | `deep_recall` | true | 9.1 |
 | `recall_candidate_cap` | 40 per wake | 9.1 |
+| `recall_wake_quota` | 24 per wake | 9.1 |
 | `recall_injection_cap` | 5 per wake | 9.2 |
 LLM access and the reply-suffix keys resolve from the per-group effective configuration (global defaults with per-group overrides, like every key above):
 

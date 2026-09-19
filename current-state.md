@@ -1,6 +1,6 @@
 # current-state.md — Tamako progress
 
-A living document. Update it at every milestone. Last update: 2026-09-18 — decision 123 (member join/leave events
+A living document. Update it at every milestone. Last update: 2026-09-18 — decision 124 (recall candidate presentation is source-partitioned), decision 123 (member join/leave events
 persist and render into the live context), after decision 122 (publication hygiene gate:
 history scrub plus the executable pre-push check), after decision 121 (alias-edge structural-binding
 fix and the tamako-jev-lab lab crate), after decision 113 (bounded-concurrent
@@ -3388,6 +3388,28 @@ feature commit (decision 92).
     quote). list_latest_messages excludes them too: the Section 8.4
     silence gate and the Section 9.7 step-2 topic window read
     conversational rows only (Runtime, addendum #2).
+124. (2026-09-18) Recall candidate presentation is source-partitioned.
+    Incident: two factual recall misses in a production group (an
+    alias-identity question and an old-fact question) — an offline
+    replay of both failed wakes (recording gate + the pre-window
+    backup) showed the two question batches producing BYTE-IDENTICAL
+    candidate lists: the sender's fresh-neighbor flood filled the
+    entire 40-candidate cap, the term-matched edges never reached the
+    relevance gate, and the gate's "select nothing" was correct given
+    what it saw. Root cause is the Phase 1 wake-person-first entry
+    order plus the flat cap, not the day-one alias data work — the
+    pre-window backup replays identically. Fix: candidates carry a
+    Wake/Term provenance tag through the pipeline (the two-hop
+    expansion runs twice, split at the wake/term entry boundary), and
+    the candidate cap is partitioned — wake-person sources fill at
+    most `recall_wake_quota` (new TriggerConfig key, default 24, per
+    group overridable), the term-driven sources are guaranteed the
+    rest, an unused share backfills. Telemetry: the presented
+    candidate list and the gate's own reason are DEBUG-logged (the
+    diagnosis above was impossible from the existing logs). Pure
+    quota unit tests (partition, backfill both directions, legacy
+    order when unbound) plus an end-to-end sender-flood regression
+    test; config overlay tests extended.
 
 ## 4. Known gaps (originally carried into Phase 1 after M6)
 

@@ -955,6 +955,7 @@ fn build_wake_services(
                                         vector_candidate_threshold: trigger_config
                                             .vector_candidate_threshold,
                                         candidate_cap: trigger_config.recall_candidate_cap,
+                                        wake_quota: trigger_config.recall_wake_quota,
                                     },
                                 )
                             })

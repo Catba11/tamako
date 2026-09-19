@@ -282,6 +282,15 @@ pub struct TriggerConfig {
     /// vector entry, two-hop expansion, edge_texts full-text) merged
     /// and deduped by edge id, then truncated. Default 40.
     pub recall_candidate_cap: u32,
+    /// specs.md Sections 9.1/13 (decision 124): the wake-person share
+    /// of `recall_candidate_cap`. Of the candidates presented to the
+    /// relevance gate, the wake-person sources (the senders' and reply
+    /// targets' entries and the two-hop expansion from them) fill at
+    /// most this many slots; the term-driven sources (alias-term and
+    /// vector entries, their expansion, and the edge_texts full-text
+    /// source) are guaranteed the rest, and an unused share backfills.
+    /// Default 24.
+    pub recall_wake_quota: u32,
     /// specs.md Sections 8.4/13 (decision 78 (e)): the warmup master
     /// switch. Default TRUE — the Phase 2 exit criterion needs live
     /// measurement.
@@ -385,6 +394,7 @@ impl Default for TriggerConfig {
             recall_injection_cap: 5,
             deep_recall: true,
             recall_candidate_cap: 40,
+            recall_wake_quota: 24,
             warmup: true,
             warmup_quota: 1,
             warmup_active_hours: ActiveHours::DEFAULT,
@@ -521,6 +531,9 @@ pub struct TriggerConfigToml {
     /// The total candidate cap before the relevance gate (decision
     /// 76). Refer to `TriggerConfig::recall_candidate_cap`.
     pub recall_candidate_cap: Option<u32>,
+    /// The wake-person share of the candidate cap (decision 124).
+    /// Refer to `TriggerConfig::recall_wake_quota`.
+    pub recall_wake_quota: Option<u32>,
     /// The warmup master switch (decision 78 (e)). Refer to
     /// `TriggerConfig::warmup`.
     pub warmup: Option<bool>,
@@ -763,6 +776,9 @@ impl TriggerConfigToml {
         }
         if let Some(value) = self.recall_candidate_cap {
             base.recall_candidate_cap = value;
+        }
+        if let Some(value) = self.recall_wake_quota {
+            base.recall_wake_quota = value;
         }
         if let Some(value) = self.warmup {
             base.warmup = value;
@@ -1213,6 +1229,8 @@ wake_floor_secs = 60
         // ON; the total candidate cap defaults to 40.
         assert!(config.deep_recall);
         assert_eq!(config.recall_candidate_cap, 40);
+        // Decision 124: the wake-person share defaults to 24.
+        assert_eq!(config.recall_wake_quota, 24);
     }
 
     #[test]
@@ -1224,10 +1242,12 @@ wake_floor_secs = 60
 [global]
 deep_recall = false
 recall_candidate_cap = 60
+recall_wake_quota = 30
 
 [groups."-100777"]
 deep_recall = true
 recall_candidate_cap = 10
+recall_wake_quota = 12
 "#;
         let config = BotConfig::from_toml_str(text).expect("the TOML loads");
         assert!(!config.global.deep_recall);
@@ -1236,13 +1256,18 @@ recall_candidate_cap = 10
         // deep recall returns for this group only).
         assert!(config.for_group("-100777").deep_recall);
         assert_eq!(config.for_group("-100777").recall_candidate_cap, 10);
+        // The decision-124 quota follows the same overlay pattern.
+        assert_eq!(config.global.recall_wake_quota, 30);
+        assert_eq!(config.for_group("-100777").recall_wake_quota, 12);
         // A group without an override receives the global value.
         assert!(!config.for_group("-100999").deep_recall);
         assert_eq!(config.for_group("-100999").recall_candidate_cap, 60);
+        assert_eq!(config.for_group("-100999").recall_wake_quota, 30);
         // Keys the TOML does not set keep the decision-76 defaults.
         let plain = BotConfig::from_toml_str("[global]\n").expect("an empty overlay loads");
         assert!(plain.global.deep_recall);
         assert_eq!(plain.global.recall_candidate_cap, 40);
+        assert_eq!(plain.global.recall_wake_quota, 24);
     }
 
     #[test]

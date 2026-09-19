@@ -1613,6 +1613,7 @@ fn spawn_with_deep_wake(
         provider: Arc::clone(embedder) as Arc<dyn EmbeddingProvider>,
         vector_candidate_threshold: config.vector_candidate_threshold,
         candidate_cap: config.recall_candidate_cap,
+        wake_quota: config.recall_wake_quota,
     });
     spawn_group_actor(GroupActorParams {
         pet_tag: "tamako".to_string(),

@@ -225,6 +225,24 @@ pub struct RecallCandidate {
     pub relationship_name: String,
     pub target_id: String,
 }
+/// The provenance class of one candidate (decision 124): `Wake` = the
+/// persons of the wake (the sender and reply-target entries and the
+/// two-hop expansion from them); `Term` = everything term-driven (the
+/// alias-term and vector entries, their expansion, and the edge_texts
+/// full-text source). Carried through the pipeline up to the
+/// source-partitioned cap of `apply_source_quota`; the gate-facing
+/// `RecallCandidate` is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateOrigin {
+    Wake,
+    Term,
+}
+/// A candidate with its provenance tag (decision 124).
+#[derive(Debug, Clone)]
+struct TaggedCandidate {
+    candidate: RecallCandidate,
+    origin: CandidateOrigin,
+}
 
 /// The candidate terms of one wake: the normalized alphanumeric
 /// tokens of the new message texts (deduped in first-occurrence
@@ -667,6 +685,14 @@ impl RelevanceGate for RigRelevanceGate {
                 // A malformed output is an AgentError; the caller maps
                 // ANY gate failure to "inject nothing" (Section 9.2).
                 .await?;
+            // Decision 124 telemetry: the verdict size AND the model's
+            // own reason — an empty selection without the reason was
+            // indistinguishable from a candidate-pipeline fault.
+            tracing::debug!(
+                selected = selection.selected.len(),
+                reason = %selection.reason,
+                "the relevance gate returned a verdict"
+            );
             Ok(zero_based_indices(&selection))
         })
     }
@@ -832,6 +858,12 @@ pub struct DeepRecallConfig {
     /// (`TriggerConfig::recall_candidate_cap`, default 40, decision
     /// 76 (d)).
     pub candidate_cap: u32,
+    /// The wake-person share of `candidate_cap` (decision 124,
+    /// specs.md Section 9.1): wake-person candidates fill at most this
+    /// many of the presented slots; the term-driven sources are
+    /// guaranteed the rest and an unused share backfills. The shared
+    /// `TriggerConfig::recall_wake_quota` (default 24).
+    pub wake_quota: u32,
 }
 
 impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
@@ -1030,7 +1062,7 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         chat_id: &str,
         new_messages: &[GateMessage],
         terms: &[String],
-    ) -> Result<Vec<String>, CoreError> {
+    ) -> Result<(Vec<String>, usize), CoreError> {
         let mut entry_ids = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1068,6 +1100,10 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             }
         }
 
+        // The wake/term boundary (decision 124): senders and reply
+        // targets are the WAKE entries; everything below is
+        // term-driven.
+        let wake_entry_count = entry_ids.len();
         // Step 2: exact alias match per candidate term (Rule R5: enter
         // through the deterministic alias identifier). No fuzzy scans
         // (step 4).
@@ -1097,7 +1133,7 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                 }
             }
         }
-        Ok(entry_ids)
+        Ok((entry_ids, wake_entry_count))
     }
 
     /// The recall flow (module docs, steps 1-7, plus the same-fact
@@ -1121,22 +1157,33 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             .map(|message| message.text.as_str())
             .collect();
         let terms = candidate_terms(&texts);
-        let mut entry_ids = self.resolve_entries(chat_id, new_messages, &terms).await?;
-        let mut candidates: Vec<RecallCandidate> = Vec::new();
+        let (mut entry_ids, wake_entry_count) =
+            self.resolve_entries(chat_id, new_messages, &terms).await?;
+        let mut candidates: Vec<TaggedCandidate> = Vec::new();
         let mut seen_edge_ids = HashSet::new();
-        for entry_id in &entry_ids {
+        for (index, entry_id) in entry_ids.iter().enumerate() {
+            // Decision 124: the shallow neighbors of a wake-person
+            // entry are Wake candidates; alias-term entries yield Term.
+            let origin = if index < wake_entry_count {
+                CandidateOrigin::Wake
+            } else {
+                CandidateOrigin::Term
+            };
             match self.memory.neighbors(chat_id, entry_id).await {
                 Ok(edges) => {
                     for edge in edges {
                         let edge_id = edge.edge_id();
                         if seen_edge_ids.insert(edge_id.clone()) {
-                            candidates.push(RecallCandidate {
-                                edge_id,
-                                edge_text: edge.edge_text,
-                                valid_at: edge.valid_at,
-                                source_id: edge.source_id,
-                                relationship_name: edge.relationship_name,
-                                target_id: edge.target_id,
+                            candidates.push(TaggedCandidate {
+                                candidate: RecallCandidate {
+                                    edge_id,
+                                    edge_text: edge.edge_text,
+                                    valid_at: edge.valid_at,
+                                    source_id: edge.source_id,
+                                    relationship_name: edge.relationship_name,
+                                    target_id: edge.target_id,
+                                },
+                                origin,
                             });
                         }
                     }
@@ -1177,29 +1224,38 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             // (shallow entries plus vector entries), under the Section
             // 8.2 rules. The hop-1 edges overlap the shallow neighbors;
             // the first-wins edge-id dedup keeps the shallow position.
-            let expansion_edges = match self
-                .memory
-                .two_hop_edges(
-                    chat_id,
-                    &entry_ids,
-                    time::OffsetDateTime::now_utc(),
-                    NEIGHBOR_EXPANSION_LIMIT,
-                )
-                .await
-            {
-                Ok(edges) => edges,
-                Err(error) => {
-                    tracing::debug!(
-                        chat_id = %chat_id,
-                        error = %error,
-                        "deep recall: the two-hop expansion failed; continuing without it"
-                    );
-                    Vec::new()
+            // Decision 124: TWO runs split at the wake/term boundary so
+            // every expansion edge carries the origin class of the
+            // entries it came from; the per-node reads are unchanged.
+            let now = time::OffsetDateTime::now_utc();
+            let (wake_entries, term_entries) = entry_ids.split_at(wake_entry_count);
+            let mut expansion_count = 0;
+            for (entries, origin) in [
+                (wake_entries, CandidateOrigin::Wake),
+                (term_entries, CandidateOrigin::Term),
+            ] {
+                if entries.is_empty() {
+                    continue;
                 }
-            };
-            let expansion_count = expansion_edges.len();
-            for edge in expansion_edges {
-                push_deep_candidate(&mut candidates, &mut seen_edge_ids, edge);
+                match self
+                    .memory
+                    .two_hop_edges(chat_id, entries, now, NEIGHBOR_EXPANSION_LIMIT)
+                    .await
+                {
+                    Ok(edges) => {
+                        expansion_count += edges.len();
+                        for edge in edges {
+                            push_deep_candidate(&mut candidates, &mut seen_edge_ids, edge, origin);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            chat_id = %chat_id,
+                            error = %error,
+                            "deep recall: the two-hop expansion failed; continuing without it"
+                        );
+                    }
+                }
             }
 
             // (4) FTS: the "who discussed X" pattern over the
@@ -1212,7 +1268,12 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
                     Ok(edges) => {
                         fts_count = edges.len();
                         for edge in edges {
-                            push_deep_candidate(&mut candidates, &mut seen_edge_ids, edge);
+                            push_deep_candidate(
+                                &mut candidates,
+                                &mut seen_edge_ids,
+                                edge,
+                                CandidateOrigin::Term,
+                            );
                         }
                     }
                     Err(error) => {
@@ -1252,17 +1313,27 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         // latest rendering BEFORE the Section 9.3 dedup; refer to
         // `collapse_same_fact_candidates` for the ordering rationale.
         let fetched_edge_count = candidates.len();
-        let mut candidates = collapse_same_fact_candidates(candidates);
-        let collapsed_count = fetched_edge_count - candidates.len();
-
+        let tagged = collapse_tagged_candidates(candidates);
+        let collapsed_count = fetched_edge_count - tagged.len();
         // The candidate cap (decision 76 (d)), AFTER the same-fact
         // collapse (decision 77, S3-F8): a capped list truncated BEFORE
         // the collapse could shrink to fewer candidates than the cap
         // intends; the cap counts the post-dedup, post-collapse
-        // candidates presented to the gate.
-        if let Some(deep) = &self.deep {
-            candidates.truncate(deep.candidate_cap as usize);
-        }
+        // candidates presented to the gate. Decision 124: the cap is
+        // SOURCE-PARTITIONED — the wake-person sources fill at most
+        // `wake_quota` of the presented slots, the term-driven sources
+        // are guaranteed the rest, and an unused share backfills. The
+        // pre-124 sender-flood starvation (the persons of the wake
+        // could consume the entire cap and crowd every term match out
+        // of the gate's sight) cannot recur.
+        let mut candidates = match &self.deep {
+            Some(deep) => apply_source_quota(
+                tagged,
+                deep.candidate_cap as usize,
+                deep.wake_quota as usize,
+            ),
+            None => tagged.into_iter().map(|tagged| tagged.candidate).collect(),
+        };
 
         // Step 3 (Section 9.3): drop the candidates that already have a
         // row in injected_memories. The table holds exactly the current
@@ -1306,6 +1377,19 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
             collapsed_count = collapsed_count,
             "recall presents candidates to the relevance gate"
         );
+        // Decision 124 telemetry: the presented list itself. A gate
+        // rejection used to be undiagnosable — whether the RIGHT edge
+        // ever reached the gate was invisible without an offline
+        // replay.
+        for (index, candidate) in input.candidates.iter().enumerate() {
+            tracing::debug!(
+                chat_id = %chat_id,
+                index = index + 1,
+                relationship_name = %candidate.relationship_name,
+                edge_text = %candidate.edge_text,
+                "recall candidate presented to the gate"
+            );
+        }
         let gate_result = self.gate.select_with_context(&input, context_view).await;
 
         // Step 6: post-validation in plain Rust (never trust the model,
@@ -1416,19 +1500,23 @@ fn deep_candidate_edge_id(edge: &CandidateEdge) -> String {
 /// edge-id dedup of `recall_inner` (module docs: source order shallow,
 /// then expansion, then fts).
 fn push_deep_candidate(
-    candidates: &mut Vec<RecallCandidate>,
+    candidates: &mut Vec<TaggedCandidate>,
     seen_edge_ids: &mut HashSet<String>,
     edge: CandidateEdge,
+    origin: CandidateOrigin,
 ) {
     let edge_id = deep_candidate_edge_id(&edge);
     if seen_edge_ids.insert(edge_id.clone()) {
-        candidates.push(RecallCandidate {
-            edge_id,
-            edge_text: edge.edge_text,
-            valid_at: edge.valid_at,
-            source_id: edge.source_id,
-            relationship_name: edge.relationship_name,
-            target_id: edge.target_id,
+        candidates.push(TaggedCandidate {
+            candidate: RecallCandidate {
+                edge_id,
+                edge_text: edge.edge_text,
+                valid_at: edge.valid_at,
+                source_id: edge.source_id,
+                relationship_name: edge.relationship_name,
+                target_id: edge.target_id,
+            },
+            origin,
         });
     }
 }
@@ -1456,31 +1544,89 @@ fn push_deep_candidate(
 /// the same edge reached through several entries (sender and
 /// reply-target neighborhoods overlap) never reaches this function
 /// twice.
+/// Test-facing untagged facade over the tagged collapse (the recall
+/// pipeline itself calls `collapse_tagged_candidates` directly,
+/// decision 124).
+#[cfg(test)]
 fn collapse_same_fact_candidates(candidates: Vec<RecallCandidate>) -> Vec<RecallCandidate> {
+    collapse_tagged_candidates(
+        candidates
+            .into_iter()
+            .map(|candidate| TaggedCandidate {
+                candidate,
+                origin: CandidateOrigin::Wake,
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|tagged| tagged.candidate)
+    .collect()
+}
+/// The tagged form of `collapse_same_fact_candidates` (decision 124):
+/// the fact key ignores `valid_at`, the position of the first
+/// occurrence — AND ITS ORIGIN TAG — survives, the latest valid_at
+/// payload wins, a tie keeps the first occurrence (deterministic).
+fn collapse_tagged_candidates(candidates: Vec<TaggedCandidate>) -> Vec<TaggedCandidate> {
     // Fact key -> position of the first occurrence in `collapsed`.
     let mut positions: HashMap<(String, String, String), usize> = HashMap::new();
-    let mut collapsed: Vec<RecallCandidate> = Vec::new();
-    for candidate in candidates {
+    let mut collapsed: Vec<TaggedCandidate> = Vec::new();
+    for tagged in candidates {
         let fact_key = (
-            candidate.source_id.clone(),
-            candidate.relationship_name.clone(),
-            candidate.target_id.clone(),
+            tagged.candidate.source_id.clone(),
+            tagged.candidate.relationship_name.clone(),
+            tagged.candidate.target_id.clone(),
         );
         match positions.get(&fact_key) {
             None => {
                 positions.insert(fact_key, collapsed.len());
-                collapsed.push(candidate);
+                collapsed.push(tagged);
             }
             Some(&position) => {
                 // The latest valid_at wins; a tie keeps the first
-                // occurrence (deterministic).
-                if candidate.valid_at > collapsed[position].valid_at {
-                    collapsed[position] = candidate;
+                // occurrence (deterministic). The FIRST occurrence's
+                // origin tag survives (first-wins, decision 124).
+                if tagged.candidate.valid_at > collapsed[position].candidate.valid_at {
+                    collapsed[position].candidate = tagged.candidate;
                 }
             }
         }
     }
     collapsed
+}
+/// The source-partitioned candidate cap (decision 124, specs.md
+/// Section 9.1). Of the `total` candidates presented to the gate the
+/// wake-person sources fill at most `wake_quota`; the term-driven
+/// sources are guaranteed `total - wake_quota` slots, and either
+/// class's unused share backfills the other (wake leftover first, so
+/// the pre-124 dominance order survives whenever the term sources are
+/// scarce). The presentation order is the wake block, then the term
+/// block, then the backfill tail.
+fn apply_source_quota(
+    tagged: Vec<TaggedCandidate>,
+    total: usize,
+    wake_quota: usize,
+) -> Vec<RecallCandidate> {
+    let wake: Vec<RecallCandidate> = tagged
+        .iter()
+        .filter(|tagged| tagged.origin == CandidateOrigin::Wake)
+        .map(|tagged| tagged.candidate.clone())
+        .collect();
+    let term: Vec<RecallCandidate> = tagged
+        .into_iter()
+        .filter(|tagged| tagged.origin == CandidateOrigin::Term)
+        .map(|tagged| tagged.candidate)
+        .collect();
+    let wake_quota = wake_quota.min(total);
+    let wake_take = wake.len().min(wake_quota);
+    let term_take = term.len().min(total.saturating_sub(wake_quota));
+    let mut chosen: Vec<RecallCandidate> = Vec::with_capacity(total);
+    chosen.extend(wake[..wake_take].iter().cloned());
+    chosen.extend(term[..term_take].iter().cloned());
+    // Backfill: an unused share yields to the other class, wake
+    // leftover first (see the fn docs).
+    chosen.extend(wake[wake_take..].iter().take(total - chosen.len()).cloned());
+    chosen.extend(term[term_take..].iter().take(total - chosen.len()).cloned());
+    chosen
 }
 
 /// The outcome classes of one recall call for the DEBUG observability
@@ -2836,6 +2982,7 @@ The context section is read-only orientation; the selection names candidate numb
             provider,
             vector_candidate_threshold: 0.80,
             candidate_cap,
+            wake_quota: 24,
         }
     }
 
@@ -3373,6 +3520,7 @@ The context section is read-only orientation; the selection names candidate numb
                 provider: embedder,
                 vector_candidate_threshold: 0.80,
                 candidate_cap: 40,
+                wake_quota: 24,
             });
         let messages = vec![gate_message(1, "u42", "espresso")];
         let outcome = recall.recall(CHAT, &messages).await.expect("recall");
@@ -3438,6 +3586,150 @@ The context section is read-only orientation; the selection names candidate numb
                 "Alice plays go.".to_string(),
             ]
         );
+        assert_eq!(outcome, RecallOutcome::default());
+    }
+
+    // --- Decision 124: the source-partitioned candidate cap. ---
+    fn tagged(origin: CandidateOrigin, text: &str, day_offset: i64) -> TaggedCandidate {
+        TaggedCandidate {
+            candidate: RecallCandidate {
+                edge_id: format!("edge|{text}"),
+                edge_text: text.to_string(),
+                valid_at: OffsetDateTime::UNIX_EPOCH + time::Duration::days(day_offset),
+                source_id: "s".to_string(),
+                relationship_name: format!("rel-{text}"),
+                target_id: "t".to_string(),
+            },
+            origin,
+        }
+    }
+    #[test]
+    fn source_quota_guarantees_the_term_share() {
+        // 36 wake + 10 term, cap 40, quota 24: the wake flood yields
+        // exactly its quota; every term candidate is presented.
+        let mut pool: Vec<TaggedCandidate> = (0..36)
+            .map(|index| tagged(CandidateOrigin::Wake, &format!("wake-{index}"), index))
+            .collect();
+        pool.extend(
+            (0..10).map(|index| tagged(CandidateOrigin::Term, &format!("term-{index}"), index)),
+        );
+        let chosen = apply_source_quota(pool, 40, 24);
+        assert_eq!(chosen.len(), 40);
+        assert!(chosen[..24]
+            .iter()
+            .all(|c| c.edge_text.starts_with("wake-")));
+        assert!(chosen[24..34]
+            .iter()
+            .all(|c| c.edge_text.starts_with("term-")));
+        assert_eq!(chosen[24].edge_text, "term-0");
+        assert_eq!(chosen[33].edge_text, "term-9");
+        // The wake leftover backfills the six slots the term class
+        // could not fill.
+        assert!(chosen[34..]
+            .iter()
+            .all(|c| c.edge_text.starts_with("wake-")));
+        assert_eq!(chosen[34].edge_text, "wake-24");
+    }
+    #[test]
+    fn source_quota_backfills_an_unused_share() {
+        // Term scarce: 30 wake + 3 term, cap 40, quota 24 — the
+        // term class takes its 3, the wake leftover backfills the
+        // remaining 13 (the pre-124 dominance order survives).
+        let mut pool: Vec<TaggedCandidate> = (0..30)
+            .map(|index| tagged(CandidateOrigin::Wake, &format!("wake-{index}"), index))
+            .collect();
+        pool.extend(
+            (0..3).map(|index| tagged(CandidateOrigin::Term, &format!("term-{index}"), index)),
+        );
+        let chosen = apply_source_quota(pool, 40, 24);
+        assert_eq!(chosen.len(), 33);
+        assert_eq!(
+            chosen[..24]
+                .iter()
+                .filter(|c| c.edge_text.starts_with("wake-"))
+                .count(),
+            24
+        );
+        assert_eq!(chosen[24].edge_text, "term-0");
+        assert!(chosen[27..]
+            .iter()
+            .all(|c| c.edge_text.starts_with("wake-")));
+        // Wake scarce: 5 wake + 40 term — the term class backfills.
+        let mut pool: Vec<TaggedCandidate> = (0..5)
+            .map(|index| tagged(CandidateOrigin::Wake, &format!("wake-{index}"), index))
+            .collect();
+        pool.extend(
+            (0..40).map(|index| tagged(CandidateOrigin::Term, &format!("term-{index}"), index)),
+        );
+        let chosen = apply_source_quota(pool, 40, 24);
+        assert_eq!(chosen.len(), 40);
+        assert!(chosen[..5].iter().all(|c| c.edge_text.starts_with("wake-")));
+        assert_eq!(chosen[5].edge_text, "term-0");
+    }
+    #[test]
+    fn source_quota_preserves_the_legacy_order_when_unbound() {
+        // A pool under the cap: no truncation, no backfill — the
+        // wake-first order is the pre-124 source order.
+        let pool = vec![
+            tagged(CandidateOrigin::Wake, "wake-0", 0),
+            tagged(CandidateOrigin::Term, "term-0", 1),
+        ];
+        let chosen = apply_source_quota(pool, 40, 24);
+        let texts: Vec<String> = chosen.iter().map(|c| c.edge_text.clone()).collect();
+        assert_eq!(texts, vec!["wake-0".to_string(), "term-0".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_source_quota_saves_a_term_match_from_a_sender_flood() {
+        // Decision 124 REGRESSION (the 2026-09-18 production miss):
+        // the sender's fresh-neighbor flood fills more than the old
+        // cap; the term-matched edge (here: the fts hit) must still
+        // reach the gate — before the quota it was truncated away.
+        let (_dir, store, memory) = backend().await;
+        store.open_group(CHAT).expect("open group");
+        let person = person_node("u42", "Alice");
+        let now = OffsetDateTime::now_utc();
+        let mut nodes = vec![person.clone()];
+        let mut edges = Vec::new();
+        // The flood: 50 sender edges, every one fresher than the term
+        // fact (created_at descending drives the neighbor order).
+        for index in 0..50_i64 {
+            let concept = concept_node(&format!("hobby-{index}"));
+            let mut edge = recent_fact_edge(
+                &person.id,
+                &concept.id,
+                "related_to",
+                &format!("Alice hobby {index}."),
+            );
+            edge.created_at = now + time::Duration::seconds(index);
+            edges.push(edge);
+            nodes.push(concept);
+        }
+        // The term fact: somebody else's older edge, reachable ONLY
+        // through the edge_texts full-text source.
+        let bob = person_node("u99", "Bob");
+        let topic = concept_node("zzz-topic");
+        let fact = recent_fact_edge(&bob.id, &topic.id, "related_to", "Bob likes zzz.");
+        nodes.push(bob);
+        nodes.push(topic);
+        seed(&memory, nodes, edges).await;
+        seed(&memory, Vec::new(), vec![fact.clone()]).await;
+        store
+            .upsert_edge_text(&edge_json_id(&fact), "Bob likes zzz.")
+            .expect("seed the edge text");
+        let embedder = Arc::new(ScriptedEmbedder::with_batches(Vec::new()));
+        let gate = ScriptedRelevanceGate::with_selections(vec![vec![]]);
+        let recall =
+            ShallowRecall::new(store, memory, gate, 5).with_deep_recall(deep_config(embedder, 40));
+        let messages = vec![gate_message(1, "u42", "tell me about zzz")];
+        let outcome = recall.recall(CHAT, &messages).await.expect("recall");
+        let texts = presented_texts(&recall.gate);
+        // 24 wake-quota slots + the term match + 15 wake backfill.
+        assert_eq!(texts.len(), 40);
+        assert_eq!(texts[24], "Bob likes zzz.".to_string());
+        assert!(texts[..24]
+            .iter()
+            .all(|text| text.starts_with("Alice hobby")));
         assert_eq!(outcome, RecallOutcome::default());
     }
 }
