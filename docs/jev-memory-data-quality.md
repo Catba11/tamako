@@ -125,9 +125,14 @@ current-state.md 决策条目 + specs.md 新增结构绑定类条文（而非 §
 - 窗口前发现并已修复（Runtime blocker，a76460b）：群发现曾仅按 is_dir 过滤，
   会对 Frameworks//bugscope/ 这类非群目录创建垃圾 memory.lbug；现要求目录内
   存在 store.db（群规范标记）。生产三步确认 Frameworks//bugscope/ 零写入。
-- 待办（Runtime concern，低风险）：旁表==图 的逐群相等性断言留待下一次自然
-  停服时以 dry run（无 --apply）复核——edge_texts 为派生数据，启动和解
-  （decision 77 S6-F6）可自愈，故不单独为此安排停服。
+- 已闭环（原 Runtime concern，2026-09-18 当日两条证据）：(1) 新镜像启动和解
+  （decision 77 S6-F6）对 8 群全部报 edge_texts_upserted=0 /
+  edge_texts_pruned=0 / enqueued=0——旁表与图零漂移，embedding 零补录；
+  (2) 对窗口前备份（~/tamako-backup-20260918）做 dry run 交叉复核，
+  stale_rows=780 / pending_keys=230 / dedup_deleted=9149 与生产三步计数器
+  逐一相符。去重规模：18,946 行别名边 → 9,797 个不同绑定（48.3% 重复，
+  单绑定最多 315 行重复；tautological 自指行 18,270，占 96%——规范名漂移
+  的退化产物）。无需再安排 dry run 停服。
 
 ## 8. 复现
 
