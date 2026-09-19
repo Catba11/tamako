@@ -106,7 +106,7 @@ current-state.md 决策条目 + specs.md 新增结构绑定类条文（而非 §
 **测试**：`cargo test -p tamako-agent` 318+13 ✓；`cargo test -p tamako-memory` 77 ✓；
 `cargo test --workspace` 见 §9 DoD 记录。
 
-## 7. 生产执行预案（待批准，本任务未执行）
+## 7. 生产执行预案（2026-09-18 已执行）
 
 1. 补丁合入主线（注意当前在 jev-memory 实验分支）+ current-state.md/specs.md 文档条目；
 2. `systemctl stop tamako.service`（lbug 单写者）；
@@ -115,6 +115,19 @@ current-state.md 决策条目 + specs.md 新增结构绑定类条文（而非 §
 5. `alias_backfill --data-root /var/lib/tamako --allow-production --apply --dedupe`（去重）；
 6. `alias_backfill --data-root /var/lib/tamako --allow-production --apply --align-valid-at --sidecar`（哨兵对齐+旁表同步）；
 7. `systemctl start tamako.service`；回滚 = 恢复步骤 3 备份。
+
+执行记录（2026-09-18，与 decision-123 v15 迁移同一窗口，operator 批准）：
+- 镜像：`localhost/tamako:fb104ed`（按 AGENT.md §6.6 从 `catball-self-use`
+  分支 tip 构建，非 main）；备份：`~/tamako-backup-20260918/data`（573M）。
+- 步骤 4：stale_rows=780，pending_keys=230，applied。步骤 5：dedup_deleted=9149。
+- 步骤 6：exit 0；旁表计数（步骤后 `SELECT COUNT(*) FROM edge_texts`，只读）：
+  4311 / 27913 / 884 / 3357 / 4766 / 5000 / 5399（七个真实群；测试群 0，无别名）。
+- 窗口前发现并已修复（Runtime blocker，a76460b）：群发现曾仅按 is_dir 过滤，
+  会对 Frameworks//bugscope/ 这类非群目录创建垃圾 memory.lbug；现要求目录内
+  存在 store.db（群规范标记）。生产三步确认 Frameworks//bugscope/ 零写入。
+- 待办（Runtime concern，低风险）：旁表==图 的逐群相等性断言留待下一次自然
+  停服时以 dry run（无 --apply）复核——edge_texts 为派生数据，启动和解
+  （decision 77 S6-F6）可自愈，故不单独为此安排停服。
 
 ## 8. 复现
 

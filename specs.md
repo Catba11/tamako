@@ -165,7 +165,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 
 ### 8.2 Digest trigger
 
-- Fire when the undigested tail reaches the first of: 5000 CJK characters, 100 messages, 2500 words, or 20 kB.
+- Fire when the undigested tail reaches the first of: 5000 CJK characters, 100 messages, 2500 words, or 20 kB. Member join/leave rows never count toward these thresholds (decision 123: membership churn is not conversational volume); they still appear in the fired digest's batch (Section 10.1).
 - Fallback: fire when the tail is non-empty and the last digest is older than the digest timeout (6 h). "Last digest" means the wall-clock completion time of the last successful digest. If no digest has ever run for the group, the fallback does not fire. The tail right after the bot joins grows until it reaches a size threshold.
 - On fire, run the digest pipeline. Refer to Section 10.
 - Shutdown drain (decision 114): while the actor drains, the digest trigger dispatches nothing new — the gate covers both the tick-path evaluation and the completion-chain re-evaluation. An in-flight digest finishes or cancels at a call boundary (Section 10.3 item 4).
@@ -180,7 +180,7 @@ All thresholds are per-group configuration items. Defaults in parentheses. Refer
 ### 8.4 Warmup trigger
 
 - Daily quota: `warmup_quota` (default 1; the range is 1–3) proactive messages, spread uniformly at random over `warmup_active_hours` (default "08:00-23:00", host-local time; overnight ranges are unsupported).
-- A warmup message is permitted only if the group has been silent for at least `warmup_silence` (4 h).
+- A warmup message is permitted only if the group has been silent for at least `warmup_silence` (4 h). Silence is measured on conversational rows only: a member join/leave does not reset the silence clock (decision 123).
 - The `muted` state suppresses warmup. The soft backoff in Section 8.5 adjusts the effective quota.
 - The next scheduled activation persists in the `warmup_next_at` state key: a restart never reshuffles the schedule (Rule P1).
 - The master switch `warmup` (default true) disables the trigger entirely when false. The procedure is Section 9.7.
@@ -246,7 +246,7 @@ One wake executes these steps in this sequence:
 One warmup executes these steps in this sequence (independent of the Wake procedure; roadmap Section 6):
 
 1. Check the gates: `warmup` enabled, not `muted`, quota remains for today (after the Section 8.5 backoff), the group silent for `warmup_silence`, and the persisted `warmup_next_at` due. Any failure exits quietly (DEBUG).
-2. Pick a topic: sample the group's Concept nodes weighted by edge count × recency decay, excluding topics on their per-topic cooldown (`warmup_topic_cooldown_days`, 3 days) and topics whose normalized name appears in the 50-row raw-log tail (never restart the conversation that just went quiet). No eligible topic means no warmup — forced small talk is worse than silence.
+2. Pick a topic: sample the group's Concept nodes weighted by edge count × recency decay, excluding topics on their per-topic cooldown (`warmup_topic_cooldown_days`, 3 days) and topics whose normalized name appears in the 50-row raw-log tail (never restart the conversation that just went quiet; the tail skips member join/leave rows — decision 123). No eligible topic means no warmup — forced small talk is worse than silence.
 3. Generate with the reply purpose: the persona preamble, the gloss, the guardrail, the shared context view, and a warmup instruction naming the topic. An interest attached to a specific person is framed as an open question to the group, never as "X likes Y" — the Section 9.4 guardrail spirit extended to proactive speech. The decision-59/64 parrot filter applies to the generated text like every reply.
 4. Send as a plain standalone message. Proactive speech never quotes a target (Section 6.2's quoting rule governs replies; warmup has no target). Write the outbound row to the raw log first.  Rule B1 applies. The decision-100 overlength reject (4096 characters) applies to the warmup text alike — rejected before the raw-log write, one ERROR, no quota consumed, no engagement watch opened.
 5. Emit one curated `warmup` INFO line, persist the engagement-watch state, and schedule the next activation (`warmup_next_at`).
