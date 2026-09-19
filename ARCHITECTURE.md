@@ -598,7 +598,7 @@ ambiguity fallback, mirrored); an unknown term yields no entry
 (step 4, Rule R5). The candidate set first collapses by fact key
 (latest `valid_at` wins per `(source_id, relationship_name,
 target_id)` — the same fact must not burn the cap twice; decision 58,
-dev-roadmap.md Section 3 item 5); THEN the Section 9.3 dedup drops
+dev-roadmap.md Section 3 item 5); the post-collapse pool is then capped at `recall_candidate_cap` (default 40) before the gate — source-partitioned since decision 124: candidates carry a wake/term provenance tag (the two-hop expansion runs twice, split at the wake/term entry boundary), the wake-person sources (the senders' and reply targets' entries and the expansion from them) fill at most `recall_wake_quota` (default 24), the term-driven sources (the alias-term and vector entries, their expansion, and the `edge_texts` FTS) are guaranteed the remaining slots, and an unused share backfills; THEN the Section 9.3 dedup drops
 candidates whose edge
 id has an `injected_memories` row. Zero candidates never call the
 cheap model (Section 9.1). The relevance gate `RigRelevanceGate`

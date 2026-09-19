@@ -879,7 +879,8 @@ fn build_summary_provider(endpoint: &EndpointConfig) -> Result<Option<Arc<dyn Su
 /// deterministic and network-free, the same discipline as the
 /// decision-73 vector pre-screen), the recall widens with
 /// [`ShallowRecall::with_deep_recall`]: the shared provider Arc, the
-/// group's `vector_candidate_threshold`, and `recall_candidate_cap`.
+/// group's `vector_candidate_threshold`, `recall_candidate_cap`, and
+/// `recall_wake_quota` (decision 124).
 /// The deep store sources (KNN over `node_embeddings`, LIKE over
 /// `edge_texts`) ride the chat_id-less single-open-group helpers, which
 /// the SHARED store cannot serve in a multi-group live deployment

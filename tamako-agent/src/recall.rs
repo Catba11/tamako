@@ -53,7 +53,10 @@
 //! 3. TWO-HOP EXPANSION from ALL entry nodes found so far (shallow
 //!    entries plus vector entries): `MemoryBackend::two_hop_edges`
 //!    under the Section 8.2 rules (whitelist, validity, the 90-day
-//!    window, `NEIGHBOR_EXPANSION_LIMIT` per node).
+//!    window, `NEIGHBOR_EXPANSION_LIMIT` per node). Decision 124:
+//!    TWO runs split at the wake/term entry boundary, so every
+//!    expansion edge carries the origin class of the entries it came
+//!    from (the per-node queries and the edge union are unchanged).
 //! 4. FTS: `Store::search_edge_texts` per candidate term over the
 //!    `edge_texts` sidecar (decision 76 (c)), the hits hydrated
 //!    through `MemoryBackend::edges_by_ids` (valid only, stale ids
@@ -62,8 +65,11 @@
 //! Then: dedup EVERYTHING by edge id — source order shallow, then
 //! expansion (which carries the vector entries' edges), then fts,
 //! FIRST occurrence wins — then the decision-40 same-fact collapse,
-//! then cap the total at `recall_candidate_cap` (default 40) BEFORE
-//! the relevance gate (decision 77, S3-F8: the cap counts the
+//! then the source-partitioned cap (decision 124): of the
+//! `recall_candidate_cap` (default 40) candidates presented to the
+//! gate, the wake-person sources fill at most `recall_wake_quota`
+//! (default 24) and the term-driven sources are guaranteed the rest,
+//! an unused share backfills (decision 77, S3-F8: the cap counts the
 //! post-collapse candidates presented to the gate). The remaining
 //! downstream steps are unchanged: the Section 9.3
 //! `injected_memories` dedup, the relevance gate, the injection cap.
@@ -1137,7 +1143,7 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
     }
 
     /// The recall flow (module docs, steps 1-7, plus the same-fact
-    /// collapse of `collapse_same_fact_candidates` between the
+    /// collapse of `collapse_tagged_candidates` between the
     /// neighbor fetch and the Section 9.3 dedup — decision 40).
     /// `context_view` is the decision-72 shared context view forwarded
     /// to the relevance gate (`None` = the pre-72 delta-only prompt).
@@ -1311,7 +1317,7 @@ impl<M: MemoryBackend, G: RelevanceGate> ShallowRecall<M, G> {
         // different valid_at yields TWO candidates whose injection
         // would burn the cap twice in one wake. Collapse to the
         // latest rendering BEFORE the Section 9.3 dedup; refer to
-        // `collapse_same_fact_candidates` for the ordering rationale.
+        // `collapse_tagged_candidates` for the ordering rationale.
         let fetched_edge_count = candidates.len();
         let tagged = collapse_tagged_candidates(candidates);
         let collapsed_count = fetched_edge_count - tagged.len();
