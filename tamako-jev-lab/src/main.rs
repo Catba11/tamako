@@ -616,23 +616,31 @@ async fn build_window(
     );
 
     // Same-fact collapse (recall.rs keys on the natural-key triple,
-    // ignoring valid_at, keeping the latest), then the presented cap.
-    let mut by_fact: HashMap<(String, String, String), &CandidateEdge> = HashMap::new();
+    // ignoring valid_at, keeping the latest) in FIRST-OCCURRENCE
+    // order — the production order, and deterministic. The former
+    // HashMap into_values() + non-total Reverse(valid_at) sort made
+    // the cap-40 cut nondeterministic run to run (39/89 windows
+    // drifted across same-binary reruns, 2026-09-18).
+    let mut positions: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut collapsed: Vec<&CandidateEdge> = Vec::new();
     for c in &candidates {
         let key = (
             c.source_id.clone(),
             c.relationship_name.clone(),
             c.target_id.clone(),
         );
-        match by_fact.get(&key) {
-            Some(existing) if existing.valid_at >= c.valid_at => {}
-            _ => {
-                by_fact.insert(key, c);
+        match positions.get(&key) {
+            None => {
+                positions.insert(key, collapsed.len());
+                collapsed.push(c);
+            }
+            Some(&position) => {
+                if c.valid_at > collapsed[position].valid_at {
+                    collapsed[position] = c;
+                }
             }
         }
     }
-    let mut collapsed: Vec<&CandidateEdge> = by_fact.into_values().collect();
-    collapsed.sort_by_key(|edge| std::cmp::Reverse(edge.valid_at));
     collapsed.truncate(MAX_PRESENTED_CANDIDATES);
     if collapsed.is_empty() {
         return Ok(None);
